@@ -1,0 +1,23 @@
+[package]
+name = "zui-truth-bcs-edge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Edge-case truth for hand-written sui-types Deserialize rules (Party, Duration, Bn254 strings, transaction intent)"
+[workspace]
+[dependencies]
+sui-types = { path = "../../../sui/crates/sui-types" }
+fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430", package = "fastcrypto-zkp" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+roaring = "0.11"
+move-core-types = { path = "../../../sui/external-crates/move/crates/move-core-types" }
+base64 = "0.22"
+rand = "0.8"
+p256 = { version = "0.13.2", features = ["ecdsa"] }
+bcs = "0.1.4"
+hex = "0.4"
+serde = "1"
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+[profile.release]
+debug = 1

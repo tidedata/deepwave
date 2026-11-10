@@ -1,0 +1,7 @@
+POST /sui.rpc.v2.LedgerService/GetCheckpoint HTTP/1.1
+host: 127.0.0.1:19000
+content-type: application/grpc-web-text
+x-grpc-web: 1
+content-length: 76
+
+AAAAADQIiP3CowEaLAoPc2VxdWVuY2VfbnVtYmVyCgZkaWdlc3QKEXN1bW1hcnkudGltZXN0YW1w

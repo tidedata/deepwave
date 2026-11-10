@@ -1,0 +1,36 @@
+[package]
+name = "zui-zk-truth"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ground truth for the zui crypto-zk lane: groth16, poseidon, zklogin vectors from fastcrypto-zkp and sui-types 1.83.1"
+
+# Standalone workspace; ../../sui is the symlink to Mysten mainnet-v1.83.1 (tools/setup-sui.sh).
+[workspace]
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430", package = "fastcrypto-zkp" }
+ark-bn254 = "0.4.0"
+ark-bls12-381 = "0.4.0"
+ark-ec = "0.4.1"
+ark-ff = "0.4.1"
+ark-groth16 = "0.4.0"
+ark-relations = "0.4.0"
+ark-serialize = "0.4.1"
+ark-snark = "0.4.0"
+ark-std = "0.4.0"
+imbl = "7"
+num-bigint = "0.4"
+bcs = "0.1.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+zstd = "0.13.2"
+anyhow = "1"
+hex = "0.4"
+rayon = "1"
+
+[profile.release]
+debug = 1

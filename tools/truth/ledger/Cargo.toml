@@ -1,0 +1,22 @@
+[package]
+name = "zui-ledger-truth"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "ledger lane truth for zui: sui-inverted-index dimension keys (tx-space and event-space) of corpus checkpoints"
+
+# Standalone workspace. ../../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
+[workspace]
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+sui-inverted-index = { path = "../../sui/crates/sui-inverted-index" }
+bcs = "0.1.4"
+anyhow = "1"
+hex = "0.4"
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[profile.release]
+debug = 1

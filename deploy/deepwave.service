@@ -1,0 +1,37 @@
+# Deepwave mainnet full node. Same shape as a sui-node unit: install the binary at
+# /usr/local/bin/deepwave, the settings at /etc/deepwave/deepwave.env, and give the node its
+# own user and data directory (docs/install.md).
+#
+#   sudo useradd --system --home /var/lib/deepwave --shell /usr/sbin/nologin deepwave
+#   sudo install -d -o deepwave -g deepwave -m 0750 /var/lib/deepwave
+#   sudo install -m 0755 zig-out/bin/deepwave /usr/local/bin/deepwave
+#   sudo install -D -m 0644 deploy/deepwave.env /etc/deepwave/deepwave.env
+#   sudo install -m 0644 deploy/deepwave.service /etc/systemd/system/deepwave.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now deepwave
+[Unit]
+Description=Deepwave Sui full node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=deepwave
+Group=deepwave
+EnvironmentFile=/etc/deepwave/deepwave.env
+ExecStart=/usr/local/bin/deepwave $DEEPWAVE_ARGS
+Restart=always
+RestartSec=10
+# SIGTERM: the node finishes the checkpoint in hand, commits and exits (seconds).
+KillSignal=SIGTERM
+TimeoutStopSec=120
+LimitNOFILE=1048576
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/deepwave
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deepwave
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,41 @@
+[package]
+name = "zui-truth-exec"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "exec ground truth for zui: sui-core GlobalStateHasher (mainnet-v1.83.1) over corpus checkpoints"
+
+# Standalone workspace; ../../sui is the Mysten tree (tools/setup-sui.sh). Shared target dir (tools/env.sh).
+[workspace]
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
+sui-core = { path = "../../sui/crates/sui-core" }
+sui-execution = { path = "../../sui/sui-execution" }
+sui-framework = { path = "../../sui/crates/sui-framework" }
+prometheus = { version = "0.14", features = ["protobuf"] }
+move-core-types = { path = "../../sui/external-crates/move/crates/move-core-types" }
+move-binary-format = { path = "../../sui/external-crates/move/crates/move-binary-format" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+bcs = "0.1.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+zstd = "0.13.2"
+anyhow = "1"
+hex = "0.4"
+rayon = "1"
+sui-rpc = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "8c356d65b1c324590a3fd25990c382af308ea545", features = ["unstable"] }
+prost-types = "0.14.1"
+prost = "0.14.1"
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+debug = 1
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[features]
+# built at a Sui release with protocol 142 (1.84): the implicit Clock (clock::borrow) vectors
+sui_184 = []

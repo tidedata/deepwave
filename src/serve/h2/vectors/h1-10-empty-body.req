@@ -1,0 +1,5 @@
+POST /sui.rpc.v2.LedgerService/GetServiceInfo HTTP/1.0
+content-type: application/grpc-web+proto
+x-grpc-web: 1
+content-length: 0
+

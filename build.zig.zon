@@ -1,0 +1,9 @@
+.{
+    .name = .zui,
+    .version = "0.0.0",
+    .fingerprint = 0xc00160db8978e7a1,
+    .minimum_zig_version = "0.17.1",
+    // Pure Zig: no package dependencies (ARCHITECTURE.md section 5.1).
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

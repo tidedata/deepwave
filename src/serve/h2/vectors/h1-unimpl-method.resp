@@ -1,0 +1,19 @@
+HTTP/1.1 200 OK
+grpc-status: 12
+content-type: application/grpc-web+proto
+x-sui-chain-id: 4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S
+x-sui-chain: mainnet
+x-sui-epoch: 1305
+x-sui-checkpoint-height: 342933271
+x-sui-timestamp-ms: 1794125240375
+x-sui-timestamp: 2026-11-08T08:07:20.375Z
+x-sui-lowest-available-checkpoint: 342390380
+x-sui-lowest-available-checkpoint-objects: 342390380
+server: sui-node/1.83.1-6a567faf6de1
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-origin: *
+access-control-expose-headers: *
+server-timing: finish_request;dur=0
+content-length: 0
+date: Sun, 08 Nov 2026 08:07:21 GMT
+

@@ -1,0 +1,9 @@
+[package]
+name = "zdep"
+edition = "2024"
+
+[dependencies]
+zvm = { local = "../work/zvm2" }
+
+[addresses]
+zdep = "0x5a7e000000000000000000000000000000000000000000000000000000000003"

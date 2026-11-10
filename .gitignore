@@ -1,0 +1,14 @@
+.zig-cache/
+zig-out/
+/target/
+tools/dumper/target/
+corpus-local/
+*.chk
+*.binpb.zst
+!corpus/smoke/**
+__pycache__/
+tools/sui
+lean/.lake/
+lean/build/
+tools/truth/*/target/
+/logs/

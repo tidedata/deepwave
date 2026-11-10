@@ -1,0 +1,27 @@
+[package]
+name = "zui-pc-truth"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ground truth for the zui protocol-config lane, built against Mysten's sui 1.83.1 sui-protocol-config and sui-types gas_model"
+
+# Standalone workspace. ../../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
+[workspace]
+
+[dependencies]
+sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
+sui-types = { path = "../../sui/crates/sui-types" }
+insta = { version = "=1.46.2", features = ["redactions", "yaml", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[profile.release]
+debug = 1
+
+[features]
+# built at a Sui release with protocol 142 (1.84): BinaryFormatLimits, ImplicitSystemObjectResolver::clock
+sui_184 = []

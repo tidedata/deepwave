@@ -1,0 +1,30 @@
+[package]
+name = "zui-serve-truth"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "serve-lane truth for zui: sui.rpc.v2 response bytes produced by Mysten's own conversions (sui-types rpc_proto_conversions + sui-rpc Merge)"
+
+# Standalone workspace. ../../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
+[workspace]
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+sui-package-resolver = { path = "../../sui/crates/sui-package-resolver" }
+move-binary-format = { path = "../../sui/external-crates/move/crates/move-binary-format" }
+sui-rpc = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "8c356d65b1c324590a3fd25990c382af308ea545", features = ["unstable"] }
+sui-sdk-types = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "8c356d65b1c324590a3fd25990c382af308ea545" }
+bcs = "0.1.4"
+move-core-types = { path = "../../sui/external-crates/move/crates/move-core-types" }
+prost = "0.14.1"
+prost-types = "0.14.1"
+zstd = "0.13.2"
+anyhow = "1"
+hex = "0.4"
+rayon = "1"
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[profile.release]
+debug = 1

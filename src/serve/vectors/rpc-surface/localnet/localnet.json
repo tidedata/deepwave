@@ -1,0 +1,226 @@
+{
+ "sui": "mainnet-v1.83.1 6a567faf6de142afda7c9ceaec2a3133011929e0",
+ "chk_range": [
+  0,
+  1250
+ ],
+ "accounts_objects": {
+  "A": "0x1315d5ec8b8f7e9ffcdcf12f3a07880a078a0c1dc875d8b0eccb85f34a6a9992",
+  "B": "0x3d68524768c036ff734eb9b7e6a61212a0e4c6bcb128fb1badaf869ce0cd7ad3",
+  "PKG": "0x7a2c946f384560c6fff7bd4c99b1138866455d4a6d60dd6d49914478dcedc17b",
+  "CTR": "0xe4b533e84975e5f2a48ae1961e2606e81a57050fe738ca30ac77ed4d8b9b4f18",
+  "CAP": "0x2876208646582383c088e3bbd319c03b1a5c627a0db2bbca7595a7ed70959213",
+  "T1": "0x12730c463049366403177487d82176a8d79a9eb806a921847d4369d1b99f35f3",
+  "T2": "0xe31b655588a622ec13b854821fa87b01277ae3ec7321adbff4017b2c4d1fa76e",
+  "T3": "0x8ae04fe791bd1e120b7031c41905cb5216888928c65d0f9533ad031cd677d27d",
+  "TB": "0x7e7f684285bb79bd8cc4b5b3bf6a5bd685bb7d463aa924243757d0eae7c4c3ee"
+ },
+ "ports": {
+  "idx": {
+   "rpc": 9100,
+   "https": 9500,
+   "admin": 1400,
+   "metrics": 9300,
+   "p2p": 8200
+  },
+  "noidx": {
+   "rpc": 9101,
+   "https": 9501,
+   "admin": 1401,
+   "metrics": 9301,
+   "p2p": 8201
+  },
+  "tls": {
+   "rpc": 9102,
+   "https": 9502,
+   "admin": 1402,
+   "metrics": 9302,
+   "p2p": 8202
+  },
+  "timeout": {
+   "rpc": 9103,
+   "https": 9503,
+   "admin": 1403,
+   "metrics": 9303,
+   "p2p": 8203
+  },
+  "limits": {
+   "rpc": 9104,
+   "https": 9504,
+   "admin": 1404,
+   "metrics": 9304,
+   "p2p": 8204
+  },
+  "deny-lists": {
+   "rpc": 9105,
+   "https": 9505,
+   "admin": 1405,
+   "metrics": 9305,
+   "p2p": 8205
+  },
+  "deny-publish": {
+   "rpc": 9106,
+   "https": 9506,
+   "admin": 1406,
+   "metrics": 9306,
+   "p2p": 8206
+  },
+  "deny-upgrade": {
+   "rpc": 9107,
+   "https": 9507,
+   "admin": 1407,
+   "metrics": 9307,
+   "p2p": 8207
+  },
+  "deny-shared": {
+   "rpc": 9108,
+   "https": 9508,
+   "admin": 1408,
+   "metrics": 9308,
+   "p2p": 8208
+  },
+  "deny-user": {
+   "rpc": 9109,
+   "https": 9509,
+   "admin": 1409,
+   "metrics": 9309,
+   "p2p": 8209
+  },
+  "deny-receiving": {
+   "rpc": 9110,
+   "https": 9510,
+   "admin": 1410,
+   "metrics": 9310,
+   "p2p": 8210
+  },
+  "deny-receiving-object": {
+   "rpc": 9111,
+   "https": 9511,
+   "admin": 1411,
+   "metrics": 9311,
+   "p2p": 8211
+  },
+  "deny-zklogin-sig": {
+   "rpc": 9112,
+   "https": 9512,
+   "admin": 1412,
+   "metrics": 9312,
+   "p2p": 8212
+  },
+  "deny-zklogin-providers": {
+   "rpc": 9113,
+   "https": 9513,
+   "admin": 1413,
+   "metrics": 9313,
+   "p2p": 8213
+  },
+  "deny-gasless": {
+   "rpc": 9114,
+   "https": 9514,
+   "admin": 1414,
+   "metrics": 9314,
+   "p2p": 8214
+  },
+  "deny-no-early-validation": {
+   "rpc": 9115,
+   "https": 9515,
+   "admin": 1415,
+   "metrics": 9315,
+   "p2p": 8215
+  },
+  "traffic-default": {
+   "rpc": 9116,
+   "https": 9516,
+   "admin": 1416,
+   "metrics": 9316,
+   "p2p": 8216
+  },
+  "traffic-strict": {
+   "rpc": 9117,
+   "https": 9517,
+   "admin": 1417,
+   "metrics": 9317,
+   "p2p": 8217
+  },
+  "traffic-xff1": {
+   "rpc": 9118,
+   "https": 9518,
+   "admin": 1418,
+   "metrics": 9318,
+   "p2p": 8218
+  },
+  "traffic-xff2": {
+   "rpc": 9119,
+   "https": 9519,
+   "admin": 1419,
+   "metrics": 9319,
+   "p2p": 8219
+  },
+  "traffic-null": {
+   "rpc": 9120,
+   "https": 9520,
+   "admin": 1420,
+   "metrics": 9320,
+   "p2p": 8220
+  },
+  "traffic-noop": {
+   "rpc": 9121,
+   "https": 9521,
+   "admin": 1421,
+   "metrics": 9321,
+   "p2p": 8221
+  },
+  "traffic-dry": {
+   "rpc": 9122,
+   "https": 9522,
+   "admin": 1422,
+   "metrics": 9322,
+   "p2p": 8222
+  },
+  "deny-dyn-false": {
+   "rpc": 9123,
+   "https": 9523,
+   "admin": 1423,
+   "metrics": 9323,
+   "p2p": 8223
+  },
+  "deny-dyn-int": {
+   "rpc": 9124,
+   "https": 9524,
+   "admin": 1424,
+   "metrics": 9324,
+   "p2p": 8224
+  },
+  "deny-dyn-error": {
+   "rpc": 9125,
+   "https": 9525,
+   "admin": 1425,
+   "metrics": 9325,
+   "p2p": 8225
+  },
+  "deny-dyn-true": {
+   "rpc": 9126,
+   "https": 9526,
+   "admin": 1426,
+   "metrics": 9326,
+   "p2p": 8226
+  },
+  "sub-limit": {
+   "rpc": 9127,
+   "https": 9527,
+   "admin": 1427,
+   "metrics": 9327,
+   "p2p": 8227
+  }
+ },
+ "home_on_capture_box": "/home/ubuntu (config paths)",
+ "counts": {
+  "config": 27,
+  "deny": 72,
+  "list-checkpoints": 54,
+  "proof": 48,
+  "subscribe-events": 51,
+  "traffic": 175,
+  "transport": 65
+ }
+}

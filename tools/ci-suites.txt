@@ -1,0 +1,53 @@
+# Suites that reached done (100% on the full corpus) and must stay there. One name per line.
+corpus
+corpus-chain
+protocol-config
+protocol-config-getters
+gas-tables
+bcs-codec
+bcs
+bcs-checkpoint
+digests
+bcs-format
+hash
+lean-bcs
+lean-gas
+lean-store
+sig-vectors
+sig-corpus   # every mainnet user signature and tx signature set (zkLogin with each checkpoint's JWKs, pinned address aliases)
+ecmh
+ecvrf
+bls12381
+bls-cert     # 38,701 mainnet certificates x 8 cases plus synthetic-committee cases
+bls-group-ops
+move-binary
+move-verify
+anemo-wire
+sync-rpc-codec
+anemo-interop   # spawns zui-net-truth peer (tools/truth/net, built in target-swarm) on loopback
+poseidon
+zklogin
+store-dst      # needs ./zig build lean (ci.sh builds it for the lean-* suites)
+store-replay
+sync-follow    # archive follower: committee chain, all corpus checkpoints, dense window state, mutants, edge cases
+natives        # stateless std/sui/crypto natives (object-runtime natives join in a later round)
+framework
+exec-state-hash  # per-checkpoint GlobalStateHasher vs sui-core accumulate_effects (tools/truth/exec, built in target-swarm)
+committee        # every epoch committee, Committee::new edges (wrapping sums), the end-of-epoch certificate chain from genesis
+checkpoint-verify  # every corpus checkpoint plus ~43 Rust-judged mutants each (signers incl. run containers, digests, chain steps, apply mode)
+grpc-v2          # GetCheckpoint/GetTransaction/GetObject renders, e2e over loopback HTTP/2 on the store, MovePackageService, request-handling cases (json/clever_error not in truth); needs binpb-r4/, vectors/grpc-v2-r4/ and grpc-v2-tx-r4/ in the corpus
+verifysig        # SignatureVerificationService.VerifySignature over loopback HTTP/2: status, message, details, response bytes vs sui-node 1.83.1 (vectors/verifysig/)
+move-vm-gas      # function calls into corpus/framework/synthetic packages: status, returns, &mut bytes, gas, stack hwm, ObjectRuntime::finish (tools/truth/move-vm)
+move-vm-trace    # move-trace-format v3 traces event for event
+move-vm-load     # make_vm linkage checks (verifier, JIT type limits, missing/refused packages)
+move-vm-gas-cuts   # move-vm-gas calls on execution cuts v0..v3 (tools/truth/move-vm cut), plus argument-error mutants
+move-vm-trace-cuts # v3 (tracing2) traces of the move-vm-trace calls
+natives-cuts       # natives vectors through each cut's VM and ObjectRuntime (v0, v1 at 21/22/30, v2, v3 at 75/103)
+exec-system      # every system transaction kind (settlement, randomness, authenticator, end of epoch, ChangeEpoch, genesis) byte-exact vs certified effects
+render-json      # object json/display/OBJ_MASK (10,321 objects) and event json (1,000 checkpoints) vs sui-node 1.83.1; needs vectors/render-json/ in the corpus
+epoch-pkg        # GetEpoch (current + 10 past), package versions (GetPackage selectors, ListPackageVersions, at_checkpoint), GetDatatype/GetFunction errors, LookupName/ReverseLookupName vs sui-node 1.83.1; needs vectors/epoch-pkg/ (capture/, atcp/, chk/) in the corpus
+node-execute     # deepwave --mode execute over the 10k binpb-done window: 0 mismatches, verify-only at or under the floor (node lane)
+index-parity     # StateService ListOwnedObjects/ListBalances/GetBalance/ListDynamicFields/GetCoinInfo over loopback HTTP/2 on the restored live set, response bytes vs sui-node 1.83.1 (vectors/index/: live-1, live-2, errors)
+index-feed       # per-checkpoint effects feed over 500 consecutive corpus checkpoints ends at the index that inserting the final states builds
+node-convert      # every archive proto in binpb-done vs the sui-types conversion (truth in chk/ or chk-extra/)
+exec-move-synth  # synthetic vectors from Mysten's executor: coin deny list v2, upgrades, references, and at protocol 142 the implicit Clock (clock::borrow, vectors-v142)

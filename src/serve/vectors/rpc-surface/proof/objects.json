@@ -1,0 +1,218 @@
+[
+ {
+  "label": "counter-shared-touched-cp148",
+  "id": "0xe4b533e84975e5f2a48ae1961e2606e81a57050fe738ca30ac77ed4d8b9b4f18",
+  "checkpoint": 148,
+  "touched": true
+ },
+ {
+  "label": "counter-shared-touched-cp162",
+  "id": "0xe4b533e84975e5f2a48ae1961e2606e81a57050fe738ca30ac77ed4d8b9b4f18",
+  "checkpoint": 162,
+  "touched": true
+ },
+ {
+  "label": "counter-shared-touched-cp166",
+  "id": "0xe4b533e84975e5f2a48ae1961e2606e81a57050fe738ca30ac77ed4d8b9b4f18",
+  "checkpoint": 166,
+  "touched": true
+ },
+ {
+  "label": "counter-shared-touched-cp528",
+  "id": "0xe4b533e84975e5f2a48ae1961e2606e81a57050fe738ca30ac77ed4d8b9b4f18",
+  "checkpoint": 528,
+  "touched": true
+ },
+ {
+  "label": "counter-shared-before-cp147",
+  "id": "0xe4b533e84975e5f2a48ae1961e2606e81a57050fe738ca30ac77ed4d8b9b4f18",
+  "checkpoint": 147,
+  "touched": false
+ },
+ {
+  "label": "counter-shared-after-cp540",
+  "id": "0xe4b533e84975e5f2a48ae1961e2606e81a57050fe738ca30ac77ed4d8b9b4f18",
+  "checkpoint": 540,
+  "touched": false
+ },
+ {
+  "label": "thing1-created-mutated-receiver-touched-cp150",
+  "id": "0x12730c463049366403177487d82176a8d79a9eb806a921847d4369d1b99f35f3",
+  "checkpoint": 150,
+  "touched": true
+ },
+ {
+  "label": "thing1-created-mutated-receiver-touched-cp156",
+  "id": "0x12730c463049366403177487d82176a8d79a9eb806a921847d4369d1b99f35f3",
+  "checkpoint": 156,
+  "touched": true
+ },
+ {
+  "label": "thing1-created-mutated-receiver-before-cp149",
+  "id": "0x12730c463049366403177487d82176a8d79a9eb806a921847d4369d1b99f35f3",
+  "checkpoint": 149,
+  "touched": false
+ },
+ {
+  "label": "thing1-created-mutated-receiver-after-cp158",
+  "id": "0x12730c463049366403177487d82176a8d79a9eb806a921847d4369d1b99f35f3",
+  "checkpoint": 158,
+  "touched": false
+ },
+ {
+  "label": "thing2-transferred-to-object-touched-cp152",
+  "id": "0xe31b655588a622ec13b854821fa87b01277ae3ec7321adbff4017b2c4d1fa76e",
+  "checkpoint": 152,
+  "touched": true
+ },
+ {
+  "label": "thing2-transferred-to-object-touched-cp158",
+  "id": "0xe31b655588a622ec13b854821fa87b01277ae3ec7321adbff4017b2c4d1fa76e",
+  "checkpoint": 158,
+  "touched": true
+ },
+ {
+  "label": "thing2-transferred-to-object-before-cp151",
+  "id": "0xe31b655588a622ec13b854821fa87b01277ae3ec7321adbff4017b2c4d1fa76e",
+  "checkpoint": 151,
+  "touched": false
+ },
+ {
+  "label": "thing2-transferred-to-object-after-cp160",
+  "id": "0xe31b655588a622ec13b854821fa87b01277ae3ec7321adbff4017b2c4d1fa76e",
+  "checkpoint": 160,
+  "touched": false
+ },
+ {
+  "label": "thing3-created-deleted-touched-cp154",
+  "id": "0x8ae04fe791bd1e120b7031c41905cb5216888928c65d0f9533ad031cd677d27d",
+  "checkpoint": 154,
+  "touched": true
+ },
+ {
+  "label": "thing3-created-deleted-touched-cp160",
+  "id": "0x8ae04fe791bd1e120b7031c41905cb5216888928c65d0f9533ad031cd677d27d",
+  "checkpoint": 160,
+  "touched": true
+ },
+ {
+  "label": "thing3-created-deleted-before-cp153",
+  "id": "0x8ae04fe791bd1e120b7031c41905cb5216888928c65d0f9533ad031cd677d27d",
+  "checkpoint": 153,
+  "touched": false
+ },
+ {
+  "label": "thing3-created-deleted-after-cp162",
+  "id": "0x8ae04fe791bd1e120b7031c41905cb5216888928c65d0f9533ad031cd677d27d",
+  "checkpoint": 162,
+  "touched": false
+ },
+ {
+  "label": "thing-b-touched-cp164",
+  "id": "0x7e7f684285bb79bd8cc4b5b3bf6a5bd685bb7d463aa924243757d0eae7c4c3ee",
+  "checkpoint": 164,
+  "touched": true
+ },
+ {
+  "label": "thing-b-before-cp163",
+  "id": "0x7e7f684285bb79bd8cc4b5b3bf6a5bd685bb7d463aa924243757d0eae7c4c3ee",
+  "checkpoint": 163,
+  "touched": false
+ },
+ {
+  "label": "thing-b-after-cp166",
+  "id": "0x7e7f684285bb79bd8cc4b5b3bf6a5bd685bb7d463aa924243757d0eae7c4c3ee",
+  "checkpoint": 166,
+  "touched": false
+ },
+ {
+  "label": "package-touched-cp148",
+  "id": "0x7a2c946f384560c6fff7bd4c99b1138866455d4a6d60dd6d49914478dcedc17b",
+  "checkpoint": 148,
+  "touched": true
+ },
+ {
+  "label": "package-before-cp147",
+  "id": "0x7a2c946f384560c6fff7bd4c99b1138866455d4a6d60dd6d49914478dcedc17b",
+  "checkpoint": 147,
+  "touched": false
+ },
+ {
+  "label": "package-after-cp150",
+  "id": "0x7a2c946f384560c6fff7bd4c99b1138866455d4a6d60dd6d49914478dcedc17b",
+  "checkpoint": 150,
+  "touched": false
+ },
+ {
+  "label": "upgrade-cap-touched-cp148",
+  "id": "0x2876208646582383c088e3bbd319c03b1a5c627a0db2bbca7595a7ed70959213",
+  "checkpoint": 148,
+  "touched": true
+ },
+ {
+  "label": "upgrade-cap-before-cp147",
+  "id": "0x2876208646582383c088e3bbd319c03b1a5c627a0db2bbca7595a7ed70959213",
+  "checkpoint": 147,
+  "touched": false
+ },
+ {
+  "label": "upgrade-cap-after-cp150",
+  "id": "0x2876208646582383c088e3bbd319c03b1a5c627a0db2bbca7595a7ed70959213",
+  "checkpoint": 150,
+  "touched": false
+ },
+ {
+  "label": "clock-0x6-touched-cp0",
+  "id": "0x6",
+  "checkpoint": 0,
+  "touched": true
+ },
+ {
+  "label": "clock-0x6-touched-cp1",
+  "id": "0x6",
+  "checkpoint": 1,
+  "touched": true
+ },
+ {
+  "label": "clock-0x6-after-cp51",
+  "id": "0x6",
+  "checkpoint": 51,
+  "touched": false
+ },
+ {
+  "label": "system-0x5-touched-cp0",
+  "id": "0x5",
+  "checkpoint": 0,
+  "touched": true
+ },
+ {
+  "label": "system-0x5-after-cp2",
+  "id": "0x5",
+  "checkpoint": 2,
+  "touched": false
+ },
+ {
+  "label": "framework-0x2-touched-cp0",
+  "id": "0x2",
+  "checkpoint": 0,
+  "touched": true
+ },
+ {
+  "label": "framework-0x2-after-cp2",
+  "id": "0x2",
+  "checkpoint": 2,
+  "touched": false
+ },
+ {
+  "label": "never-existed-cp10",
+  "id": "0x9999999999999999999999999999999999999999999999999999999999999999",
+  "checkpoint": 10,
+  "touched": false
+ },
+ {
+  "label": "short-id-0x6-cp1",
+  "id": "0x6",
+  "checkpoint": 1,
+  "touched": null
+ }
+]

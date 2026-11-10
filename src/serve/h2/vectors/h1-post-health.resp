@@ -1,0 +1,18 @@
+HTTP/1.1 405 Method Not Allowed
+x-sui-chain-id: 4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S
+x-sui-chain: mainnet
+x-sui-epoch: 1305
+x-sui-checkpoint-height: 342960597
+x-sui-timestamp-ms: 1794131884129
+x-sui-timestamp: 2026-11-08T09:58:04.129Z
+x-sui-lowest-available-checkpoint: 342420773
+x-sui-lowest-available-checkpoint-objects: 342420773
+server: sui-node/1.83.1-6a567faf6de1
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-origin: *
+access-control-expose-headers: *
+server-timing: finish_request;dur=0
+allow: GET,HEAD
+content-length: 0
+date: Sun, 08 Nov 2026 09:58:05 GMT
+

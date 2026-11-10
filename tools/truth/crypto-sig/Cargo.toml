@@ -1,0 +1,36 @@
+[package]
+name = "zui-truth-sig"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "crypto-sig ground truth for zui: fastcrypto + sui-types (mainnet-v1.83.1) verdicts"
+
+# Standalone workspace; ../../sui is the Mysten tree (tools/setup-sui.sh). Shared target dir (tools/env.sh).
+[workspace]
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
+shared-crypto = { path = "../../sui/crates/shared-crypto" }
+# "experimental" only adds APIs (verify_batch_empty_fail*, for the empty-batch vector).
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430", features = ["experimental"] }
+fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430", package = "fastcrypto-zkp" }
+curve25519-dalek = "4.1.3"
+ed25519-consensus = "2.1.0"
+bcs = "0.1.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+zstd = "0.13.2"
+anyhow = "1"
+hex = "0.4"
+rayon = "1"
+rand = "0.8"
+rand_chacha = "0.3.1"
+nonempty = "0.9.0"
+imbl = "7.0.2"
+roaring = "0.11.4"
+p256 = { version = "0.13.2", features = ["ecdsa"] }
+base64ct = { version = "1.8.0", features = ["alloc"] }
+
+[profile.release]
+debug = 1

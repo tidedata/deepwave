@@ -1,0 +1,34 @@
+[package]
+name = "zui-truth-hash"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ground truth for the zui `hash` suite: fastcrypto hash/HMAC/HKDF at the pinned revision, plus the Rust speed baseline"
+
+# Standalone workspace; lock file starts as a copy of tools/dumper/Cargo.lock so deps are shared.
+[workspace]
+
+[features]
+# `fastcrypto` (default) routes through Mysten's wrappers; without it (used to build the speed
+# baseline on a bare Linux box) the same backend crates are called directly. fastcrypto's hash
+# types are zero-cost wrappers over exactly these crates, so the bench numbers are the same.
+default = ["fastcrypto"]
+fastcrypto = ["dep:fastcrypto"]
+
+[dependencies]
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430", optional = true }
+sha2 = "=0.10.9"
+sha3 = "=0.10.8"
+blake2 = "=0.10.6"
+digest = "=0.10.7"
+hmac = "=0.12.1"
+hkdf = "=0.12.4"
+hex = "0.4"
+zstd = "0.13.2"
+anyhow = "1"
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[profile.release]
+debug = 1

@@ -1,0 +1,8 @@
+HTTP/2 200 
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-methods: GET,POST
+access-control-allow-headers: *
+access-control-allow-origin: *
+server-timing: finish_request;dur=0
+date: Sun, 08 Nov 2026 09:57:33 GMT
+

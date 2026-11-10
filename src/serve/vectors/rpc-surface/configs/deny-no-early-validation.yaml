@@ -1,0 +1,18 @@
+db-path: /home/ubuntu/nodes/deny-no-early-validation/db
+network-address: /ip4/127.0.0.1/tcp/7715/http
+json-rpc-address: 127.0.0.1:9115
+metrics-address: 127.0.0.1:9315
+admin-interface-port: 1415
+genesis:
+  genesis-file-location: /home/ubuntu/ln/genesis.blob
+p2p-config:
+  listen-address: 127.0.0.1:8215
+  external-address: /ip4/127.0.0.1/udp/8215
+  seed-peers:
+  - peer-id: 7de2fe30fbc5f08439ff8b5ffebcce33be93d32dfe2b3e8b441fab09f3466b78
+    address: /ip4/127.0.0.1/udp/41663
+rpc: {}
+transaction-deny-config:
+  user-transaction-disabled: true
+transaction-driver-config:
+  enable-early-validation: false

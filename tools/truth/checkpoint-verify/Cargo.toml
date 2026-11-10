@@ -1,0 +1,26 @@
+[package]
+name = "zui-truth-checkpoint"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ground truth for the zui checkpoint-verify lane: Mysten sui-types verification paths over every corpus checkpoint"
+
+# Standalone workspace. ../../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
+[workspace]
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+shared-crypto = { path = "../../sui/crates/shared-crypto" }
+bcs = "0.1.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+hex = "0.4"
+rayon = "1"
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[profile.release]
+debug = 1

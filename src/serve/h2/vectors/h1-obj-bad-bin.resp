@@ -1,0 +1,21 @@
+HTTP/1.1 200 OK
+content-type: application/grpc-web+proto
+grpc-status: 3
+grpc-message: invalid%20object_id:%20Unable%20to%20parse%20Address%20(must%20be%20hex%20string%20of%20length%2032)
+grpc-status-details-bin: CAMSTGludmFsaWQgb2JqZWN0X2lkOiBVbmFibGUgdG8gcGFyc2UgQWRkcmVzcyAobXVzdCBiZSBoZXggc3RyaW5nIG9mIGxlbmd0aCAzMikakAEKFi9nb29nbGUucnBjLkJhZFJlcXVlc3QSdgp0ChVyZXF1ZXN0c1swXS5vYmplY3RfaWQSTGludmFsaWQgb2JqZWN0X2lkOiBVbmFibGUgdG8gcGFyc2UgQWRkcmVzcyAobXVzdCBiZSBoZXggc3RyaW5nIG9mIGxlbmd0aCAzMikaDUZJRUxEX0lOVkFMSUQ
+x-sui-chain-id: 4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S
+x-sui-chain: mainnet
+x-sui-epoch: 1305
+x-sui-checkpoint-height: 342933270
+x-sui-timestamp-ms: 1794125240121
+x-sui-timestamp: 2026-11-08T08:07:20.121Z
+x-sui-lowest-available-checkpoint: 342390332
+x-sui-lowest-available-checkpoint-objects: 342390332
+server: sui-node/1.83.1-6a567faf6de1
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-origin: *
+access-control-expose-headers: *
+server-timing: finish_request;dur=0
+content-length: 0
+date: Sun, 08 Nov 2026 08:07:20 GMT
+

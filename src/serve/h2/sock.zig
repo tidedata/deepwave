@@ -1,0 +1,253 @@
+//! Blocking socket helpers on a raw fd (libc): poll with a timeout, read, write-all without
+//! SIGPIPE, TCP_NODELAY, peer-closed probe.
+const std = @import("std");
+const builtin = @import("builtin");
+const c = std.c;
+
+pub const Error = error{ Closed, Timeout, Io };
+
+/// TCP_NODELAY, no SIGPIPE, and a 5 s send timeout so a write to a peer that stopped reading
+/// returns to `writeAll`, which gives up after `write_stall_limit` such timeouts in a row.
+pub fn tune(fd: c.fd_t) void {
+    const one: c_int = 1;
+    _ = c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
+    if (comptime builtin.os.tag.isDarwin()) {
+        _ = c.setsockopt(fd, std.posix.SOL.SOCKET, 0x1022, std.mem.asBytes(&one), @sizeOf(c_int)); // SO_NOSIGPIPE
+    }
+    const tv: c.timeval = .{ .sec = 5, .usec = 0 };
+    _ = c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(c.timeval));
+}
+
+
+/// A byte-stream session layered on an accepted fd (TLS 1.3 for `--serve-tls`): once attached,
+/// `read`, `writeAll`, `writeSome`, `waitReadable`, `waitConn` and `close` on that fd go through
+/// it, so the h2c and HTTP/1.1 paths serve TLS connections unchanged. The record layer itself
+/// lives outside this module (native/tcptls.zig); the raw I/O below is what it uses.
+pub const Session = struct {
+    ctx: *anyopaque,
+    vt: *const VTable,
+    pub const VTable = struct {
+        /// Plaintext into `buf`: blocks until at least one byte (0: closed).
+        read: *const fn (ctx: *anyopaque, buf: []u8) Error!usize,
+        /// Encrypts and writes all of `bytes`.
+        write: *const fn (ctx: *anyopaque, bytes: []const u8) Error!void,
+        /// Plaintext (or a whole record) is buffered: a read would not block.
+        buffered: *const fn (ctx: *anyopaque) bool,
+        /// Frees the session (the fd is closed by `close`).
+        deinit: *const fn (ctx: *anyopaque) void,
+    };
+};
+
+/// Makes a session for a freshly accepted fd (the TLS handshake runs here, blocking on the
+/// connection thread); null refuses the connection.
+pub const Acceptor = struct {
+    ctx: *anyopaque,
+    accept: *const fn (ctx: *anyopaque, fd: c.fd_t) ?*const Session,
+};
+
+/// fds with a session; fds past the table are never given one (`attach` fails).
+const max_session_fd = 65536;
+var sessions: [max_session_fd]std.atomic.Value(?*const Session) = @splat(.init(null));
+
+pub fn attach(fd: c.fd_t, s: *const Session) bool {
+    if (fd < 0 or fd >= max_session_fd) return false;
+    sessions[@intCast(fd)].store(s, .release);
+    return true;
+}
+
+inline fn sessionOf(fd: c.fd_t) ?*const Session {
+    if (fd < 0 or fd >= max_session_fd) return null;
+    return sessions[@intCast(fd)].load(.acquire);
+}
+
+fn buffered(fd: c.fd_t) bool {
+    const s = sessionOf(fd) orelse return false;
+    return s.vt.buffered(s.ctx);
+}
+
+/// 5 s send timeouts in a row before a write fails (a peer that reads nothing for 2 min).
+pub const write_stall_limit = 24;
+
+/// Waits until `fd` is readable (or hung up). False on timeout.
+pub fn waitReadable(fd: c.fd_t, timeout_ms: i32) Error!bool {
+    if (buffered(fd)) return true;
+    return waitReadableRaw(fd, timeout_ms);
+}
+
+/// `waitReadable` on the socket itself (a session's own buffer not counted).
+pub fn waitReadableRaw(fd: c.fd_t, timeout_ms: i32) Error!bool {
+    var p = [_]c.pollfd{.{ .fd = fd, .events = c.POLL.IN, .revents = 0 }};
+    while (true) {
+        const r = c.poll(&p, 1, timeout_ms);
+        if (r < 0) {
+            if (c.errno(r) == .INTR) continue;
+            return error.Io;
+        }
+        return r > 0;
+    }
+}
+
+/// Reads what is available (blocks if nothing is). 0 means the peer closed.
+pub fn read(fd: c.fd_t, buf: []u8) Error!usize {
+    if (sessionOf(fd)) |s| return s.vt.read(s.ctx, buf);
+    return rawRead(fd, buf);
+}
+
+/// `read` without a session.
+pub fn rawRead(fd: c.fd_t, buf: []u8) Error!usize {
+    while (true) {
+        const r = c.read(fd, buf.ptr, buf.len);
+        if (r < 0) switch (c.errno(r)) {
+            .INTR => continue,
+            .AGAIN => return error.Timeout,
+            .CONNRESET, .PIPE, .TIMEDOUT => return 0,
+            else => return error.Io,
+        };
+        return @intCast(r);
+    }
+}
+
+pub fn writeAll(fd: c.fd_t, bytes: []const u8) Error!void {
+    if (sessionOf(fd)) |s| return s.vt.write(s.ctx, bytes);
+    return rawWriteAll(fd, bytes);
+}
+
+/// `writeAll` without a session.
+pub fn rawWriteAll(fd: c.fd_t, bytes: []const u8) Error!void {
+    const flags: u32 = if (comptime builtin.os.tag == .linux) 0x4000 else 0; // MSG_NOSIGNAL
+    var off: usize = 0;
+    var stalls: u32 = 0;
+    while (off < bytes.len) {
+        const r = c.send(fd, bytes[off..].ptr, bytes.len - off, flags);
+        if (r < 0) switch (c.errno(r)) {
+            .INTR => continue,
+            .AGAIN => {
+                stalls += 1;
+                if (stalls >= write_stall_limit) return error.Closed;
+                var p = [_]c.pollfd{.{ .fd = fd, .events = c.POLL.OUT, .revents = 0 }};
+                _ = c.poll(&p, 1, 1000);
+                continue;
+            },
+            else => return error.Closed,
+        };
+        if (r > 0) stalls = 0;
+        off += @intCast(r);
+    }
+}
+
+/// Writes what the socket takes now without waiting; 0 when its send buffer is full.
+pub fn writeSome(fd: c.fd_t, bytes: []const u8) Error!usize {
+    // A session takes everything: records are not split across calls.
+    if (sessionOf(fd)) |s| {
+        try s.vt.write(s.ctx, bytes);
+        return bytes.len;
+    }
+    const nosig: u32 = if (comptime builtin.os.tag == .linux) 0x4000 else 0; // MSG_NOSIGNAL
+    const flags: u32 = nosig | @as(u32, std.posix.MSG.DONTWAIT);
+    while (true) {
+        const r = c.send(fd, bytes.ptr, bytes.len, flags);
+        if (r < 0) switch (c.errno(r)) {
+            .INTR => continue,
+            .AGAIN => return 0,
+            else => return error.Closed,
+        };
+        return @intCast(r);
+    }
+}
+
+/// True when the peer has closed or reset (a pending EOF or error); data waiting to be read does
+/// not count (a pipelined next request).
+pub fn peerClosed(fd: c.fd_t) bool {
+    var p = [_]c.pollfd{.{ .fd = fd, .events = c.POLL.IN, .revents = 0 }};
+    const r = c.poll(&p, 1, 0);
+    if (r <= 0) return false;
+    if (p[0].revents & (c.POLL.ERR | c.POLL.HUP | c.POLL.NVAL) != 0) return true;
+    var b: [1]u8 = undefined;
+    const n = c.recv(fd, &b, 1, std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT);
+    return n == 0;
+}
+
+pub fn shutdown(fd: c.fd_t) void {
+    _ = c.shutdown(fd, 2); // SHUT_RDWR
+}
+
+pub fn close(fd: c.fd_t) void {
+    if (sessionOf(fd)) |s| {
+        sessions[@intCast(fd)].store(null, .release);
+        s.vt.deinit(s.ctx);
+    }
+    _ = c.close(fd);
+}
+
+pub fn sleepMs(ms: u64) void {
+    var ts: c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    _ = c.nanosleep(&ts, &ts);
+}
+
+/// A wake-up fd pair for a thread that waits in `waitConn`: eventfd on Linux (one fd), a
+/// non-blocking pipe elsewhere. `r` is polled, `w` is written. Null when the system is out of fds
+/// (the caller then falls back to short poll timeouts).
+pub const Wake = struct {
+    r: c.fd_t,
+    w: c.fd_t,
+
+    pub fn open() ?Wake {
+        if (comptime builtin.os.tag == .linux) {
+            const fd = c.eventfd(0, 0x800 | 0x80000); // EFD_NONBLOCK | EFD_CLOEXEC
+            if (fd < 0) return null;
+            return .{ .r = fd, .w = fd };
+        }
+        var fds: [2]c.fd_t = undefined;
+        if (c.pipe(&fds) != 0) return null;
+        for (fds) |fd| {
+            const fl = c.fcntl(fd, c.F.GETFL);
+            _ = c.fcntl(fd, c.F.SETFL, fl | @as(c_int, @bitCast(c.O{ .NONBLOCK = true })));
+            _ = c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
+        }
+        return .{ .r = fds[0], .w = fds[1] };
+    }
+
+    pub fn close(k: Wake) void {
+        _ = c.close(k.r);
+        if (k.w != k.r) _ = c.close(k.w);
+    }
+
+    /// Wakes the waiter (never blocks; a full pipe already means "woken").
+    pub fn signal(k: Wake) void {
+        const one: u64 = 1;
+        const n: usize = if (comptime builtin.os.tag == .linux) 8 else 1;
+        _ = c.write(k.w, std.mem.asBytes(&one).ptr, n);
+    }
+
+    /// Clears pending wake-ups.
+    pub fn clear(k: Wake) void {
+        var b: [64]u8 = undefined;
+        while (c.read(k.r, &b, b.len) > 0) {}
+    }
+};
+
+pub const Ready = struct { readable: bool = false, writable: bool = false, woken: bool = false };
+
+/// Waits until `fd` is readable (or hung up), writable when `want_out`, or `wake` fires.
+pub fn waitConn(fd: c.fd_t, want_out: bool, wake: ?Wake, timeout_ms: i32) Error!Ready {
+    if (buffered(fd)) return .{ .readable = true };
+    const ev: i16 = if (want_out) c.POLL.IN | c.POLL.OUT else c.POLL.IN;
+    var p = [_]c.pollfd{
+        .{ .fd = fd, .events = ev, .revents = 0 },
+        .{ .fd = if (wake) |k| k.r else -1, .events = c.POLL.IN, .revents = 0 },
+    };
+    const n: c_uint = if (wake != null) 2 else 1;
+    while (true) {
+        const r = c.poll(&p, n, timeout_ms);
+        if (r < 0) {
+            if (c.errno(r) == .INTR) continue;
+            return error.Io;
+        }
+        const bad = c.POLL.ERR | c.POLL.HUP | c.POLL.NVAL;
+        return .{
+            .readable = p[0].revents & (c.POLL.IN | bad) != 0,
+            .writable = p[0].revents & c.POLL.OUT != 0,
+            .woken = n == 2 and p[1].revents & c.POLL.IN != 0,
+        };
+    }
+}

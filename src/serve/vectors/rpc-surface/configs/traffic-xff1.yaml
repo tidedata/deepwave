@@ -1,0 +1,31 @@
+db-path: /home/ubuntu/nodes/traffic-xff1/db
+network-address: /ip4/127.0.0.1/tcp/7718/http
+json-rpc-address: 127.0.0.1:9118
+metrics-address: 127.0.0.1:9318
+admin-interface-port: 1418
+genesis:
+  genesis-file-location: /home/ubuntu/ln/genesis.blob
+p2p-config:
+  listen-address: 127.0.0.1:8218
+  external-address: /ip4/127.0.0.1/udp/8218
+  seed-peers:
+  - peer-id: 7de2fe30fbc5f08439ff8b5ffebcce33be93d32dfe2b3e8b441fab09f3466b78
+    address: /ip4/127.0.0.1/udp/41663
+rpc: {}
+policy-config:
+  client-id-source:
+    x-forwarded-for: 1
+  connection-blocklist-ttl-sec: 60
+  dry-run: false
+  spam-sample-rate: 1.0
+  channel-capacity: 100
+  spam-policy-type:
+    freq-threshold:
+      client-threshold: 3
+      window-size-secs: 5
+      update-interval-secs: 1
+  error-policy-type:
+    freq-threshold:
+      client-threshold: 2
+      window-size-secs: 5
+      update-interval-secs: 1

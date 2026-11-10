@@ -1,0 +1,17 @@
+db-path: /home/ubuntu/nodes/deny-receiving-object/db
+network-address: /ip4/127.0.0.1/tcp/7711/http
+json-rpc-address: 127.0.0.1:9111
+metrics-address: 127.0.0.1:9311
+admin-interface-port: 1411
+genesis:
+  genesis-file-location: /home/ubuntu/ln/genesis.blob
+p2p-config:
+  listen-address: 127.0.0.1:8211
+  external-address: /ip4/127.0.0.1/udp/8211
+  seed-peers:
+  - peer-id: 7de2fe30fbc5f08439ff8b5ffebcce33be93d32dfe2b3e8b441fab09f3466b78
+    address: /ip4/127.0.0.1/udp/41663
+rpc: {}
+transaction-deny-config:
+  object-deny-list:
+  - '0xe31b655588a622ec13b854821fa87b01277ae3ec7321adbff4017b2c4d1fa76e'

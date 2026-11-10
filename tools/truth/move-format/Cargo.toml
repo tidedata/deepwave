@@ -1,0 +1,40 @@
+[package]
+name = "zui-truth-move-format"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ground truth for the zui move-format lane: Mysten's move-binary-format, move-bytecode-verifier and sui-verifier (1.83.1) over every module in the corpus"
+
+# Standalone workspace. ../../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
+[workspace]
+
+[[bin]]
+name = "zui-truth-move-format"
+path = "src/main.rs"
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
+sui-verifier-latest = { path = "../../sui/sui-execution/latest/sui-verifier" }
+sui-move-natives-latest = { path = "../../sui/sui-execution/latest/sui-move-natives" }
+move-binary-format = { path = "../../sui/external-crates/move/crates/move-binary-format" }
+move-bytecode-verifier = { path = "../../sui/external-crates/move/crates/move-bytecode-verifier" }
+move-bytecode-verifier-meter = { path = "../../sui/external-crates/move/crates/move-bytecode-verifier-meter" }
+move-vm-config = { path = "../../sui/external-crates/move/crates/move-vm-config" }
+move-core-types = { path = "../../sui/external-crates/move/crates/move-core-types" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+bcs = "0.1.4"
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+hex = "0.4"
+rayon = "1"
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[profile.release]
+debug = 1
+
+[features]
+# built at a Sui release with protocol 142 (1.84): BinaryFormatLimits, ImplicitSystemObjectResolver::clock
+sui_184 = []

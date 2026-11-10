@@ -1,0 +1,3 @@
+[package]
+name = "evts"
+edition = "2024"

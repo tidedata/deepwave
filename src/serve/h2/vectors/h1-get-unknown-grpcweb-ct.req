@@ -1,0 +1,5 @@
+GET /nope HTTP/1.1
+host: 127.0.0.1:19000
+content-type: application/grpc-web+proto
+x-grpc-web: 1
+

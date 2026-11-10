@@ -1,0 +1,18 @@
+[package]
+name = "zui-truth-bcs-types"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Ground truth for the bcs-codec suite: vectors from crates.io bcs (the codec sui-types uses)"
+
+# Standalone workspace; builds into the shared target dir (tools/env.sh CARGO_TARGET_DIR).
+[workspace]
+
+[[bin]]
+name = "zui-truth-bcs-types"
+path = "src/main.rs"
+
+[dependencies]
+bcs = "=0.1.6"
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"

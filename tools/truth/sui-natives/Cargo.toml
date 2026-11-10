@@ -1,0 +1,65 @@
+[package]
+name = "zui-truth-sui-natives"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ground truth for the zui sui-natives lane: every Move native run through Mysten's own move-vm-runtime and sui-move-natives (1.83.1, execution version 4, and the older cuts v0..v3 via `cut`), plus framework snapshot objects"
+
+# Standalone workspace. ../../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
+[workspace]
+
+[[bin]]
+name = "zui-truth-sui-natives"
+path = "src/main.rs"
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
+sui-framework = { path = "../../sui/crates/sui-framework" }
+sui-framework-snapshot = { path = "../../sui/crates/sui-framework-snapshot" }
+sui-move-natives = { path = "../../sui/sui-execution/latest/sui-move-natives", package = "sui-move-natives-latest" }
+sui-adapter = { path = "../../sui/sui-execution/latest/sui-adapter", package = "sui-adapter-latest" }
+prometheus = "0.14"
+# Older execution cuts (the `cut` subcommand): each cut's VM, natives and adapter link side by side.
+sui-move-natives-v0 = { path = "../../sui/sui-execution/historical-versions/v0/sui-move-natives" }
+sui-adapter-v0 = { path = "../../sui/sui-execution/historical-versions/v0/sui-adapter" }
+move-vm-runtime-v0 = { path = "../../sui/external-crates/move/historical-versions/v0/crates/move-vm-runtime" }
+move-vm-types-v0 = { path = "../../sui/external-crates/move/historical-versions/v0/crates/move-vm-types" }
+sui-move-natives-v1 = { path = "../../sui/sui-execution/historical-versions/v1/sui-move-natives" }
+sui-adapter-v1 = { path = "../../sui/sui-execution/historical-versions/v1/sui-adapter" }
+move-vm-runtime-v1 = { path = "../../sui/external-crates/move/historical-versions/v1/crates/move-vm-runtime" }
+move-vm-types-v1 = { path = "../../sui/external-crates/move/historical-versions/v1/crates/move-vm-types" }
+sui-move-natives-v2 = { path = "../../sui/sui-execution/historical-versions/v2/sui-move-natives" }
+sui-adapter-v2 = { path = "../../sui/sui-execution/historical-versions/v2/sui-adapter" }
+move-vm-runtime-v2 = { path = "../../sui/external-crates/move/historical-versions/v2/crates/move-vm-runtime" }
+move-vm-types-v2 = { path = "../../sui/external-crates/move/historical-versions/v2/crates/move-vm-types" }
+sui-move-natives-v3 = { path = "../../sui/sui-execution/historical-versions/v3/sui-move-natives" }
+sui-adapter-v3 = { path = "../../sui/sui-execution/historical-versions/v3/sui-adapter" }
+move-vm-runtime-v3 = { path = "../../sui/external-crates/move/historical-versions/v3/crates/move-vm-runtime" }
+move-vm-types-v3 = { path = "../../sui/external-crates/move/historical-versions/v3/crates/move-vm-types" }
+move-vm-runtime = { path = "../../sui/external-crates/move/crates/move-vm-runtime" }
+move-binary-format = { path = "../../sui/external-crates/move/crates/move-binary-format" }
+move-core-types = { path = "../../sui/external-crates/move/crates/move-core-types" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+num-bigint = "0.4"
+bcs = "0.1.4"
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+hex = "0.4"
+rand = "0.8.5"
+rand_chacha = "0.3.1"
+ciborium = "0.2"
+x509-parser = "0.17"
+blst = "=0.3.16"
+multibase = "=0.9.1"
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[profile.release]
+debug = 1
+
+[features]
+# built at a Sui release with protocol 142 (1.84): BinaryFormatLimits, ImplicitSystemObjectResolver::clock
+sui_184 = []

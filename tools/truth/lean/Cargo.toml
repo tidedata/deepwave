@@ -1,0 +1,25 @@
+[package]
+name = "zui-lean-truth"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ground truth for the zui Lean specs: runs the lean lane's exported vectors through Mysten's Rust (bcs 0.1.6, sui-types gas) at sui 1.83.1"
+
+# Standalone workspace; ../../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
+[workspace]
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
+move-core-types = { path = "../../sui/external-crates/move/crates/move-core-types" }
+move-binary-format = { path = "../../sui/external-crates/move/crates/move-binary-format" }
+bcs = "0.1.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.8"
+serde-reflection = "0.5.0"
+anyhow = "1"
+hex = "0.4"
+
+[profile.release]
+debug = 1

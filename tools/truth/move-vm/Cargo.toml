@@ -1,0 +1,60 @@
+[package]
+name = "zui-truth-move-vm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ground truth for the zui move-vm lane: Mysten's move-vm-runtime (1.83.1, latest execution) with SuiGasMeter over function calls into corpus packages"
+
+# Standalone workspace. ../../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
+[workspace]
+
+[[bin]]
+name = "zui-truth-move-vm"
+path = "src/main.rs"
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
+sui-adapter-latest = { path = "../../sui/sui-execution/latest/sui-adapter", features = ["tracing"] }
+sui-move-natives-latest = { path = "../../sui/sui-execution/latest/sui-move-natives" }
+move-vm-runtime = { path = "../../sui/external-crates/move/crates/move-vm-runtime", features = ["tracing"] }
+move-vm-config = { path = "../../sui/external-crates/move/crates/move-vm-config" }
+move-binary-format = { path = "../../sui/external-crates/move/crates/move-binary-format" }
+move-core-types = { path = "../../sui/external-crates/move/crates/move-core-types" }
+move-trace-format = { path = "../../sui/external-crates/move/crates/move-trace-format" }
+# Older execution cuts (sui-execution/historical-versions/vN, move historical-versions/vN), for the `cut`
+# subcommand. Each cut is its own crate, so all four link into this binary next to latest.
+sui-adapter-v0 = { path = "../../sui/sui-execution/historical-versions/v0/sui-adapter" }
+sui-adapter-v1 = { path = "../../sui/sui-execution/historical-versions/v1/sui-adapter" }
+sui-adapter-v2 = { path = "../../sui/sui-execution/historical-versions/v2/sui-adapter" }
+sui-adapter-v3 = { path = "../../sui/sui-execution/historical-versions/v3/sui-adapter", features = ["tracing"] }
+sui-move-natives-v0 = { path = "../../sui/sui-execution/historical-versions/v0/sui-move-natives" }
+sui-move-natives-v1 = { path = "../../sui/sui-execution/historical-versions/v1/sui-move-natives" }
+sui-move-natives-v2 = { path = "../../sui/sui-execution/historical-versions/v2/sui-move-natives" }
+sui-move-natives-v3 = { path = "../../sui/sui-execution/historical-versions/v3/sui-move-natives" }
+move-vm-runtime-v0 = { path = "../../sui/external-crates/move/historical-versions/v0/crates/move-vm-runtime" }
+move-vm-runtime-v1 = { path = "../../sui/external-crates/move/historical-versions/v1/crates/move-vm-runtime" }
+move-vm-runtime-v2 = { path = "../../sui/external-crates/move/historical-versions/v2/crates/move-vm-runtime" }
+move-vm-runtime-v3 = { path = "../../sui/external-crates/move/historical-versions/v3/crates/move-vm-runtime", features = ["tracing"] }
+move-vm-types-v0 = { path = "../../sui/external-crates/move/historical-versions/v0/crates/move-vm-types" }
+move-vm-types-v1 = { path = "../../sui/external-crates/move/historical-versions/v1/crates/move-vm-types" }
+move-vm-types-v2 = { path = "../../sui/external-crates/move/historical-versions/v2/crates/move-vm-types" }
+move-vm-types-v3 = { path = "../../sui/external-crates/move/historical-versions/v3/crates/move-vm-types" }
+indexmap = "2"
+bcs = "0.1.4"
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+hex = "0.4"
+rayon = "1"
+prometheus = "0.14"
+zstd = "0.13"
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[profile.release]
+debug = 1
+
+[features]
+# built at a Sui release with protocol 142 (1.84): ImplicitSystemObjectResolver::clock, framework snapshot 142
+sui_184 = []

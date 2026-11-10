@@ -1,0 +1,29 @@
+[package]
+name = "zui-truth-state-sync"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ground truth for the zui state-sync lane: follow windows, applied state and mutants from Mysten sui-types"
+
+# Standalone workspace. ../../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
+[workspace]
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+bcs = "0.1.4"
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+hex = "0.4"
+rayon = "1"
+roaring = "=0.11.4"
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "zui-sync-truth"
+path = "src/main.rs"

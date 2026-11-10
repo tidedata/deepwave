@@ -1,0 +1,33 @@
+[package]
+name = "zui-dumper"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ground-truth dumper for the zui conformance corpus, built against Mysten's sui 1.83.1 types"
+
+# Standalone workspace. ../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
+[workspace]
+
+[dependencies]
+sui-types = { path = "../sui/crates/sui-types" }
+sui-rpc = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "8c356d65b1c324590a3fd25990c382af308ea545", features = ["unstable"] }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+shared-crypto = { path = "../sui/crates/shared-crypto" }
+bcs = "0.1.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+prost = "0.14.1"
+prost-types = "0.14.1"
+tonic = { version = "0.14.6", features = ["transport", "tls-ring", "tls-webpki-roots"] }
+tokio = { version = "1", features = ["full"] }
+zstd = "0.13.2"
+anyhow = "1"
+hex = "0.4"
+serde_yaml = "0.8"
+rayon = "1"
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[profile.release]
+debug = 1

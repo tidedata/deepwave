@@ -1,0 +1,18 @@
+import { SuiGrpcClient } from '@mysten/sui/grpc';
+import { Transaction } from '@mysten/sui/transactions';
+const client = new SuiGrpcClient({ network: 'mainnet', baseUrl: process.argv[2] ?? 'http://127.0.0.1:19007' });
+const info = await client.core.getChainIdentifier?.() ;
+const sender = process.argv[3];
+const tx = new Transaction();
+tx.setSender(sender);
+const [c] = tx.splitCoins(tx.gas, [1]);
+tx.transferObjects([c], sender);
+const bytes = await tx.build({ client });
+const d = Transaction.from(bytes).getData();
+console.log(JSON.stringify({gas: d.gasData, exp: d.expiration}, null, 1));
+const tx2 = new Transaction();
+tx2.setSender(sender);
+tx2.moveCall({ target: '0x2::clock::timestamp_ms', arguments: [tx2.object('0x6')] });
+const b2 = await tx2.build({ client });
+const d2 = Transaction.from(b2).getData();
+console.log(JSON.stringify({gas: d2.gasData, exp: d2.expiration, inputs: d2.inputs}, null, 1));
