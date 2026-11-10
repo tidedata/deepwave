@@ -140,6 +140,24 @@ pub fn summary(s: State) Error!Summary {
     return out;
 }
 
+/// Parameters and flags the validator lane reads at an epoch switch (val-epoch-api-keys): the
+/// system parameters' `epoch_duration_ms` (their first field in V1 and V2) and `safe_mode`.
+pub fn epochParams(s: State) Error!struct { epoch_duration_ms: u64, safe_mode: bool } {
+    if (s.version != 1 and s.version != 2) return error.UnsupportedSystemState;
+    var r = Reader.init(s.inner);
+    _ = try r.int(u64); // epoch
+    _ = try r.bytes(16); // protocol_version, system_state_version
+    try skipValidatorSet(&r);
+    _ = try r.bytes(16); // storage fund
+    const duration = try r.int(u64);
+    _ = try r.bytes(if (s.version == 2) 7 * 8 + 40 else 6 * 8 + 40); // rest of the parameters
+    _ = try r.int(u64); // reference_gas_price
+    try skipReportRecords(&r);
+    _ = try r.bytes(8 * 4 + 2 + 40); // stake subsidy
+    const safe_mode = try r.boolean();
+    return .{ .epoch_duration_ms = duration, .safe_mode = safe_mode };
+}
+
 /// The system state's epoch and `storage_fund.total_object_storage_rebates` (the value of the
 /// first Balance of `StorageFund`, right after the validator set in both inner versions): what
 /// sui-node's SUI conservation check reads (`storage_fund_total_object_storage_rebates`).

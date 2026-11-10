@@ -209,11 +209,11 @@ pub fn pollDue(now: u64, last_poll: u64, last_push: u64, active: bool, poll_ms: 
     return last_push == 0 or now -| last_push >= skip_ms;
 }
 
-const ring = 512;
+pub const ring = 512;
 /// Seeds plus discovered peers (one thread each; the fetch masks are 64 bits).
 const max_peers = 64;
 
-const Slot = struct {
+pub const Slot = struct {
     seq: u64 = std.math.maxInt(u64),
     cert: []u8 = &.{},
     content_digest: [32]u8 = undefined,
@@ -245,10 +245,15 @@ const Slot = struct {
     /// Most transactions per GetCheckpointTransactions page: halved after a page fails, so the
     /// next peer asks for smaller pages (sui-node `PaginatedProgress.max_items`).
     page_max: u64 = std.math.maxInt(u64),
+    /// In the tile pipeline (p2p_tiles.zig) and not finished: not queued again (lock held).
+    queued: bool = false,
+    /// The exec thread is building it outside the lock (`execLoop`): `cert` and `full` are in
+    /// use, so the slot is not reused for a later sequence number until the build returns.
+    building: bool = false,
 };
 
 /// A built checkpoint's writes, kept until it is committed so the next one can run on them.
-const Parent = struct { seq: u64, digest: [32]u8, layer: px.Layer };
+pub const Parent = struct { seq: u64, digest: [32]u8, layer: px.Layer };
 
 pub const P2p = struct {
     gpa: std.mem.Allocator,
@@ -319,6 +324,17 @@ pub const P2p = struct {
     exec_threads: u8 = 4,
     pool: px.Pool = undefined,
     stats: Stats = .{},
+    /// `--tiles`: the checkpoint tip path runs as a pipeline of pinned tiles on shared-memory
+    /// rings (p2p_tiles.zig) instead of the exec thread. Off: the path above, unchanged.
+    tiles: bool = false,
+    /// Cores for the tiles (`--tile-cpus`), in pipeline order; fewer than tiles: the rest float.
+    tile_cpus: []const u16 = &.{},
+    /// Tiles spin on their rings without ever sleeping (`--tile-spin`).
+    tile_spin: bool = false,
+    pipeline: ?*@import("p2p_tiles.zig").Pipeline = null,
+    /// Bumped whenever a slot may have become ready to build (contents arrived, a build ended):
+    /// the ingest tile takes the lock only when it moved (or every millisecond).
+    ready_gen: Atomic(u64) = .init(0),
     stopping: Atomic(bool) = .init(false),
     threads: std.ArrayList(std.Thread) = .empty,
     lock: Io.Mutex = .init,
@@ -416,13 +432,21 @@ pub const P2p = struct {
             try p.threads.append(p.gpa, t);
         }
         p.n_peers.store(p.peers.len + slots, .release);
-        try p.threads.append(p.gpa, try std.Thread.spawn(.{ .stack_size = 64 << 20 }, execLoop, .{p}));
+        if (p.tiles) {
+            p.pipeline = try @import("p2p_tiles.zig").Pipeline.create(p);
+            try p.pipeline.?.start();
+        } else try p.threads.append(p.gpa, try std.Thread.spawn(.{ .stack_size = 64 << 20 }, execLoop, .{p}));
     }
 
     pub fn stop(p: *P2p) void {
         p.lock.lockUncancelable(p.io);
         p.stopping.store(true, .release);
         p.lock.unlock(p.io);
+        if (p.pipeline) |pl| {
+            pl.stop();
+            pl.destroy();
+            p.pipeline = null;
+        }
         for (p.threads.items) |t| t.join();
         p.threads.deinit(p.gpa);
         for (p.slots) |*s| {
@@ -440,7 +464,7 @@ pub const P2p = struct {
         p.gpa.free(p.pushed_to);
         if (p.genesis) |g| p.gpa.free(g);
         p.cands.deinit();
-        p.pkg_src.keep.deinit();
+        p.pkg_src.deinit();
         p.pool.stop();
     }
 
@@ -626,7 +650,7 @@ pub const P2p = struct {
     }
 
     /// Exec thread: elects the active set once a second.
-    fn maybeElect(p: *P2p, now_ms: u64) void {
+    pub fn maybeElect(p: *P2p, now_ms: u64) void {
         if (p.push_peers == 0 or now_ms < p.next_elect_ms) return;
         p.next_elect_ms = now_ms + 1000;
         const n = @min(p.n_peers.load(.acquire), max_peers);
@@ -729,6 +753,11 @@ pub const P2p = struct {
             if (pushed) p.notePushLag(peer, now -| slot.seen_ms);
             return;
         }
+        // S + ring maps to S's slot. Once S is applied from another source, a summary for S + ring
+        // is in range while S may still be building here (execLoop or the tile pipeline read
+        // `cert` and `full` outside the lock): freeing them under the builder was a use after
+        // free. Leave the slot; S + ring is asked for again once the slot is free.
+        if (slot.building or slot.queued) return;
         p.gpa.free(slot.cert);
         p.gpa.free(slot.full);
         slot.* = .{ .seq = seq, .cert = p.gpa.dupe(u8, cert) catch return, .content_digest = cert[25..57].*, .timestamp_ms = ts_at, .seen_ms = now, .seen_peer = @intCast(@min(peer, 255)), .pushed = pushed };
@@ -884,6 +913,7 @@ pub const P2p = struct {
             slot.state = .ready;
             slot.contents_ms = source.wallMs();
             slot.contents_peer = @intCast(@min(peer, 255));
+            _ = p.ready_gen.fetchAdd(1, .release);
             _ = p.stats.contents_ms_sum.fetchAdd(slot.contents_ms -| slot.timestamp_ms, .monotonic);
         } else if (slot.state == .fetching and slot.inflight == 0) {
             slot.tries += 1;
@@ -1297,7 +1327,9 @@ pub const P2p = struct {
                 const s0 = &p.slots[lo % ring];
                 if (s0.seq == lo and s0.done) seq = lo + 1;
                 const slot = &p.slots[seq % ring];
-                break :blk slot.seq == seq and slot.state == .ready and !slot.done;
+                const go = slot.seq == seq and slot.state == .ready and !slot.done;
+                if (go) slot.building = true;
+                break :blk go;
             };
             if (!ready) {
                 p.io.sleep(.fromMicroseconds(300), .awake) catch {};
@@ -1309,7 +1341,13 @@ pub const P2p = struct {
             };
             _ = ar.reset(.retain_capacity);
             const fb0 = p.stats.fallbacks.load(.monotonic);
-            if (p.buildOne(ar.allocator(), seq)) {
+            const retry = p.buildOne(ar.allocator(), seq);
+            {
+                p.lock.lockUncancelable(p.io);
+                defer p.lock.unlock(p.io);
+                p.slots[seq % ring].building = false;
+            }
+            if (retry) {
                 p.io.sleep(.fromMicroseconds(200), .awake) catch {};
                 continue;
             }
@@ -1424,7 +1462,7 @@ pub const P2p = struct {
         }
     }
 
-    fn fallback(p: *P2p, why: []const u8) void {
+    pub fn fallback(p: *P2p, why: []const u8) void {
         p.last_reason = why;
         _ = p.stats.fallbacks.fetchAdd(1, .monotonic);
         p.noteReason(why);
@@ -1787,13 +1825,13 @@ test "p2p: availability polls skipped while a peer pushes" {
 
 /// A P2p with no network and no store (as p2p_only.zig's test): slots, heights and the fetcher's
 /// spool only.
-const TestRig = struct {
+pub const TestRig = struct {
     tmp: std.testing.TmpDir,
     applied_next: Atomic(u64),
     f: *source.Fetcher,
     p: P2p,
 
-    fn init(r: *TestRig, lo: u64) !void {
+    pub fn init(r: *TestRig, lo: u64) !void {
         const gpa = std.testing.allocator;
         const io = std.testing.io;
         r.tmp = std.testing.tmpDir(.{});
@@ -1805,7 +1843,11 @@ const TestRig = struct {
         try r.p.init();
     }
 
-    fn deinit(r: *TestRig) void {
+    pub fn deinit(r: *TestRig) void {
+        for (&r.p.reasons) |*x| {
+            if (x.*) |why| r.p.gpa.free(why);
+            x.* = null;
+        }
         r.p.stop();
         r.f.stop();
         std.testing.allocator.destroy(r.f);
@@ -1813,7 +1855,7 @@ const TestRig = struct {
     }
 
     /// Checkpoint `seq`'s summary seen `ago_ms` ago, contents not fetched.
-    fn seen(r: *TestRig, seq: u64, ago_ms: u64) !void {
+    pub fn seen(r: *TestRig, seq: u64, ago_ms: u64) !void {
         const slot = &r.p.slots[seq % ring];
         r.p.gpa.free(slot.cert);
         r.p.gpa.free(slot.full);
@@ -1857,6 +1899,48 @@ test "p2p: a summary already seen is handled without a decode (height, push time
     p.onSummary(3, &cert, true);
     try t.expect(p.slots[101 % ring].seq != 101);
     try t.expectEqual(@as(u64, 2), p.stats.push_dups.load(.monotonic));
+}
+
+test "p2p: a summary for S + ring leaves S's slot alone while S is building (no use after free)" {
+    const t = std.testing;
+    var r: TestRig = undefined;
+    try r.init(100);
+    defer r.deinit();
+    const p = &r.p;
+    const gpa = t.allocator;
+    const S: u64 = 100;
+    try r.seen(S, 0);
+    const slot = &p.slots[S % ring];
+    slot.full = try gpa.dupe(u8, "full");
+    slot.state = .ready;
+    slot.building = true;
+    const cert0 = slot.cert.ptr;
+    const full0 = slot.full.ptr;
+    // S applied from another source meanwhile: S + ring is in range
+    r.applied_next.store(S + 1, .release);
+    const summary: types.CheckpointSummary = .{
+        .epoch = 1,
+        .sequence_number = S + ring,
+        .network_total_transactions = 5,
+        .content_digest = .{ .@"0" = .{ .@"0" = @splat(7) } },
+        .previous_digest = null,
+        .epoch_rolling_gas_cost_summary = .{ .computationCost = 0, .storageCost = 0, .storageRebate = 0, .nonRefundableStorageFee = 0 },
+        .timestamp_ms = 1,
+        .checkpoint_commitments = &.{},
+        .end_of_epoch_data = null,
+        .version_specific_data = &.{},
+    };
+    const enc = try bcs.encodeAlloc(types.CheckpointSummary, gpa, &summary);
+    defer gpa.free(enc);
+    const cert = try std.mem.concat(gpa, u8, &.{ enc, &@as([96]u8, @splat(0)) });
+    defer gpa.free(cert);
+    p.onSummary(3, cert, true);
+    try t.expectEqual(S, slot.seq);
+    try t.expect(slot.cert.ptr == cert0 and slot.full.ptr == full0);
+    // once the build is over the slot is free for it
+    slot.building = false;
+    p.onSummary(3, cert, true);
+    try t.expectEqual(S + ring, slot.seq);
 }
 
 test "p2p: contents fetched from the active set only, one request per checkpoint until the hedge" {

@@ -50,14 +50,17 @@ pub const Upstream = struct {
     /// A connection retained for the caller (`unref` it), reopened when the current one is dead
     /// and its cooldown has passed (until then the dead one is returned and fails at once).
     pub fn acquire(u: *Upstream) ?*grpc.Conn {
+        // released after the upstream lock: no connection lock is taken under it
+        var stale: ?*grpc.Conn = null;
+        defer if (stale) |c| c.release();
         u.mu.lockUncancelable(u.io);
         defer u.mu.unlock(u.io);
         if (u.conn) |c| {
-            if (!c.isDead() or @as(u64, @intCast(Io.Clock.awake.now(u.io).nanoseconds)) -| c.died_at < u.cooldown_ns) {
+            if (!c.isDead() or @as(u64, @intCast(Io.Clock.awake.now(u.io).nanoseconds)) -| c.diedAt() < u.cooldown_ns) {
                 c.retain();
                 return c;
             }
-            c.release();
+            stale = c;
             u.conn = null;
             _ = u.reconnects.fetchAdd(1, .monotonic);
         }

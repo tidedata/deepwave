@@ -15,6 +15,7 @@ const inputs = @import("inputs.zig");
 const ptb = @import("ptb/root.zig");
 const packages = @import("packages.zig");
 const classify = @import("classify.zig");
+const perf = @import("perf.zig");
 
 pub const Outcome = enum { pass, fail, skip };
 
@@ -158,6 +159,10 @@ fn runMove(ctx: *harness.Ctx, arena: std.mem.Allocator, id: []const u8, blob: []
     };
     const tx_pos = (@intFromPtr(tx) - @intFromPtr(idx.txs.ptr)) / @sizeOf(types.index.Tx);
     const unsettled_ctx: Unsettled = .{ .blob = blob, .txs = idx.txs[0..tx_pos] };
+    // test/vm measurement hooks (perf.zig): off unless ZUI_REPLAY_TIMES is set
+    const pf = perf.perf;
+    if (pf) |p| perf.begin(p, ctx.io);
+    const t0 = std.Io.Timestamp.now(ctx.io, .awake);
     const res = ptb.execute(arena, m.env, tx.data.slice(blob), data, .{
         .objs = lookup.objectLookup(),
         .effects = fx,
@@ -165,9 +170,11 @@ fn runMove(ctx: *harness.Ctx, arena: std.mem.Allocator, id: []const u8, blob: []
         .unsettled = .{ .ctx = &unsettled_ctx, .get = Unsettled.get },
         .insufficient_funds = fx.status == .Failure and fx.status.Failure.@"error" == .InsufficientFundsForWithdraw and fx.status.Failure.command == null,
     }) catch |e| {
+        if (pf) |p| perf.end(p, ctx.io, id, t0, "error");
         ctx.fail(id, "ptb: {s}", .{@errorName(e)});
         return .fail;
     };
+    if (pf) |p| perf.end(p, ctx.io, id, t0, @tagName(res));
     switch (res) {
         .unsupported => |why| {
             skips.addAt(ctx.io, why, id);

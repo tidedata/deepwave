@@ -135,6 +135,36 @@ test "trust: a parallel prefetch walk equals the serial walk, and a wrong hint s
     try testing.expectEqualSlices(u64, serial.stakes, par.stakes);
     try testing.expectEqual(serial.rgp, par.rgp);
     try testing.expectEqual(serial.start_ms, par.start_ms);
+    // With a shared CPU pool the prefetched certificates are checked in parallel windows
+    // (trust.zig PreWindow): same answer, and the timing of both for the record.
+    const pool = try @import("core").pool.Pool.init(testing.io, gpa, 4);
+    defer pool.deinit();
+    {
+        const old = @import("core").pool.setShared(pool);
+        defer _ = @import("core").pool.setShared(old);
+        var t0 = std.Io.Timestamp.now(testing.io, .awake);
+        const win = try w.walk(a, genesis, null, target, std.math.maxInt(u64));
+        const t_win = t0.durationTo(std.Io.Timestamp.now(testing.io, .awake)).nanoseconds;
+        try testing.expectEqualSlices([96]u8, serial.keys, win.keys);
+        try testing.expectEqualSlices(u64, serial.stakes, win.stakes);
+        try testing.expectEqual(serial.epoch, win.epoch);
+        try testing.expectEqual(serial.protocol_version, win.protocol_version);
+        try testing.expectEqual(serial.rgp, win.rgp);
+        try testing.expectEqual(serial.start_ms, win.start_ms);
+        _ = @import("core").pool.setShared(old);
+        t0 = std.Io.Timestamp.now(testing.io, .awake);
+        _ = try w.walk(a, genesis, null, target, std.math.maxInt(u64));
+        const t_one = t0.durationTo(std.Io.Timestamp.now(testing.io, .awake)).nanoseconds;
+        _ = @import("core").pool.setShared(pool);
+        std.debug.print("trust walk {d} epochs (prefetched): one lane {d} ms, 4-lane windows {d} ms\n", .{ target, @divTrunc(t_one, 1_000_000), @divTrunc(t_win, 1_000_000) });
+        // a wrong hint inside a window still fails
+        const bad = try a.dupe(?u64, w.index.last);
+        const saved = w.index.last;
+        bad[40] = bad[41];
+        w.index.last = bad;
+        try testing.expectError(error.UntrustedCheckpoint, w.walk(a, genesis, null, target, std.math.maxInt(u64)));
+        w.index.last = saved;
+    }
     // Resumed from a saved committee (a short walk) gives the same answer.
     const mid = try w.walk(a, genesis, null, target / 2, std.math.maxInt(u64));
     const resumed = try w.walk(a, genesis, mid, target, std.math.maxInt(u64));
@@ -184,6 +214,16 @@ test "trust: epoch parameters of every corpus end-of-epoch checkpoint equal the 
     }
     try testing.expect(checked > 1000);
     try testing.expect(no_event < 4);
+}
+
+test "node: pools sized by the node use the usable CPU count (cgroup quota), not the host's" {
+    const Node = @import("node.zig").Node;
+    try testing.expectEqual(@as(usize, 6), Node.indexBuildThreads(6)); // CPUQuota=600% on a 32-thread host: was 32
+    try testing.expectEqual(@as(usize, 32), Node.indexBuildThreads(64));
+    try testing.expectEqual(@as(usize, 1), Node.indexBuildThreads(0));
+    const usable = Node.usableCpus();
+    try testing.expect(usable >= 1 and usable <= (std.Thread.getCpuCount() catch 1));
+    try testing.expectEqual(@import("core").hw.detect(null).logical_cores, usable);
 }
 
 // ------------------------------------------------------------------ source
@@ -271,6 +311,45 @@ test "source: a frontier left on an already fetched checkpoint moves on" {
     while (f.stats.fetched.load(.acquire) < 248 and waited < 5000) : (waited += 1) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
     f.stop();
     try testing.expectEqual(@as(u64, 248), f.stats.fetched.load(.acquire));
+}
+
+test "source: writeSpool announces a checkpoint once its .chk and .aux are in place" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src: source_mod.Source = .{ .gpa = testing.allocator, .io = testing.io, .kind = .none };
+    var applied: std.atomic.Value(u64) = .init(100);
+    const Seen = struct {
+        dir: Io.Dir,
+        calls: u32 = 0,
+        last: u64 = 0,
+        complete: bool = true,
+        fn on(ctx: *anyopaque, seq: u64) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            s.calls += 1;
+            s.last = seq;
+            // A follower worker woken here opens the file at once: both must be readable.
+            var nb: [32]u8 = undefined;
+            inline for (.{ "{d}.chk", "{d}.aux" }) |fmt| {
+                _ = s.dir.statFile(testing.io, std.fmt.bufPrint(&nb, fmt, .{seq}) catch unreachable, .{}) catch {
+                    s.complete = false;
+                };
+            }
+        }
+    };
+    var seen: Seen = .{ .dir = tmp.dir };
+    var f: source_mod.Fetcher = .{ .gpa = testing.allocator, .io = testing.io, .source = &src, .spool = tmp.dir, .next = .init(100), .applied_next = &applied, .window = 64, .poll_ms = 25, .to = std.math.maxInt(u64) };
+    f.on_spooled = .{ .ctx = &seen, .call = Seen.on };
+    try f.writeSpool(100, "blob", "aux");
+    try testing.expectEqual(@as(u32, 1), seen.calls);
+    try testing.expectEqual(@as(u64, 100), seen.last);
+    try testing.expect(seen.complete);
+    try f.writeSpool(101, "blob", "aux");
+    try testing.expectEqual(@as(u32, 2), seen.calls);
+    try testing.expectEqual(@as(u64, 101), seen.last);
+    try testing.expect(seen.complete);
+    // The node's safety net is far above the old 2 ms poll and at most a checkpoint interval.
+    const fb = @import("node.zig").Node.spool_fallback_ms;
+    try testing.expect(fb >= 100 and fb <= 250);
 }
 
 // ------------------------------------------------------------------ convert
@@ -1983,4 +2062,1028 @@ test "removal-prior index: the store derivation equals the one from the checkpoi
     // The watermark is the last mark (written with removals, or every mark_every checkpoints);
     // the checkpoints after it are derived from the store again at open (openPriorLog).
     try testing.expect(l2.wm.? >= 342456120 and l2.wm.? <= 342456131);
+}
+
+// ------------------------------------------------------------- sigorder: the sweep and fixes
+
+const CDigest = struct { tx: [32]u8, fx: [32]u8, k: u64 };
+
+/// Each transaction of V1/V2 checkpoint contents: digests and certified signature count.
+fn contentsDigests(a: std.mem.Allocator, contents: []const u8) ![]CDigest {
+    var r = bcs.Reader.init(contents);
+    const tag = try r.uleb32();
+    const n = try r.length();
+    const out = try a.alloc(CDigest, n);
+    for (out) |*d| {
+        const b = try r.bytes(66);
+        d.* = .{ .tx = b[1..33].*, .fx = b[34..66].*, .k = 0 };
+        if (tag == 1) {
+            d.k = try r.length();
+            for (0..d.k) |_| {
+                _ = try r.bytes(try r.length());
+                if (try r.int(u8) == 1) _ = try r.int(u64);
+            }
+        }
+    }
+    if (tag == 0) {
+        const m = try r.length();
+        for (out[0..@min(m, n)]) |*d| {
+            d.k = try r.length();
+            for (0..d.k) |_| _ = try r.bytes(try r.length());
+        }
+    }
+    return out;
+}
+
+test "sigorder: reorder takes a permutation of the stored signatures only (sponsored E7yj...)" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try types.CheckpointIndex.init(gpa);
+    defer idx.deinit(gpa);
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(gpa);
+    _ = try convert.protoToChk(gpa, a, sigorder_proto, &want);
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(gpa);
+    _ = try convert.protoToChkOpts(gpa, a, sigorder_proto, &plain, null, .{ .tx_signature_order = false });
+    try types.indexCheckpointData(want.items, &idx);
+    const want_env = try a.dupe(u8, idx.txs[21].transaction.slice(want.items));
+    try types.indexCheckpointData(plain.items, &idx);
+    const plain_env = idx.txs[21].transaction.slice(plain.items);
+    var node: [2][]const u8 = undefined;
+    for (&node, sigorder_sui_node) |*w, hex| {
+        const b = try a.alloc(u8, hex.len / 2);
+        _ = try std.fmt.hexToBytes(b, hex);
+        w.* = b;
+    }
+    // The stored contents order, sui-node's order: the envelope sui-node serves, byte for byte.
+    const fixed = (try sigorder.reorder(a, plain_env, &node)).?;
+    try testing.expectEqualSlices(u8, want_env, fixed);
+    try testing.expectEqual(plain_env.len, fixed.len);
+    // Already in that order: nothing to fix.
+    try testing.expect(try sigorder.reorder(a, want_env, &node) == null);
+    // Not a permutation: a duplicate, a foreign signature, a short list.
+    try testing.expect(try sigorder.reorder(a, plain_env, &.{ node[0], node[0] }) == null);
+    const foreign = try a.dupe(u8, node[0]);
+    foreign[9] ^= 1;
+    try testing.expect(try sigorder.reorder(a, plain_env, &.{ foreign, node[1] }) == null);
+    try testing.expect(try sigorder.reorder(a, plain_env, &.{node[0]}) == null);
+    // A truncated envelope does not parse.
+    if (sigorder.reorder(a, plain_env[0 .. plain_env.len - 1], &node)) |_| return error.TestUnexpectedResult else |_| {}
+}
+
+test "sigorder: BatchGetTransactions request and answer" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d1: [32]u8 = @splat(1);
+    const d2: [32]u8 = @splat(2);
+    const body = try sigorder.batchBody(a, &.{ d1, d2 });
+    try testing.expectEqual(@as(u8, 0), body[0]);
+    try testing.expectEqual(@as(usize, body.len - 5), std.mem.readInt(u32, body[1..5], .big));
+    try testing.expect(std.mem.indexOf(u8, body, "signatures.bcs") != null);
+    var tb: [44]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, body, @import("serve").b58.encode32(&tb, &d2)) != null);
+    // { transactions: [ { transaction: { digest, signatures: [{bcs{name,value}} x2] } }, { error: { code 5 } } ] }
+    var t: std.ArrayList(u8) = .empty;
+    try pbPutLen(a, &t, 1, @import("serve").b58.encode32(&tb, &d1));
+    for ([_][]const u8{ "\x00ab", "\x01cd" }) |sv| {
+        var bb: std.ArrayList(u8) = .empty;
+        try pbPutLen(a, &bb, 1, "UserSignatureBytes");
+        try pbPutLen(a, &bb, 2, sv);
+        var us: std.ArrayList(u8) = .empty;
+        try pbPutLen(a, &us, 1, bb.items);
+        try pbPutLen(a, &t, 3, us.items);
+    }
+    var r1: std.ArrayList(u8) = .empty;
+    try pbPutLen(a, &r1, 1, t.items);
+    var r2: std.ArrayList(u8) = .empty;
+    try pbPutLen(a, &r2, 2, &.{ 0x08, 0x05 });
+    var msg: std.ArrayList(u8) = .empty;
+    try pbPutLen(a, &msg, 1, r1.items);
+    try pbPutLen(a, &msg, 1, r2.items);
+    const got = try sigorder.parseBatch(a, msg.items);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqualSlices(u8, &d1, &got[0].tx.digest.?);
+    try testing.expectEqual(@as(usize, 2), got[0].tx.sigs.len);
+    try testing.expectEqualStrings("\x01cd", got[0].tx.sigs[1]);
+    try testing.expectEqual(@as(u64, 5), got[1].err);
+    try testing.expectError(error.Malformed, sigorder.parseBatch(a, &.{ 0x0a, 0x05, 0x01 }));
+}
+
+/// A grpc-web unary HTTP reply carrying `msg`.
+fn grpcWebReply(a: std.mem.Allocator, msg: []const u8) ![]const u8 {
+    var body: std.ArrayList(u8) = .empty;
+    var h: [5]u8 = .{ 0, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, h[1..5], @intCast(msg.len), .big);
+    try body.appendSlice(a, &h);
+    try body.appendSlice(a, msg);
+    const trailer = "grpc-status:0\r\n";
+    h = .{ 0x80, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, h[1..5], trailer.len, .big);
+    try body.appendSlice(a, &h);
+    try body.appendSlice(a, trailer);
+    return std.fmt.allocPrint(a, "HTTP/1.1 200 OK\r\ncontent-type: application/grpc-web+proto\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ body.items.len, body.items });
+}
+
+test "sigorder: the sweep serves the node's order for a bucket-stored sponsored transaction, durably" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const seq: u64 = 343111673;
+    var idx = try types.CheckpointIndex.init(gpa);
+    defer idx.deinit(gpa);
+
+    // sui-node's envelopes (the full node proto) and the bucket's (the contents order).
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(gpa);
+    _ = try convert.protoToChk(gpa, a, sigorder_proto, &want);
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(gpa);
+    _ = try convert.protoToChkOpts(gpa, a, sigorder_proto, &plain, null, .{ .tx_signature_order = false });
+    try types.indexCheckpointData(want.items, &idx);
+    const node_envs = try a.alloc([]const u8, idx.tx_count);
+    for (node_envs, idx.txs[0..idx.tx_count]) |*e, t| e.* = try a.dupe(u8, t.transaction.slice(want.items));
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const base = pb[0..try tmp.dir.realPath(io, &pb)];
+    const sdir = try std.fs.path.join(a, &.{ base, "store" });
+    var cfg: store.Config = .{ .dir = sdir, .max_live_objects = 1 << 10, .max_object_versions = 1 << 10, .max_transactions = 1 << 10, .max_checkpoints = 1 << 6, .max_batch_bytes = 1 << 26, .max_batch_objects = 1 << 10, .max_segments = 4, .segment_reserve = 1 << 22, .seed = 7 };
+    var h = try store.openDir(gpa, io, &cfg, .{ .sync = .none });
+    defer {
+        h.store.deinit();
+        h.io.deinit();
+    }
+    // The checkpoint as a bucket catch-up stored it.
+    try types.indexCheckpointData(plain.items, &idx);
+    const blob = plain.items;
+    const contents = idx.contents.slice(blob);
+    const ds = try contentsDigests(a, contents);
+    try testing.expectEqual(@as(usize, idx.tx_count), ds.len);
+    var sr = bcs.Reader.init(idx.summary.slice(blob));
+    const epoch = try sr.int(u64);
+    {
+        const b = try h.store.begin(seq, epoch);
+        try b.checkpoint(blob[idx.summary.o .. idx.sig.o + idx.sig.n], contents);
+        for (idx.txs[0..idx.tx_count], ds) |t, d| try b.transaction(&d.tx, &d.fx, t.transaction.slice(blob), t.effects.slice(blob), if (t.events) |e| e.slice(blob) else null);
+        try h.store.commit(b);
+    }
+    const e7: [32]u8 = ds[21].tx;
+    {
+        var snap = h.store.snapshot();
+        defer snap.release();
+        try testing.expect(!std.mem.eql(u8, snap.transaction(&e7).?.tx, node_envs[21]));
+    }
+
+    // The node's answer: every multi-signer transaction of the checkpoint, in contents order.
+    var msg: std.ArrayList(u8) = .empty;
+    var asked: usize = 0;
+    for (ds, 0..) |d, i| {
+        if (d.k < 2) continue;
+        asked += 1;
+        var tb: [44]u8 = undefined;
+        var t: std.ArrayList(u8) = .empty;
+        try pbPutLen(a, &t, 1, @import("serve").b58.encode32(&tb, &d.tx));
+        for ((try sigorder.envelopeSigs(a, node_envs[i])).sigs) |g| {
+            var bb: std.ArrayList(u8) = .empty;
+            try pbPutLen(a, &bb, 2, g);
+            var us: std.ArrayList(u8) = .empty;
+            try pbPutLen(a, &us, 1, bb.items);
+            try pbPutLen(a, &t, 3, us.items);
+        }
+        var res: std.ArrayList(u8) = .empty;
+        try pbPutLen(a, &res, 1, t.items);
+        try pbPutLen(a, &msg, 1, res.items);
+    }
+    try testing.expect(asked >= 1);
+    var srv: netguard.TestServer = undefined;
+    try srv.start(io, try grpcWebReply(a, msg.items));
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    var o = sigorder.Overlay.init(gpa, io, srv.url(&ub), 20);
+    defer o.deinit();
+
+    try tmp.dir.createDir(io, "node", .default_dir);
+    const node_dir = try tmp.dir.openDir(io, "node", .{});
+    defer node_dir.close(io);
+    {
+        const sw = try sigorder.Sweep.open(gpa, io, h.store, &o, node_dir);
+        defer sw.deinit();
+        sw.behind = 0;
+        try testing.expect(sw.next == null);
+        try testing.expectEqual(sigorder.Sweep.Step.progress, try sw.step());
+        try testing.expectEqual(@as(?u64, seq + 1), sw.next);
+        try testing.expectEqual(@as(u64, 1), sw.stats.requests.load(.monotonic));
+        try testing.expectEqual(@as(u64, asked), sw.stats.candidates.load(.monotonic));
+        try testing.expect(sw.stats.fixed.load(.monotonic) >= 1);
+        try testing.expectEqual(@as(u64, asked), sw.stats.fixed.load(.monotonic) + sw.stats.same.load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), sw.stats.rejected.load(.monotonic));
+        // Nothing new to sweep: no request.
+        try testing.expectEqual(sigorder.Sweep.Step.idle, try sw.step());
+        try testing.expectEqual(@as(u64, 1), srv.accepts.load(.monotonic));
+    }
+    // Every transaction now reads as sui-node's envelope (also through the hinted lookup).
+    {
+        var snap = h.store.snapshot();
+        defer snap.release();
+        for (ds, node_envs) |d, env| {
+            try testing.expectEqualSlices(u8, env, snap.transaction(&d.tx).?.tx);
+            try testing.expectEqualSlices(u8, env, snap.transactionNear(&d.tx, seq).?.tx);
+        }
+    }
+    // A restart: the log reinstalls the fixes (before any request) and resumes after the mark.
+    const fixed = h.store.tx_fix.count();
+    h.store.tx_fix.reset();
+    {
+        const sw = try sigorder.Sweep.open(gpa, io, h.store, &o, node_dir);
+        defer sw.deinit();
+        try testing.expectEqual(@as(u64, fixed), sw.stats.loaded.load(.monotonic));
+        try testing.expectEqual(@as(?u64, seq + 1), sw.next);
+        // One bulk build: one generation, everything in the base.
+        try testing.expectEqual(@as(u64, 1), h.store.tx_fix.generation());
+        try testing.expectEqual(fixed, h.store.tx_fix.count());
+        var snap = h.store.snapshot();
+        defer snap.release();
+        try testing.expectEqualSlices(u8, node_envs[21], snap.transaction(&e7).?.tx);
+    }
+    // A torn tail is cut; the records before it still load.
+    {
+        const f = try node_dir.openFile(io, sigorder.log_name, .{ .mode = .read_write });
+        defer f.close(io);
+        const len = (try f.stat(io)).size;
+        try f.writePositionalAll(io, "garbage-tail", len);
+    }
+    h.store.tx_fix.reset();
+    {
+        const sw = try sigorder.Sweep.open(gpa, io, h.store, &o, node_dir);
+        defer sw.deinit();
+        try testing.expectEqual(@as(u64, fixed), sw.stats.loaded.load(.monotonic));
+    }
+    try testing.expectEqual(@as(u64, 1), srv.accepts.load(.monotonic));
+}
+
+test "sigorder: a sweep answer that is not the stored signatures changes nothing" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const seq: u64 = 343111673;
+    var idx = try types.CheckpointIndex.init(gpa);
+    defer idx.deinit(gpa);
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(gpa);
+    _ = try convert.protoToChkOpts(gpa, a, sigorder_proto, &plain, null, .{ .tx_signature_order = false });
+    try types.indexCheckpointData(plain.items, &idx);
+    const blob = plain.items;
+    const contents = idx.contents.slice(blob);
+    const ds = try contentsDigests(a, contents);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const base = pb[0..try tmp.dir.realPath(io, &pb)];
+    var cfg: store.Config = .{ .dir = try std.fs.path.join(a, &.{ base, "store" }), .max_live_objects = 1 << 10, .max_object_versions = 1 << 10, .max_transactions = 1 << 10, .max_checkpoints = 1 << 6, .max_batch_bytes = 1 << 26, .max_batch_objects = 1 << 10, .max_segments = 4, .segment_reserve = 1 << 22, .seed = 7 };
+    var h = try store.openDir(gpa, io, &cfg, .{ .sync = .none });
+    defer {
+        h.store.deinit();
+        h.io.deinit();
+    }
+    var sr = bcs.Reader.init(idx.summary.slice(blob));
+    const b = try h.store.begin(seq, try sr.int(u64));
+    try b.checkpoint(blob[idx.summary.o .. idx.sig.o + idx.sig.n], contents);
+    for (idx.txs[0..idx.tx_count], ds) |t, d| try b.transaction(&d.tx, &d.fx, t.transaction.slice(blob), t.effects.slice(blob), if (t.events) |e| e.slice(blob) else null);
+    try h.store.commit(b);
+    // Each multi-signer transaction answered with its stored signatures reversed, the first
+    // signature's bytes flipped: not the certified multiset.
+    var msg: std.ArrayList(u8) = .empty;
+    var asked: u64 = 0;
+    for (ds, idx.txs[0..idx.tx_count]) |d, t| {
+        if (d.k < 2) continue;
+        asked += 1;
+        var tx: std.ArrayList(u8) = .empty;
+        const sigs = (try sigorder.envelopeSigs(a, t.transaction.slice(blob))).sigs;
+        var k = sigs.len;
+        while (k > 0) {
+            k -= 1;
+            const g = try a.dupe(u8, sigs[k]);
+            if (k == sigs.len - 1) g[5] ^= 1;
+            var bb: std.ArrayList(u8) = .empty;
+            try pbPutLen(a, &bb, 2, g);
+            var us: std.ArrayList(u8) = .empty;
+            try pbPutLen(a, &us, 1, bb.items);
+            try pbPutLen(a, &tx, 3, us.items);
+        }
+        var res: std.ArrayList(u8) = .empty;
+        try pbPutLen(a, &res, 1, tx.items);
+        try pbPutLen(a, &msg, 1, res.items);
+    }
+    var srv: netguard.TestServer = undefined;
+    try srv.start(io, try grpcWebReply(a, msg.items));
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    var o = sigorder.Overlay.init(gpa, io, srv.url(&ub), 20);
+    defer o.deinit();
+    try tmp.dir.createDir(io, "node", .default_dir);
+    const node_dir = try tmp.dir.openDir(io, "node", .{});
+    defer node_dir.close(io);
+    const sw = try sigorder.Sweep.open(gpa, io, h.store, &o, node_dir);
+    defer sw.deinit();
+    sw.behind = 0;
+    try testing.expectEqual(sigorder.Sweep.Step.progress, try sw.step());
+    try testing.expectEqual(asked, sw.stats.rejected.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), sw.stats.fixed.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), h.store.tx_fix.count());
+}
+
+// ------------------------------------------------------------------ p2p: read sets
+
+const serve = @import("serve");
+const RsKey = exec.objects.Key;
+const RsMeta = struct { epoch: u64, pv: ?u64 = null, rgp: ?u64 = null, start_ms: ?u64 = null };
+
+/// `packages/<id>.obj` of the corpus behind a p2p `PackageSource`'s own lookup (the store): a
+/// node holds every package, a store seeded with one checkpoint's objects does not.
+const RsPkgs = struct {
+    inner: exec.packages.Store.Lookup,
+    dir: Io.Dir,
+    keep: std.mem.Allocator,
+    lock: std.atomic.Mutex = .unlocked,
+    seen: std.AutoHashMapUnmanaged([32]u8, ?[]const u8) = .empty,
+
+    fn get(p: *const anyopaque, id: *const [32]u8, epoch: u64) ?[]const u8 {
+        const c: *RsPkgs = @ptrCast(@alignCast(@constCast(p)));
+        if (c.inner.get(c.inner.ctx, id, epoch)) |raw| return raw;
+        return c.file(id);
+    }
+
+    fn file(c: *RsPkgs, id: *const [32]u8) ?[]const u8 {
+        while (!c.lock.tryLock()) std.atomic.spinLoopHint();
+        defer c.lock.unlock();
+        if (c.seen.get(id.*)) |hit| return hit;
+        var nb: [80]u8 = undefined;
+        const name = std.fmt.bufPrint(&nb, "{x}.obj", .{id}) catch unreachable;
+        const raw: ?[]const u8 = c.dir.readFileAlloc(testing.io, name, c.keep, .limited(1 << 28)) catch null;
+        c.seen.put(c.keep, id.*, raw) catch {};
+        return raw;
+    }
+};
+
+/// Execution's own allocator (per-thread package caches and VM runtimes, kept for the thread's
+/// life as on a node): not the test allocator, which would report the pool threads' caches.
+const rs_exec_gpa = std.heap.smp_allocator;
+
+const RsEnv = struct {
+    gpa: std.mem.Allocator,
+    base: []const u8,
+    tmp: *testing.TmpDir,
+    metas: []const RsMeta,
+    ps: *p2p_exec.PackageSource,
+    pkgs: *RsPkgs,
+    sys: *execute.Executor,
+    /// The node's exec threads: the level-parallel build must give the in-order build's bytes.
+    pool: ?*p2p_exec.Pool = null,
+    stats: p2p_exec.Stats = .{},
+    idx: types.CheckpointIndex,
+    /// Print every difference (exploration: ZUI_P2P_READSETS=FROM-TO).
+    diag: bool = false,
+    built: u64 = 0,
+    fallbacks: u64 = 0,
+    /// Transactions whose p2p loaded list differs from the bucket's, and checkpoints whose
+    /// extra objects differ.
+    list_diffs: u64 = 0,
+    extra_diffs: u64 = 0,
+    store_diffs: u64 = 0,
+    render_diffs: u64 = 0,
+    loaded_txs: u64 = 0,
+    loaded_refs: u64 = 0,
+    /// Implicit system object reads (the accumulator root of an object funds check).
+    implicit_reads: u64 = 0,
+    /// Entries of sui-node's lists for the two objects the production shadow saw missing.
+    seen_count_field: u64 = 0,
+    seen_usdc_config: u64 = 0,
+};
+
+/// The accumulator object count field every settlement reads (0xea4eb7...c468) and the coin deny
+/// list v2 config of USDC under 0x403 (0x184a29...9284, read through `ObjectStore::get_object`
+/// when a transaction leaves a USDC coin with an owner): the entries a p2p-built checkpoint
+/// missed on the production shadow.
+const rs_count_field: [32]u8 = .{ 0xea, 0x4e, 0xb7, 0x7f, 0x2a, 0x5a, 0x8b, 0xa1, 0x72, 0xde, 0x0c, 0x4d, 0x2c, 0x51, 0xbe, 0x91, 0x68, 0x6e, 0xc8, 0x4f, 0xdc, 0xcd, 0x9a, 0x9d, 0xad, 0xd3, 0xba, 0x76, 0x74, 0xba, 0xc4, 0x68 };
+const rs_usdc_config: [32]u8 = .{ 0x18, 0x4a, 0x29, 0x2d, 0x5c, 0xf7, 0x92, 0x04, 0x4a, 0xf5, 0xe2, 0x6f, 0x00, 0x1e, 0x4c, 0x87, 0x9e, 0xc6, 0x4b, 0x7a, 0x34, 0x57, 0xa8, 0xbc, 0x90, 0xa0, 0xcd, 0x77, 0xe8, 0x83, 0x92, 0x84 };
+
+fn rsLess(_: void, a: RsKey, b: RsKey) bool {
+    const o = std.mem.order(u8, &a.id, &b.id);
+    return if (o == .eq) a.version < b.version else o == .lt;
+}
+
+const RsStore = struct { store: *store.Store, io: *store.RealIo };
+
+fn rsStore(env: *RsEnv, a: std.mem.Allocator, name: []const u8) !RsStore {
+    var cfg: store.Config = .{ .dir = try std.fs.path.join(a, &.{ env.base, name }), .max_live_objects = 1 << 16, .max_object_versions = 1 << 16, .max_transactions = 1 << 14, .max_checkpoints = 1 << 6, .max_segments = 16, .segment_reserve = 1 << 26, .seed = 7 };
+    const h = try store.openDir(env.gpa, testing.io, &cfg, .{ .sync = .none });
+    return .{ .store = h.store, .io = h.io };
+}
+
+/// The store as of the checkpoint before `blob`'s: every object version the checkpoint read that
+/// it did not write itself (its input objects and the archive's object set) is live, with the
+/// system packages of `epoch`. It holds nothing sui-node did not read, so a read of some other
+/// object that a node's full store would answer is not seen here (`deepwave check` against the
+/// bucket on a store followed with --p2p covers that).
+fn rsSeed(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, epoch: u64, blob: []const u8, bucket: convert.Aux) !void {
+    const idx = &env.idx;
+    var outs: std.AutoHashMapUnmanaged(RsKey, void) = .empty;
+    for (0..idx.tx_count) |i| {
+        const t = idx.txAt(i);
+        for (idx.objs[t.out_first..][0..t.out_count]) |r| try outs.put(a, try exec.objects.keyOf(r.slice(blob)), {});
+    }
+    var pre: std.AutoArrayHashMapUnmanaged(RsKey, []const u8) = .empty;
+    for (0..idx.tx_count) |i| {
+        const t = idx.txAt(i);
+        for (idx.objs[t.in_first..][0..t.in_count]) |r| {
+            const k = try exec.objects.keyOf(r.slice(blob));
+            if (!outs.contains(k)) try pre.put(a, k, r.slice(blob));
+        }
+    }
+    for (bucket.objects) |raw| {
+        const k = try exec.objects.keyOf(raw);
+        if (!outs.contains(k)) try pre.put(a, k, raw);
+    }
+    const keys = try a.dupe(RsKey, pre.keys());
+    std.mem.sort(RsKey, keys, {}, rsLess);
+    const b = try st.begin(seq - 1, epoch);
+    var live: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    for (keys) |k| {
+        const raw = pre.get(k).?;
+        const d = sync.verify.objectDigest(raw);
+        // One pre-state version per id is live (the lowest); any other is only readable by version.
+        if ((try live.getOrPut(a, k.id)).found_existing) try b.putHistorical(&k.id, k.version, &d, raw) else try b.putObject(&k.id, k.version, &d, raw);
+    }
+    var it = env.sys.pkgs.system.keyIterator();
+    while (it.next()) |id| {
+        if ((try live.getOrPut(a, id.*)).found_existing) continue;
+        const raw = env.sys.pkgs.get(id, epoch) orelse continue;
+        const v = try exec.objects.ObjectView.parse(raw);
+        try b.putObject(id, v.version, &sync.verify.objectDigest(raw), raw);
+    }
+    // The packages a system transaction's commands name (a settlement's coin types): the system
+    // executor reads them from the store, which on a node holds every package.
+    var named: std.ArrayList([32]u8) = .empty;
+    for (0..idx.tx_count) |i| {
+        const td = try bcs.decode(types.TransactionData, a, idx.txAt(i).data.slice(blob));
+        switch (td.V1.kind) {
+            .ProgrammableSystemTransaction => |*pt| for (pt.commands) |*cmd| switch (cmd.*) {
+                .MoveCall => |*mc| {
+                    try named.append(a, mc.package.@"0".@"0");
+                    for (mc.type_arguments) |*ty| try rsTypeIds(a, &named, ty);
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+    for (named.items) |*id| {
+        if ((try live.getOrPut(a, id.*)).found_existing) continue;
+        const raw = env.pkgs.file(id) orelse continue;
+        const v = try exec.objects.ObjectView.parse(raw);
+        try b.putObject(id, v.version, &sync.verify.objectDigest(raw), raw);
+    }
+    try st.commit(b);
+}
+
+fn rsTypeIds(a: std.mem.Allocator, out: *std.ArrayList([32]u8), t: *const types.TypeInput) std.mem.Allocator.Error!void {
+    switch (t.*) {
+        .vector => |e| try rsTypeIds(a, out, e),
+        .@"struct" => |*st| {
+            try out.append(a, st.address.@"0");
+            for (st.type_args) |*x| try rsTypeIds(a, out, x);
+        },
+        else => {},
+    }
+}
+
+/// The follower's apply of one checkpoint (sync/follower.zig `applyOne`, certificate aside) with
+/// the node's read-set hook reading `<seq>.aux` from `aux_dir`.
+fn rsApply(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, blob: []const u8, aux_dir: Io.Dir) !void {
+    const idx = &env.idx;
+    try types.indexCheckpointData(blob, idx);
+    const c = switch (try sync.verify.check(a, blob, idx)) {
+        .ok => |c| c,
+        .bad => return error.BadCheckpoint,
+    };
+    var h = try history.History.init(env.gpa, testing.io, aux_dir);
+    defer h.deinit();
+    const b = try st.begin(seq, c.epoch);
+    try b.checkpoint(blob[idx.summary.o .. idx.sig.o + idx.sig.n], idx.contents.slice(blob));
+    try b.checkpointDigest(&c.digest);
+    for (c.txs, 0..) |plan, i| {
+        const t = idx.txAt(i);
+        try b.transaction(plan.tx_digest, &plan.effects_digest, t.transaction.slice(blob), t.effects.slice(blob), if (t.events) |ev| ev.slice(blob) else null);
+        for (plan.puts) |p| try b.putObject(p.id, p.version, &p.digest, idx.objs[p.index].slice(blob));
+        for (plan.removes) |r| try b.removeObject(&r.id, r.version, if (r.kind == 1) .wrapped else .deleted);
+    }
+    try h.onBatch(st, seq, &c, blob, b);
+    try st.commit(b);
+}
+
+fn rsLoadedOf(_: *const anyopaque, snap: *const store.Snapshot, digest: *const [32]u8, at: u64) []const serve.objset.Ref {
+    return history.loadedListNear(serve.objset.Ref, snap, digest, at);
+}
+
+fn rsMask(a: std.mem.Allocator, paths: []const []const u8) ![]const u8 {
+    var m: std.ArrayList(u8) = .empty;
+    for (paths) |p| try pbPutLen(a, &m, 1, p);
+    return m.items;
+}
+
+/// GetCheckpoint (objects and every transaction's unchanged loaded runtime objects) and
+/// BatchGetTransactions (the same per transaction) from the store, as response message bytes.
+fn rsRender(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, digests: []const [32]u8) ![2][]const u8 {
+    var svc: serve.service.Service = .{ .gpa = env.gpa, .store = st, .chain_id = @splat(0), .json = false, .display = false, .lowest_checkpoint = seq, .loaded = .{ .ctx = st, .get = rsLoadedOf } };
+    defer svc.deinit();
+    var req: std.ArrayList(u8) = .empty;
+    try pbPutVarint(a, &req, 1 << 3);
+    try pbPutVarint(a, &req, seq);
+    try pbPutLen(a, &req, 3, try rsMask(a, &.{ "sequence_number", "digest", "transactions.digest", "transactions.effects.unchanged_loaded_runtime_objects", "transactions.objects", "objects" }));
+    const cp = try serve.loopback.unary(a, svc.handler(), "/sui.rpc.v2.LedgerService/GetCheckpoint", req.items);
+    if (cp.status != 0) {
+        std.debug.print("GetCheckpoint {d}: grpc-status {d} {s}\n", .{ seq, cp.status, cp.grpc_message });
+        return error.RenderFailed;
+    }
+    var out: [2][]const u8 = .{ cp.message, "" };
+    var all: std.ArrayList(u8) = .empty;
+    // BatchGetTransactions takes at most 200 digests a request.
+    var i: usize = 0;
+    while (i < digests.len) : (i += 200) {
+        var breq: std.ArrayList(u8) = .empty;
+        for (digests[i..@min(i + 200, digests.len)]) |*d| {
+            var tb: [44]u8 = undefined;
+            try pbPutLen(a, &breq, 1, serve.b58.encode32(&tb, d));
+        }
+        try pbPutLen(a, &breq, 2, try rsMask(a, &.{ "digest", "effects.unchanged_loaded_runtime_objects", "objects" }));
+        const bt = try serve.loopback.unary(a, svc.handler(), "/sui.rpc.v2.LedgerService/BatchGetTransactions", breq.items);
+        if (bt.status != 0) {
+            std.debug.print("BatchGetTransactions {d}: grpc-status {d} {s}\n", .{ seq, bt.status, bt.grpc_message });
+            return error.RenderFailed;
+        }
+        try all.appendSlice(a, bt.message);
+    }
+    out[1] = all.items;
+    return out;
+}
+
+/// One corpus checkpoint through both paths. False: the p2p build fell back (nothing compared).
+fn rsOne(env: *RsEnv, seq: u64) !bool {
+    const gpa = env.gpa;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pb: [96]u8 = undefined;
+    // The archive proto: the dense window, or (exploration) the corpus's older protos.
+    const z = for ([_][]const u8{ "binpb-done", "binpb-hist", "binpb-r4", "binpb-exec" }) |dir| {
+        break readCorpus(gpa, try std.fmt.bufPrint(&pb, "{s}/{d}.binpb.zst", .{ dir, seq })) catch continue;
+    } else return error.SkipZigTest;
+    defer gpa.free(z);
+    const proto = try convert.unzstd(gpa, z, 1 << 30);
+    defer gpa.free(proto);
+    var blob_b: std.ArrayList(u8) = .empty;
+    defer blob_b.deinit(gpa);
+    var aux_b: std.ArrayList(u8) = .empty;
+    defer aux_b.deinit(gpa);
+    try testing.expectEqual(seq, try convert.protoToChkAux(gpa, a, proto, &blob_b, &aux_b));
+    const blob = blob_b.items;
+    const bucket = try convert.Aux.parse(a, aux_b.items);
+    const idx = &env.idx;
+    try types.indexCheckpointData(blob, idx);
+    var sr = bcs.Reader.init(idx.summary.slice(blob));
+    const epoch = try sr.int(u64);
+    const m = for (env.metas) |x| {
+        if (x.epoch == epoch) break x;
+    } else return error.SkipZigTest;
+    const n = idx.tx_count;
+
+    // ---- the p2p build: local execution on the store as of the previous checkpoint
+    const txs = try a.alloc(p2p_exec.ExecData, n);
+    const digests = try a.alloc([32]u8, n);
+    for (txs, digests, 0..) |*t, *d, i| {
+        const x = idx.txAt(i);
+        t.* = .{ .tx = x.transaction.slice(blob), .effects = x.effects.slice(blob) };
+        d.* = types.digest.transactionDataDigest(x.data.slice(blob));
+    }
+    const cert = try a.dupe(u8, blob[idx.summary.o .. idx.sig.o + idx.sig.n]);
+    const contents = try a.dupe(u8, idx.contents.slice(blob));
+    const names = [3][]const u8{ try std.fmt.allocPrint(a, "{d}-pre", .{seq}), try std.fmt.allocPrint(a, "{d}-bucket", .{seq}), try std.fmt.allocPrint(a, "{d}-p2p", .{seq}) };
+    defer for (names) |nm| env.tmp.dir.deleteTree(testing.io, nm) catch {};
+    const res = blk: {
+        const h = try rsStore(env, a, names[0]);
+        defer h.io.deinit();
+        defer h.store.deinit();
+        try rsSeed(env, a, h.store, seq, epoch, blob, bucket);
+        var snap = h.store.snapshot();
+        defer snap.release();
+        const params: p2p_exec.Params = .{ .pv = m.pv.?, .rgp = m.rgp.?, .start_ms = m.start_ms.? };
+        const serial = try p2p_exec.run(rs_exec_gpa, a, &snap, env.ps, params, epoch, cert, contents, txs, &env.stats, null, null);
+        if (env.pool) |pl| if (serial == .ok) switch (try p2p_exec.run(rs_exec_gpa, a, &snap, env.ps, params, epoch, cert, contents, txs, &env.stats, null, pl)) {
+            .ok => |o| {
+                try testing.expectEqualSlices(u8, serial.ok.blob, o.blob);
+                try testing.expectEqualSlices(u8, serial.ok.aux, o.aux);
+            },
+            .fallback => |why| {
+                std.debug.print("p2p read sets: checkpoint {d}: the level-parallel build fell back: {s}\n", .{ seq, why });
+                return error.ParallelFellBack;
+            },
+        };
+        break :blk serial;
+    };
+    const built = switch (res) {
+        .ok => |o| o,
+        .fallback => |why| {
+            env.fallbacks += 1;
+            if (env.diag) std.debug.print("p2p read sets: checkpoint {d} fell back: {s}\n", .{ seq, why });
+            return false;
+        },
+    };
+    env.built += 1;
+    try testing.expectEqualSlices(u8, blob, built.blob);
+    const p2p = try convert.Aux.parse(a, built.aux);
+    try testing.expectEqual(n, p2p.loaded.len);
+
+    // The rule for implicit system object reads against the archive: a read-only root entry of
+    // the accumulator root or the Clock that the transaction does not declare is in sui-node's
+    // list at that version.
+    for (bucket.loaded, 0..) |want, i| {
+        const x = idx.txAt(i);
+        const td = try bcs.decode(types.TransactionData, a, x.data.slice(blob));
+        const fx = switch (try bcs.decode(types.TransactionEffects, a, x.effects.slice(blob))) {
+            .V2 => |v| v,
+            .V1 => continue,
+        };
+        for (try p2p_exec.implicitReads(a, &td.V1, &fx)) |r| {
+            env.implicit_reads += 1;
+            if (env.diag) std.debug.print("p2p read sets: checkpoint {d} tx {d}: implicit read of {x} v{d}\n", .{ seq, i, &r.id, r.version });
+            const listed = for (want) |w| {
+                if (w.version == r.version and std.mem.eql(u8, &w.id, &r.id)) break true;
+            } else false;
+            if (!listed) {
+                std.debug.print("p2p read sets: checkpoint {d} tx {d}: implicit read of {x} v{d} is not in the bucket's list\n", .{ seq, i, &r.id, r.version });
+                return error.ImplicitReadNotListed;
+            }
+        }
+    }
+
+    // ---- the aux records: each transaction's loaded runtime objects, and the extra objects
+    var oset = try serve.objset.ObjSet.build(a, bucket.objects);
+    for (bucket.loaded, p2p.loaded, 0..) |want, got, i| {
+        if (want.len > 0) {
+            env.loaded_txs += 1;
+            env.loaded_refs += want.len;
+        }
+        for (want) |w| {
+            env.seen_count_field += @intFromBool(std.mem.eql(u8, &w.id, &rs_count_field));
+            env.seen_usdc_config += @intFromBool(std.mem.eql(u8, &w.id, &rs_usdc_config));
+        }
+        var same = want.len == got.len;
+        if (same) for (want, got) |w, g| {
+            if (w.version != g.version or !std.mem.eql(u8, &w.id, &g.id)) same = false;
+        };
+        if (same) continue;
+        env.list_diffs += 1;
+        if (!env.diag) continue;
+        const td = try bcs.decode(types.TransactionData, a, idx.txAt(i).data.slice(blob));
+        std.debug.print("p2p read sets: checkpoint {d} tx {d} ({s}): bucket {d} loaded, p2p {d}\n", .{ seq, i, @tagName(td.V1.kind), want.len, got.len });
+        for (want, 0..) |w, j| {
+            const at = for (got, 0..) |g, k| {
+                if (g.version == w.version and std.mem.eql(u8, &g.id, &w.id)) break k;
+            } else null;
+            if (at) |k| {
+                if (k != j) std.debug.print("    order   {x} v{d}: bucket #{d}, p2p #{d}\n", .{ &w.id, w.version, j, k });
+                continue;
+            }
+            std.debug.print("    missing {x} v{d}: {s}\n", .{ &w.id, w.version, (oset.typeString(a, &w.id, w.version) catch null) orelse "?" });
+        }
+        for (got) |g| {
+            const found = for (want) |w| {
+                if (g.version == w.version and std.mem.eql(u8, &g.id, &w.id)) break true;
+            } else false;
+            if (!found) std.debug.print("    extra   {x} v{d}\n", .{ &g.id, g.version });
+        }
+    }
+    {
+        var want: std.AutoHashMapUnmanaged(RsKey, []const u8) = .empty;
+        for (bucket.objects) |raw| try want.put(a, try exec.objects.keyOf(raw), raw);
+        var got: std.AutoHashMapUnmanaged(RsKey, []const u8) = .empty;
+        for (p2p.objects) |raw| try got.put(a, try exec.objects.keyOf(raw), raw);
+        var differs = want.count() != got.count();
+        var wi = want.iterator();
+        while (wi.next()) |e| {
+            if (got.get(e.key_ptr.*)) |raw| {
+                if (std.mem.eql(u8, raw, e.value_ptr.*)) continue;
+            }
+            differs = true;
+            if (env.diag) std.debug.print("p2p read sets: checkpoint {d}: object {x} v{d} in the bucket's aux only: {s}\n", .{ seq, &e.key_ptr.id, e.key_ptr.version, (oset.typeString(a, &e.key_ptr.id, e.key_ptr.version) catch null) orelse "?" });
+        }
+        var gi = got.iterator();
+        while (gi.next()) |e| if (!want.contains(e.key_ptr.*)) {
+            differs = true;
+            if (env.diag) std.debug.print("p2p read sets: checkpoint {d}: object {x} v{d} in the p2p aux only\n", .{ seq, &e.key_ptr.id, e.key_ptr.version });
+        };
+        if (differs) env.extra_diffs += 1;
+    }
+
+    // ---- stored and served: the same checkpoint applied with each aux record
+    var rendered: [2][2][]const u8 = undefined;
+    var lists: [2][]const []const u8 = undefined;
+    var objs: [2][]const ?[]const u8 = undefined;
+    for ([2][]const u8{ aux_b.items, built.aux }, 0..) |aux_bytes, side| {
+        const h = try rsStore(env, a, names[1 + side]);
+        defer h.io.deinit();
+        defer h.store.deinit();
+        try types.indexCheckpointData(blob, idx);
+        try rsSeed(env, a, h.store, seq, epoch, blob, bucket);
+        try env.tmp.dir.writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&pb, "{d}.aux", .{seq}), .data = aux_bytes });
+        try rsApply(env, a, h.store, seq, blob, env.tmp.dir);
+        var snap = h.store.snapshot();
+        defer snap.release();
+        const ll = try a.alloc([]const u8, n);
+        var os: std.ArrayList(?[]const u8) = .empty;
+        for (ll, digests, 0..) |*l, *d, i| {
+            const refs = history.loadedList(serve.objset.Ref, &snap, d);
+            l.* = try a.dupe(u8, std.mem.sliceAsBytes(refs));
+            const x = idx.txAt(i);
+            const td = try bcs.decode(types.TransactionData, a, x.data.slice(blob));
+            const fx = try bcs.decode(types.TransactionEffects, a, x.effects.slice(blob));
+            // The transaction's object set by the bucket's list: every version must be stored.
+            const want_refs = try a.alloc(serve.objset.Ref, bucket.loaded[i].len);
+            for (bucket.loaded[i], want_refs) |w, *r| r.* = .{ .id = w.id, .version = w.version };
+            for (try serve.txobjects.keys(a, td, fx, want_refs)) |k| {
+                try os.append(a, if (snap.objectAt(&k.id, k.version)) |raw| try a.dupe(u8, raw) else null);
+            }
+        }
+        lists[side] = ll;
+        objs[side] = os.items;
+        rendered[side] = try rsRender(env, a, h.store, seq, digests);
+    }
+    var stored_same = objs[0].len == objs[1].len;
+    for (lists[0], lists[1]) |x, y| {
+        if (!std.mem.eql(u8, x, y)) stored_same = false;
+    }
+    if (stored_same) for (objs[0], objs[1]) |x, y| {
+        if (x == null or y == null or !std.mem.eql(u8, x.?, y.?)) stored_same = false;
+    };
+    if (!stored_same) env.store_diffs += 1;
+    for (rendered[0], rendered[1], [2][]const u8{ "GetCheckpoint", "BatchGetTransactions" }) |x, y, what| {
+        if (std.mem.eql(u8, x, y)) continue;
+        env.render_diffs += 1;
+        if (env.diag) std.debug.print("p2p read sets: checkpoint {d}: {s} differs: bucket {d} bytes, p2p {d} bytes\n", .{ seq, what, x.len, y.len });
+    }
+    return true;
+}
+
+test "p2p: unchanged loaded runtime objects are one per id at the highest version read, without the effects' object changes, in id order" {
+    // sui-core transaction_outputs.rs `unchanged_loaded_runtime_objects`.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const T = struct {
+        fn id(b: u8) types.ObjectID {
+            return .{ .@"0" = .{ .@"0" = @splat(b) } };
+        }
+        fn ref(b: u8, v: u64) exec.ptb.Ref {
+            return .{ .id = @splat(b), .version = v };
+        }
+        fn oref(b: u8, v: u64) struct { types.ObjectID, types.SequenceNumber, types.ObjectDigest } {
+            return .{ id(b), .{ .@"0" = v }, .{ .@"0" = .{ .@"0" = @splat(0) } } };
+        }
+    };
+    const dz: types.ObjectDigest = .{ .@"0" = .{ .@"0" = @splat(0) } };
+    const owner: types.Owner = .{ .AddressOwner = .{ .@"0" = @splat(7) } };
+    const gas: types.GasCostSummary = .{ .computationCost = 0, .storageCost = 0, .storageRebate = 0, .nonRefundableStorageFee = 0 };
+    // Read in execution order: 0x50, 0x10 twice (two versions), 0x30 (mutated), 0x20 (only named
+    // by an accumulator write, which is not an object change), 0x40 (deleted), 0x10 again.
+    const loads = [_]exec.ptb.Ref{ T.ref(0x50, 9), T.ref(0x10, 4), T.ref(0x30, 5), T.ref(0x20, 6), T.ref(0x40, 7), T.ref(0x10, 8), T.ref(0x10, 4) };
+    const fx: types.TransactionEffectsV2 = .{
+        .status = .Success,
+        .executed_epoch = 1,
+        .gas_used = gas,
+        .transaction_digest = .{ .@"0" = .{ .@"0" = @splat(1) } },
+        .gas_object_index = null,
+        .events_digest = null,
+        .dependencies = &.{},
+        .lamport_version = .{ .@"0" = 10 },
+        .changed_objects = &.{
+            .{ T.id(0x30), .{ .input_state = .{ .Exist = .{ .{ .{ .@"0" = 5 }, dz }, owner } }, .output_state = .{ .ObjectWrite = .{ dz, owner } }, .id_operation = .None } },
+            .{ T.id(0x20), .{ .input_state = .NotExist, .output_state = .{ .AccumulatorWriteV1 = .{ .address = .{ .address = .{ .@"0" = @splat(7) }, .ty = .u64 }, .operation = .Merge, .value = .{ .Integer = 1 } } }, .id_operation = .None } },
+            .{ T.id(0x40), .{ .input_state = .{ .Exist = .{ .{ .{ .@"0" = 7 }, dz }, owner } }, .output_state = .NotExist, .id_operation = .Deleted } },
+        },
+        .unchanged_consensus_objects = &.{},
+        .aux_data_digest = null,
+    };
+    const got = try p2p_exec.unchangedLoaded(a, &loads, &fx, null);
+    try testing.expectEqualSlices(exec.ptb.Ref, &.{ T.ref(0x10, 8), T.ref(0x20, 6), T.ref(0x50, 9) }, got);
+    // V1 effects: created, mutated, unwrapped, deleted, unwrapped_then_deleted and wrapped are the
+    // object changes (`fx` is then only the driver's view and is not consulted).
+    const v1: types.TransactionEffectsV1 = .{
+        .status = .Success,
+        .executed_epoch = 1,
+        .gas_used = gas,
+        .modified_at_versions = &.{},
+        .shared_objects = &.{},
+        .transaction_digest = .{ .@"0" = .{ .@"0" = @splat(1) } },
+        .created = &.{},
+        .mutated = &.{.{ T.oref(0x30, 10), owner }},
+        .unwrapped = &.{},
+        .deleted = &.{},
+        .unwrapped_then_deleted = &.{T.oref(0x50, 10)},
+        .wrapped = &.{T.oref(0x40, 10)},
+        .gas_object = .{ T.oref(0x30, 10), owner },
+        .events_digest = null,
+        .dependencies = &.{},
+    };
+    const got1 = try p2p_exec.unchangedLoaded(a, &loads, &fx, &v1);
+    try testing.expectEqualSlices(exec.ptb.Ref, &.{ T.ref(0x10, 8), T.ref(0x20, 6) }, got1);
+    try testing.expectEqual(@as(usize, 0), (try p2p_exec.unchangedLoaded(a, &.{}, &fx, null)).len);
+}
+
+test "p2p: an undeclared read-only root entry of the accumulator root or the Clock is an implicit store read" {
+    // TemporaryStore::load_implicitly_read_system_object goes through the tracking store; the
+    // effects list the read as a read-only consensus object (loaded_system_objects).
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const T = struct {
+        fn sys(lo: u16) [32]u8 {
+            var id: [32]u8 = @splat(0);
+            id[30] = @intCast(lo >> 8);
+            id[31] = @intCast(lo & 0xff);
+            return id;
+        }
+        fn oid(b: [32]u8) types.ObjectID {
+            return .{ .@"0" = .{ .@"0" = b } };
+        }
+        fn shared(b: [32]u8) types.CallArg {
+            return .{ .Object = .{ .SharedObject = .{ .id = oid(b), .initial_shared_version = .{ .@"0" = 1 }, .mutability = .Immutable } } };
+        }
+        fn data(inputs: []const types.CallArg) types.TransactionDataV1 {
+            return .{
+                .kind = .{ .ProgrammableTransaction = .{ .inputs = inputs, .commands = &.{} } },
+                .sender = .{ .@"0" = @splat(7) },
+                .gas_data = .{ .payment = &.{}, .owner = .{ .@"0" = @splat(7) }, .price = 1, .budget = 1 },
+                .expiration = .None,
+            };
+        }
+    };
+    const dz: types.ObjectDigest = .{ .@"0" = .{ .@"0" = @splat(0) } };
+    const root = T.sys(0x0acc);
+    const clock = T.sys(6);
+    const other: [32]u8 = @splat(0x44);
+    const fx: types.TransactionEffectsV2 = .{
+        .status = .Success,
+        .executed_epoch = 1,
+        .gas_used = .{ .computationCost = 0, .storageCost = 0, .storageRebate = 0, .nonRefundableStorageFee = 0 },
+        .transaction_digest = .{ .@"0" = .{ .@"0" = @splat(1) } },
+        .gas_object_index = null,
+        .events_digest = null,
+        .dependencies = &.{},
+        .lamport_version = .{ .@"0" = 10 },
+        .changed_objects = &.{},
+        .unchanged_consensus_objects = &.{
+            .{ T.oid(clock), .{ .ReadOnlyRoot = .{ .{ .@"0" = 31 }, dz } } },
+            .{ T.oid(other), .{ .ReadOnlyRoot = .{ .{ .@"0" = 32 }, dz } } },
+            .{ T.oid(T.sys(0x0403)), .PerEpochConfig },
+            .{ T.oid(root), .{ .ReadOnlyRoot = .{ .{ .@"0" = 33 }, dz } } },
+        },
+        .aux_data_digest = null,
+    };
+    // Clock and another shared object declared, the accumulator root not: one implicit read.
+    const declared = [_]types.CallArg{ .{ .Pure = "x" }, T.shared(clock), T.shared(other) };
+    const d1 = T.data(&declared);
+    try testing.expectEqualSlices(exec.ptb.Ref, &.{.{ .id = root, .version = 33 }}, try p2p_exec.implicitReads(a, &d1, &fx));
+    // Nothing declared: both system objects were read implicitly; the other object never is.
+    const d2 = T.data(&.{});
+    try testing.expectEqualSlices(exec.ptb.Ref, &.{ .{ .id = clock, .version = 31 }, .{ .id = root, .version = 33 } }, try p2p_exec.implicitReads(a, &d2, &fx));
+    // Both declared: none.
+    const both = [_]types.CallArg{ T.shared(root), T.shared(clock) };
+    const d3 = T.data(&both);
+    try testing.expectEqual(@as(usize, 0), (try p2p_exec.implicitReads(a, &d3, &fx)).len);
+}
+
+const RsOut = struct { built: u64 = 0, fallbacks: u64 = 0, list_diffs: u64 = 0, extra_diffs: u64 = 0, store_diffs: u64 = 0, render_diffs: u64 = 0, loaded_txs: u64 = 0, loaded_refs: u64 = 0, implicit_reads: u64 = 0, seen_count_field: u64 = 0, seen_usdc_config: u64 = 0 };
+
+fn rsRun(seqs: []const u64, diag: bool, out: *RsOut) !void {
+    const gpa = testing.allocator;
+    const c = corpus() orelse return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try a.dupe(u8, pb[0..try tmp.dir.realPath(testing.io, &pb)]);
+    const text = try readCorpus(gpa, "epochs.jsonl");
+    defer gpa.free(text);
+    var metas: std.ArrayList(RsMeta) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| if (line.len > 0) {
+        try metas.append(a, try std.json.parseFromSliceLeaky(RsMeta, a, line, .{ .ignore_unknown_fields = true }));
+    };
+    const pkg_dir = Io.Dir.cwd().openDir(testing.io, try std.fmt.bufPrint(&pb, "{s}/packages", .{c}), .{}) catch return error.SkipZigTest;
+    defer pkg_dir.close(testing.io);
+    const chk_dir = Io.Dir.cwd().openDir(testing.io, try std.fmt.bufPrint(&pb, "{s}/chk", .{c}), .{}) catch return error.SkipZigTest;
+    defer chk_dir.close(testing.io);
+    const eidx = try trust.EpochIndex.load(a, testing.io, try std.fmt.bufPrint(&pb, "{s}/epochs.jsonl", .{c}));
+
+    var env: RsEnv = .{ .gpa = gpa, .base = base, .tmp = &tmp, .metas = metas.items, .ps = undefined, .pkgs = undefined, .sys = undefined, .idx = try types.CheckpointIndex.init(gpa), .diag = diag };
+    defer env.idx.deinit(gpa);
+    // System packages of every epoch (the executor's loader; its store is not used).
+    const sh = try rsStore(&env, a, "sys");
+    defer sh.io.deinit();
+    defer sh.store.deinit();
+    var sys = try execute.Executor.init(gpa, testing.io, sh.store, null);
+    defer sys.deinit();
+    try testing.expect(sys.seedSystemPackages(chk_dir, eidx.last, eidx.last.len) > 0);
+    env.sys = &sys;
+    var ps: p2p_exec.PackageSource = .{ .keep = .init(gpa) };
+    defer ps.deinit();
+    ps.bind();
+    var corpus_pkgs: RsPkgs = .{ .inner = ps.pkgs.lookup.?, .dir = pkg_dir, .keep = a };
+    ps.pkgs.lookup = .{ .ctx = &corpus_pkgs, .get = RsPkgs.get };
+    env.ps = &ps;
+    env.pkgs = &corpus_pkgs;
+    defer exec.ptb.pkgs.releaseThreadCaches();
+    defer exec.system.movecall.releaseThreadCaches();
+    var pool: p2p_exec.Pool = .{ .gpa = gpa, .io = testing.io };
+    try pool.start(4);
+    defer pool.stop();
+    env.pool = &pool;
+
+    for (seqs) |seq| _ = rsOne(&env, seq) catch |e| switch (e) {
+        error.SkipZigTest => return e,
+        else => {
+            std.debug.print("p2p read sets: checkpoint {d}: {s}\n", .{ seq, @errorName(e) });
+            return e;
+        },
+    };
+    out.* = .{ .built = env.built, .fallbacks = env.fallbacks, .list_diffs = env.list_diffs, .extra_diffs = env.extra_diffs, .store_diffs = env.store_diffs, .render_diffs = env.render_diffs, .loaded_txs = env.loaded_txs, .loaded_refs = env.loaded_refs, .implicit_reads = env.implicit_reads, .seen_count_field = env.seen_count_field, .seen_usdc_config = env.seen_usdc_config };
+}
+
+fn rsOnThread(seqs: []const u64, diag: bool, out: *RsOut) !void {
+    const T = struct {
+        fn run(s: []const u64, d: bool, o: *RsOut, r: *?anyerror) void {
+            rsRun(s, d, o) catch |e| {
+                r.* = e;
+            };
+        }
+    };
+    var res: ?anyerror = null;
+    // Its own thread: exec's per-thread package caches are keyed by the packages store's address,
+    // and the Move VM wants the stack the p2p exec threads have.
+    const t = try std.Thread.spawn(.{ .stack_size = 64 << 20 }, T.run, .{ seqs, diag, out, &res });
+    t.join();
+    if (res) |e| return e;
+}
+
+test "p2p: a checkpoint built by local execution stores and serves the same read sets as the bucket's" {
+    const gpa = testing.allocator;
+    var seqs: std.ArrayList(u64) = .empty;
+    defer seqs.deinit(gpa);
+    var diag = false;
+    if (std.c.getenv("ZUI_P2P_READSETS")) |r| {
+        // Exploration: ZUI_P2P_READSETS=FROM-TO[,SEQ,...] prints every difference over those
+        // checkpoints.
+        var parts = std.mem.tokenizeScalar(u8, std.mem.span(r), ',');
+        while (parts.next()) |text| {
+            const dash = std.mem.indexOfScalar(u8, text, '-') orelse text.len;
+            var s = try std.fmt.parseInt(u64, text[0..dash], 10);
+            const to = if (dash == text.len) s else try std.fmt.parseInt(u64, text[dash + 1 ..], 10);
+            while (s <= to) : (s += 1) try seqs.append(gpa, s);
+        }
+        diag = true;
+    } else {
+        // The end of epoch 1303 (342451160: the epoch change and its system state reads) and the
+        // start of 1304: Move calls with dynamic-field reads and read-only shared inputs,
+        // regulated-coin transfers (coin deny list reads) and a settlement in every checkpoint.
+        var s: u64 = 342451158;
+        while (s < 342451170) : (s += 1) try seqs.append(gpa, s);
+        // Transaction 29 checks an object's funds: the accumulator root is read implicitly.
+        try seqs.append(gpa, 342453625);
+    }
+    var out: RsOut = .{};
+    try rsOnThread(seqs.items, diag, &out);
+    std.debug.print("p2p read sets: {d} checkpoints built, {d} fell back; {d} transactions with loaded objects ({d} refs: {d} implicit system object reads, {d} of the accumulator object count field, {d} of the USDC deny list config); differences: {d} lists, {d} extra-object sets, {d} stores, {d} renders\n", .{ out.built, out.fallbacks, out.loaded_txs, out.loaded_refs, out.implicit_reads, out.seen_count_field, out.seen_usdc_config, out.list_diffs, out.extra_diffs, out.store_diffs, out.render_diffs });
+    try testing.expectEqual(@as(u64, 0), out.fallbacks);
+    try testing.expect(out.loaded_refs > 0);
+    if (!diag) {
+        // The fixed set holds what the production shadow saw missing, and an implicit read.
+        try testing.expect(out.seen_count_field > 0);
+        try testing.expect(out.seen_usdc_config > 0);
+        try testing.expect(out.implicit_reads > 0);
+    }
+    try testing.expectEqual(@as(u64, 0), out.list_diffs);
+    try testing.expectEqual(@as(u64, 0), out.extra_diffs);
+    try testing.expectEqual(@as(u64, 0), out.store_diffs);
+    try testing.expectEqual(@as(u64, 0), out.render_diffs);
 }

@@ -759,12 +759,25 @@ pub fn finish(r: *Run) Error!Results {
     const max_size = p.cfg.getOpt("max_move_object_size");
     const out = try arena.alloc(Write, writes.len);
     var deny_pairs: std.ArrayList(deny.Pair) = .empty;
+    // has_public_transfer is the `store` ability of the object's type. A transaction that
+    // writes many objects writes few types (coins, the fields of one table), so the type is
+    // resolved once per run of writes of the same type instead of once per write: the last few
+    // answers are kept, and a type not among them is resolved as before.
+    var stores: [4]struct { st: *const types.StructTag, has_store: bool } = undefined;
+    var n_stores: usize = 0;
     for (writes, out) |w, *o| {
         const st = switch (w.ty.*) {
             .@"struct" => |s| s,
             else => return r.diag().unsupported("non-struct object type"),
         };
-        const ty = try typing.fromStruct(p, &st);
+        const has_store = for (stores[0..@min(n_stores, stores.len)]) |known| {
+            if (objrt.structEql(known.st, &w.ty.@"struct")) break known.has_store;
+        } else blk: {
+            const hs = typing.abilities(try typing.fromStruct(p, &st)).hasStore();
+            stores[n_stores % stores.len] = .{ .st = &w.ty.@"struct", .has_store = hs };
+            n_stores += 1;
+            break :blk hs;
+        };
         const contents = try types.layout.encodeAlloc(arena, &w.value);
         if (max_size) |m| if (contents.len > m)
             return r.diag().failWith(.{ .MoveObjectTooBig = .{ .object_size = contents.len, .max_object_size = m } }, null);
@@ -780,7 +793,7 @@ pub fn finish(r: *Run) Error!Results {
             .id = w.id,
             .owner = owner,
             .tag = st,
-            .has_public_transfer = typing.abilities(ty).hasStore(),
+            .has_public_transfer = has_store,
             .contents = contents,
             .old_version = if (loaded.get(w.id)) |l| l.version else 0,
         };

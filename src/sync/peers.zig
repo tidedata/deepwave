@@ -66,7 +66,7 @@ pub fn syncHeaders(gpa: std.mem.Allocator, io: Io, st: ?*store_mod.Store, addr: 
         bcs.skip(types.gen.CheckpointSummary, &rd) catch return error.BadCheckpoint;
         const summary_bytes = payload[0..rd.at];
         const sig_bytes = payload[rd.at..];
-        const summary = bcs.decode(types.CheckpointSummary, a, summary_bytes) catch return error.BadCheckpoint;
+        const summary = bcs.decode(types.CheckpointSummary, a, summary_bytes) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.BadCheckpoint;
         if (summary.sequence_number != seq) return error.BadCheckpoint;
         if (summary.epoch != epoch) {
             if (!(summary.epoch == epoch + 1 and prev_eoe)) return error.BadCheckpoint;
@@ -76,7 +76,7 @@ pub fn syncHeaders(gpa: std.mem.Allocator, io: Io, st: ?*store_mod.Store, addr: 
         if (prev) |pd| {
             if (summary.previous_digest == null or !std.mem.eql(u8, &summary.previous_digest.?.@"0".@"0", &pd)) return error.BadCheckpoint;
         }
-        if (!verify.checkCert(a, &committee, summary.epoch, summary_bytes, sig_bytes).isOk()) return error.BadCheckpoint;
+        if (!(try verify.checkCert(a, &committee, summary.epoch, summary_bytes, sig_bytes)).isOk()) return error.BadCheckpoint;
         if (st) |s| {
             const b = try s.begin(seq, summary.epoch);
             errdefer s.abort(b);

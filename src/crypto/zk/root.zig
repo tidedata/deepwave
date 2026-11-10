@@ -8,6 +8,7 @@ pub const groth16 = @import("groth16.zig");
 pub const b64 = @import("b64.zig");
 pub const json = @import("json.zig");
 pub const zklogin = @import("zklogin.zig");
+pub const corpus_vectors = @import("corpus_vectors.zig");
 pub const conformance = @import("conformance.zig");
 
 test {

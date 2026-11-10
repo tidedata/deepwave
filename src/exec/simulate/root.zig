@@ -3,6 +3,7 @@
 const std = @import("std");
 
 pub const api = @import("api.zig");
+pub const batch = @import("batch.zig");
 pub const overlay = @import("overlay.zig");
 pub const conformance = @import("conformance.zig");
 

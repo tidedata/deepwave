@@ -1,0 +1,16 @@
+# Not compiled yet. Depends on the Mysten checkout at
+# mainnet-v1.83.1 (tools/setup-sui.sh) through a path dependency; adjust --sui-src if elsewhere.
+[package]
+name = "zui-authority-dump"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+sui-core = { path = "../../../sui/crates/sui-core" }
+sui-types = { path = "../../../sui/crates/sui-types" }
+typed-store = { path = "../../../sui/crates/typed-store" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"

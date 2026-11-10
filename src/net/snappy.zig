@@ -41,6 +41,7 @@ fn readVarint(in: []const u8) Error!struct { v: u64, n: usize } {
         if (i >= 10) return error.Corrupt;
         v |= @as(u64, b & 0x7f) << shift;
         if (b < 0x80) return .{ .v = v, .n = i + 1 };
+        if (i == 9) return error.Corrupt; // a tenth byte with the continuation bit (shift is a u6)
         shift += 7;
     }
     return error.Corrupt;
@@ -384,6 +385,14 @@ pub fn compressFrame(arena: Allocator, in: []const u8) Allocator.Error![]u8 {
     arena.destroy(enc);
     arena.free(tmp);
     return out.items;
+}
+
+test "a varint of ten continuation bytes is corrupt, not a shift overflow" {
+    const ff: [16]u8 = @splat(0xff);
+    try std.testing.expectError(error.Corrupt, readVarint(&ff));
+    try std.testing.expectError(error.Corrupt, blockLen(&ff));
+    var out: [16]u8 = undefined;
+    try std.testing.expectError(error.Corrupt, decompressBlock(&ff, &out));
 }
 
 test "block round trip" {

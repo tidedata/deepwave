@@ -994,7 +994,10 @@ pub fn verifyBatchImpl(items: []const BatchItem, scratch: []u8) Verdict {
         return .valid;
     }
     const fit = batchCapacity(scratch.len);
-    const cap = @max(1, fit);
+    // Chunks above ~256 items get slower per item (the tables fall out of cache): on a test machine,
+    // 64..256 items 16.8 us/sig, 1024 18.2, 4096 22.7 to 24.3, 30k 30.3 (slower than single
+    // checks, 29.2). A caller handing over scratch for the whole batch still gets the fast size.
+    const cap: usize = @max(1, @min(fit, batch_chunk_best));
     var seed: [32]u8 = undefined;
     {
         var h = hash.Blake2b256.init();
@@ -1037,6 +1040,9 @@ fn alignedScratch(scratch: []u8) []u8 {
     const off = (a - addr % a) % a;
     return if (off > scratch.len) scratch[0..0] else scratch[off..];
 }
+
+/// Items per chunk at most: the fastest size measured (sig-fast bench, batch-chunk sweep).
+pub const batch_chunk_best: usize = 256;
 
 /// Max items per chunk for a scratch buffer of `len` bytes.
 pub fn batchCapacity(len: usize) usize {
@@ -1418,6 +1424,35 @@ test "batch: large batches accept valid and reject one bad item" {
         msgs[bad][3] ^= 0x80;
     }
     try std.testing.expect(verifyBatch(&items, buf) == .valid);
+}
+
+test "batch: whole-batch scratch above batch_chunk_best runs in capped chunks, a bad item in any chunk rejects" {
+    const N = 2 * batch_chunk_best + 37;
+    const kps = try std.testing.allocator.alloc(KeyPair, N);
+    defer std.testing.allocator.free(kps);
+    const msgs = try std.testing.allocator.alloc([16]u8, N);
+    defer std.testing.allocator.free(msgs);
+    const sigs = try std.testing.allocator.alloc([64]u8, N);
+    defer std.testing.allocator.free(sigs);
+    const items = try std.testing.allocator.alloc(BatchItem, N);
+    defer std.testing.allocator.free(items);
+    for (0..N) |i| {
+        var sd: [32]u8 = @splat(0x77);
+        std.mem.writeInt(u32, sd[0..4], @intCast(i), .little);
+        kps[i] = KeyPair.fromSeed(&sd);
+        msgs[i] = @splat(@truncate(i));
+        sigs[i] = kps[i].sign(&msgs[i]);
+        items[i] = .{ .pk = &kps[i].pk, .msg = &msgs[i], .sig = &sigs[i] };
+    }
+    const buf = try std.testing.allocator.alloc(u8, (N + 1) * batch_scratch_per_item + 64);
+    defer std.testing.allocator.free(buf);
+    try std.testing.expect(batchCapacity(buf.len) > batch_chunk_best);
+    try std.testing.expect(verifyBatch(items, buf) == .valid);
+    for ([_]usize{ 0, batch_chunk_best - 1, batch_chunk_best, 2 * batch_chunk_best + 5, N - 1 }) |bad| {
+        sigs[bad][40] ^= 1;
+        try std.testing.expect(verifyBatch(items, buf) == .invalid);
+        sigs[bad][40] ^= 1;
+    }
 }
 
 test "batch: chunking, odd sizes and one bad item agree with single verification" {

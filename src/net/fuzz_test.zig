@@ -5,6 +5,7 @@ const snappy = @import("snappy.zig");
 const wire = @import("wire.zig");
 const x509 = @import("x509.zig");
 const tls13 = @import("tls13.zig");
+const tls13_server = @import("tls13_server.zig");
 const Ed25519 = std.crypto.sign.Ed25519;
 
 fn mutate(r: std.Random, buf: []u8) void {
@@ -112,4 +113,56 @@ test "tls client survives random server messages" {
         c.feed(gpa, .initial, msg[0..n]) catch {};
         c.feed(gpa, .handshake, msg[0..n]) catch {};
     }
+}
+
+test "tls server survives mutated ClientHellos, every length field forced to its extremes" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(5);
+    const r = prng.random();
+    const ckp = try Ed25519.KeyPair.generateDeterministic(@splat(1));
+    const skp = try Ed25519.KeyPair.generateDeterministic(@splat(2));
+    var scert: [x509.max_cert_len]u8 = undefined;
+    const sl = x509.generateSelfSigned(&scert, skp, @splat(6), "zui");
+    var hellos: [2][]u8 = undefined;
+    for (&hellos, [_][]const u8{ "zui/1", "" }) |*h, alpn| {
+        var c = tls13.Client.init(.{ .server_name = "zui", .local_tp = "ctp", .identity = ckp, .cert_der = "", .now_unix = 0, .random = @splat(7), .x25519_secret = @splat(8), .alpn = alpn });
+        defer c.deinit(gpa);
+        try c.start(gpa);
+        h.* = try gpa.dupe(u8, c.takeOutput(.initial));
+    }
+    defer for (hellos) |h| gpa.free(h);
+    const extremes = [_]u16{ 0, 1, 2, 0x7f, 0x80, 0xfe, 0xff, 0x100, 0x7fff, 0xfffd, 0xfffe, 0xffff };
+    const exts = [_]u16{ 0x0000, 0x000a, 0x000d, 0x0033, 0x002b, 0x0010, 0x0039 };
+    const no_alpn: []const []const u8 = &.{};
+    const zui_alpn: []const []const u8 = &.{"zui/1"};
+    var m: [512]u8 = undefined;
+    var accepted: usize = 0;
+    for (0..20000) |i| {
+        const h = hellos[i % 2];
+        @memcpy(m[0..h.len], h);
+        var n = h.len;
+        const v = if (r.boolean()) extremes[r.uintLessThan(usize, extremes.len)] else r.int(u16);
+        switch (r.uintLessThan(u8, 4)) {
+            // a length inside one extension's data (u8 or u16)
+            0 => if (tls13_server.helloExtOffset(m[0..n], exts[r.uintLessThan(usize, exts.len)])) |at| {
+                const w: u8 = if (r.boolean()) 1 else 2;
+                if (at + w <= n) tls13_server.pokeLength(m[0..n], at, v, w);
+            },
+            // any 16-bit position (extension type/length, cipher suite and extension list lengths)
+            1 => tls13_server.pokeLength(m[0..n], 4 + r.uintLessThan(usize, n - 5), v, 2),
+            // any byte (session id and compression method lengths)
+            2 => m[4 + r.uintLessThan(usize, n - 4)] = @truncate(v),
+            else => mutate(r, m[4..n]),
+        }
+        if (i % 9 == 0) n = 4 + r.uintLessThan(usize, n - 3);
+        // keep the handshake header consistent so the body reaches the parser
+        const bl = n - 4;
+        m[1] = @intCast(bl >> 16);
+        m[2] = @intCast((bl >> 8) & 0xff);
+        m[3] = @intCast(bl & 0xff);
+        var s = tls13_server.Server.init(.{ .server_name = "zui", .local_tp = "stp", .identity = skp, .cert_der = scert[0..sl], .now_unix = 1_800_000_000, .random = @splat(9), .x25519_secret = @splat(10), .alpn = if (i % 3 == 0) no_alpn else zui_alpn, .client_auth = i % 2 == 0, .tcp = i % 5 == 0 });
+        defer s.deinit(gpa);
+        if (s.feed(gpa, .initial, m[0..n])) |_| accepted += 1 else |_| {}
+    }
+    try std.testing.expect(accepted > 0); // some mutations land in ignored bytes
 }

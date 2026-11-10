@@ -50,4 +50,5 @@ node-execute     # deepwave --mode execute over the 10k binpb-done window: 0 mis
 index-parity     # StateService ListOwnedObjects/ListBalances/GetBalance/ListDynamicFields/GetCoinInfo over loopback HTTP/2 on the restored live set, response bytes vs sui-node 1.83.1 (vectors/index/: live-1, live-2, errors)
 index-feed       # per-checkpoint effects feed over 500 consecutive corpus checkpoints ends at the index that inserting the final states builds
 node-convert      # every archive proto in binpb-done vs the sui-types conversion (truth in chk/ or chk-extra/)
+sig-order        # every corpus sponsored/multi-signer tx: V2 contents in required_signers order; the sweep reorder and the ingest overlay rule take exactly a certified permutation
 exec-move-synth  # synthetic vectors from Mysten's executor: coin deny list v2, upgrades, references, and at protocol 142 the implicit Clock (clock::borrow, vectors-v142)

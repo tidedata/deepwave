@@ -6,6 +6,8 @@
 const std = @import("std");
 const fp = @import("bn254/fp.zig");
 const consts = @import("poseidon_constants.zig");
+/// The raw circomlib tables (round constants `c<t>`, MDS matrices `m<t>`), for the GPU path.
+pub const constants = consts;
 const errors = @import("errors.zig");
 const Fr = fp.Fr;
 

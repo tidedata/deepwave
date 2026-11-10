@@ -72,6 +72,14 @@ pub const Config = struct {
     /// one PING+PADDING datagram of this size is sent; its ACK raises the datagram size from
     /// 1200. 0: no probing (anemo keeps 1200). 1452 fits IPv6 over a 1500-byte Ethernet MTU.
     pmtu_max: u16 = 0,
+    /// 1-RTT packets sealed under one key before we update the keys ourselves (RFC 9001 6.6:
+    /// AES-128-GCM must not seal more than 2^23 packets under one key). quinn rotates on its own
+    /// side; a zui-to-zui link needs this one. Tests and the interop suite set it low.
+    key_update_pkts: u64 = 1 << 22,
+    /// A connection still handshaking this long after it was created is dropped silently (0:
+    /// only the idle timeout). Listeners set it so half-open connections cannot hold a slot for
+    /// a whole idle timeout.
+    handshake_timeout_ms: u64 = 0,
 };
 
 pub const Error = error{ OutOfMemory, ConnectionClosed, StreamLimit, InvalidStream, FlowControl };
@@ -118,7 +126,21 @@ const FrameRec = union(enum) {
     handshake_done,
     /// PMTU probe of this datagram size (not retransmitted; loss is no congestion signal).
     pmtu: u16,
+    reset_stream: Ctl.Reset,
+    stop_sending: Ctl.Stop,
 };
+
+/// RESET_STREAM and STOP_SENDING waiting to be sent (or resent after a loss). Kept on the
+/// connection, not the stream: a reset must reach the peer after the stream is gone.
+const Ctl = union(enum) {
+    reset: Reset,
+    stop: Stop,
+    const Reset = struct { id: u64, code: u64, final: u64 };
+    const Stop = struct { id: u64, code: u64 };
+};
+/// Streams the application freed while the peer may still send on them or a packet of ours is
+/// unacknowledged (`streamFree`). Past this many the oldest is dropped outright.
+const max_detached = 1024;
 const max_recs = 6;
 
 const Sent = struct {
@@ -210,11 +232,27 @@ pub const Stream = struct {
     fin_sent: bool = false,
     retx: std.ArrayList(buf.Range) = .empty,
     peer_max: u64 = 0,
+    /// STREAM frames of this stream in packets not yet acknowledged or declared lost. A stream
+    /// whose bytes are all sent is not finished until this is 0 (`streamSettled`): a lost packet
+    /// requeues its range on the stream, so a freed stream's lost data could never be resent.
+    inflight: u32 = 0,
     // receive side
     recv: buf.RecvBuf = .{},
     recv_limit: u64 = 0,
     reset: ?u64 = null,
     stopped_by_peer: ?u64 = null,
+    /// Highest offset counted toward the connection's received bytes (`recv_data`).
+    counted: u64 = 0,
+    /// Offset up to which this stream's bytes were returned to the connection window (consumed
+    /// by the application, or discarded).
+    credited: u64 = 0,
+    /// On the connection's `recv_watch` list (window credit is checked from `recv.base`).
+    watched: bool = false,
+    /// Freed by the application but kept: late bytes are counted and dropped, unacknowledged
+    /// data stays retransmittable, until both directions are finished (`reapDetached`).
+    detached: bool = false,
+    /// Our send side was reset (RESET_STREAM queued): nothing more is sent or resent.
+    send_reset: bool = false,
 
     fn deinit(s: *Stream, gpa: Allocator) void {
         s.send_buf.deinit(gpa);
@@ -223,6 +261,7 @@ pub const Stream = struct {
     }
 
     fn hasPending(s: *const Stream) bool {
+        if (s.send_reset) return false;
         if (s.retx.items.len > 0) return true;
         if (s.send_off < s.send_base + s.send_buf.items.len) return true;
         return s.fin_queued and !s.fin_sent;
@@ -270,6 +309,14 @@ pub const Connection = struct {
     app_recv_next: ?qc.PacketKeys = null,
     send_phase: bool = false,
     recv_phase: bool = false,
+    /// 1-RTT packets sealed under the current send keys, the first packet number sent under them,
+    /// and whether the peer has acknowledged one of those (required before the next update).
+    phase_pkts: u64 = 0,
+    phase_first_pn: u64 = 0,
+    phase_acked: bool = false,
+    /// Key updates we initiated, and 1-RTT packets that failed authentication (integrity limit).
+    key_updates: u64 = 0,
+    auth_failures: u64 = 0,
     handshake_confirmed: bool = false,
     /// Validated datagram size on the current path (`max_datagram` until a probe is acked).
     mtu: usize = max_datagram,
@@ -292,6 +339,10 @@ pub const Connection = struct {
     /// original_destination_connection_id transport parameter).
     srv_odcid: [20]u8 = undefined,
     srv_odcid_len: u8 = 0,
+    /// The source connection id of the Retry we sent (retry_source_connection_id), if any.
+    srv_retry_scid: [20]u8 = undefined,
+    srv_retry_scid_len: u8 = 0,
+    hs_deadline: u64 = 0,
     need_handshake_done: bool = false,
     /// Anti-amplification (RFC 9000 section 8.1): before the client's address is validated (its
     /// first Handshake packet) a server sends at most 3x the bytes it received.
@@ -304,6 +355,16 @@ pub const Connection = struct {
     sent_data: u64 = 0,
     recv_max_data: u64,
     recv_data: u64 = 0,
+    /// Bytes returned to the connection window: consumed by the application from a stream,
+    /// discarded when it freed one, or dropped on a reset or freed stream. MAX_DATA follows
+    /// this, not `recv_data`: credit given on receipt let a peer send without bound while the
+    /// application read nothing, and data it never read held credit for ever.
+    recv_consumed: u64 = 0,
+    /// Streams with receive data whose window credit may be due (scanned by `creditScan`).
+    recv_watch: std.ArrayList(*Stream) = .empty,
+    credit_due: bool = true,
+    detached: std.ArrayList(u64) = .empty,
+    ctl: std.ArrayList(Ctl) = .empty,
     need_max_data: bool = false,
     need_max_streams_uni: bool = false,
     need_max_streams_bidi: bool = false,
@@ -381,6 +442,7 @@ pub const Connection = struct {
         @memcpy(c.dcid[0..cid_len], &odcid);
         c.cert_len = x509.generateSelfSigned(&c.cert, kp, serial, cfg.server_name);
         c.encodeLocalParams();
+        if (cfg.handshake_timeout_ms != 0) c.hs_deadline = now + cfg.handshake_timeout_ms * ms;
         c.tls = tls.Client.init(.{
             .server_name = cfg.server_name,
             .local_tp = c.local_tp[0..c.local_tp_len],
@@ -441,6 +503,7 @@ pub const Connection = struct {
         @memcpy(c.dcid[0..client_scid.len], client_scid);
         c.cert_len = x509.generateSelfSigned(&c.cert, kp, serial, cfg.server_name);
         c.encodeLocalParams();
+        if (cfg.handshake_timeout_ms != 0) c.hs_deadline = now + cfg.handshake_timeout_ms * ms;
         const st = try gpa.create(tls_srv.Server);
         st.* = tls_srv.Server.init(.{
             .server_name = cfg.server_name,
@@ -459,6 +522,21 @@ pub const Connection = struct {
         c.spaces[0].send = k.server;
         c.spaces[0].recv = k.client;
         return c;
+    }
+
+    /// Server role, right after `initServer`: the client came back with a valid Retry token. Its
+    /// Initial keys and `initServer`'s odcid are the Retry's source connection id; the transport
+    /// parameters name the client's first destination id (from the token) and the Retry's id
+    /// (RFC 9000 section 7.3), and the address counts as validated (no amplification limit).
+    pub fn markRetried(c: *Connection, original_dcid: []const u8, retry_scid: []const u8) void {
+        std.debug.assert(original_dcid.len <= 20 and retry_scid.len <= 20);
+        @memcpy(c.srv_odcid[0..original_dcid.len], original_dcid);
+        c.srv_odcid_len = @intCast(original_dcid.len);
+        @memcpy(c.srv_retry_scid[0..retry_scid.len], retry_scid);
+        c.srv_retry_scid_len = @intCast(retry_scid.len);
+        c.encodeLocalParams();
+        if (c.srv) |st| st.cfg.local_tp = c.local_tp[0..c.local_tp_len];
+        c.addr_validated = true;
     }
 
     /// Server role: index into `cfg.alpn` of the negotiated protocol.
@@ -488,6 +566,9 @@ pub const Connection = struct {
             gpa.destroy(s);
         }
         c.streams.deinit(gpa);
+        c.recv_watch.deinit(gpa);
+        c.detached.deinit(gpa);
+        c.ctl.deinit(gpa);
         for (c.stream_pool.items) |s| {
             s.deinit(gpa);
             gpa.destroy(s);
@@ -535,6 +616,12 @@ pub const Connection = struct {
             putVarint(o, &p, c.srv_odcid_len);
             @memcpy(o[p..][0..c.srv_odcid_len], c.srv_odcid[0..c.srv_odcid_len]);
             p += c.srv_odcid_len;
+        }
+        if (c.srv_retry_scid_len != 0) {
+            putVarint(o, &p, 0x10);
+            putVarint(o, &p, c.srv_retry_scid_len);
+            @memcpy(o[p..][0..c.srv_retry_scid_len], c.srv_retry_scid[0..c.srv_retry_scid_len]);
+            p += c.srv_retry_scid_len;
         }
         putVarint(o, &p, 0x0f);
         putVarint(o, &p, cid_len);
@@ -752,7 +839,8 @@ pub const Connection = struct {
                 return c.fail(0x0a, "version negotiation: peer does not speak QUIC v1");
             }
             if (version != 1) return error.Drop;
-            if (!std.mem.eql(u8, dcid, &c.scid) and !(c.srv_odcid_len != 0 and std.mem.eql(u8, dcid, c.srv_odcid[0..c.srv_odcid_len]))) return error.Drop;
+            if (!std.mem.eql(u8, dcid, &c.scid) and !(c.srv_odcid_len != 0 and std.mem.eql(u8, dcid, c.srv_odcid[0..c.srv_odcid_len])) and
+                !(c.srv_retry_scid_len != 0 and std.mem.eql(u8, dcid, c.srv_retry_scid[0..c.srv_retry_scid_len]))) return error.Drop;
             const ty = (b0 >> 4) & 3;
             if (ty == 3) {
                 try c.handleRetry(d, p, scid);
@@ -813,6 +901,11 @@ pub const Connection = struct {
         const hdr_len = pn_off + pn_len;
         const plain_len = qc.open(&use_keys, pn, pkt, hdr_len) catch {
             tr("  decrypt failed space={s} pn={d}", .{ @tagName(space), pn });
+            if (space == .app) {
+                // AES-128-GCM integrity limit (RFC 9001 section 6.6): 2^52 forgeries
+                c.auth_failures += 1;
+                if (c.auth_failures >= 1 << 52) return c.fail(0x0f, "AEAD integrity limit");
+            }
             return error.Drop;
         };
         tr("  rx {s} pn={d} len={d}", .{ @tagName(space), pn, plain_len });
@@ -821,8 +914,10 @@ pub const Connection = struct {
             c.app_recv_next = null;
             c.recv_phase = !c.recv_phase;
             if (c.send_phase != c.recv_phase) {
+                // the peer updated: follow it
                 c.spaces[2].send = c.spaces[2].send.?.nextGeneration();
                 c.send_phase = c.recv_phase;
+                c.newSendPhase();
             }
         }
         if (sp.recv_set.contains(pn)) return error.Drop; // duplicate
@@ -910,16 +1005,15 @@ pub const Connection = struct {
                     const code = getVarint(pl, &p) orelse return c.fail(0x07, "frame encoding");
                     const final = getVarint(pl, &p) orelse return c.fail(0x07, "frame encoding");
                     eliciting = true;
-                    if (c.streamFor(id, true)) |s| {
-                        s.reset = code;
-                        s.recv.fin_at = final;
-                    }
+                    if (!c.peerInitiated(id) and (id & 2) != 0) return c.fail(0x05, "RESET_STREAM on our send-only stream");
+                    if (c.streamFor(id, true)) |s| try c.onResetStream(s, code, final);
                 },
                 0x05 => { // STOP_SENDING
                     const id = getVarint(pl, &p) orelse return c.fail(0x07, "frame encoding");
                     const code = getVarint(pl, &p) orelse return c.fail(0x07, "frame encoding");
                     eliciting = true;
-                    if (c.streams.get(id)) |s| s.stopped_by_peer = code;
+                    if (c.peerInitiated(id) and (id & 2) != 0) return c.fail(0x05, "STOP_SENDING on a receive-only stream");
+                    if (c.streams.get(id)) |s| try c.onStopSending(s, code);
                 },
                 0x06 => { // CRYPTO
                     const off = getVarint(pl, &p) orelse return c.fail(0x07, "frame encoding");
@@ -1078,7 +1172,10 @@ pub const Connection = struct {
     fn onCrypto(c: *Connection, space: Space, off: u64, data: []const u8) Error!void {
         const sp = &c.spaces[@intFromEnum(space)];
         if (off + data.len > sp.crypto_in.base + max_crypto_buffer) return c.fail(0x0d, "crypto buffer exceeded");
-        try sp.crypto_in.insert(c.gpa, off, data);
+        sp.crypto_in.insert(c.gpa, off, data) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Fragmented => return c.fail(0x0d, "crypto buffer exceeded"),
+        };
         const ready = sp.crypto_in.contiguous();
         if (ready.len > 0) {
             const lv: tls.Level = @enumFromInt(@intFromEnum(space));
@@ -1146,25 +1243,120 @@ pub const Connection = struct {
             if ((id & 2) != 0 and (id & 1) == @intFromBool(c.srv != null)) return c.fail(0x05, "data on our send-only stream");
             return c.fail(0x04, "stream limit"); // STREAM_LIMIT_ERROR
         };
+        if (!c.peerInitiated(id) and (id & 2) != 0) return c.fail(0x05, "data on our send-only stream");
         const end = off + len;
+        // The window moves only as the application consumes (`creditScan`), so this bounds what
+        // one stream can make us hold.
         if (end > s.recv_limit) return c.fail(0x03, "stream flow control");
-        const before = s.recv.highest();
-        s.recv.insert(c.gpa, off, data) catch return error.OutOfMemory;
-        const after = s.recv.highest();
-        if (after > before) {
-            c.recv_data += after - before;
+        if (s.recv.fin_at) |f| if (end > f or (fin and end != f)) return c.fail(0x06, "final size");
+        if (fin and end < s.counted) return c.fail(0x06, "final size");
+        if (end > s.counted) {
+            c.recv_data += end - s.counted;
+            s.counted = end;
             if (c.recv_data > c.recv_max_data) return c.fail(0x03, "connection flow control");
         }
         if (fin) s.recv.fin_at = end;
-        // window updates: raise when more than half consumed
-        if (s.recv.highest() > s.recv_limit - c.cfg.max_stream_data / 2) {
-            s.recv_limit = s.recv.highest() + c.cfg.max_stream_data;
-            c.pending_msd.append(c.gpa, id) catch return error.OutOfMemory;
+        if (s.detached or s.reset != null) {
+            // nobody reads it: the bytes go straight back to the connection window
+            c.creditDiscard(s);
+            return;
         }
-        if (c.recv_data > c.recv_max_data - c.cfg.max_data / 2) {
-            c.recv_max_data = c.recv_data + c.cfg.max_data;
+        s.recv.insert(c.gpa, off, data) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Fragmented => return c.fail(0x0a, "stream data too fragmented"),
+        };
+        if (!s.watched) {
+            c.recv_watch.append(c.gpa, s) catch return error.OutOfMemory;
+            s.watched = true;
+        }
+        c.credit_due = true;
+    }
+
+    /// Everything counted on `s` so far is returned to the connection window (the application
+    /// will not read it: the stream was freed or reset).
+    fn creditDiscard(c: *Connection, s: *Stream) void {
+        if (s.counted > s.credited) {
+            c.recv_consumed += s.counted - s.credited;
+            s.credited = s.counted;
+        }
+        c.credit_due = true;
+    }
+
+    fn onResetStream(c: *Connection, s: *Stream, code: u64, final: u64) PktError!void {
+        if (s.reset != null) return;
+        if (final > s.recv_limit) return c.fail(0x03, "stream flow control");
+        if (final < s.counted) return c.fail(0x06, "final size");
+        if (s.recv.fin_at) |f| if (final != f) return c.fail(0x06, "final size");
+        c.recv_data += final - s.counted;
+        s.counted = final;
+        if (c.recv_data > c.recv_max_data) return c.fail(0x03, "connection flow control");
+        s.reset = code;
+        s.recv.fin_at = final;
+        c.creditDiscard(s);
+    }
+
+    /// RFC 9000 section 3.5: a STOP_SENDING is answered with a RESET_STREAM (the peer's code),
+    /// and nothing more of the stream is sent. The stream is then settled for the application.
+    fn onStopSending(c: *Connection, s: *Stream, code: u64) PktError!void {
+        if (s.stopped_by_peer == null) s.stopped_by_peer = code;
+        if (s.send_reset or c.sendSettled(s)) return;
+        c.resetSend(s, code) catch return error.OutOfMemory;
+    }
+
+    fn sendSettled(c: *const Connection, s: *const Stream) bool {
+        _ = c;
+        return s.send_reset or (s.fin_sent and s.retx.items.len == 0 and s.send_off == s.send_base + s.send_buf.items.len and s.inflight == 0);
+    }
+
+    /// Queues RESET_STREAM for our send side and drops what was waiting to be sent.
+    fn resetSend(c: *Connection, s: *Stream, code: u64) Allocator.Error!void {
+        try c.ctl.append(c.gpa, .{ .reset = .{ .id = s.id, .code = code, .final = s.send_off } });
+        s.send_reset = true;
+        s.retx.clearRetainingCapacity();
+        s.send_buf.clearRetainingCapacity();
+        s.send_base = s.send_off;
+        s.fin_queued = true;
+        s.fin_sent = true;
+    }
+
+    /// Returns consumed bytes to the stream and connection windows (MAX_STREAM_DATA once half a
+    /// stream window was consumed, MAX_DATA once half the connection window was), and frees
+    /// detached streams that are finished. Runs at the start of a transmit round.
+    fn creditScan(c: *Connection) void {
+        c.credit_due = false;
+        var i: usize = 0;
+        while (i < c.recv_watch.items.len) {
+            const s = c.recv_watch.items[i];
+            if (s.recv.base > s.credited) {
+                c.recv_consumed += s.recv.base - s.credited;
+                s.credited = s.recv.base;
+            }
+            const finished = s.reset != null or s.recv.fin_at != null;
+            if (!finished and s.recv_limit - s.recv.base < c.cfg.max_stream_data / 2) {
+                s.recv_limit = s.recv.base + c.cfg.max_stream_data;
+                c.pending_msd.append(c.gpa, s.id) catch return c.internalError();
+            }
+            if (s.reset != null or (s.recv.fin_at != null and s.recv.base >= s.recv.fin_at.?)) {
+                s.watched = false;
+                _ = c.recv_watch.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        if (c.recv_max_data - c.recv_consumed < c.cfg.max_data / 2) {
+            c.recv_max_data = c.recv_consumed + c.cfg.max_data;
             c.need_max_data = true;
         }
+        c.reapDetached();
+    }
+
+    /// An allocation failure where carrying on would leave a hole (a packet sent but not
+    /// recorded, a retransmission or window update dropped): close the connection instead.
+    /// Out of memory where state would otherwise be lost silently (a retransmission, a sent
+    /// packet's record, a control frame): close the connection (INTERNAL_ERROR) rather than let
+    /// data be lost unseen and the peer wait for it.
+    fn internalError(c: *Connection) void {
+        c.startClose(0x01, false, "out of memory");
     }
 
     // ------------------------------------------------------------ ACK processing and recovery
@@ -1221,9 +1413,16 @@ pub const Connection = struct {
                     continue;
                 }
                 newly_acked_any = true;
-                for (s.recs[0..s.nrec]) |r| if (r == .pmtu) {
-                    c.mtu = @max(c.mtu, r.pmtu);
-                    c.pmtu_inflight = false;
+                for (s.recs[0..s.nrec]) |r| switch (r) {
+                    .pmtu => |m| {
+                        c.mtu = @max(c.mtu, m);
+                        c.pmtu_inflight = false;
+                    },
+                    .stream => |sr| if (c.streams.get(sr.id)) |st| {
+                        st.inflight -|= 1;
+                        if (st.detached) c.credit_due = true;
+                    },
+                    else => {},
                 };
                 if (s.pn == largest and s.ack_eliciting) newly_largest_eliciting_time = s.time;
                 if (s.in_flight) {
@@ -1240,6 +1439,7 @@ pub const Connection = struct {
             _ = getVarint(pl, p) orelse return c.fail(0x07, "frame encoding");
         }
         if (sp.largest_acked == null or largest > sp.largest_acked.?) sp.largest_acked = largest;
+        if (space == .app and newly_acked_any and largest >= c.phase_first_pn) c.phase_acked = true;
         if (newly_largest_eliciting_time) |t| {
             c.latest_rtt = now -| t;
             var ack_delay: u64 = 0;
@@ -1289,16 +1489,25 @@ pub const Connection = struct {
         if (s.in_flight) c.bytes_in_flight -|= s.size;
         // requeue payload
         for (s.recs[0..s.nrec]) |r| switch (r) {
-            .crypto => |cr| c.spaces[@intFromEnum(space)].crypto_retx.append(c.gpa, .{ .start = cr.off, .end = cr.off + cr.len }) catch {},
+            .crypto => |cr| c.spaces[@intFromEnum(space)].crypto_retx.append(c.gpa, .{ .start = cr.off, .end = cr.off + cr.len }) catch c.internalError(),
             .stream => |sr| if (c.streams.get(sr.id)) |st| {
-                st.retx.append(c.gpa, .{ .start = sr.off, .end = sr.off + sr.len }) catch {};
-                if (sr.fin) st.fin_sent = false;
+                st.inflight -|= 1;
+                if (!st.send_reset) {
+                    st.retx.append(c.gpa, .{ .start = sr.off, .end = sr.off + sr.len }) catch c.internalError();
+                    if (sr.fin) st.fin_sent = false;
+                }
+            },
+            .reset_stream => |rs| c.ctl.append(c.gpa, .{ .reset = rs }) catch c.internalError(),
+            .stop_sending => |ss| if (c.streams.get(ss.id)) |st| {
+                // only while the peer may still send
+                if (st.reset == null and !(st.recv.fin_at != null and st.counted >= st.recv.fin_at.?))
+                    c.ctl.append(c.gpa, .{ .stop = ss }) catch c.internalError();
             },
             .max_data => c.need_max_data = true,
-            .max_stream_data => |id| c.pending_msd.append(c.gpa, id) catch {},
+            .max_stream_data => |id| c.pending_msd.append(c.gpa, id) catch c.internalError(),
             .max_streams_uni => c.need_max_streams_uni = true,
             .max_streams_bidi => c.need_max_streams_bidi = true,
-            .retire_cid => |seq| c.pending_retire.append(c.gpa, seq) catch {},
+            .retire_cid => |seq| c.pending_retire.append(c.gpa, seq) catch c.internalError(),
             .handshake_done => c.need_handshake_done = true,
             .pmtu => {
                 c.pmtu_inflight = false;
@@ -1391,6 +1600,7 @@ pub const Connection = struct {
         if (c.spaces[2].ack_needed) if (c.spaces[2].ack_deadline) |t| {
             best = if (best) |b| @min(b, t) else t;
         };
+        if (c.state == .handshaking and c.hs_deadline != 0) best = if (best) |b| @min(b, c.hs_deadline) else c.hs_deadline;
         if (c.state == .established or c.state == .handshaking) {
             if (c.idle_ns != 0) {
                 const t = c.last_recv + c.idle_ns;
@@ -1452,6 +1662,11 @@ pub const Connection = struct {
             c.state = .closed;
             return;
         }
+        if (c.state == .handshaking and c.hs_deadline != 0 and now >= c.hs_deadline) {
+            c.close = .{ .code = 0, .app = false, .remote = false, .reason = "handshake timeout" };
+            c.state = .closed;
+            return;
+        }
         if (c.timer) |t| if (now >= t) {
             var earliest_loss: ?u64 = null;
             var loss_space: Space = .initial;
@@ -1483,13 +1698,38 @@ pub const Connection = struct {
                 if (space != .app) {
                     // retransmit unacked handshake data
                     for (sp.live()) |s| for (s.recs[0..s.nrec]) |r| switch (r) {
-                        .crypto => |cr| sp.crypto_retx.append(c.gpa, .{ .start = cr.off, .end = cr.off + cr.len }) catch {},
+                        .crypto => |cr| sp.crypto_retx.append(c.gpa, .{ .start = cr.off, .end = cr.off + cr.len }) catch c.internalError(),
                         else => {},
                     };
-                }
+                } else c.probeData();
             }
             c.updateTimer(now);
         };
+    }
+
+    /// RFC 9002 section 6.2.4: a PTO probe carries data. Without new data to send, the stream
+    /// data of the oldest packets in flight (one per probe) is queued again, so the probe repairs
+    /// a tail loss at once instead of a PING that only asks for the ACK that then declares the
+    /// loss, a round trip later. The originals stay in flight; whichever copy arrives first wins.
+    fn probeData(c: *Connection) void {
+        for (c.streams.values()) |st| if (st.hasPending() and st.stopped_by_peer == null) return;
+        const sp = &c.spaces[2];
+        var probes: usize = 0;
+        for (sp.live()) |pk| {
+            if (probes >= 2) break;
+            if (!pk.ack_eliciting) continue;
+            var any = false;
+            for (pk.recs[0..pk.nrec]) |r| switch (r) {
+                .stream => |sr| if (c.streams.get(sr.id)) |st| {
+                    if (st.send_reset or sr.off < st.send_base or (sr.len == 0 and !sr.fin)) continue;
+                    st.retx.append(c.gpa, .{ .start = sr.off, .end = sr.off + sr.len }) catch return c.internalError();
+                    if (sr.fin) st.fin_sent = false;
+                    any = true;
+                },
+                else => {},
+            };
+            if (any) probes += 1;
+        }
     }
 
     // ------------------------------------------------------------ transmit
@@ -1530,6 +1770,10 @@ pub const Connection = struct {
             if (!c.close_pending) return null;
             return c.buildClose(now, out);
         }
+        if (c.credit_due) {
+            c.creditScan();
+            if (c.state == .closing) return c.buildClose(now, out);
+        }
         if (!c.addr_validated and c.amp_sent + max_datagram > 3 * c.amp_recv) return null;
         if (c.pmtuProbeDue(out.len)) return c.buildProbe(now, out);
         const mtu = @min(c.mtu, out.len, max_mtu);
@@ -1555,7 +1799,11 @@ pub const Connection = struct {
             used += overhead + plan.len;
             if (sp_id == .initial) has_initial = true;
         }
-        if (np == 0) return null;
+        if (np == 0) {
+            // the round is over: the application may consume before the next one
+            c.credit_due = true;
+            return null;
+        }
         // Pad datagrams carrying Initial packets to 1200 bytes (RFC 9000 section 14.1).
         if (has_initial and used < max_datagram) {
             const last = &plans[np - 1];
@@ -1657,6 +1905,16 @@ pub const Connection = struct {
             plan.eliciting = true;
         }
         if (plan.eliciting and sp.probe > 0) sp.probe -= 1;
+        // A key update waits for the peer to acknowledge a packet of the current phase. A side that
+        // only sends ACKs (a client downloading) never gets one: when the next update is near and
+        // nothing ack-eliciting is in flight, one PING per key phase asks for it.
+        if (!plan.eliciting and plan.space == .app and c.handshake_confirmed and !c.phase_acked and
+            sp.ack_eliciting_in_flight == 0 and c.phase_pkts + 1 >= c.cfg.key_update_pkts and p + 1 <= lim)
+        {
+            f[p] = 0x01;
+            p += 1;
+            plan.eliciting = true;
+        }
         // keep-alive
         if (!plan.eliciting and plan.space == .app and c.state == .established and c.cfg.keep_alive_ms != 0 and p + 1 <= lim) {
             if (now >= @max(c.last_send, c.last_recv) + c.cfg.keep_alive_ms * ms) {
@@ -1700,7 +1958,7 @@ pub const Connection = struct {
         while (c.pending_retire.items.len > 0 and p + 9 <= lim) {
             const seq = c.pending_retire.orderedRemove(0);
             if (!plan.addRec(.{ .retire_cid = seq })) {
-                c.pending_retire.insert(c.gpa, 0, seq) catch {};
+                c.pending_retire.insert(c.gpa, 0, seq) catch c.internalError();
                 break;
             }
             f[p] = 0x19;
@@ -1715,11 +1973,36 @@ pub const Connection = struct {
             c.need_max_data = false;
             plan.eliciting = true;
         }
+        while (c.ctl.items.len > 0 and p + 25 <= lim) {
+            const e = c.ctl.items[0];
+            if (!plan.addRec(switch (e) {
+                .reset => |r| .{ .reset_stream = r },
+                .stop => |t| .{ .stop_sending = t },
+            })) break;
+            _ = c.ctl.orderedRemove(0);
+            switch (e) {
+                .reset => |r| {
+                    f[p] = 0x04;
+                    p += 1;
+                    putVarint(f, &p, r.id);
+                    putVarint(f, &p, r.code);
+                    putVarint(f, &p, r.final);
+                },
+                .stop => |t| {
+                    f[p] = 0x05;
+                    p += 1;
+                    putVarint(f, &p, t.id);
+                    putVarint(f, &p, t.code);
+                },
+            }
+            plan.eliciting = true;
+        }
         while (c.pending_msd.items.len > 0 and p + 17 <= lim) {
             const id = c.pending_msd.orderedRemove(0);
             const s = c.streams.get(id) orelse continue;
+            if (s.detached or s.reset != null) continue;
             if (!plan.addRec(.{ .max_stream_data = id })) {
-                c.pending_msd.insert(c.gpa, 0, id) catch {};
+                c.pending_msd.insert(c.gpa, 0, id) catch c.internalError();
                 break;
             }
             f[p] = 0x11;
@@ -1778,6 +2061,7 @@ pub const Connection = struct {
             const send_fin = s.fin_queued and at_end and (!s.fin_sent or !is_new);
             if (take == 0 and !send_fin) break;
             if (!plan.addRec(.{ .stream = .{ .id = s.id, .off = start, .len = @intCast(take), .fin = send_fin } })) break;
+            s.inflight += 1;
             f[p] = 0x08 | 0x04 | 0x02 | @as(u8, if (send_fin) 1 else 0);
             p += 1;
             putVarint(f, &p, s.id);
@@ -1825,9 +2109,35 @@ pub const Connection = struct {
         return p;
     }
 
+    /// Starts a key update of our own (RFC 9001 section 6.1) once `key_update_pkts` packets were
+    /// sealed under the current keys: only with the handshake confirmed, no update in progress
+    /// (our phase is the peer's) and a packet of the current phase acknowledged. If the peer
+    /// never lets us update, the connection closes before the confidentiality limit.
+    fn maybeUpdateKeys(c: *Connection) void {
+        c.phase_pkts += 1;
+        if (c.phase_pkts <= c.cfg.key_update_pkts) return;
+        if (c.handshake_confirmed and c.send_phase == c.recv_phase and c.phase_acked) {
+            c.spaces[2].send = c.spaces[2].send.?.nextGeneration();
+            c.send_phase = !c.send_phase;
+            c.key_updates += 1;
+            c.newSendPhase();
+            c.phase_pkts = 1;
+            tr("key update (ours) phase={}", .{c.send_phase});
+        } else if (c.phase_pkts >= 1 << 23) {
+            c.startClose(0x0f, false, "AEAD confidentiality limit"); // AEAD_LIMIT_REACHED
+        }
+    }
+
+    fn newSendPhase(c: *Connection) void {
+        c.phase_pkts = 0;
+        c.phase_first_pn = c.spaces[2].next_pn;
+        c.phase_acked = false;
+    }
+
     /// Serialises one packet; returns bytes written.
     fn writePacket(c: *Connection, now: u64, plan: *Plan, out: []u8) usize {
         const sp = &c.spaces[@intFromEnum(plan.space)];
+        if (plan.space == .app) c.maybeUpdateKeys();
         const keys = sp.send.?;
         const pn = sp.next_pn;
         sp.next_pn += 1;
@@ -1891,7 +2201,7 @@ pub const Connection = struct {
         rec.nrec = plan.nrec;
         if (plan.nrec > 0) @memcpy(rec.recs[0..plan.nrec], plan.recs[0..plan.nrec]);
         if (plan.eliciting) {
-            sp.sent.append(c.gpa, rec) catch {};
+            sp.sent.append(c.gpa, rec) catch c.internalError();
             sp.time_last_ack_eliciting = now;
             sp.ack_eliciting_in_flight += 1;
             c.bytes_in_flight += total;
@@ -1971,14 +2281,15 @@ pub const Connection = struct {
             var send_buf = s.send_buf;
             var retx = s.retx;
             var data = s.recv.data;
-            var ranges = s.recv.ranges;
+            s.recv.discard(c.gpa);
+            var ooo = s.recv.ooo;
             send_buf.clearRetainingCapacity();
             retx.clearRetainingCapacity();
             data.clearRetainingCapacity();
-            ranges.clearRetainingCapacity();
+            ooo.clearRetainingCapacity();
             s.* = .{ .id = id, .send_buf = send_buf, .retx = retx };
             s.recv.data = data;
-            s.recv.ranges = ranges;
+            s.recv.ooo = ooo;
             return s;
         }
         const s = try c.gpa.create(Stream);
@@ -1988,6 +2299,7 @@ pub const Connection = struct {
 
     /// Keeps a freed stream for reuse (bounded pool; big buffers go back to the allocator).
     fn recycle(c: *Connection, s: *Stream) void {
+        s.recv.discard(c.gpa); // out-of-order chunks are not kept warm
         const big = s.send_buf.capacity > 64 << 10 or s.recv.data.capacity > 64 << 10;
         if (!big and c.stream_pool.items.len < 64) {
             if (c.stream_pool.append(c.gpa, s)) |_| return else |_| {}
@@ -1996,20 +2308,24 @@ pub const Connection = struct {
         c.gpa.destroy(s);
     }
 
+    /// The application's view of a stream: null once it was freed (a detached stream is only
+    /// the connection's).
     pub fn stream(c: *Connection, id: u64) ?*Stream {
-        return c.streams.get(id);
+        const s = c.streams.get(id) orelse return null;
+        return if (s.detached) null else s;
     }
 
     /// Appends `data` to the stream's send buffer (copied) and optionally finishes the stream.
     pub fn streamWrite(c: *Connection, id: u64, data: []const u8, fin: bool) Error!void {
-        const s = c.streams.get(id) orelse return error.InvalidStream;
+        const s = c.stream(id) orelse return error.InvalidStream;
+        if (s.send_reset) return error.InvalidStream;
         try s.send_buf.appendSlice(c.gpa, data);
         if (fin) s.fin_queued = true;
     }
 
     /// Bytes written to the stream that have not been sent yet (a long-lived stream's backlog).
     pub fn streamUnsent(c: *Connection, id: u64) u64 {
-        const s = c.streams.get(id) orelse return 0;
+        const s = c.stream(id) orelse return 0;
         return s.send_base + s.send_buf.items.len - s.send_off;
     }
 
@@ -2017,7 +2333,7 @@ pub const Connection = struct {
     /// needs, so a long-lived send stream (a subscription) keeps a bounded buffer. Cheap enough
     /// to call when the buffer passes a threshold (scans the 1-RTT sent list once).
     pub fn streamTrim(c: *Connection, id: u64) void {
-        const s = c.streams.get(id) orelse return;
+        const s = c.stream(id) orelse return;
         var keep: u64 = s.send_off;
         for (s.retx.items) |r| keep = @min(keep, r.start);
         for (c.spaces[2].live()) |e| for (e.recs[0..e.nrec]) |r| switch (r) {
@@ -2034,6 +2350,17 @@ pub const Connection = struct {
         s.send_base = keep;
     }
 
+    /// The stream's send side is finished and nothing of it can be needed again: FIN and every
+    /// byte sent, nothing queued for retransmission, and every packet that carried any of it
+    /// acknowledged (or declared lost and its range requeued, which makes `retx` non-empty).
+    /// Only then may a server `streamFree` an answered stream: freeing on "all sent" dropped the
+    /// ranges of packets lost afterwards, and the client waited out its request timeout.
+    /// A stream the peer stopped (STOP_SENDING, answered with RESET_STREAM) is settled too.
+    pub fn streamSettled(c: *Connection, id: u64) bool {
+        const s = c.stream(id) orelse return true;
+        return c.sendSettled(s);
+    }
+
     /// Next peer-initiated unidirectional stream id, if any.
     pub fn acceptUni(c: *Connection) ?u64 {
         if (c.incoming_uni.items.len == 0) return null;
@@ -2044,10 +2371,92 @@ pub const Connection = struct {
         return c.incoming_bidi.orderedRemove(0);
     }
 
-    /// Releases a finished stream and credits the peer with a new stream slot.
+    /// The application is done with the stream; the peer gets a new stream slot at once. What
+    /// is unfinished is finished properly (RFC 9000 section 3): data written but not yet sent is
+    /// abandoned with RESET_STREAM; data sent but unacknowledged stays retransmittable; bytes the
+    /// peer still sends are counted and dropped, so they keep returning connection credit. The
+    /// stream object goes when both directions are done (`reapDetached`).
     pub fn streamFree(c: *Connection, id: u64) void {
+        c.release(id, null);
+    }
+
+    /// Abandons the stream (a timed-out or cancelled request, a request refused unread): as
+    /// `streamFree`, and the peer is asked to stop sending (STOP_SENDING) and our unfinished send
+    /// side is reset, both with application error `code`.
+    pub fn streamAbort(c: *Connection, id: u64, code: u64) void {
+        c.release(id, code);
+    }
+
+    fn hasSend(c: *const Connection, id: u64) bool {
+        return (id & 2) == 0 or !c.peerInitiated(id);
+    }
+
+    fn recvDone(c: *const Connection, s: *const Stream) bool {
+        if ((s.id & 2) != 0 and !c.peerInitiated(s.id)) return true; // our send-only stream
+        if (s.reset != null) return true;
+        const f = s.recv.fin_at orelse return false;
+        return s.counted >= f;
+    }
+
+    fn release(c: *Connection, id: u64, abort: ?u64) void {
+        const s = c.stream(id) orelse return;
+        if (s.watched) {
+            for (c.recv_watch.items, 0..) |w, i| if (w == s) {
+                _ = c.recv_watch.swapRemove(i);
+                break;
+            };
+            s.watched = false;
+        }
+        if (s.recv.base > s.credited) {
+            // consumed since the last scan
+            c.recv_consumed += s.recv.base - s.credited;
+            s.credited = s.recv.base;
+        }
+        c.creditDiscard(s);
+        s.recv.discard(c.gpa);
+        const recv_done = c.recvDone(s);
+        if (c.hasSend(id) and !c.sendSettled(s)) {
+            // written but not all sent (or no FIN): the peer would wait for the rest for ever
+            const all_sent = s.fin_sent and s.retx.items.len == 0 and s.send_off == s.send_base + s.send_buf.items.len;
+            if (abort != null or !all_sent) c.resetSend(s, abort orelse 0) catch return c.internalError();
+        }
+        if (abort) |code| if (!recv_done) {
+            c.ctl.append(c.gpa, .{ .stop = .{ .id = id, .code = code } }) catch return c.internalError();
+        };
+        s.detached = true;
+        c.creditStreamSlot(id);
+        if (recv_done and (!c.hasSend(id) or c.sendSettled(s))) return c.dropStream(id);
+        c.detached.append(c.gpa, id) catch return c.internalError();
+        if (c.detached.items.len > max_detached) {
+            const old = c.detached.orderedRemove(0);
+            c.dropStream(old);
+        }
+    }
+
+    fn dropStream(c: *Connection, id: u64) void {
         const kv = c.streams.fetchSwapRemove(id) orelse return;
         c.recycle(kv.value);
+    }
+
+    /// Frees detached streams whose both directions are finished.
+    fn reapDetached(c: *Connection) void {
+        var i: usize = 0;
+        while (i < c.detached.items.len) {
+            const id = c.detached.items[i];
+            const s = c.streams.get(id) orelse {
+                _ = c.detached.swapRemove(i);
+                continue;
+            };
+            if (c.recvDone(s) and (!c.hasSend(id) or c.sendSettled(s))) {
+                c.dropStream(id);
+                _ = c.detached.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn creditStreamSlot(c: *Connection, id: u64) void {
         if (c.peerInitiated(id)) {
             if ((id & 2) != 0) {
                 c.streams_uni_limit += 1;
@@ -2234,6 +2643,181 @@ test "1-RTT key update initiated by the peer rotates both directions" {
     try std.testing.expect(!c.spaces[2].recv_set.contains(2));
 }
 
+test "1-RTT key update initiated by us, after an ACK in the current phase, and followed by the peer" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    c.cfg.key_update_pkts = 4;
+    const id = try c.openBidi();
+    var ours = [_]qc.PacketKeys{qc.PacketKeys.fromSecret(@splat(0x11))};
+    var theirs = qc.PacketKeys.fromSecret(@splat(0x22));
+    var their_phase = false;
+    var their_pn: u64 = 0;
+    var gen: usize = 0; // our send generation
+    var updates_seen: usize = 0;
+    var pkt: [200]u8 = undefined;
+    var out: [max_datagram]u8 = undefined;
+    for (0..60) |round| {
+        try c.streamWrite(id, "0123456789", false);
+        const m = c.pollTransmit(1000 + round * 1000, &out).?;
+        // our packet opens under generation `gen` with phase gen % 2, or under the next one
+        var phase: bool = undefined;
+        var pn: u64 = undefined;
+        const copy = out;
+        if (openOurs(&ours[0], out[0..m], &phase, &pn)) |_| {
+            try std.testing.expectEqual(gen % 2 == 1, phase);
+        } else |_| {
+            out = copy;
+            const next = ours[0].nextGeneration();
+            _ = try openOurs(&next, out[0..m], &phase, &pn);
+            ours[0] = next;
+            gen += 1;
+            updates_seen += 1;
+            try std.testing.expectEqual(gen % 2 == 1, phase);
+        }
+        // the peer acks everything; when it sees our new phase it updates too (as quinn does)
+        if (phase != their_phase) {
+            theirs = theirs.nextGeneration();
+            their_phase = phase;
+        }
+        var a: [32]u8 = undefined;
+        const al = ackFrame(&a, pn, pn);
+        const n = craftShort(&theirs, &c.scid, their_pn, their_phase, a[0..al], &pkt);
+        their_pn += 1;
+        c.handleDatagram(1500 + round * 1000, pkt[0..n]);
+        try std.testing.expect(c.state == .established);
+    }
+    // 60 packets at 4 per key, each update waiting for the peer's ACK: about one per 5 packets
+    try std.testing.expect(updates_seen >= 8);
+    try std.testing.expectEqual(@as(u64, updates_seen), c.key_updates);
+}
+
+test "a PTO probe retransmits the tail's stream data, not a bare PING (RFC 9002 6.2.4)" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    c.cfg.keep_alive_ms = 0;
+    const id = try c.openBidi();
+    try c.streamWrite(id, "the last request of a burst", true);
+    var out: [max_datagram]u8 = undefined;
+    _ = c.pollTransmit(1000, &out).?; // lost
+    try std.testing.expect(c.pollTransmit(1000, &out) == null);
+    const t = c.nextTimeout().?;
+    c.onTimeout(t);
+    const m = c.pollTransmit(t, &out).?;
+    var keys = qc.PacketKeys.fromSecret(@splat(0x11));
+    var phase: bool = undefined;
+    var pn: u64 = undefined;
+    const pl = try openOurs(&keys, out[0..m], &phase, &pn);
+    try std.testing.expectEqual(@as(u64, 1), pn);
+    // a STREAM frame with offset 0, the data and FIN
+    var p: usize = 0;
+    while (p < pl.len and pl[p] == 0) p += 1;
+    try std.testing.expect(pl[p] & 0xf8 == 0x08 and pl[p] & 0x01 == 1);
+    try std.testing.expect(std.mem.indexOf(u8, pl, "the last request of a burst") != null);
+    try std.testing.expectEqual(@as(u64, 1), c.ptos);
+}
+
+test "out of memory for a sent packet's record closes the connection instead of losing the data" {
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const c = try testEstablished(fa.allocator());
+    defer c.deinit();
+    const id = try c.openBidi();
+    try c.streamWrite(id, "data that must not be lost", true);
+    fa.fail_index = fa.alloc_index; // every allocation from here on fails
+    var out: [max_datagram]u8 = undefined;
+    var now: u64 = 1000;
+    for (0..4) |_| {
+        while (c.pollTransmit(now, &out)) |_| {}
+        now += 1000;
+    }
+    const cc = c.close orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0x01), cc.code);
+}
+
+test "a side that only sends ACKs still updates its keys (a PING asks for the phase ACK)" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    c.cfg.key_update_pkts = 8;
+    c.cfg.keep_alive_ms = 0;
+    var ours = qc.PacketKeys.fromSecret(@splat(0x11));
+    var theirs = qc.PacketKeys.fromSecret(@splat(0x22));
+    var their_phase = false;
+    var their_pn: u64 = 0;
+    var pkt: [200]u8 = undefined;
+    var out: [max_datagram]u8 = undefined;
+    var now: u64 = 1000;
+    var ack_due = false; // the peer acks only when we sent something ack-eliciting (as quinn)
+    var our_largest: u64 = 0;
+    var pings: usize = 0;
+    for (0..200) |_| {
+        // the peer sends data-like (ack-eliciting) packets, two per round
+        for (0..2) |_| {
+            var pl: [40]u8 = undefined;
+            var q: usize = 0;
+            if (ack_due) {
+                q = ackFrame(&pl, our_largest, our_largest);
+                ack_due = false;
+            }
+            pl[q] = 0x01;
+            q += 1;
+            const n = craftShort(&theirs, &c.scid, their_pn, their_phase, pl[0..q], &pkt);
+            their_pn += 1;
+            c.handleDatagram(now, pkt[0..n]);
+        }
+        now += 50 * ms;
+        while (c.pollTransmit(now, &out)) |m| {
+            var phase: bool = undefined;
+            var pn: u64 = undefined;
+            const copy = out;
+            const pl = openOurs(&ours, out[0..m], &phase, &pn) catch blk: {
+                out = copy;
+                const next = ours.nextGeneration();
+                const r = try openOurs(&next, out[0..m], &phase, &pn);
+                ours = next;
+                break :blk r;
+            };
+            if (phase != their_phase) {
+                theirs = theirs.nextGeneration();
+                their_phase = phase;
+            }
+            our_largest = pn;
+            // skip a leading ACK frame; anything else but PADDING is ack-eliciting
+            var p: usize = 0;
+            if (pl[0] == 0x02) {
+                p = 1;
+                for (0..4) |_| _ = getVarint(pl, &p).?;
+            }
+            for (pl[p..]) |b| if (b == 0x01) {
+                ack_due = true;
+                pings += 1;
+                break;
+            };
+        }
+        try std.testing.expect(c.state == .established);
+    }
+    // about 200 ACK packets at 8 per key, with a round trip of waiting for the phase ACK each
+    try std.testing.expect(c.key_updates >= 10);
+    try std.testing.expect(pings <= c.key_updates + 2);
+}
+
+test "no key update of ours before the peer acknowledged the current phase" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    c.cfg.key_update_pkts = 2;
+    c.phase_acked = false;
+    const id = try c.openBidi();
+    var out: [max_datagram]u8 = undefined;
+    for (0..10) |round| {
+        try c.streamWrite(id, "x", false);
+        _ = c.pollTransmit(1000 + round, &out);
+    }
+    try std.testing.expectEqual(@as(u64, 0), c.key_updates);
+    try std.testing.expect(!c.send_phase);
+}
+
 test "stream data round trip through the state machine, with loss and retransmission" {
     const gpa = std.testing.allocator;
     const c = try testConn(gpa);
@@ -2404,6 +2988,208 @@ test "late frames for freed streams are ignored, not a connection error" {
     try std.testing.expectEqual(@as(u64, 0x05), c.close.?.code);
 }
 
+fn testEstablishedWindows(gpa: Allocator, msd: u64, md: u64) !*Connection {
+    const c = try testEstablished(gpa);
+    c.cfg.max_stream_data = msd;
+    c.cfg.max_data = md;
+    c.recv_max_data = md;
+    return c;
+}
+
+fn streamFrame(out: []u8, id: u64, off: u64, data: []const u8, fin: bool) usize {
+    var q: usize = 0;
+    out[q] = 0x0e | @as(u8, @intFromBool(fin));
+    q += 1;
+    putVarint(out, &q, id);
+    putVarint(out, &q, off);
+    putVarint(out, &q, data.len);
+    @memcpy(out[q..][0..data.len], data);
+    return q + data.len;
+}
+
+/// Sends what `c` has queued and returns the decrypted frames of every packet, concatenated.
+fn ourFrames(c: *Connection, now: u64, out: *std.ArrayList(u8), gpa: Allocator) !void {
+    const keys = qc.PacketKeys.fromSecret(@splat(0x11));
+    var d: [max_mtu]u8 = undefined;
+    while (c.pollTransmit(now, &d)) |n| {
+        var phase: bool = undefined;
+        var pn: u64 = undefined;
+        const f = try openOurs(&keys, d[0..n], &phase, &pn);
+        try out.appendSlice(gpa, f);
+    }
+}
+
+test "receive windows move with what the application consumes, not with what arrives" {
+    const gpa = std.testing.allocator;
+    var f: [1400]u8 = undefined;
+    const fill: [1000]u8 = @splat('a');
+    {
+        // one byte at the end of the stream window is held as one byte; one past it is refused
+        const c = try testEstablished(gpa);
+        defer c.deinit();
+        const lim = c.cfg.max_stream_data;
+        sendTheirs(c, 0, f[0..streamFrame(&f, 1, lim - 1, "x", false)], 1000);
+        try std.testing.expect(c.state == .established);
+        try std.testing.expectEqual(@as(usize, 1), c.stream(1).?.recv.held());
+        sendTheirs(c, 1, f[0..streamFrame(&f, 5, lim, "x", false)], 1100);
+        try std.testing.expectEqual(@as(u64, 0x03), c.close.?.code);
+    }
+    {
+        const c = try testEstablishedWindows(gpa, 4000, 8000);
+        defer c.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        var pn: u64 = 0;
+        for (0..3) |k| {
+            sendTheirs(c, pn, f[0..streamFrame(&f, 1, k * 1000, &fill, false)], 1000 + pn);
+            pn += 1;
+        }
+        try ourFrames(c, 2000, &out, gpa);
+        // 3000 of 4000 received, nothing consumed: no MAX_STREAM_DATA, no MAX_DATA
+        const st = c.stream(1).?;
+        try std.testing.expectEqual(@as(u64, 4000), st.recv_limit);
+        try std.testing.expectEqual(@as(u64, 8000), c.recv_max_data);
+        // the 4001st byte is a flow control error even though 3000 sit unread
+        // (checked on a copy of the limit below); consume 2500: the stream window moves
+        st.recv.consume(2500);
+        out.clearRetainingCapacity();
+        try ourFrames(c, 3000, &out, gpa);
+        try std.testing.expectEqual(@as(u64, 6500), c.stream(1).?.recv_limit);
+        try std.testing.expect(std.mem.indexOf(u8, out.items, &.{ 0x11, 0x01, 0x59, 0x64 }) != null); // MAX_STREAM_DATA 1 6500
+        // freeing a stream returns everything it held to the connection window
+        sendTheirs(c, pn, f[0..streamFrame(&f, 5, 0, &fill, false)], 4000);
+        pn += 1;
+        sendTheirs(c, pn, f[0..streamFrame(&f, 5, 1000, &fill, false)], 4100);
+        pn += 1;
+        c.streamFree(5);
+        out.clearRetainingCapacity();
+        try ourFrames(c, 5000, &out, gpa);
+        try std.testing.expectEqual(@as(u64, 5000), c.recv_data);
+        try std.testing.expectEqual(@as(u64, 4500), c.recv_consumed);
+        try std.testing.expectEqual(@as(u64, 4500 + 8000), c.recv_max_data);
+        try std.testing.expect(c.state == .established);
+    }
+}
+
+test "an abandoned stream asks the peer to stop, counts its late bytes and is reaped on its reset" {
+    const gpa = std.testing.allocator;
+    var f: [1400]u8 = undefined;
+    const fill: [1000]u8 = @splat('b');
+    const c = try testEstablishedWindows(gpa, 4000, 8000);
+    defer c.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const id = try c.openBidi();
+    try c.streamWrite(id, "request", true);
+    try ourFrames(c, 1000, &out, gpa);
+    sendTheirs(c, 0, f[0..streamFrame(&f, id, 0, &fill, false)], 1100);
+    // the request times out part-way through the response
+    c.streamAbort(id, 7);
+    try std.testing.expect(c.stream(id) == null);
+    out.clearRetainingCapacity();
+    try ourFrames(c, 1200, &out, gpa);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, &.{ 0x05, @intCast(id), 0x07 }) != null); // STOP_SENDING
+    // and our unacknowledged request is reset rather than kept for retransmission (final size 7)
+    try std.testing.expect(std.mem.indexOf(u8, out.items, &.{ 0x04, @intCast(id), 0x07, 0x07 }) != null);
+    // bytes in flight from the peer keep arriving: counted and given back at once
+    sendTheirs(c, 1, f[0..streamFrame(&f, id, 1000, &fill, false)], 1300);
+    sendTheirs(c, 2, f[0..streamFrame(&f, id, 2000, &fill, false)], 1400);
+    try std.testing.expectEqual(@as(u64, 3000), c.recv_data);
+    try std.testing.expectEqual(c.recv_data, c.recv_consumed);
+    // the peer answers STOP_SENDING with RESET_STREAM (final size 3500)
+    sendTheirs(c, 3, &.{ 0x04, @intCast(id), 0x07, 0x4d, 0xac }, 1500);
+    try std.testing.expectEqual(@as(u64, 3500), c.recv_data);
+    try std.testing.expectEqual(c.recv_data, c.recv_consumed);
+    // both directions are done and the stream goes
+    out.clearRetainingCapacity();
+    try ourFrames(c, 1700, &out, gpa);
+    try std.testing.expect(c.streams.get(id) == null);
+    try std.testing.expectEqual(@as(usize, 0), c.detached.items.len);
+    try std.testing.expect(c.state == .established);
+    // a long-lived connection keeps its window: 20 more abandoned windows flow through
+    var pn: u64 = 5;
+    c.peer.max_streams_bidi = 100;
+    for (0..20) |_| {
+        const sid = try c.openBidi();
+        try c.streamWrite(sid, "r", true);
+        for (0..4) |k| {
+            sendTheirs(c, pn, f[0..streamFrame(&f, sid, k * 1000, &fill, false)], 2000 + pn);
+            pn += 1;
+        }
+        c.streamAbort(sid, 7);
+        try ourFrames(c, 2000 + pn, &out, gpa);
+        var rf: [32]u8 = undefined;
+        var q: usize = 0;
+        rf[q] = 0x04;
+        q += 1;
+        for ([_]u64{ sid, 7, 4000 }) |v| putVarint(&rf, &q, v);
+        sendTheirs(c, pn, rf[0..q], 2000 + pn);
+        pn += 1;
+        try ourFrames(c, 2000 + pn, &out, gpa);
+        if (c.state != .established) std.debug.print("closed: {s}\n", .{c.close.?.reason});
+        try std.testing.expect(c.state == .established);
+    }
+    try std.testing.expectEqual(@as(usize, 0), c.detached.items.len);
+    try std.testing.expectEqual(c.recv_data, c.recv_consumed);
+}
+
+test "STOP_SENDING from the peer is answered with RESET_STREAM and settles the stream" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const id = try c.openBidi();
+    const big: [5000]u8 = @splat('c');
+    try c.streamWrite(id, &big, false);
+    c.peer.max_stream_data_bidi_remote = 1000;
+    c.stream(id).?.peer_max = 1000; // most of it waits on the peer's window
+    try ourFrames(c, 1000, &out, gpa);
+    try std.testing.expect(!c.streamSettled(id));
+    sendTheirs(c, 0, &.{ 0x05, @intCast(id), 0x09 }, 1100);
+    try std.testing.expect(c.streamSettled(id));
+    try std.testing.expectEqual(@as(u64, 0), c.streamUnsent(id));
+    out.clearRetainingCapacity();
+    try ourFrames(c, 1200, &out, gpa);
+    // RESET_STREAM id, the peer's code, final size = what was sent (1000)
+    try std.testing.expect(std.mem.indexOf(u8, out.items, &.{ 0x04, @intCast(id), 0x09, 0x43, 0xe8 }) != null);
+    // a lost RESET_STREAM is sent again, even once the stream is gone
+    c.streamFree(id);
+    const live = c.spaces[2].live();
+    const last = live[live.len - 1];
+    c.onLostPacket(1300, last, .app);
+    try std.testing.expect(c.ctl.items.len == 1 and c.ctl.items[0] == .reset);
+    try std.testing.expect(c.streams.get(id) == null or c.streams.get(id).?.detached);
+}
+
+test "a freed stream whose answer is unacknowledged is still retransmitted, then reaped" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const id = try c.openBidi();
+    try c.streamWrite(id, "question", true);
+    try ourFrames(c, 1000, &out, gpa);
+    var f: [64]u8 = undefined;
+    sendTheirs(c, 0, f[0..streamFrame(&f, id, 0, "answer", true)], 1100);
+    c.streamFree(id);
+    try std.testing.expect(c.stream(id) == null);
+    try std.testing.expect(c.streams.get(id) != null); // lingering for retransmission
+    const sp = &c.spaces[2];
+    const lost = sp.live()[0];
+    sp.dropFront(1);
+    c.onLostPacket(1200, lost, .app);
+    out.clearRetainingCapacity();
+    try ourFrames(c, 1300, &out, gpa);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "question") != null);
+    var a: [32]u8 = undefined;
+    sendTheirs(c, 1, a[0..ackFrame(&a, sp.next_pn - 1, 0)], 1400);
+    out.clearRetainingCapacity();
+    try ourFrames(c, 1500, &out, gpa);
+    try std.testing.expect(c.streams.get(id) == null);
+}
+
 test "frames not permitted in Initial or Handshake packets close the connection" {
     const gpa = std.testing.allocator;
     const c = try testConn(gpa);
@@ -2483,6 +3269,34 @@ test "hostile peer input is bounded: crypto offset, connection ids, transport pa
     }
 }
 
+test "a QUIC Initial whose ClientHello has an overflowing extension length closes the connection, no panic" {
+    const gpa = std.testing.allocator;
+    var seed: [64]u8 = @splat(4);
+    for (tls_srv.hostile_hello_lengths) |h| {
+        const client = try Connection.init(gpa, .{ .server_name = "zui", .identity_seed = @as([32]u8, @splat(3)), .seed = seed, .now_unix = 1_800_000_000, .alpn = &.{"zui/1"} }, 0);
+        defer client.deinit();
+        // rewrite one length inside the ClientHello before it is packetised and sealed
+        const ch = client.spaces[0].crypto_out.items;
+        tls_srv.pokeLength(ch, tls_srv.helloExtOffset(ch, h.et).?, h.v, h.w);
+        var d: [max_datagram]u8 = undefined;
+        const n = client.pollTransmit(0, &d).?;
+        const dl = d[5];
+        const dcid = d[6..][0..dl];
+        const sl = d[6 + dl];
+        const scid = d[7 + dl ..][0..sl];
+        seed[0] +%= 1;
+        const server = try Connection.initServer(gpa, .{ .server_name = "zui", .identity_seed = @as([32]u8, @splat(5)), .seed = seed, .now_unix = 1_800_000_000, .alpn = &.{"zui/1"}, .client_auth = false }, 0, dcid, scid);
+        defer server.deinit();
+        server.handleDatagram(1000, d[0..n]);
+        try std.testing.expect(server.state == .closing);
+        try std.testing.expectEqual(@as(u64, 0x100 + 0x28), server.close.?.code);
+        // the server says so in an Initial CONNECTION_CLOSE and is then done
+        var o: [max_datagram]u8 = undefined;
+        try std.testing.expect(server.pollTransmit(2000, &o) != null);
+        try std.testing.expect(server.isClosed());
+    }
+}
+
 fn ackFrame(out: []u8, largest: u64, first_range: u64) usize {
     var q: usize = 0;
     out[q] = 0x02;
@@ -2546,4 +3360,237 @@ test "ACK of a long in-flight run removes exactly the acked packets" {
     sendTheirs(c, 1, ack[0..ackFrame(&ack, sent - 1, sent - 501)], 1_000_200);
     try std.testing.expectEqual(@as(usize, 0), c.spaces[2].live().len);
     try std.testing.expectEqual(@as(u64, 0), c.bytes_in_flight);
+}
+
+// ------------------------------------------------------------------ request/response simulation
+
+/// A zui/1-shaped exchange between a real client and a real server Connection over a simulated
+/// link that drops, delays and reorders datagrams, and receivers that stall (a CPU-starved
+/// process) with a bounded receive queue (the socket buffer). The client sends one request per
+/// bidirectional stream and waits for the whole response; the server frees an answered stream
+/// as the zui/1 listener does (`streamSettled`). Returns the slowest request in ns, or
+/// error.Stalled when a request takes longer than `stall_ns` (the edge client's request timeout).
+const SimOpts = struct {
+    seed: u64,
+    requests: usize = 120,
+    drop_pct: u32 = 2,
+    /// Percent of passes after which an endpoint sleeps up to `starve_ns` (CPU starvation).
+    starve_pct: u32 = 5,
+    starve_ns: u64 = 40 * std.time.ns_per_ms,
+    /// Datagrams a receiver holds before the link drops more (SO_RCVBUF).
+    rx_cap: usize = 160,
+    max_resp: usize = 300 << 10,
+    stall_ns: u64 = 20 * std.time.ns_per_s,
+};
+
+const SimStats = struct { slowest_ns: u64 = 0, dropped: u64 = 0, server_lost: u64 = 0, server_ptos: u64 = 0 };
+
+fn simRequests(gpa: Allocator, o: SimOpts) !SimStats {
+    var prng = std.Random.DefaultPrng.init(o.seed);
+    const rnd = prng.random();
+    const server_seed: [32]u8 = @splat(9);
+    const skey = (try Ed25519.KeyPair.generateDeterministic(server_seed)).public_key.toBytes();
+    var cseed: [64]u8 = undefined;
+    rnd.bytes(&cseed);
+    var now: u64 = 1_000_000_000;
+    const client = try Connection.init(gpa, .{ .server_name = "zui", .identity_seed = @splat(4), .expected_peer = skey, .seed = cseed, .now_unix = 1_800_000_000, .alpn = &.{"zui/1"}, .max_streams_uni = 16, .max_streams_bidi = 64, .keep_alive_ms = 3_000, .pmtu_max = 1452 }, now);
+    defer client.deinit();
+    var server: ?*Connection = null;
+    defer if (server) |s| s.deinit();
+
+    const Pkt = struct { t: u64, to_server: bool, len: u16, data: [1500]u8 };
+    var link: std.ArrayList(Pkt) = .empty;
+    defer link.deinit(gpa);
+    var rxq: [2]std.ArrayList(Pkt) = .{ .empty, .empty }; // 0 client, 1 server
+    defer for (&rxq) |*q| q.deinit(gpa);
+    var wake: [2]u64 = .{ 0, 0 };
+    var st: SimStats = .{};
+
+    // server application state
+    var reqs: std.ArrayList(u64) = .empty;
+    defer reqs.deinit(gpa);
+    var answered: std.ArrayList(u64) = .empty;
+    defer answered.deinit(gpa);
+    var reqbuf: std.AutoHashMapUnmanaged(u64, std.ArrayList(u8)) = .empty;
+    defer {
+        var it = reqbuf.valueIterator();
+        while (it.next()) |v| v.deinit(gpa);
+        reqbuf.deinit(gpa);
+    }
+    // client application state
+    var done: usize = 0;
+    var cur: ?u64 = null;
+    var cur_len: usize = 0;
+    var cur_seed: u32 = 0;
+    var started: u64 = 0;
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(gpa);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+
+    var out: [1500]u8 = undefined;
+    var iter: u64 = 0;
+    while (done < o.requests) : (iter += 1) {
+        if (iter > 50_000_000) return error.SimRunaway;
+        // the link delivers what is due into the receivers' queues (a full queue drops)
+        var i: usize = 0;
+        while (i < link.items.len) {
+            if (link.items[i].t > now) {
+                i += 1;
+                continue;
+            }
+            const p = link.swapRemove(i);
+            const q = &rxq[@intFromBool(p.to_server)];
+            if (q.items.len >= o.rx_cap) st.dropped += 1 else try q.append(gpa, p);
+        }
+        for (0..2) |side| {
+            if (now < wake[side]) continue;
+            const is_server = side == 1;
+            for (rxq[side].items) |*p| {
+                const d = p.data[0..p.len];
+                if (is_server) {
+                    if (server == null) {
+                        // an Initial: create the server connection as the zui/1 listener does
+                        const dl = d[5];
+                        const dcid = d[6..][0..dl];
+                        const sl = d[6 + dl];
+                        const scid = d[7 + dl ..][0..sl];
+                        var sseed: [64]u8 = undefined;
+                        rnd.bytes(&sseed);
+                        server = try Connection.initServer(gpa, .{ .server_name = "zui", .identity_seed = server_seed, .seed = sseed, .now_unix = 1_800_000_000, .max_streams_bidi = 128, .max_streams_uni = 16, .max_data = 16 << 20, .max_stream_data = 1 << 20, .idle_timeout_ms = 30_000, .keep_alive_ms = 0, .alpn = &.{"zui/1"}, .client_auth = false, .pmtu_max = 1452 }, now, dcid, scid);
+                    }
+                    server.?.handleDatagram(now, d);
+                } else client.handleDatagram(now, d);
+            }
+            rxq[side].clearRetainingCapacity();
+            const c = if (is_server) server orelse continue else client;
+            if (c.nextTimeout()) |t| if (now >= t) c.onTimeout(now);
+            if (c.isClosed()) return error.SimClosed;
+            if (is_server and c.isEstablished()) {
+                // the listener's deepwave branch: read requests, answer them, free settled streams
+                while (c.acceptBidi()) |id| try reqs.append(gpa, id);
+                var k: usize = 0;
+                while (k < reqs.items.len) {
+                    const id = reqs.items[k];
+                    const s = c.stream(id) orelse {
+                        _ = reqs.swapRemove(k);
+                        continue;
+                    };
+                    const gop = try reqbuf.getOrPut(gpa, id);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    const data = s.recv.contiguous();
+                    try gop.value_ptr.appendSlice(gpa, data);
+                    s.recv.consume(data.len);
+                    if (!s.recv.complete()) {
+                        k += 1;
+                        continue;
+                    }
+                    const rq = gop.value_ptr.items;
+                    try std.testing.expectEqual(@as(usize, 8), rq.len);
+                    const len = std.mem.readInt(u32, rq[0..4], .little);
+                    const seed = std.mem.readInt(u32, rq[4..8], .little);
+                    payload.clearRetainingCapacity();
+                    try payload.resize(gpa, len);
+                    for (payload.items, 0..) |*b, j| b.* = @truncate((j *% 131) ^ seed);
+                    try c.streamWrite(id, payload.items, true);
+                    try answered.append(gpa, id);
+                    gop.value_ptr.deinit(gpa);
+                    _ = reqbuf.remove(id);
+                    _ = reqs.swapRemove(k);
+                }
+                k = 0;
+                while (k < answered.items.len) {
+                    const id = answered.items[k];
+                    if (c.stream(id) == null or c.streamSettled(id)) {
+                        c.streamFree(id);
+                        _ = answered.swapRemove(k);
+                        continue;
+                    }
+                    k += 1;
+                }
+            }
+            if (!is_server and c.isEstablished()) {
+                if (cur == null) {
+                    const id = try c.openBidi();
+                    cur_len = 1 + rnd.uintLessThan(usize, o.max_resp);
+                    cur_seed = rnd.int(u32);
+                    var rq: [8]u8 = undefined;
+                    std.mem.writeInt(u32, rq[0..4], @intCast(cur_len), .little);
+                    std.mem.writeInt(u32, rq[4..8], cur_seed, .little);
+                    try c.streamWrite(id, &rq, true);
+                    cur = id;
+                    started = now;
+                    resp.clearRetainingCapacity();
+                }
+                const id = cur.?;
+                const s = c.stream(id) orelse return error.SimStreamGone;
+                const data = s.recv.contiguous();
+                try resp.appendSlice(gpa, data);
+                s.recv.consume(data.len);
+                if (s.recv.complete()) {
+                    try std.testing.expectEqual(cur_len, resp.items.len);
+                    for (resp.items, 0..) |b, j| if (b != @as(u8, @truncate((j *% 131) ^ cur_seed))) return error.SimCorrupt;
+                    c.streamFree(id);
+                    st.slowest_ns = @max(st.slowest_ns, now - started);
+                    cur = null;
+                    done += 1;
+                } else if (now - started > o.stall_ns) {
+                    st.slowest_ns = now - started;
+                    if (server) |sv| {
+                        st.server_lost = sv.pkts_lost;
+                        st.server_ptos = sv.ptos;
+                    }
+                    std.debug.print("sim seed {d}: request {d} stalled {d} ms (got {d} of {d} bytes, server lost {d}, ptos {d})\n", .{ o.seed, done, st.slowest_ns / ms, resp.items.len, cur_len, st.server_lost, st.server_ptos });
+                    return error.Stalled;
+                }
+            }
+            // send everything; the link drops some and delays the rest by 0.1 to 3 ms (reorders)
+            while (c.pollTransmit(now, &out)) |n| {
+                if (rnd.uintLessThan(u32, 100) < o.drop_pct) {
+                    st.dropped += 1;
+                    continue;
+                }
+                var p: Pkt = .{ .t = now + 100_000 + rnd.uintLessThan(u64, 3 * ms), .to_server = !is_server, .len = @intCast(n), .data = undefined };
+                @memcpy(p.data[0..n], out[0..n]);
+                try link.append(gpa, p);
+            }
+            if (rnd.uintLessThan(u32, 100) < o.starve_pct) wake[side] = now + rnd.uintLessThan(u64, o.starve_ns);
+        }
+        // next event: a delivery, a timer or a wake-up, at least 20 us on
+        var next: u64 = now + 5 * ms;
+        for (link.items) |p| next = @min(next, p.t);
+        if (client.nextTimeout()) |t| next = @min(next, t);
+        if (server) |s| if (s.nextTimeout()) |t| {
+            next = @min(next, t);
+        };
+        for (wake) |w| if (w > now) {
+            next = @min(next, w);
+        };
+        if (rxq[0].items.len > 0 or rxq[1].items.len > 0) next = @min(next, @max(wake[0], wake[1]));
+        now = @max(now + 20_000, next);
+    }
+    if (server) |sv| {
+        st.server_lost = sv.pkts_lost;
+        st.server_ptos = sv.ptos;
+    }
+    return st;
+}
+
+test "zui/1 requests over a lossy, reordering link with starved receivers all complete (edge 20 s stall)" {
+    const gpa = std.testing.allocator;
+    // ZUI_NET_SIM_SEEDS=N sweeps N seeds (default 12), ZUI_NET_SIM_DROP=pct the loss rate (2)
+    const n: u64 = if (std.c.getenv("ZUI_NET_SIM_SEEDS")) |v| std.fmt.parseInt(u64, std.mem.span(v), 10) catch 12 else 12;
+    const drop: u32 = if (std.c.getenv("ZUI_NET_SIM_DROP")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 2 else 2;
+    var worst: u64 = 0;
+    var lost: u64 = 0;
+    var seed: u64 = 1;
+    while (seed <= n) : (seed += 1) {
+        const st = try simRequests(gpa, .{ .seed = seed, .drop_pct = drop });
+        // a lost tail costs a few PTOs at most, never the client's 20 s request timeout
+        try std.testing.expect(st.slowest_ns < 5 * std.time.ns_per_s);
+        worst = @max(worst, st.slowest_ns);
+        lost += st.server_lost;
+    }
+    if (std.c.getenv("ZUI_NET_SIM_SEEDS") != null)
+        std.debug.print("zui/1 sim: {d} seeds at {d}% drop, slowest request {d} ms, server packets lost {d}\n", .{ n, drop, worst / ms, lost });
 }

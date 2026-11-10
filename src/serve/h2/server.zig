@@ -34,6 +34,12 @@ pub const Options = struct {
     /// h2 keepalive PING interval (null: none, as sui-node) and how long an ack may take.
     keepalive_ns: ?u64 = null,
     keepalive_timeout_ns: u64 = 20 * ns_per_s,
+    /// Zero-downtime upgrade (node/handoff.zig): the listener is shared with a successor process.
+    /// The accept loop then never blocks in accept(): it polls the listener with a short timeout
+    /// and checks `stop` first, so after the stop it takes no connection that belongs to the
+    /// successor (and needs no wake-up connection), and a connection accepted in the race with
+    /// the stop is served (the drain sends it GOAWAY), not reset.
+    poll_accept: bool = false,
     /// Grace for open h2 streams after the server is told to stop.
     stop_grace_ns: u64 = 2 * ns_per_s,
     /// Stack of connection threads (HTTP/1.1 runs handlers on them; rendering a checkpoint
@@ -74,6 +80,11 @@ pub var stats: Stats = .{};
 /// unblocks `accept`) and serves each on its own thread.
 pub fn serveBlocking(gpa: std.mem.Allocator, io: Io, server: *Io.net.Server, opts: Options, handler: Handler, stop: *Atomic(bool)) !void {
     while (!stop.load(.acquire)) {
+        if (opts.poll_accept) {
+            const ready = sock.waitReadableRaw(server.socket.handle, 100) catch false;
+            if (!ready) continue;
+            if (stop.load(.acquire)) return;
+        }
         const stream = server.accept(io) catch |e| {
             const ms = acceptBackoffMs(e) orelse return;
             _ = stats.accept_errors.fetchAdd(1, .monotonic);
@@ -82,7 +93,7 @@ pub fn serveBlocking(gpa: std.mem.Allocator, io: Io, server: *Io.net.Server, opt
             continue;
         };
         const fd = stream.socket.handle;
-        if (stop.load(.acquire)) {
+        if (stop.load(.acquire) and !opts.poll_accept) {
             sock.close(fd);
             return;
         }

@@ -15,6 +15,7 @@ pub const certhttp = @import("certhttp.zig");
 pub const tcptls = @import("tcptls.zig");
 pub const indexq = @import("indexq.zig");
 pub const jobs = @import("jobs.zig");
+pub const edgefeed = @import("edgefeed.zig");
 
 test {
     std.testing.refAllDecls(@This());

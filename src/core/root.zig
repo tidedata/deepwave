@@ -20,6 +20,12 @@ pub const cpu = @import("cpu.zig");
 pub const prom = @import("prom.zig");
 /// sui-node's p2p metric families as hooks the p2p transport calls (anemo requests, quinn peers).
 pub const p2p_metrics = @import("p2p_metrics.zig");
+/// Machine detection, profiles and path overrides.
+pub const hw = @import("hw.zig");
+/// The shared CPU worker pool (batch verification, GPU host prep).
+pub const pool = @import("pool.zig");
+/// Batch dispatch table (CPU single, CPU pool, GPU on k devices) and its cache.
+pub const dispatch = @import("dispatch.zig");
 
 /// 32 raw bytes: the shape of every Sui digest, address and object id. Typed wrappers
 /// (ObjectDigest, SuiAddress, ...) live in `types` and convert to/from this for free.

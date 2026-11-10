@@ -334,6 +334,61 @@ const BenchCert = struct { signers: []const u32, msg: []const u8, sig: *const [4
 const BenchEpoch = struct { keys: []const [96]u8, committee: sig.PreparedCommittee, certs: []const BenchCert };
 const BenchState = struct { epochs: []const BenchEpoch, arena: *std.heap.ArenaAllocator };
 
+const BatchBench = struct {
+    epochs: []const BenchEpoch,
+    items: []sig.BatchItem,
+    out: []bool,
+    pool: *core.pool.Pool,
+    rng: std.Random,
+    gpa: std.mem.Allocator,
+    /// Certificates per batch (0: the whole epoch's set at once).
+    k: usize = 0,
+    /// Lanes (0: the whole pool).
+    lanes: usize = 0,
+
+    fn with(b: BatchBench, k: usize, lanes: usize) BatchBench {
+        var c = b;
+        c.k = k;
+        c.lanes = lanes;
+        return c;
+    }
+
+    const Single = struct {
+        e: *const BenchEpoch,
+        fn f(j: Single, lo: usize, hi: usize) void {
+            for (j.e.certs[lo..hi]) |*c| {
+                if (!j.e.committee.verifyAggregate(c.signers, c.msg, c.sig)) @panic("bench certificate rejected");
+            }
+        }
+    };
+
+    /// Single checks spread over the pool's lanes (today's follower: one worker per certificate).
+    fn singles(b: BatchBench) !void {
+        for (b.epochs) |*e| b.pool.forRange(e.certs.len, 1, b.lanes, Single{ .e = e }, Single.f);
+    }
+
+    fn batches(b: BatchBench) !void {
+        for (b.epochs) |*e| {
+            const n = e.certs.len;
+            for (e.certs, b.items[0..n]) |*c, *it| {
+                const s = sig.Signature.decode(c.sig) orelse return error.BenchCertRejected;
+                const pk = switch (e.committee.aggregateKey(c.signers)) {
+                    .ok => |x| x,
+                    else => return error.BenchCertRejected,
+                };
+                it.* = .{ .pk = pk, .msg = c.msg, .sig = s.point };
+            }
+            const step = if (b.k == 0) n else b.k;
+            var lo: usize = 0;
+            while (lo < n) : (lo += step) {
+                const hi = @min(n, lo + step);
+                sig.verifyBatchValidated(b.gpa, b.items[lo..hi], e.committee.g2_lines, b.rng, .{ .pool = b.pool, .max_lanes = if (b.lanes == 0) 0 else b.lanes, .keys_in_group = true, .max_batch = @max(1024, step) }, b.out[lo..hi]);
+            }
+            for (b.out[0..n]) |ok| if (!ok) return error.BenchCertRejected;
+        }
+    }
+};
+
 fn benchCerts(ctx: *harness.Ctx) !void {
     var arena = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena.deinit();
@@ -369,6 +424,36 @@ fn benchCerts(ctx: *harness.Ctx) !void {
         fn f(s: BenchState) !void {
             for (s.epochs) |*e| for (e.certs) |*c| {
                 if (!e.committee.verifyAggregate(c.signers, c.msg, c.sig)) return error.BenchCertRejected;
+            };
+        }
+    }.f);
+    // The follower's certificate batching (sync.follower Config.cert_batch, sync.verify
+    // prepCert + pairingVerdicts): per certificate the signature decode and aggregate key, then
+    // randomized batches with keys_in_group. Same certificates; lanes 1 and the pool (at most 6).
+    const lanes = @min(6, std.Thread.getCpuCount() catch 1);
+    const pool = try core.pool.Pool.init(ctx.io, ctx.gpa, lanes);
+    defer pool.deinit();
+    var seed: [32]u8 = undefined;
+    ctx.io.random(&seed);
+    var chacha = std.Random.ChaCha.init(seed);
+    var max_certs: usize = 0;
+    for (epochs) |e| max_certs = @max(max_certs, e.certs.len);
+    const bst: BatchBench = .{
+        .epochs = epochs,
+        .items = try a.alloc(sig.BatchItem, max_certs),
+        .out = try a.alloc(bool, max_certs),
+        .pool = pool,
+        .rng = chacha.random(),
+        .gpa = ctx.gpa,
+    };
+    try ctx.benchPasses("cert-verify-pool", "cert", units, BatchBench.with(bst, 0, 0), BatchBench.singles);
+    inline for (.{ .{ "cert-verify-batch32", 32, 1 }, .{ "cert-verify-batch32-pool", 32, 0 }, .{ "cert-verify-batchall", 0, 1 }, .{ "cert-verify-batchall-pool", 0, 0 } }) |row| {
+        try ctx.benchPasses(row[0], "cert", units, BatchBench.with(bst, row[1], row[2]), BatchBench.batches);
+    }
+    try ctx.benchPasses("committee-g2-check", "key", n_keys, st, struct {
+        fn f(s: BenchState) !void {
+            for (s.epochs) |*e| for (e.committee.keys) |k| {
+                if (!k.isInfinity() and !curve.g2AffineInGroup(k)) return error.BenchKeyNotInG2;
             };
         }
     }.f);

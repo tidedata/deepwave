@@ -20,6 +20,9 @@ pub const nshards = 16;
 pub const Entry = struct {
     seq: u64,
     hash: u64,
+    /// The store's transaction-fix generation the response was rendered at (store txfix.zig):
+    /// a later fix for this checkpoint (a submitted signature order) makes it stale.
+    gen: u64 = 0,
     mask: []u8,
     bytes: []u8,
     /// Compressed frames of `bytes` (codec.compress), filled by the first call that asks.
@@ -100,12 +103,39 @@ pub const Cache = struct {
 
     /// Caches a copy of `bytes` for (seq, mask). Errors are dropped: the cache is an optimisation.
     pub fn put(c: *Cache, gpa: Allocator, seq: u64, mask: []const u8, bytes: []const u8) void {
+        c.putGen(gpa, seq, mask, bytes, 0);
+    }
+
+    /// Drops the entry for (seq, mask) if there is one (a stale response; readers holding it
+    /// keep it alive until they release it).
+    pub fn drop(c: *Cache, gpa: Allocator, seq: u64, mask: []const u8) void {
+        if (!c.enabled()) return;
+        const k = keyOf(seq, mask);
+        const sh = c.shardOf(k);
+        const victim: ?*Entry = blk: {
+            sh.lock.lock();
+            defer sh.lock.unlock();
+            const e = sh.map.get(k) orelse break :blk null;
+            if (e.seq != seq or !std.mem.eql(u8, e.mask, mask)) break :blk null;
+            _ = sh.map.remove(k);
+            for (sh.clock.items, 0..) |v, i| if (v == e) {
+                _ = sh.clock.swapRemove(i);
+                break;
+            };
+            sh.bytes -= e.size();
+            break :blk e;
+        };
+        if (victim) |e| release(gpa, e);
+    }
+
+    /// `put`, recording the transaction-fix generation the response was rendered at.
+    pub fn putGen(c: *Cache, gpa: Allocator, seq: u64, mask: []const u8, bytes: []const u8, gen: u64) void {
         if (!c.enabled()) return;
         const shard_budget = c.budget / nshards;
         if (bytes.len + mask.len + @sizeOf(Entry) > shard_budget / 4) return; // one response may not flush a shard
         const k = keyOf(seq, mask);
         const e = gpa.create(Entry) catch return;
-        e.* = .{ .seq = seq, .hash = k, .mask = gpa.dupe(u8, mask) catch {
+        e.* = .{ .seq = seq, .hash = k, .gen = gen, .mask = gpa.dupe(u8, mask) catch {
             gpa.destroy(e);
             return;
         }, .bytes = gpa.dupe(u8, bytes) catch {
@@ -241,4 +271,30 @@ test "cpcache: hit, miss, eviction keeps held entries alive" {
     const k2 = try maskKey(gpa, &.{""});
     defer gpa.free(k2);
     try std.testing.expect(!std.mem.eql(u8, k1, k2));
+}
+
+test "cpcache: a stale entry is dropped and replaced, readers keep the old bytes" {
+    const gpa = std.testing.allocator;
+    var c: Cache = .{ .budget = nshards * 64 * 1024 };
+    defer c.deinit(gpa);
+    const k = try maskKey(gpa, &.{"t"});
+    defer gpa.free(k);
+    c.putGen(gpa, 9, k, "old", 3);
+    const held = c.get(9, k).?;
+    try std.testing.expectEqual(@as(u64, 3), held.gen);
+    // put keeps the existing entry; drop then put replaces it.
+    c.putGen(gpa, 9, k, "new", 4);
+    try std.testing.expectEqualStrings("old", c.get(9, k).?.bytes);
+    release(gpa, held); // the get just above
+    c.drop(gpa, 9, k);
+    try std.testing.expect(c.get(9, k) == null);
+    try std.testing.expectEqualStrings("old", held.bytes);
+    c.putGen(gpa, 9, k, "new", 4);
+    const e = c.get(9, k).?;
+    try std.testing.expectEqualStrings("new", e.bytes);
+    try std.testing.expectEqual(@as(u64, 4), e.gen);
+    release(gpa, e);
+    release(gpa, held);
+    // Dropping what is not there is a no-op.
+    c.drop(gpa, 10, k);
 }

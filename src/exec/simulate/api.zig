@@ -484,7 +484,7 @@ test "the cache budget is shared by every caching thread" {
 
 /// Frees this thread's package caches and VM runtimes (call as a worker exits).
 pub fn releaseThreadCaches() void {
-    exec.ptb.pkgs.releaseThreadCaches(std.heap.smp_allocator);
+    exec.ptb.pkgs.releaseThreadCaches();
     exec.system.movecall.releaseThreadCaches();
 }
 

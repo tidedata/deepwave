@@ -211,16 +211,24 @@ fn isBlank(text: []const u8) bool {
 /// "0x" stripped, any-case hex, exactly 32 bytes), else `from_hex_literal`: "0x" required, fewer
 /// than 64 digits left-padded with '0' and parsed again, otherwise the digits parsed again. Every
 /// failure ends in `HexLiteralPrefixMissing`.
-pub fn objectIdFromStr(s: []const u8) ?[32]u8 {
-    if (decodeHex32(s)) |id| return id;
-    if (!std.mem.startsWith(u8, s, "0x")) return null;
-    const hex_len = s.len - 2;
-    if (hex_len < 64) {
-        var padded: [64]u8 = @splat('0');
-        @memcpy(padded[64 - hex_len ..], s[2..]);
-        return objectIdFromStr(&padded);
+/// A loop, not the Rust recursion: a 4 MiB "0x0x0x..." id would otherwise recurse two million
+/// frames deep on a request worker's stack.
+pub fn objectIdFromStr(s_in: []const u8) ?[32]u8 {
+    var s = s_in;
+    var padded: [64]u8 = undefined;
+    while (true) {
+        if (decodeHex32(s)) |id| return id;
+        if (!std.mem.startsWith(u8, s, "0x")) return null;
+        const hex_len = s.len - 2;
+        if (hex_len < 64) {
+            // s may be `padded` itself: copy the digits out first
+            var tmp: [64]u8 = undefined;
+            @memcpy(tmp[0..hex_len], s[2..]);
+            @memset(padded[0 .. 64 - hex_len], '0');
+            @memcpy(padded[64 - hex_len ..], tmp[0..hex_len]);
+            s = &padded;
+        } else s = s[2..];
     }
-    return objectIdFromStr(s[2..]);
 }
 
 fn decodeHex32(s: []const u8) ?[32]u8 {
@@ -306,6 +314,16 @@ test "proof: ObjectID::from_str as sui-types parses it" {
     try std.testing.expectEqual(@as(u8, 0), six[0]);
     try std.testing.expectEqual(@as(u8, 0), objectIdFromStr("0x").?[31]); // padded to 64 zeros
     try std.testing.expect(objectIdFromStr("6") == null); // short without 0x: prefix missing
+    {
+        // "0x" repeated to the request cap: a loop, not a recursion two million deep
+        const gpa = std.testing.allocator;
+        const n = 2 << 20;
+        const long = try gpa.alloc(u8, 2 * n + 64);
+        defer gpa.free(long);
+        for (0..n) |i| @memcpy(long[2 * i ..][0..2], "0x");
+        @memcpy(long[2 * n ..], full);
+        try std.testing.expectEqualSlices(u8, &want, &objectIdFromStr(long).?);
+    }
     try std.testing.expect(objectIdFromStr("0xzz") == null);
     const ones: [66]u8 = @splat('1');
     try std.testing.expect(objectIdFromStr("0x" ++ ones) == null);

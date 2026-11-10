@@ -1,0 +1,12 @@
+[package]
+name = "consensus-net-proto-vectors"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone: the message structs below are copied verbatim from
+# consensus/core/src/network/tonic_network.rs at mainnet-v1.83.1 (they are pub(crate) there).
+[dependencies]
+prost = "0.14"
+hex = "0.4"
+
+[workspace]

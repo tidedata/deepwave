@@ -1,8 +1,8 @@
 //! Fast zstd through the reference C library (zstd 1.5.7, compress and decompress sides, vendored
 //! at vendor/zstd with its BSD license and compiled into the `store` module by build.zig; no
 //! multithreading, no legacy formats, no dictionaries).
-//! Decoding keeps one context per thread, created on first use; encoding contexts are owned by
-//! their holder (`Compressor`).
+//! Decoding (and `Dict.compress`) borrow contexts from small process-wide pools, so threads that
+//! come and go leak nothing; `Compressor` contexts are owned by their holder.
 //! Decoding: `decodeInto` writes straight into the caller's buffer, which must be exactly the
 //! frame's content size. std.compress.zstd stays as the fallback (`chunk.decode` uses it when
 //! `enabled` is false or the C decoder fails).
@@ -15,8 +15,10 @@ const std = @import("std");
 
 const DCtx = opaque {};
 extern fn ZSTD_createDCtx() ?*DCtx;
+extern fn ZSTD_freeDCtx(dctx: *DCtx) usize;
 extern fn ZSTD_decompressDCtx(dctx: *DCtx, dst: [*]u8, dst_cap: usize, src: [*]const u8, src_size: usize) usize;
 extern fn ZSTD_isError(code: usize) c_uint;
+extern fn ZSTD_getFrameContentSize(src: [*]const u8, size: usize) c_ulonglong;
 
 const CCtx = opaque {};
 extern fn ZSTD_createCCtx() ?*CCtx;
@@ -56,11 +58,8 @@ pub fn freeCDict(c: *CDict) void {
 /// Decodes one zstd frame compressed with raw-content dictionary `dict` (referenced, not
 /// copied: O(1) to set up) into `out`, whose length must be the frame's content size.
 pub fn decodeIntoDict(src: []const u8, out: []u8, dict: []const u8) Error!void {
-    const d = tl_dctx orelse blk: {
-        const c = ZSTD_createDCtx() orelse return error.OutOfMemory;
-        tl_dctx = c;
-        break :blk c;
-    };
+    const d = try dctx_pool.get();
+    defer dctx_pool.put(d);
     if (dict.len >= 8 and std.mem.readInt(u32, dict[0..4], .little) == dict_magic) return error.Corrupt;
     const n = ZSTD_decompress_usingDict(d, out.ptr, out.len, src.ptr, src.len, dict.ptr, dict.len);
     if (ZSTD_isError(n) != 0) return error.Corrupt;
@@ -79,7 +78,44 @@ pub var enabled: bool = true;
 pub var level: i32 = 3;
 var env_checked = std.atomic.Value(bool).init(false);
 
-threadlocal var tl_dctx: ?*DCtx = null;
+/// Free contexts, borrowed for one call (`get`, `put`): at most `cap` are kept, so the pool
+/// holds about one per thread that decodes at the same time and none for threads that exited
+/// (a thread-local context was never freed when its thread exited).
+fn Pool(comptime T: type, comptime create: fn () callconv(.c) ?*T, comptime destroy: fn (*T) callconv(.c) usize) type {
+    return struct {
+        const cap = 64;
+        lock: std.atomic.Mutex = .unlocked,
+        n: usize = 0,
+        free: [cap]*T = undefined,
+
+        fn get(p: *@This()) Error!*T {
+            while (!p.lock.tryLock()) std.atomic.spinLoopHint();
+            if (p.n > 0) {
+                p.n -= 1;
+                const c = p.free[p.n];
+                p.lock.unlock();
+                return c;
+            }
+            p.lock.unlock();
+            return create() orelse error.OutOfMemory;
+        }
+
+        fn put(p: *@This(), c: *T) void {
+            while (!p.lock.tryLock()) std.atomic.spinLoopHint();
+            if (p.n < cap) {
+                p.free[p.n] = c;
+                p.n += 1;
+                p.lock.unlock();
+                return;
+            }
+            p.lock.unlock();
+            _ = destroy(c);
+        }
+    };
+}
+
+var dctx_pool: Pool(DCtx, ZSTD_createDCtx, ZSTD_freeDCtx) = .{};
+var cctx_pool: Pool(CCtx, ZSTD_createCCtx, ZSTD_freeCCtx) = .{};
 
 fn checkEnv() void {
     if (env_checked.load(.acquire)) return;
@@ -210,17 +246,118 @@ pub fn compressAny(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
 
 pub const Error = error{ OutOfMemory, Corrupt };
 
+/// The content size a zstd frame declares, null when it does not say (or is not a frame).
+pub fn frameContentSize(src: []const u8) ?u64 {
+    if (src.len == 0) return null;
+    const n = ZSTD_getFrameContentSize(src.ptr, src.len);
+    // ZSTD_CONTENTSIZE_UNKNOWN = -1, ZSTD_CONTENTSIZE_ERROR = -2
+    if (n >= std.math.maxInt(u64) - 1) return null;
+    return n;
+}
+
 /// Decodes one complete zstd frame (or several concatenated) in `src` into `out`. The decoded
 /// size must equal `out.len`.
 pub fn decodeInto(src: []const u8, out: []u8) Error!void {
-    const d = tl_dctx orelse blk: {
-        const c = ZSTD_createDCtx() orelse return error.OutOfMemory;
-        tl_dctx = c;
-        break :blk c;
-    };
+    const d = try dctx_pool.get();
+    defer dctx_pool.put(d);
     const n = ZSTD_decompressDCtx(d, out.ptr, out.len, src.ptr, src.len);
     if (ZSTD_isError(n) != 0) return error.Corrupt;
     if (n != out.len) return error.Corrupt;
+}
+
+// ---------------------------------------------------------------- raw-content dictionaries
+// (lane edge: the zui/1 edge feed compresses small per-checkpoint frames with a shared dictionary.
+// A dictionary here is raw content: any bytes, no zstd dictionary header, no trainer; the
+// digested forms are read-only and shared between threads, the contexts are per thread.)
+
+const DDict = opaque {};
+const CustomMem = extern struct { alloc: ?*const anyopaque = null, free: ?*const anyopaque = null, opaque_: ?*anyopaque = null };
+const CParams = extern struct { window_log: c_uint, chain_log: c_uint, hash_log: c_uint, search_log: c_uint, min_match: c_uint, target_length: c_uint, strategy: c_uint };
+extern fn ZSTD_getCParams(level: c_int, src_size: c_ulonglong, dict_size: usize) CParams;
+extern fn ZSTD_createCDict_advanced(dict: [*]const u8, size: usize, by_ref: c_int, content_type: c_int, cparams: CParams, mem: CustomMem) ?*CDict;
+extern fn ZSTD_createDDict_advanced(dict: [*]const u8, size: usize, by_ref: c_int, content_type: c_int, mem: CustomMem) ?*DDict;
+extern fn ZSTD_freeDDict(d: *DDict) usize;
+extern fn ZSTD_decompress_usingDDict(dctx: *DCtx, dst: [*]u8, dst_cap: usize, src: [*]const u8, src_size: usize, d: *const DDict) usize;
+
+
+/// A shared raw-content dictionary: digested once for compression (at `level`) and decompression.
+/// Frames made with it carry their content size and need the same dictionary to decode.
+pub const Dict = struct {
+    c: *CDict,
+    d: *DDict,
+
+    pub fn init(content: []const u8, lvl: i32) Error!Dict {
+        if (content.len == 0) return error.Corrupt;
+        const cp = ZSTD_getCParams(lvl, 0, content.len);
+        const c = ZSTD_createCDict_advanced(content.ptr, content.len, 0, 1, cp, .{}) orelse return error.OutOfMemory;
+        errdefer _ = ZSTD_freeCDict(c);
+        const d = ZSTD_createDDict_advanced(content.ptr, content.len, 0, 1, .{}) orelse return error.OutOfMemory;
+        return .{ .c = c, .d = d };
+    }
+
+    pub fn deinit(z: *Dict) void {
+        _ = ZSTD_freeCDict(z.c);
+        _ = ZSTD_freeDDict(z.d);
+    }
+
+    /// One zstd frame of `src` into `dst`; null when it does not fit.
+    pub fn compress(z: *const Dict, src: []const u8, dst: []u8) Error!?usize {
+        const cc = try cctx_pool.get();
+        defer cctx_pool.put(cc);
+        const n = ZSTD_compress_usingCDict(cc, dst.ptr, dst.len, src.ptr, src.len, z.c);
+        if (ZSTD_isError(n) != 0) return null;
+        return n;
+    }
+
+    /// Decodes a frame made with this dictionary into `out`, which must be exactly its content size.
+    pub fn decompress(z: *const Dict, src: []const u8, out: []u8) Error!void {
+        const dc = try dctx_pool.get();
+        defer dctx_pool.put(dc);
+        const n = ZSTD_decompress_usingDDict(dc, out.ptr, out.len, src.ptr, src.len, z.d);
+        if (ZSTD_isError(n) != 0 or n != out.len) return error.Corrupt;
+    }
+};
+
+pub fn compressBound(n: usize) usize {
+    return ZSTD_compressBound(n);
+}
+
+test "zstd_c Dict: round trip, dictionary helps, wrong dictionary fails" {
+    const gpa = std.testing.allocator;
+    var content: [20000]u8 = undefined;
+    var x: u32 = 9;
+    for (&content) |*b| {
+        x = x *% 1103515245 +% 12345;
+        b.* = @truncate(x >> 16);
+    }
+    var other: [20000]u8 = undefined;
+    for (&other) |*b| {
+        x = x *% 1103515245 +% 12345;
+        b.* = @truncate(x >> 16);
+    }
+    var d = try Dict.init(&content, 3);
+    defer d.deinit();
+    var d2 = try Dict.init(&other, 3);
+    defer d2.deinit();
+    // a frame that repeats the dictionary's content compresses to almost nothing with it
+    var src: [6000]u8 = undefined;
+    @memcpy(src[0..3000], content[1000..4000]);
+    @memcpy(src[3000..], content[9000..12000]);
+    const buf = try gpa.alloc(u8, compressBound(src.len));
+    defer gpa.free(buf);
+    const n = (try d.compress(&src, buf)).?;
+    try std.testing.expect(n < 200);
+    var out: [6000]u8 = undefined;
+    try d.decompress(buf[0..n], &out);
+    try std.testing.expectEqualSlices(u8, &src, &out);
+    // a raw dictionary has no id and the frame no checksum: the wrong one either fails or yields
+    // other bytes (the frame envelope in edgewire names the dictionary; digests catch the rest)
+    var wrong: [6000]u8 = undefined;
+    if (d2.decompress(buf[0..n], &wrong)) |_| {
+        try std.testing.expect(!std.mem.eql(u8, &src, &wrong));
+    } else |e| try std.testing.expectEqual(error.Corrupt, e);
+    var short: [5999]u8 = undefined;
+    try std.testing.expectError(error.Corrupt, d.decompress(buf[0..n], &short));
 }
 
 /// True when the C decoder should be used (default; `ZUI_ZSTD=std` turns it off).

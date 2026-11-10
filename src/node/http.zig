@@ -37,6 +37,114 @@ pub const Stats = struct {
     retries: Atomic(u64) = .init(0),
 };
 
+/// One byte-rate limit for every download this process makes (`--net-max-mbps N`, in MiB per
+/// second; 0, the default, is no limit and nothing here does anything). A token bucket in its
+/// GCRA form: one word, `tat`, holds the time at which every byte booked so far is paid for at
+/// `rate`. A reader books the bytes it just received and sleeps until they are due, so it stops
+/// reading, the socket's window fills, and TCP slows the sender. Lock-free: any number of
+/// threads share it, and together they get `rate`, not `rate` each.
+///
+/// Who books: the public bucket's body loop below (every 64 KiB read), and after the fact (the
+/// whole object once it is in, which caps the average but lets one object arrive at link
+/// speed) the S3 fallback here, the S3 source in source.zig and the snapshot files in
+/// snapshot.zig, whose clients cannot be paced inside a body. Not capped: zui/1 edge feeds,
+/// p2p, the live stream, RPC serving.
+pub const ByteBucket = struct {
+    /// Bytes per second; 0: unlimited.
+    rate: Atomic(u64) = .init(0),
+    /// Monotonic ns at which everything booked so far is paid for.
+    tat: Atomic(u64) = .init(0),
+    /// How far `tat` may be ahead of the clock before a reader waits: the burst, as time at
+    /// `rate` (100 ms: at 80 MiB/s, 8 MiB may pass at once after an idle spell).
+    burst_ns: u64 = 100 * std.time.ns_per_ms,
+    /// Set at shutdown: sleepers return at once.
+    stopping: Atomic(bool) = .init(false),
+    /// Bytes booked and time slept (diagnostics, tests).
+    bytes: Atomic(u64) = .init(0),
+    waited_ns: Atomic(u64) = .init(0),
+
+    /// Sets the cap in MiB per second (0: none) and clears a previous stop.
+    pub fn configure(b: *ByteBucket, mib_per_s: u32) void {
+        b.rate.store(@as(u64, mib_per_s) << 20, .release);
+        b.stopping.store(false, .release);
+    }
+
+    pub fn on(b: *const ByteBucket) bool {
+        return b.rate.load(.monotonic) != 0;
+    }
+
+    /// Books `n` bytes at `now` (monotonic ns). Returns the time until which the caller should
+    /// not read again (at or before `now`: no wait). Never blocks.
+    pub fn reserve(b: *ByteBucket, n: u64, now: u64) u64 {
+        const r = b.rate.load(.monotonic);
+        if (r == 0 or n == 0) return now;
+        const cost: u64 = @intCast(@min(@as(u128, n) * std.time.ns_per_s / r, std.math.maxInt(u64) / 4));
+        _ = b.bytes.fetchAdd(n, .monotonic);
+        var cur = b.tat.load(.monotonic);
+        while (true) {
+            // An idle spell earns nothing beyond the burst: the schedule restarts at `now`.
+            const next = @max(cur, now) + cost;
+            cur = b.tat.cmpxchgWeak(cur, next, .monotonic, .monotonic) orelse return next -| b.burst_ns;
+        }
+    }
+
+    /// Sleeps the calling thread until `due` (from `reserve`), in steps that notice a stop.
+    pub fn sleepUntil(b: *ByteBucket, io: Io, due: u64) void {
+        while (!b.stopping.load(.acquire)) {
+            const now = monoNs();
+            if (now >= due) return;
+            const step = @min(due - now, 100 * std.time.ns_per_ms);
+            io.sleep(.fromNanoseconds(@intCast(step)), .awake) catch return;
+            _ = b.waited_ns.fetchAdd(step, .monotonic);
+        }
+    }
+
+    /// Books `n` bytes that were just received and waits until they are due.
+    pub fn charge(b: *ByteBucket, io: Io, n: u64) void {
+        if (!b.on() or n == 0) return;
+        b.sleepUntil(io, b.reserve(n, monoNs()));
+    }
+};
+
+/// The process's download cap (`ByteBucket`); the node sets it from `--net-max-mbps` at start.
+pub var net_cap: ByteBucket = .{};
+
+/// Bytes read from a paced body between two bookings.
+const pace_chunk: usize = 64 << 10;
+
+/// One request's bookings. The body loop sleeps inside the request for at most `budget_ns` in
+/// total, and `Public.requestHttp` adds exactly that to the request's timeout, so the limiter's
+/// sleep never counts against the time a GET has for the network. What is still owed when the
+/// budget is spent is slept after the request, outside its timeout (`due`).
+const Paced = struct {
+    bucket: *ByteBucket,
+    io: Io,
+    budget_ns: u64,
+    due: u64 = 0,
+
+    fn charge(pc: *Paced, n: usize) void {
+        if (n == 0) return;
+        const now = monoNs();
+        pc.due = pc.bucket.reserve(n, now);
+        if (pc.due <= now) return;
+        const s = @min(pc.due - now, pc.budget_ns);
+        if (s == 0) return;
+        pc.budget_ns -= s;
+        pc.io.sleep(.fromNanoseconds(@intCast(s)), .awake) catch return;
+        _ = pc.bucket.waited_ns.fetchAdd(s, .monotonic);
+    }
+};
+
+fn monoNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    if (@import("builtin").os.tag == .linux) {
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    } else {
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    }
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
 pub const Result = enum { ok, missing };
 
 pub const Public = struct {
@@ -46,8 +154,11 @@ pub const Public = struct {
     base: []const u8 = mainnet_base,
     /// Client pool: a request takes a free slot for its duration, so each std.http.Client (and
     /// its keep-alive connections and TLS clock) is used by one thread at a time and its clock can
-    /// be refreshed without racing a handshake (netguard.Client).
+    /// be refreshed without racing a handshake (netguard.Client). The first `limit` slots are in
+    /// use; the rest stay untouched (a client that never made a request holds no memory).
     slots: [max_clients]Slot,
+    /// Requests in flight at once, at most: `default_clients` until `setConcurrency`.
+    limit: Atomic(u32) = .init(default_clients),
     fallback: ?*s3.Bucket = null,
     /// Highest sequence number this source has served (the tip as far as it knows).
     highest: Atomic(u64) = .init(0),
@@ -58,8 +169,31 @@ pub const Public = struct {
     /// Set at shutdown: requests in flight end within ~100 ms (error.Stopped).
     stopping: Atomic(bool) = .init(false),
 
-    /// More than the fetcher's threads plus the main thread and stream-check.
-    pub const max_clients = 16;
+    /// The pool with the default `--fetchers 8` (and the whole pool until lane tip-cheap, when
+    /// `--fetchers 64` on the public bucket was silently 16 in flight): the fetch threads, the
+    /// trust walk's 16 parallel requests, the main thread and stream-check.
+    pub const default_clients = 16;
+    /// Slots beside the fetch threads' own: the main thread's tip search and stream-check.
+    pub const spare_clients = 2;
+    /// The most requests this client ever has in flight at the bucket, whatever `--fetchers`
+    /// says: 62 fetch threads and the two spare. More fetch threads than that still start; the
+    /// extra ones wait for a slot. Each request in flight is a download at the link's speed, so
+    /// on a shared box raise `--fetchers` together with `--net-max-mbps`.
+    pub const max_clients = 64;
+
+    /// Pool size for `fetchers` fetch threads: theirs plus the spare, never under the default
+    /// (so nothing changes at or below 14 fetchers) and never over `max_clients`.
+    pub fn clientsFor(fetchers: u32) u32 {
+        return std.math.clamp(fetchers +| spare_clients, default_clients, max_clients);
+    }
+
+    /// Sizes the pool for `fetchers` fetch threads (before they start). Returns how many of
+    /// them can have a request in flight at once.
+    pub fn setConcurrency(p: *Public, fetchers: u32) u32 {
+        const n = clientsFor(fetchers);
+        p.limit.store(n, .release);
+        return @min(fetchers, n);
+    }
 
     const Slot = struct {
         busy: Atomic(bool) = .init(false),
@@ -80,11 +214,16 @@ pub const Public = struct {
         for (&p.slots) |*sl| sl.client.deinit();
     }
 
+    fn tryAcquire(p: *Public) ?*Slot {
+        for (p.slots[0..p.limit.load(.acquire)]) |*sl| {
+            if (sl.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) return sl;
+        }
+        return null;
+    }
+
     fn acquire(p: *Public) *Slot {
         while (true) {
-            for (&p.slots) |*sl| {
-                if (sl.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) return sl;
-            }
+            if (p.tryAcquire()) |sl| return sl;
             p.io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
     }
@@ -124,11 +263,13 @@ pub const Public = struct {
     }
 
     fn viaS3(p: *Public, b: *s3.Bucket, seq: u64, out: *std.ArrayList(u8), first_byte: bool) !Result {
-        _ = p;
         var nb: [48]u8 = undefined;
         const key = std.fmt.bufPrint(&nb, "{d}.binpb.zst", .{seq}) catch unreachable;
         if (first_byte) return if (try b.exists(key)) .ok else .missing;
-        return switch (try b.get(key, out)) {
+        const r = try b.get(key, out);
+        // s3.zig cannot pace inside a body: the object is booked once it is in.
+        if (r == .ok) net_cap.charge(p.io, out.items.len);
+        return switch (r) {
             .ok => .ok,
             .missing => .missing,
         };
@@ -146,6 +287,14 @@ pub const Public = struct {
         _ = p.stats.gets.fetchAdd(1, .monotonic);
         var aw: std.Io.Writer.Allocating = .fromArrayList(p.gpa, out);
         defer out.* = aw.toArrayList();
+        // With a download cap (`net_cap`): the body is read in chunks, each booked. The request
+        // may sleep for the limiter up to `timeout_ms` in total and gets that much more time,
+        // so the network still has its full `timeout_ms`; the rest is slept once the slot is
+        // free again (this defer runs last).
+        const capped = net_cap.on();
+        const budget_ms: u64 = if (capped) p.timeout_ms else 0;
+        var paced: Paced = .{ .bucket = &net_cap, .io = p.io, .budget_ns = 0 };
+        defer if (capped) net_cap.sleepUntil(p.io, paced.due);
         const sl = p.acquire();
         defer sl.busy.store(false, .release);
         // Idle pooled connections older than `idle_ms` are dropped here (netguard.Client).
@@ -160,7 +309,8 @@ pub const Public = struct {
         const res = while (true) : (attempt += 1) {
             aw.writer.end = 0;
             ab.reset();
-            break netguard.timed(p.io, p.timeout_ms, &p.stopping, &ab, fetchOnce, .{ &sl.client.http, url, hdrs[0..nh], &aw.writer, &ab }) catch |e| {
+            paced.budget_ns = budget_ms * std.time.ns_per_ms;
+            break netguard.timed(p.io, p.timeout_ms + budget_ms, &p.stopping, &ab, fetchOnce, .{ &sl.client.http, url, hdrs[0..nh], &aw.writer, &ab, if (capped) &paced else null }) catch |e| {
                 sl.client.noteError(e, netguard.wallMs());
                 if (attempt < 4 and transient(@errorName(e))) {
                     sl.client.dropPool();
@@ -202,7 +352,9 @@ pub const Public = struct {
 /// One GET into `w`: std.http.Client.fetch's steps (no redirects, no content encoding: the
 /// bucket serves the object's bytes), with the connection's socket registered in `abort` from the
 /// moment it exists until it goes back to the pool.
-fn fetchOnce(c: *std.http.Client, url: []const u8, hdrs: []const std.http.Header, w: *std.Io.Writer, abort: *netguard.Abort) !std.http.Status {
+/// With `pace` the body is read `pace_chunk` bytes at a time and each read is booked on the
+/// download cap before the next (the reader sleeps, the sender slows down).
+fn fetchOnce(c: *std.http.Client, url: []const u8, hdrs: []const std.http.Header, w: *std.Io.Writer, abort: *netguard.Abort, pace: ?*Paced) !std.http.Status {
     const uri = try std.Uri.parse(url);
     var req = try c.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
@@ -221,6 +373,17 @@ fn fetchOnce(c: *std.http.Client, url: []const u8, hdrs: []const std.http.Header
     var response = try req.receiveHead(&.{});
     if (response.head.content_encoding != .identity) return error.UnsupportedCompressionMethod;
     const reader = response.reader(&.{});
+    if (pace) |pc| {
+        while (true) {
+            const n = reader.stream(w, .limited(pace_chunk)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+                else => |e| return e,
+            };
+            pc.charge(n);
+        }
+        return response.head.status;
+    }
     _ = reader.streamRemaining(w) catch |err| switch (err) {
         error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
         else => |e| return e,
@@ -271,6 +434,62 @@ test "public bucket: a 404 and a hit through the slot pool" {
     defer p2.deinit();
     try std.testing.expectEqual(Result.ok, try p2.get(8, &out));
     try std.testing.expectEqualStrings("abc", out.items);
+}
+
+test "public bucket: the request pool follows the fetcher count, 16 by default and 64 at most" {
+    try std.testing.expectEqual(@as(u32, 16), Public.clientsFor(0));
+    try std.testing.expectEqual(@as(u32, 16), Public.clientsFor(8)); // the default: as before
+    try std.testing.expectEqual(@as(u32, 16), Public.clientsFor(14));
+    try std.testing.expectEqual(@as(u32, 18), Public.clientsFor(16));
+    try std.testing.expectEqual(@as(u32, 34), Public.clientsFor(32));
+    try std.testing.expectEqual(@as(u32, 64), Public.clientsFor(62));
+    try std.testing.expectEqual(@as(u32, 64), Public.clientsFor(64));
+    try std.testing.expectEqual(@as(u32, 64), Public.clientsFor(4096));
+    // A server that accepts and never answers: every request stays in flight.
+    var srv: netguard.TestServer = undefined;
+    try srv.start(std.testing.io, null);
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    var p = Public.init(std.testing.allocator, std.testing.io, srv.url(&ub));
+    defer p.deinit();
+    p.timeout_ms = 60_000;
+    try std.testing.expectEqual(@as(u32, 16), p.limit.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 8), p.setConcurrency(8));
+    try std.testing.expectEqual(@as(u32, 16), p.limit.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 64), p.setConcurrency(100)); // the documented maximum
+    try std.testing.expectEqual(@as(u32, Public.max_clients), p.limit.load(.acquire));
+    const fetchers = 32;
+    try std.testing.expectEqual(@as(u32, fetchers), p.setConcurrency(fetchers));
+    const Get = struct {
+        fn run(pp: *Public, seq: u64, stopped: *Atomic(u32)) void {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(pp.gpa);
+            if (pp.get(seq, &out)) |_| {} else |e| {
+                if (e == error.Stopped) _ = stopped.fetchAdd(1, .acq_rel);
+            }
+        }
+    };
+    var stopped: Atomic(u32) = .init(0);
+    var threads: [fetchers]std.Thread = undefined;
+    var made: usize = 0;
+    defer {
+        p.stopping.store(true, .release);
+        for (threads[0..made]) |t| t.join();
+    }
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Get.run, .{ &p, 1000 + i, &stopped });
+        made += 1;
+    }
+    // All 32 are in flight at once. With the fixed pool of 16 the server saw 16 connections
+    // and the other 16 threads slept in acquire() until a request timed out.
+    var waited: u32 = 0;
+    while (srv.accepts.load(.acquire) < fetchers and waited < 10_000) : (waited += 5) napMs(5);
+    try std.testing.expectEqual(@as(u32, fetchers), srv.accepts.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), stopped.load(.acquire));
+    p.stopping.store(true, .release);
+    for (threads[0..made]) |t| t.join();
+    made = 0;
+    try std.testing.expectEqual(@as(u32, fetchers), stopped.load(.acquire));
 }
 
 const keep_alive_reply = "HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nabc";
@@ -356,4 +575,131 @@ test "public bucket live: a GET after an idle gap succeeds" {
     ta.join();
     tb.join();
     try std.testing.expect(ok_a and ok_b);
+}
+
+test "byte bucket: the rate over a simulated clock is the configured one within 10%, for one reader and for many" {
+    const mib: u64 = 1 << 20;
+    // One reader, 64 KiB reads that arrive at once (a link far faster than the cap).
+    {
+        var b: ByteBucket = .{};
+        b.configure(8);
+        const t0: u64 = 5 * std.time.ns_per_s;
+        var now = t0;
+        var total: u64 = 0;
+        while (now - t0 < 20 * std.time.ns_per_s) {
+            const due = b.reserve(64 << 10, now);
+            total += 64 << 10;
+            now = @max(now, due) + 20_000; // the read itself
+        }
+        const rate = @as(u128, total) * std.time.ns_per_s / (now - t0);
+        try std.testing.expect(rate >= 8 * mib * 90 / 100 and rate <= 8 * mib * 110 / 100);
+        try std.testing.expectEqual(total, b.bytes.load(.monotonic));
+    }
+    // 48 readers sharing it, uneven read sizes (4 KiB to 256 KiB): together they get the rate,
+    // not the rate each.
+    {
+        var b: ByteBucket = .{};
+        b.configure(25);
+        const t0: u64 = 1000;
+        var ready: [48]u64 = @splat(t0);
+        var total: u64 = 0;
+        var now: u64 = t0;
+        var rng = std.Random.DefaultPrng.init(7);
+        while (now - t0 < 30 * std.time.ns_per_s) {
+            var who: usize = 0;
+            for (ready, 0..) |r, i| {
+                if (r < ready[who]) who = i;
+            }
+            now = @max(now, ready[who]);
+            const n: u64 = @as(u64, 4 << 10) << rng.random().uintLessThan(u6, 7);
+            const due = b.reserve(n, now);
+            total += n;
+            ready[who] = @max(now, due) + 50_000 + rng.random().uintLessThan(u64, 200_000);
+        }
+        const rate = @as(u128, total) * std.time.ns_per_s / (now - t0);
+        try std.testing.expect(rate >= 25 * mib * 90 / 100 and rate <= 25 * mib * 110 / 100);
+    }
+    // A link slower than the cap is never delayed.
+    {
+        var b: ByteBucket = .{};
+        b.configure(8);
+        var now: u64 = 1000;
+        for (0..1000) |_| {
+            try std.testing.expect(b.reserve(64 << 10, now) <= now);
+            now += 16 * std.time.ns_per_ms; // 4 MiB/s
+        }
+    }
+    // After an idle minute only the burst (100 ms of rate) passes at once, not a minute's worth.
+    {
+        var b: ByteBucket = .{};
+        b.configure(8);
+        _ = b.reserve(64 << 10, 1000);
+        const now: u64 = 60 * std.time.ns_per_s;
+        var passed: u64 = 0;
+        while (b.reserve(64 << 10, now) <= now) passed += 64 << 10;
+        try std.testing.expect(passed <= 8 * mib / 10 and passed >= 8 * mib / 10 - (128 << 10));
+    }
+    // No cap (the default): nothing is booked or delayed.
+    {
+        var b: ByteBucket = .{};
+        try std.testing.expect(!b.on());
+        try std.testing.expectEqual(@as(u64, 77), b.reserve(1 << 30, 77));
+        try std.testing.expectEqual(@as(u64, 0), b.tat.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), b.bytes.load(.monotonic));
+    }
+}
+
+test "public bucket: a GET under the download cap takes the capped time, keeps its bytes and does not time out" {
+    const gpa = std.testing.allocator;
+    const body_len: usize = 1 << 20;
+    const head = "HTTP/1.1 200 OK\r\ncontent-length: 1048576\r\nconnection: close\r\n\r\n";
+    const reply = try gpa.alloc(u8, head.len + body_len);
+    defer gpa.free(reply);
+    @memcpy(reply[0..head.len], head);
+    for (reply[head.len..], 0..) |*c, i| c.* = @truncate(i *% 31 +% (i >> 8));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var ub: [64]u8 = undefined;
+    defer net_cap = .{};
+    // No cap: at once.
+    {
+        var srv: netguard.TestServer = undefined;
+        try srv.start(std.testing.io, reply);
+        defer srv.stop();
+        var p = Public.init(gpa, std.testing.io, srv.url(&ub));
+        defer p.deinit();
+        try std.testing.expectEqual(Result.ok, try p.get(1, &out));
+        try std.testing.expectEqualSlices(u8, reply[head.len..], out.items);
+        try std.testing.expectEqual(@as(u64, 0), net_cap.bytes.load(.monotonic));
+    }
+    // 2 MiB/s: 1 MiB less the 100 ms burst is 0.4 s. The request's timeout is 250 ms, less than
+    // the limiter's sleep: the sleep does not count against it.
+    {
+        var srv: netguard.TestServer = undefined;
+        try srv.start(std.testing.io, reply);
+        defer srv.stop();
+        var p = Public.init(gpa, std.testing.io, srv.url(&ub));
+        defer p.deinit();
+        p.timeout_ms = 250;
+        net_cap = .{};
+        net_cap.configure(2);
+        const t0 = netguard.wallMs();
+        try std.testing.expectEqual(Result.ok, try p.get(2, &out));
+        const ms = netguard.wallMs() - t0;
+        try std.testing.expectEqualSlices(u8, reply[head.len..], out.items);
+        try std.testing.expectEqual(@as(u64, body_len), net_cap.bytes.load(.monotonic));
+        try std.testing.expect(ms >= 350);
+        try std.testing.expect(ms < 10_000);
+        try std.testing.expectEqual(@as(u64, 0), p.stats.timeouts.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), p.stats.errors.load(.monotonic));
+    }
+    // A stop ends a limiter sleep at once.
+    {
+        net_cap = .{};
+        net_cap.configure(1);
+        net_cap.stopping.store(true, .release);
+        const t0 = netguard.wallMs();
+        net_cap.sleepUntil(std.testing.io, monoNs() + 60 * std.time.ns_per_s);
+        try std.testing.expect(netguard.wallMs() - t0 < 1000);
+    }
 }

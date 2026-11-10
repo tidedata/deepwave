@@ -103,6 +103,9 @@ pub const Options = struct {
     /// Test only: drop this percentage of datagrams in each direction (deterministic PRNG).
     sim_drop_pct: u8 = 0,
     sim_seed: u64 = 1,
+    /// Packets per 1-RTT key before we update the keys (conn.Config.key_update_pkts; the interop
+    /// suite lowers it to exercise quinn's side of an update we start).
+    key_update_pkts: u64 = 1 << 22,
     /// Spin on the socket for this long before blocking in poll: trades CPU for wake-up latency.
     busy_poll_us: u32 = 0,
     /// Answers requests the remote sends us (null: 404, or an empty 200 for pushes).
@@ -227,6 +230,11 @@ pub const Peer = struct {
             .expected_peer = opts.expected,
             .seed = seed,
             .now_unix = now_unix,
+            // A response is parsed whole from the stream before any of it is consumed, and the
+            // window moves only with consumption: one response of the largest frame size must fit.
+            .max_stream_data = @max(128 << 20, opts.max_response_frame + (1 << 20)),
+            .max_data = @max(256 << 20, 2 * (opts.max_response_frame + (1 << 20))),
+            .key_update_pkts = opts.key_update_pkts,
         }, p.nowNs());
         errdefer p.conn.deinit();
         const t0 = p.nowNs();
@@ -386,12 +394,14 @@ pub const Peer = struct {
             }
             i += 1;
         }
-        // free answered streams once their send side is done
+        // free answered streams once every packet of the answer is acknowledged
+        // (conn.streamSettled), as the listener does: freeing on "all sent" dropped the range of a
+        // packet lost afterwards, and these answers are one packet each, so the sui-node peer that
+        // asked timed out
         var j: usize = 0;
         while (j < p.answered.items.len) {
             const id = p.answered.items[j];
-            const s = p.conn.stream(id);
-            if (s == null or (s.?.fin_sent and s.?.retx.items.len == 0 and s.?.recv.complete())) {
+            if (p.conn.streamSettled(id)) {
                 p.conn.streamFree(id);
                 _ = p.answered.orderedRemove(j);
             } else j += 1;
@@ -415,9 +425,10 @@ pub const Peer = struct {
 
     fn requestInner(p: *Peer, arena: Allocator, route: []const u8, headers: []const wire.Header, body: []const u8, timeout_ms: u64) Error!Response {
         const id = try p.conn.openBidi();
-        // On every error path (timeout, reset, malformed response) the stream is released; late
-        // frames for it are then ignored by the connection.
-        errdefer p.conn.streamFree(id);
+        // On every error path (timeout, reset, malformed response) the stream is abandoned: the
+        // peer is asked to stop sending (STOP_SENDING) and the bytes it still sends are counted
+        // and dropped, so a timed-out large response does not eat the connection window.
+        errdefer p.conn.streamAbort(id, 0);
         const bytes = try wire.encodeRequest(arena, route, headers, body);
         try p.conn.streamWrite(id, bytes, true);
         const deadline = p.nowNs() + timeout_ms * std.time.ns_per_ms;

@@ -40,8 +40,18 @@ pub const Options = struct {
     sub_backlog: u64 = 512 << 10,
     /// Worker threads for dry_run and submit_transaction.
     slow_workers: usize = 4,
+    /// Worker threads and queue depth for edge feed assembly (their own pool: dry_run and
+    /// submit_transaction never wait behind feeds).
+    feed_workers: usize = 4,
+    feed_queue: usize = 64,
     /// Run on each slow worker before it exits (the simulate engine's thread caches).
     slow_worker_exit: ?*const fn () void = null,
+    /// Half-open connections above which a new client must come back with a Retry token
+    /// (stateless address validation, net/retry.zig; 0: always).
+    retry_threshold: usize = 64,
+    /// A connection that has not finished its handshake this long after its first Initial is
+    /// dropped (instead of holding a slot for the 30 s idle timeout).
+    handshake_timeout_ms: u64 = 5_000,
 };
 
 /// A live subscription sends a Heartbeat after this long without a match (spec 5.1).
@@ -55,6 +65,9 @@ pub const Stats = struct {
     sub_frames: Atomic(u64) = .init(0),
     bytes_in: Atomic(u64) = .init(0),
     bytes_out: Atomic(u64) = .init(0),
+    /// Retry packets sent, and Initials whose Retry token checked out.
+    retries: Atomic(u64) = .init(0),
+    retried_ok: Atomic(u64) = .init(0),
 };
 
 const Kind = enum { pending, zui, h3 };
@@ -169,6 +182,10 @@ pub const Listener = struct {
     /// Per-request scratch, reset (capacity kept) for each request instead of a fresh arena.
     req_arena: std.heap.ArenaAllocator = undefined,
     jobs: ?*jobs_mod.Jobs = null,
+    feed_jobs: ?*jobs_mod.Jobs = null,
+    /// I/O thread only: Retry tokens, and connections whose handshake is not finished.
+    guard: net.retry.Guard = undefined,
+    half_open: usize = 0,
 
     pub fn start(gpa: Allocator, io: Io, opts: Options, disp: *dispatch.Dispatcher) !*Listener {
         const l = try gpa.create(Listener);
@@ -182,10 +199,16 @@ pub const Listener = struct {
         errdefer gpa.destroy(tx);
         const rx = try gpa.create(udpio.RxBatch);
         errdefer gpa.destroy(rx);
-        tx.n = 0;
+        // Field defaults, not just `n`: `off[0]` must be 0 (gpa.create leaves it undefined, and
+        // `slot()` indexed the buffer with 0xaaaaaaaa in safe builds: panic on the first send).
+        tx.* = .{};
+        rx.* = .{};
         var o = opts;
         if (std.c.getenv("ZUI_NATIVE_SPIN_US")) |v| o.spin_us = std.fmt.parseInt(u32, std.mem.span(v), 10) catch o.spin_us;
         l.* = .{ .gpa = gpa, .io = io, .opts = o, .disp = disp, .sock = sock, .keys = .init(gpa), .us = .init(sock.handle), .tx = tx, .rx = rx, .req_arena = .init(gpa) };
+        var gk: [32]u8 = undefined;
+        io.random(&gk);
+        l.guard = net.retry.Guard.init(gk);
         l.io_thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, ioLoop, .{l});
         return l;
     }
@@ -197,7 +220,12 @@ pub const Listener = struct {
     pub fn stop(l: *Listener) void {
         l.stop_flag.store(true, .release);
         if (l.io_thread) |t| t.join();
+        l.closeAll();
         if (l.jobs) |j| {
+            j.deinit();
+            l.gpa.destroy(j);
+        }
+        if (l.feed_jobs) |j| {
             j.deinit();
             l.gpa.destroy(j);
         }
@@ -216,6 +244,31 @@ pub const Listener = struct {
         l.gpa.destroy(l.rx);
         l.sock.close(l.io);
         l.gpa.destroy(l);
+    }
+
+    /// Tells every client the listener is going away (CONNECTION_CLOSE: zui/1 `shutdown`,
+    /// H3_NO_ERROR under h3), so an edge fails over at once instead of waiting out its request
+    /// timeout. Sent twice: the connection is freed right after, nothing would repeat a lost one.
+    fn closeAll(l: *Listener) void {
+        const now = l.nowNs();
+        var it = l.slots.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            const c = s.conn;
+            if (c.isClosed()) continue;
+            c.closeApp(if (s.kind == .h3) 0x100 else @intFromEnum(proto.Code.shutdown));
+            var d: [udpio.max_dgram]u8 = undefined;
+            var k: usize = 0;
+            while (k < 4) : (k += 1) {
+                const n = c.pollTransmit(now, &d) orelse break;
+                for (0..2) |_| {
+                    if (l.tx.full()) l.tx.flush(&l.us);
+                    @memcpy(l.tx.slot()[0..n], d[0..n]);
+                    l.tx.commit(n, &s.addr);
+                }
+            }
+        }
+        l.tx.flush(&l.us);
     }
 
     fn nowNs(l: *const Listener) u64 {
@@ -296,6 +349,7 @@ pub const Listener = struct {
             l.tx.flush(&l.us);
             for (dead.items) |k| if (l.slots.fetchRemove(k)) |kv| {
                 _ = l.stats.active.fetchSub(1, .monotonic);
+                if (kv.value.kind == .pending) l.half_open -|= 1;
                 for (kv.value.reqs.keys(), kv.value.reqs.values()) |id, *r| if (r.relay) |rr| l.relayDetach(k, id, rr);
                 l.freeSlot(kv.value);
             };
@@ -339,6 +393,29 @@ pub const Listener = struct {
         if (version != 1) return;
         const ty = (d[0] >> 4) & 3;
         if (ty != 0 or d.len < 1200 or dl < 8) return;
+        // Under a handshake flood a client first proves it receives at its address (a Retry and
+        // its token); nothing is kept until it does.
+        var ab: [19]u8 = undefined;
+        const abytes = net.retry.addrBytes(&from, &ab);
+        const tok = net.retry.initialToken(d) orelse return;
+        const now_s: u32 = @truncate(@as(u64, @intCast(@divTrunc(Io.Clock.real.now(l.io).toNanoseconds(), std.time.ns_per_s))));
+        var orig_buf: [20]u8 = undefined;
+        var orig: ?[]const u8 = null;
+        if (tok.len > 0) if (l.guard.check(tok, abytes, now_s)) |o| {
+            @memcpy(orig_buf[0..o.len], o);
+            orig = orig_buf[0..o.len];
+        };
+        if (orig == null and l.half_open >= l.opts.retry_threshold) {
+            var tb: [net.retry.max_token]u8 = undefined;
+            const t = l.guard.token(&tb, abytes, now_s, dcid);
+            var nscid: [conn_mod.cid_len]u8 = undefined;
+            l.io.random(&nscid);
+            if (l.tx.full()) l.tx.flush(&l.us);
+            const n = net.retry.writeRetry(l.tx.slot(), version, scid, &nscid, t, dcid, @truncate(nscid[0]));
+            l.tx.commit(n, &from);
+            _ = l.stats.retries.fetchAdd(1, .monotonic);
+            return;
+        }
         if (l.slots.count() >= l.opts.max_connections) return;
         var seed: [64]u8 = undefined;
         l.io.random(&seed);
@@ -359,7 +436,12 @@ pub const Listener = struct {
             .alt = .{ .alpn_index = 1, .cert_der = l.opts.cert.bytes(), .key = l.opts.cert.key },
             .max_datagram_frame_size = 65535,
             .pmtu_max = 1452,
+            .handshake_timeout_ms = l.opts.handshake_timeout_ms,
         }, now, dcid, scid) catch return;
+        if (orig) |o| {
+            c.markRetried(o, dcid);
+            _ = l.stats.retried_ok.fetchAdd(1, .monotonic);
+        }
         const s = l.gpa.create(Slot) catch {
             c.deinit();
             return;
@@ -373,6 +455,7 @@ pub const Listener = struct {
         };
         _ = l.stats.accepted.fetchAdd(1, .monotonic);
         _ = l.stats.active.fetchAdd(1, .monotonic);
+        l.half_open += 1;
         c.handleDatagram(now, d);
     }
 
@@ -398,6 +481,7 @@ pub const Listener = struct {
         if (!c.isEstablished()) return;
         const cio: CIo = .{ .c = c };
         if (s.kind == .pending) {
+            l.half_open -|= 1;
             s.kind = if (c.alpnIndex() == 1) .h3 else .zui;
             if (s.kind == .h3) {
                 s.h3s = h3.ServerSession.init(l.gpa);
@@ -415,10 +499,9 @@ pub const Listener = struct {
                         r.done = true;
                         continue;
                     };
-                    if (r.relay != null and st.reset != null) {
-                        l.relayDetach(s.key, id, r.relay.?);
-                        r.relay = null;
-                        r.done = true;
+                    if (st.reset != null) {
+                        // the client cancelled (spec 3.1): stop and free the stream
+                        l.cancelReq(s, id, r);
                         continue;
                     }
                     const data = st.recv.contiguous();
@@ -434,6 +517,7 @@ pub const Listener = struct {
         }
         // slow methods finished on a worker
         if (l.jobs) |j| j.collect(s.key, JobCtx{ .l = l, .s = s }, jobDone, &l.slots);
+        if (l.feed_jobs) |j| j.collect(s.key, JobCtx{ .l = l, .s = s }, jobDone, &l.slots);
         // requests
         var i: usize = 0;
         while (i < s.reqs.count()) {
@@ -451,11 +535,14 @@ pub const Listener = struct {
         i = 0;
         while (i < s.answered.items.len) {
             const id = s.answered.items[i];
-            const st = c.stream(id) orelse {
+            if (c.stream(id) == null) {
                 _ = s.answered.swapRemove(i);
                 continue;
-            };
-            if (st.fin_sent and st.retx.items.len == 0 and c.streamUnsent(id) == 0) {
+            }
+            // Every packet of the response acknowledged, not just sent (conn.streamSettled). Freed
+            // on "all sent", a packet lost afterwards could not be resent (its stream was gone)
+            // and the client waited out its 20 s request timeout: the edge catch-up stall.
+            if (c.streamSettled(id)) {
                 c.streamFree(id);
                 _ = s.answered.swapRemove(i);
                 continue;
@@ -479,11 +566,13 @@ pub const Listener = struct {
                 continue;
             };
             if (st.reset != null) {
-                if (s.reqs.getPtr(id)) |r| if (r.relay) |rr| {
-                    l.relayDetach(s.key, id, rr);
-                    r.relay = null;
-                    r.done = true;
-                };
+                const unwritten = st.send_off == 0 and st.send_buf.items.len == 0 and !st.fin_queued;
+                if (s.reqs.getPtr(id)) |r| {
+                    l.cancelReq(s, id, r);
+                } else if (unwritten) {
+                    // an HTTP/3 request or a client uni stream reset before any answer
+                    c.streamAbort(id, h3_request_cancelled);
+                }
                 if (hs.onReset(cio, id)) |dv| l.deliver(s, dv);
                 s.h3_streams.swapRemoveAt(i);
                 continue;
@@ -500,9 +589,42 @@ pub const Listener = struct {
                 if (dv) |d| l.deliver(s, d);
                 if (c.stream(id)) |st2| if (n > 0) st2.recv.consume(n);
                 if (fin) fin_done.* = true;
+                // The session is done with the stream (answered 400/404/405/429, a finished
+                // client uni stream, a stream of a stale session) and no zui/1 request owns it.
+                if (!hs.streams.contains(id) and !s.reqs.contains(id)) if (c.stream(id)) |st2| {
+                    if (st2.fin_queued) {
+                        s.answered.append(l.gpa, id) catch {};
+                    } else if (id & 2 != 0) {
+                        c.streamFree(id); // uni: nothing to send
+                    } else {
+                        c.streamAbort(id, h3_request_cancelled);
+                    }
+                    s.h3_streams.swapRemoveAt(i);
+                    continue;
+                };
             }
             i += 1;
         }
+    }
+
+    /// H3_REQUEST_CANCELLED (RFC 9114 section 8.1).
+    const h3_request_cancelled: u64 = 0x10c;
+
+    /// The client reset request stream `id`: detach a relay, drop a request in progress (a
+    /// worker's answer finds the stream gone), and free the stream with STOP_SENDING/RESET_STREAM
+    /// as needed. A subscription's control stream is left to `pumpSubs`, which ends it.
+    fn cancelReq(l: *Listener, s: *Slot, id: u64, r: *ReqStream) void {
+        if (r.relay) |rr| l.relayDetach(s.key, id, rr);
+        r.relay = null;
+        if (r.sub != null) return;
+        r.done = true;
+        s.conn.streamAbort(id, l.cancelCode(s));
+    }
+
+    /// The zui/1 code 0 as a stream error: itself on raw QUIC, its WebTransport code under h3.
+    fn cancelCode(l: *const Listener, s: *const Slot) u64 {
+        _ = l;
+        return if (s.kind == .h3) h3.wtErrorCode(0) else 0;
     }
 
     fn deliver(l: *Listener, s: *Slot, dv: h3.Delivery) void {
@@ -551,6 +673,14 @@ pub const Listener = struct {
         const j = l.gpa.create(jobs_mod.Jobs) catch return null;
         j.* = .{ .gpa = l.gpa, .io = l.io, .disp = l.disp, .wake = .{ .ctx = l, .call = wakeSelf }, .workers = l.opts.slow_workers, .on_exit = l.opts.slow_worker_exit };
         l.jobs = j;
+        return j;
+    }
+
+    fn feedJobs(l: *Listener) ?*jobs_mod.Jobs {
+        if (l.feed_jobs) |j| return j;
+        const j = l.gpa.create(jobs_mod.Jobs) catch return null;
+        j.* = .{ .gpa = l.gpa, .io = l.io, .disp = l.disp, .wake = .{ .ctx = l, .call = wakeSelf }, .workers = l.opts.feed_workers, .max_inflight = l.opts.feed_queue, .on_exit = l.opts.slow_worker_exit };
+        l.feed_jobs = j;
         return j;
     }
 
@@ -667,6 +797,15 @@ pub const Listener = struct {
                 return;
             }
             proto.errorResponse(&out, a, .rate_limited, "too many executions in flight", &.{ 0, 0, 0, 0 }) catch return;
+            return l.respond(s, id, out.items);
+        }
+        if (dispatch.feedMethod(req.method)) {
+            const j = l.feedJobs();
+            if (j != null and j.?.push(s.key, id, s.principal, r.buf.items)) {
+                r.queued = true;
+                return;
+            }
+            proto.errorResponse(&out, a, .rate_limited, "too many feed requests in flight", &.{ 0, 0, 0, 0 }) catch return;
             return l.respond(s, id, out.items);
         }
         l.disp.handle(a, req, s.principal, &out);
@@ -929,7 +1068,6 @@ pub const Listener = struct {
 
     fn pumpSubs(l: *Listener, s: *Slot, tip_opt: ?u64) void {
         if (s.subs.items.len == 0) return;
-        const tip = tip_opt orelse return;
         const c = s.conn;
         var snap = l.disp.svc.store.snapshot();
         defer snap.release();
@@ -943,11 +1081,20 @@ pub const Listener = struct {
             const ds = c.stream(sb.data);
             const cs = c.stream(sb.ctrl);
             if (ds == null or ds.?.stopped_by_peer != null or cs == null or cs.?.reset != null) {
+                // the client ended it (spec 3.2): free both streams and their credit
+                const code = l.cancelCode(s);
+                c.streamAbort(sb.data, code);
+                c.streamAbort(sb.ctrl, code);
                 subGone(s, sb.ctrl);
                 sub.deinit(l.gpa, &sb.req);
                 _ = s.subs.swapRemove(i);
                 continue;
             }
+            // (cancels are handled before the store has a checkpoint too)
+            const tip = tip_opt orelse {
+                i += 1;
+                continue;
+            };
             if (sb.cursor > tip) sb.live = true;
             if (sb.live and tip >= sb.cursor and tip - sb.cursor > sb.req.max_lag) {
                 l.endSub(s, i, .lagged, sb.cursor -| 1);
@@ -982,3 +1129,113 @@ pub const Listener = struct {
         }
     }
 };
+
+const ListenerTestClient = struct {
+    io: Io,
+    sock: Io.net.Socket,
+    us: udpio.Sock,
+    to: Io.net.IpAddress,
+    c: *conn_mod.Connection,
+    tx: udpio.TxBatch = .{},
+    rx: udpio.RxBatch = .{},
+
+    fn pump(t: *ListenerTestClient) void {
+        var now: u64 = @intCast(Io.Clock.awake.now(t.io).toNanoseconds());
+        while (t.c.pollTransmit(now, t.tx.slot())) |n| {
+            t.tx.commit(n, &t.to);
+            if (t.tx.full()) t.tx.flush(&t.us);
+        }
+        t.tx.flush(&t.us);
+        t.us.setWait(5 * std.time.ns_per_ms);
+        const n = t.rx.recv(&t.us, true);
+        now = @intCast(Io.Clock.awake.now(t.io).toNanoseconds());
+        for (0..n) |i| t.c.handleDatagram(now, t.rx.data(i));
+        if (t.c.nextTimeout()) |d| if (now >= d) t.c.onTimeout(now);
+    }
+};
+
+test "zui/1 listener: cancelled requests give their stream back, and stop sends CONNECTION_CLOSE" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var cfg: store.Config = .{ .max_live_objects = 1 << 10, .max_object_versions = 1 << 11, .max_transactions = 1 << 10, .max_checkpoints = 16, .max_batch_bytes = 16 << 20, .max_batch_objects = 1 << 10, .max_segments = 16, .segment_reserve = 4 << 20, .seed = 5 };
+    const sim = try store.SimIo.init(gpa, 11, .{}, 32 << 20);
+    defer sim.deinit();
+    const st = try store.Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer st.deinit();
+    var svc: @import("serve").service.Service = .{ .gpa = gpa, .store = st, .chain_id = @splat(0) };
+    defer svc.deinit();
+    var disp: dispatch.Dispatcher = .{ .svc = &svc };
+    const P256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const cert = cert_mod.generate(try P256.KeyPair.generateDeterministic(@splat(6)), @splat(1), 1_800_000_000, 14, "zui");
+    const id_seed: [32]u8 = @splat(9);
+    const l = try Listener.start(gpa, io, .{ .listen = .{ .ip4 = Io.net.Ip4Address.loopback(0) }, .identity_seed = id_seed, .cert = &cert, .max_streams = 8 }, &disp);
+    var stopped = false;
+    defer if (!stopped) l.stop();
+
+    var lo: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(0) };
+    const sock = try Io.net.IpAddress.bind(&lo, io, .{ .mode = .dgram });
+    defer sock.close(io);
+    var seed: [64]u8 = @splat(2);
+    const now0: u64 = @intCast(Io.Clock.awake.now(io).toNanoseconds());
+    const c = try conn_mod.Connection.init(gpa, .{
+        .server_name = "zui",
+        .identity_seed = @splat(4),
+        .expected_peer = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(id_seed)).public_key.toBytes(),
+        .seed = seed,
+        .now_unix = 1_800_000_000,
+        .alpn = &.{proto.alpn},
+        .max_streams_uni = 16,
+        .max_streams_bidi = 64,
+        .keep_alive_ms = 0,
+    }, now0);
+    defer c.deinit();
+    seed[0] = 1;
+    var cl: ListenerTestClient = .{ .io = io, .sock = sock, .us = .init(sock.handle), .to = l.address(), .c = c };
+    var rounds: usize = 0;
+    while (!c.isEstablished()) : (rounds += 1) {
+        if (rounds > 1000 or c.isClosed()) return error.TestUnexpectedResult;
+        cl.pump();
+    }
+    // 40 requests cut off mid-header (a 2-byte method varint, one byte of it) and cancelled, with
+    // 8 streams of credit: each must come back
+    for (0..40) |_| {
+        rounds = 0;
+        const id = while (true) : (rounds += 1) {
+            if (c.openBidi()) |id| break id else |_| {}
+            if (rounds > 2000) return error.TestUnexpectedResult;
+            cl.pump();
+        };
+        try c.streamWrite(id, &.{0x40}, false);
+        for (0..3) |_| cl.pump();
+        c.streamAbort(id, 0);
+        cl.pump();
+    }
+    // and a whole request is still answered
+    rounds = 0;
+    const id = while (true) : (rounds += 1) {
+        if (c.openBidi()) |id| break id else |_| {}
+        if (rounds > 2000) return error.TestUnexpectedResult;
+        cl.pump();
+    };
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(gpa);
+    try proto.encodeRequest(&req, gpa, .hello, 0, "");
+    try c.streamWrite(id, req.items, true);
+    rounds = 0;
+    while (!(c.stream(id).?.recv.complete())) : (rounds += 1) {
+        if (rounds > 2000) return error.TestUnexpectedResult;
+        cl.pump();
+    }
+    try std.testing.expect(c.stream(id).?.recv.contiguous().len > 0);
+    c.streamFree(id);
+    // stop: the client hears CONNECTION_CLOSE (zui/1 `shutdown`) instead of timing out
+    l.stop();
+    stopped = true;
+    rounds = 0;
+    while (!c.isClosed() and rounds < 200) : (rounds += 1) cl.pump();
+    const cc = c.close orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cc.remote);
+    try std.testing.expectEqual(@as(u64, @intFromEnum(proto.Code.shutdown)), cc.code);
+}

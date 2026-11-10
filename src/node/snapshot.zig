@@ -334,6 +334,7 @@ pub const Fetcher = struct {
                 }
             },
         }
+        if (f.origin == .https) @import("http.zig").net_cap.charge(f.io, out.items.len); // --net-max-mbps, after the fact
         _ = f.bytes.fetchAdd(out.items.len, .monotonic);
     }
 };

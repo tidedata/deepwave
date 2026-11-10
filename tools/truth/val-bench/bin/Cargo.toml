@@ -1,0 +1,28 @@
+[package]
+name = "zui-val-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "zui validator speed bench, Mysten side (sui 1.83.1 sui-types / sui-core), stages 1, 5 and 6"
+
+# Built as a member of a scratch worktree of the sui 1.83.1 checkout (tools/truth/val-bench/run.sh),
+# so it links the very crates sui-node is built from, from the shared target dir.
+
+[[bin]]
+name = "zui-val-bench"
+path = "src/main.rs"
+
+[dependencies]
+sui-types.workspace = true
+sui-core.workspace = true
+sui-protocol-config.workspace = true
+fastcrypto.workspace = true
+fastcrypto-zkp.workspace = true
+bcs.workspace = true
+serde_json.workspace = true
+zstd.workspace = true
+nonempty.workspace = true
+imbl.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true

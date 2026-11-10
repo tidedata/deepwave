@@ -21,6 +21,8 @@ pub const zstd_c = @import("zstd_c.zig");
 pub const convert = @import("convert.zig");
 pub const prefetch = @import("prefetch.zig");
 pub const psort = @import("psort.zig");
+/// Envelopes served in place of stored ones (submitted signature order).
+pub const txfix = @import("txfix.zig");
 /// Sampled read latency per table (`rocksdb_get_latency_seconds{cf_name}`).
 pub const readstats = @import("readstats.zig");
 const store_impl = @import("store.zig");

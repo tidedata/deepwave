@@ -22,6 +22,8 @@ pub const Method = enum(u64) {
     get_dictionary = 0x0b,
     get_epoch_proof = 0x0c,
     get_epoch_info = 0x0d,
+    /// Edge feed of one checkpoint (docs/EDGE.md), deepwave lane edge.
+    get_checkpoint_feed = 0x0e,
     subscribe = 0x20,
     pair_relay = 0x30,
     _,

@@ -10,9 +10,29 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const node = @import("node");
 const rpc_exec = @import("rpc_exec");
+const move_vm = @import("move_vm");
 const build_options = @import("build_options");
 const store = node.store;
 const node_options = @import("node_options");
+const edge = @import("edge");
+
+/// `deepwave validator ARGS...`: validator mode lives in its own binary (the unaudited validator
+/// modules are never linked into deepwave, docs/VALIDATOR-DESIGN.md 3); this hands over to the
+/// `deepwave-validator` installed next to this executable with the same arguments.
+fn validatorCmd(io: Io, arena: std.mem.Allocator, rest: []const []const u8) !u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = std.process.executableDirPath(io, &buf) catch {
+        std.debug.print("deepwave validator: cannot locate deepwave-validator next to this executable\n", .{});
+        return 1;
+    };
+    const exe = try std.fmt.allocPrint(arena, "{s}/deepwave-validator", .{buf[0..n]});
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(arena, exe);
+    try argv.appendSlice(arena, rest);
+    const e = std.process.replace(io, .{ .argv = argv.items });
+    std.debug.print("deepwave validator: cannot run {s}: {s} (build it with ./zig build validator)\n", .{ exe, @errorName(e) });
+    return 1;
+}
 
 const usage =
     \\deepwave run --dir DIR [options]       follow mainnet or testnet: verify, (execute,) store, serve
@@ -22,6 +42,16 @@ const usage =
     \\  --source http[:URL] | s3 | dir:PATH  checkpoint source (default http: https://checkpoints.<network>.sui.io,
     \\                                       no credentials; S3 is its fallback when the credentials below load)
     \\  --no-s3-fallback                     http source without the S3 fallback
+    \\  --source zui1:ADDR:PORT/KEYHEX[,...]  edge node: follow core nodes (or other edges) over zui/1; the
+    \\                                       feeds are verified here like any other source (certificate, digests, objects)
+    \\  --profile core | edge | macmini      flag defaults of a node kind (edge: one epoch of history, no read sets, age-out;
+    \\                                       macmini: Mac mini 32 GB and up); flags after it win
+    \\  --edge-feed                          serve the edge feed and its zstd dictionary on --native-listen (core nodes, and
+    \\                                       edges that feed other edges); off by default
+    \\  --native-http-rpc                    POST /zui1/rpc on the --native-listen TCP port: zui/1 requests over HTTP/1.1 (Workers, fetch;
+    \\                                       put a TLS terminator in front); never dry_run, submit, subscribe or the feed
+    \\  --edge-conns N                       zui/1 connections to the cores (default 4; the profile's)
+    \\  --no-edge-zstd                       ask the cores for raw feeds (no zstd dictionary)
     \\  --stream URL[,URL...] | off         live SubscribeCheckpoints streams (gRPC-web) racing each other and the
     \\                                       tip polls; default https://fullnode.<network>.sui.io with a network source.
     \\                                       Any node works (http://127.0.0.1:9000 = the local sui-node standby);
@@ -30,6 +60,9 @@ const usage =
     \\                                       checkpoints with sponsored or multi-signer transactions (the bucket holds
     \\                                       only the signer order); default the first loopback --stream URL, else the first
     \\  --sig-order-rps N                    its request budget (default 20, 200 for a loopback node; 0 = off)
+    \\  --sig-order-sweep on|off             also sweep committed checkpoints (BatchGetTransactions, 200 a request) and
+    \\                                       serve that node's order for transactions stored in the contents' order
+    \\                                       (node/sig-order.log; default on)
     \\  --p2p HOST:PORT[@PEERID][,...]       also follow over p2p state sync (anemo) from these peers: summaries
     \\                                       and contents from peers, every transaction executed locally, the
     \\                                       checkpoint taken only when all effects equal the certified ones
@@ -42,7 +75,16 @@ const usage =
     \\  --p2p-only | --source p2p          follow from p2p peers alone (needs --p2p and a store to resume): no bucket,
     \\                                       S3 or stream; a checkpoint deepwave cannot build is retried, never left
     \\  --p2p-pinned SEQ:DIGEST[,...]        pinned checkpoints: a summary at SEQ must have this digest (base58)
+    \\  --tiles                             run the p2p tip path as pinned tiles on shared-memory rings (ingest, verify, exec, store, notify); default off
+    \\  --tile-cpus A,B,C,D,E                cores for the five tiles in order (default: not pinned); --tile-spin: never sleep when idle
     \\  --p2p-exec-threads N                 threads executing a checkpoint's independent transactions (default 4; 1: in order)
+    \\  --sig-fast                           signature speed layer: decoded public-key caches, zkLogin proof cache, multisig batch (on with --sig-parallel; same verdicts)
+    \\  --sig-parallel MODE                  auto|on|off: batch signature and certificate checks on every core (CPU pool from the hw plan) and on
+    \\                                       the GPU when one passes its startup self-check; auto = on with more than 2 cores or such a GPU (default auto;
+    \\                                       verdicts identical in every mode)
+    \\  --gpu MODE                           off|auto|metal|cuda: accelerator for --sig-parallel (default: $ZUI_GPU, unset = auto)
+    \\  --cert-batch N                       checkpoint certificates decided as randomized batches of up to N (default 0: one
+    \\                                       pairing check per certificate, on every worker; same verdicts)
     \\  --exec-threads N                     execute mode: threads running transactions, across checkpoints (default: half the CPUs, at most 16; 0: one at a time on the ordered thread)
     \\  --exec-window N                      execute mode: checkpoints in flight between commit and execution (default 64)
     \\  --exec-cache-mb N                    execute mode: memory the threads' Move package caches share (default 3072)
@@ -79,6 +121,7 @@ const usage =
     \\                                       subscription-watermark-interval (25), subscription-max-subscribers (1024)
     \\  --native-listen ADDR                 zui/1 native protocol on UDP (QUIC zui/1 + WebTransport), off by default
     \\  --native-cert-hash-file FILE         write the WebTransport cert sha256 and the zui/1 key (hex lines)
+    \\  --native-identity-file FILE          zui/1 Ed25519 seed, kept across restarts (default <dir>/node/native-identity.seed)
     \\  --rpc-release 1.83 | 1.84 | N        GetEpoch protocol_config lists the fields of this sui-node release (default 1.83, as sui-node 1.83.1; raised to the chain's protocol version when newer)
     \\  --indexes | --no-indexes             StateService indexes (on disk in DIR/state-index: built from the live set once, then replayed from its watermark)
     \\  --metrics ADDR                       Prometheus text at http://ADDR/metrics
@@ -102,8 +145,13 @@ const usage =
     \\                                   or sui-node (1.83.1 exactly: gas price / RGP proposers, acks without details); same responses
     \\  --workers N --fetchers N --window N --poll-ms N --status-every S
     \\                                       (--poll-ms: tip request spacing, default 25 for http, 100 for s3)
+    \\  --net-max-mbps N                     download cap in MiB per second (megabytes, not megabits) for checkpoint
+    \\                                       fetches and the snapshot restore together; 0 (default) = no cap
     \\  --lookahead N                        at the tip, checkpoints past the frontier requested at once each time it moves (default 2, 0 = off)
     \\  --sync none | data | full            store durability (default data)
+    \\  --vm-aot                             run compiled Move code (src/move/vm/aot_gen, built by deepwave-aot) for packages whose bytecode digest
+    \\                                       matches; everything else interprets (off by default)
+    \\  --vm-aot-hot FILE                    with --vm-aot: only the functions this hot list names (<addr>::<module>::<fn|*> [calls [instrs]] per line)
     \\  --no-halt                            execute mode: keep going after a mismatch
     \\  --snapshot EPOCH | latest | retained   empty store: restore Mysten's formal snapshot of EPOCH, then follow;
     \\                                       retained: the newest one at or below current - --retention-epochs, so the
@@ -123,6 +171,8 @@ const usage =
     \\  --no-compress                       write new segments uncompressed (default: zstd chunks, store/chunk.zig)
     \\  --age-out                           background age-out: superseded versions and checkpoint data below the retention floors become holes in sealed segments, freed by hole punching (default off; ZUI_AGE_OUT=1 also turns it on)
     \\  --chunk-cache-mb N                  decoded-chunk cache budget in MiB (default 1024)
+    \\  --hw SPEC                           machine profile and path overrides (also env ZUI_HW), e.g. profile=server,sha_ni=off,pin=on;
+    \\                                       off unless given; explicit cache flags win. keys: src/core/hw.zig, `deepwave-hw report`
     \\  --cp-cache-mb N                     pre-encoded GetCheckpoint response cache in MiB (default 256, 0 off)
     \\  --no-smooth                         prune whole epochs at once (sui-node smooth: false); default: smoothed over the epoch like sui-node
     \\  --memtable-versions N               object versions per index run (default 4M; leave it unset for a snapshot restore, like --live-capacity: the bulk restore needs no larger runs)
@@ -145,6 +195,8 @@ const usage =
     \\  --snapshot-write-threads N           (default half the cores, 4 to 16)
     \\  --drain-ms N                         SIGTERM: time open RPC calls and streams get to finish (default 20000)
     \\  --shutdown-timeout S                 SIGTERM: exit after S seconds even if the flush is not done (default 110)
+    \\  --handoff-sock PATH                  zero-downtime upgrade: take over from a running deepwave on PATH, and be taken over from (SIGUSR2 starts a successor); takes DIR/zui.lock; off by default
+    \\  --verify-fallback                    protocol newer than this binary: keep following and serving, pause execution (alert lines are always on; zui_protocol_* metrics with this flag); off by default
     \\deepwave --config-path FILE.yaml [flags]          sui-node's command line: run with its fullnode.yaml
     \\deepwave config-check FILE                         the deepwave flags a config (fullnode.yaml or key = value) becomes
     \\deepwave check --dir DIR --against PATH --from A --to B
@@ -268,7 +320,7 @@ fn withConfigFile(arena: std.mem.Allocator, io: Io, args: []const []const u8) ![
         const eq = std.mem.indexOfScalar(u8, line, '=');
         const key = std.mem.trim(u8, if (eq) |e| line[0..e] else line, " \t");
         const val = if (eq) |e| std.mem.trim(u8, line[e + 1 ..], " \t") else "true";
-        const is_bool = for ([_][]const u8{ "keep-spool", "no-read-sets", "no-halt", "no-s3-fallback", "p2p-only" }) |b| {
+        const is_bool = for ([_][]const u8{ "keep-spool", "no-read-sets", "no-halt", "no-s3-fallback", "p2p-only", "tiles", "tile-spin", "edge-feed", "no-edge-zstd", "native-http-rpc" }) |b| {
             if (std.mem.eql(u8, key, b)) break true;
         } else false;
         if (is_bool) {
@@ -280,6 +332,11 @@ fn withConfigFile(arena: std.mem.Allocator, io: Io, args: []const []const u8) ![
     }
     try out.appendSlice(arena, rest.items);
     return out.items;
+}
+
+fn hwSpecErr(e: node.core.hw.ParseError, f: *const node.core.hw.ParseFail) u8 {
+    std.debug.print("--hw / ZUI_HW: {s} at {s}={s}\n", .{ @errorName(e), f.key[0..f.key_len], f.value[0..f.value_len] });
+    return 2;
 }
 
 fn need(args: []const []const u8, i: *usize) ![]const u8 {
@@ -324,6 +381,7 @@ pub fn main(init: std.process.Init) !u8 {
         try w.interface.flush();
         return 0;
     }
+    if (std.mem.eql(u8, cmd, "validator")) return validatorCmd(io, init.arena.allocator(), args[2..]);
     if (std.mem.eql(u8, cmd, "config-check") and args.len == 3) return configCheckCmd(init.arena.allocator(), io, args[2]);
     if (std.mem.eql(u8, cmd, "convert") and args.len == 4) return convertCmd(gpa, io, args[2], args[3]);
     if (std.mem.eql(u8, cmd, "check")) return checkCmd(gpa, io, args);
@@ -350,6 +408,40 @@ pub fn main(init: std.process.Init) !u8 {
     var exec_driver: rpc_exec.live.node_exec.NodeExec.Driver = .zui;
     var stream_url: ?[]const u8 = null;
     var stream_set = false;
+    var vm_aot = false;
+    var vm_aot_hot: ?[]const u8 = null;
+    // Machine profile (core/hw.zig): ZUI_HW first, `--hw` layered on top. Applied only if either is given.
+    const hw = node.core.hw;
+    var hw_spec: hw.Spec = .{};
+    var hw_fail: hw.ParseFail = .{};
+    hw.parseEnv(&hw_spec, &hw_fail) catch |e| return hwSpecErr(e, &hw_fail);
+
+    var sig_parallel: node.gpu.engine.Parallel = .auto;
+    var cert_batch: ?u32 = null;
+    var gpu_mode: ?node.gpu.Mode = null;
+    var edge_conns: ?u32 = null;
+    var edge_zstd = true;
+    var profile: ?edge.profile.Kind = null;
+    // `--profile` sets defaults, so it is applied before any other flag (a flag still wins).
+    {
+        var k: usize = 2;
+        while (k + 1 < args.len) : (k += 1) if (std.mem.eql(u8, args[k], "--profile")) {
+            profile = edge.profile.Kind.parse(args[k + 1]) orelse return usageErr("--profile core | edge | macmini");
+            const ps = edge.profile.settings(profile.?);
+            cfg.store_cfg.retention_epochs = ps.retention_epochs;
+            cfg.store_cfg.object_retention_epochs = ps.object_retention_epochs;
+            cfg.age_out = ps.age_out;
+            cfg.store_cfg.cache_bytes = @as(u64, ps.chunk_cache_mb) << 20;
+            cfg.cp_cache_bytes = @as(u64, ps.cp_cache_mb) << 20;
+            cfg.fetchers = ps.fetchers;
+            cfg.window = ps.window;
+            cfg.read_sets = ps.read_sets;
+            cfg.indexes = ps.indexes;
+            cfg.edge_feed = ps.edge_feed and profile.? != .core;
+            cfg.native_http_rpc = ps.http_rpc;
+            std.log.info("profile {s}: cache budget about {d} MiB", .{ @tagName(profile.?), edge.profile.cacheBudgetMb(ps) });
+        };
+    }
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -373,9 +465,21 @@ pub fn main(init: std.process.Init) !u8 {
                 cfg.source = .{ .http = .{ .base = v[5..] } };
             } else if (std.mem.startsWith(u8, v, "dir:")) {
                 cfg.source = .{ .dir = v[4..] };
+            } else if (std.mem.startsWith(u8, v, "zui1:")) {
+                cfg.source = .{ .zui1 = .{ .cores = v[5..] } };
             } else if (std.mem.eql(u8, v, "p2p")) {
                 cfg.p2p_only = true;
             } else return usageErr("--source http[:URL] | s3 | dir:PATH | p2p");
+        } else if (std.mem.eql(u8, a, "--profile")) {
+            _ = try need(args, &i); // applied above
+        } else if (std.mem.eql(u8, a, "--edge-feed")) {
+            cfg.edge_feed = true;
+        } else if (std.mem.eql(u8, a, "--native-http-rpc")) {
+            cfg.native_http_rpc = true;
+        } else if (std.mem.eql(u8, a, "--edge-conns")) {
+            edge_conns = try std.fmt.parseInt(u32, try need(args, &i), 10);
+        } else if (std.mem.eql(u8, a, "--no-edge-zstd")) {
+            edge_zstd = false;
         } else if (std.mem.eql(u8, a, "--stream")) {
             const v = try need(args, &i);
             stream_url = if (std.mem.eql(u8, v, "off")) null else v;
@@ -386,6 +490,14 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.p2p_key = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--p2p-discover")) {
             cfg.p2p_discover = try std.fmt.parseInt(u8, try need(args, &i), 10);
+        } else if (std.mem.eql(u8, a, "--sig-fast")) {
+            node.sig.fast.configure(node.sig.fast.all_on);
+        } else if (std.mem.eql(u8, a, "--sig-parallel")) {
+            sig_parallel = node.gpu.engine.Parallel.parse(try need(args, &i)) orelse return usageErr("--sig-parallel: auto, on or off");
+        } else if (std.mem.eql(u8, a, "--cert-batch")) {
+            cert_batch = try std.fmt.parseInt(u32, try need(args, &i), 10);
+        } else if (std.mem.eql(u8, a, "--gpu")) {
+            gpu_mode = node.gpu.Mode.parse(try need(args, &i)) orelse return usageErr("--gpu: off, auto, metal or cuda");
         } else if (std.mem.eql(u8, a, "--exec-threads")) {
             cfg.exec_threads = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--exec-window-mb")) {
@@ -394,6 +506,12 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.exec_cache_mb = @max(64, try std.fmt.parseInt(u32, try need(args, &i), 10));
         } else if (std.mem.eql(u8, a, "--exec-window")) {
             cfg.exec_window = @max(2, try std.fmt.parseInt(u32, try need(args, &i), 10));
+        } else if (std.mem.eql(u8, a, "--tiles")) {
+            cfg.tiles = true;
+        } else if (std.mem.eql(u8, a, "--tile-cpus")) {
+            cfg.tile_cpus = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--tile-spin")) {
+            cfg.tile_spin = true;
         } else if (std.mem.eql(u8, a, "--p2p-only")) {
             cfg.p2p_only = true;
         } else if (std.mem.eql(u8, a, "--p2p-pinned")) {
@@ -468,6 +586,8 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.native_listen = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--native-cert-hash-file")) {
             cfg.native_cert_hash_file = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--native-identity-file")) {
+            cfg.native_identity_file = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--rpc-release")) {
             cfg.rpc_release_max = node.node.parseRpcRelease(try need(args, &i)) orelse return usageErr("--rpc-release 1.83 | 1.84 | protocol version");
         } else if (std.mem.eql(u8, a, "--indexes")) {
@@ -493,12 +613,17 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.workers = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--fetchers")) {
             cfg.fetchers = try std.fmt.parseInt(u32, try need(args, &i), 10);
+        } else if (std.mem.eql(u8, a, "--net-max-mbps")) {
+            cfg.net_max_mbps = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--lookahead")) {
             cfg.lookahead = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--sig-order-rps")) {
             cfg.sig_order_rps = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--sig-order-from")) {
             cfg.sig_order_from = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--sig-order-sweep")) {
+            const v = try need(args, &i);
+            cfg.sig_order_sweep = if (std.mem.eql(u8, v, "on")) true else if (std.mem.eql(u8, v, "off")) false else return usageErr("--sig-order-sweep on | off");
         } else if (std.mem.eql(u8, a, "--window")) {
             cfg.window = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--poll-ms")) {
@@ -507,6 +632,10 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.status_every_s = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--sync")) {
             cfg.sync_mode = std.meta.stringToEnum(store.SyncMode, try need(args, &i)) orelse return usageErr("--sync none | data | full");
+        } else if (std.mem.eql(u8, a, "--vm-aot")) {
+            vm_aot = true;
+        } else if (std.mem.eql(u8, a, "--vm-aot-hot")) {
+            vm_aot_hot = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--no-halt")) {
             cfg.halt_on_mismatch = false;
         } else if (std.mem.eql(u8, a, "--snapshot")) {
@@ -523,6 +652,9 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, a, "--snapshot-threads")) {
             if (cfg.snapshot == null) cfg.snapshot = .{};
             cfg.snapshot.?.threads = try std.fmt.parseInt(u32, try need(args, &i), 10);
+        } else if (node_options.test_flags and std.mem.eql(u8, a, "--test-protocol-max")) {
+            // Test-only: claim protocols above N unsupported (drives --verify-fallback on a real chain).
+            node.node.upgrade.test_protocol_max = try std.fmt.parseInt(u64, try need(args, &i), 10);
         } else if (node_options.test_flags and std.mem.eql(u8, a, "--snapshot-expect-root")) {
             // Test-only trust bypass (a synthetic snapshot's root): built only with -Dnode-test-flags.
             if (cfg.snapshot == null) cfg.snapshot = .{};
@@ -553,6 +685,8 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.store_cfg.compress = false;
         } else if (std.mem.eql(u8, a, "--age-out")) {
             cfg.age_out = true;
+        } else if (std.mem.eql(u8, a, "--hw")) {
+            hw.parse(&hw_spec, try need(args, &i), &hw_fail) catch |e| return hwSpecErr(e, &hw_fail);
         } else if (std.mem.eql(u8, a, "--cp-cache-mb")) {
             cfg.cp_cache_bytes = (try std.fmt.parseInt(u64, try need(args, &i), 10)) << 20;
         } else if (std.mem.eql(u8, a, "--chunk-cache-mb")) {
@@ -591,6 +725,10 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.snapshot_write_threads = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--drain-ms")) {
             cfg.drain_ms = try std.fmt.parseInt(u32, try need(args, &i), 10);
+        } else if (std.mem.eql(u8, a, "--handoff-sock")) {
+            cfg.handoff_sock = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--verify-fallback")) {
+            cfg.verify_fallback = true;
         } else if (std.mem.eql(u8, a, "--shutdown-timeout")) {
             cfg.shutdown_timeout_s = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else {
@@ -600,10 +738,87 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (cfg.dir.len == 0) return usageErr("--dir is required");
     if (!stream_set) stream_url = cfg.network.params().fullnode_url;
+    if (vm_aot_hot != null and !vm_aot) return usageErr("--vm-aot-hot needs --vm-aot");
+    if (vm_aot) {
+        var hot: ?move_vm.aot.HotList = null;
+        if (vm_aot_hot) |hp| {
+            const text = Io.Dir.cwd().readFileAlloc(io, hp, std.heap.page_allocator, .limited(64 << 20)) catch |e| {
+                std.debug.print("--vm-aot-hot {s}: {s}\n", .{ hp, @errorName(e) });
+                return 2;
+            };
+            hot = move_vm.aot.HotList.parse(std.heap.page_allocator, text) catch |e| {
+                std.debug.print("--vm-aot-hot {s}: {s}\n", .{ hp, @errorName(e) });
+                return 2;
+            };
+        }
+        const n = move_vm.aot.enable(hot) catch return usageErr("out of memory");
+        std.log.info("vm-aot: on, {d} compiled modules{s}", .{ n, if (hot != null) " (hot list)" else "" });
+    }
     std.log.info("network: {s} (chain id {s})", .{ cfg.network.params().name, cfg.network.params().chain_id_b58 });
+    if (hw_spec.any) {
+        const m = hw.detect(cfg.dir);
+        const plan = hw.plan(&m, &hw_spec);
+        // Explicit cache flags win over the profile.
+        var exec_set = false;
+        var chunk_set = false;
+        var cp_set = false;
+        var workers_set = false;
+        var memtable_set = false;
+        var net_set = false;
+        for (args[2..]) |a| {
+            workers_set = workers_set or std.mem.eql(u8, a, "--workers");
+            memtable_set = memtable_set or std.mem.eql(u8, a, "--memtable-versions");
+            net_set = net_set or std.mem.eql(u8, a, "--p2p-listen-threads");
+            exec_set = exec_set or std.mem.eql(u8, a, "--exec-cache-mb");
+            chunk_set = chunk_set or std.mem.eql(u8, a, "--chunk-cache-mb");
+            cp_set = cp_set or std.mem.eql(u8, a, "--cp-cache-mb");
+        }
+        if (!exec_set) cfg.exec_cache_mb = @max(64, plan.exec_cache_mb);
+        if (!chunk_set) cfg.store_cfg.cache_bytes = @as(u64, plan.chunk_cache_mb) << 20;
+        if (!cp_set) cfg.cp_cache_bytes = @as(u64, plan.cp_cache_mb) << 20;
+        if (!workers_set) if (plan.workers) |w| {
+            cfg.workers = w;
+        };
+        // A snapshot restore wants the default run size (see --memtable-versions).
+        if (!memtable_set and cfg.snapshot == null) if (plan.memtable_versions) |v| {
+            cfg.store_cfg.max_object_versions = v;
+        };
+        if (!net_set) if (plan.net_threads) |v| {
+            cfg.p2p_listen_threads = v;
+        };
+        const applied = hw.apply(&m, &plan);
+        hw.logPlan(&m, &plan, applied);
+    }
     node.core.cpu.logChoice();
+    // Signature engine (gpu.engine): the CPU pool from the hw plan (cgroup quota and affinity
+    // counted), the GPU when one passes its self-check, installed for every batch path:
+    // checkpoint certificates (follower), zkLogin and Ed25519 batches (sig.batch), intake caches.
+    const sig_engine = blk: {
+        const m = hw.detect(cfg.dir);
+        const plan = hw.plan(&m, &hw_spec);
+        // follower workers: cores the cgroup quota and affinity leave us (getCpuCount ignores both)
+        if (cfg.workers == 0) cfg.workers = @max(1, plan.cores -| 1);
+        break :blk node.gpu.engine.install(io, std.heap.page_allocator, .{ .parallel = sig_parallel, .gpu = gpu_mode, .plan = &plan });
+    };
+    defer node.gpu.engine.uninstall();
+    // Checkpoint certificates as randomized batches (same verdicts): opt-in until the follower's
+    // batched wall time is measured at or under unbatched (dense window: 6.39 s vs 4.96 s before
+    // 2f4e4f3c). The workers already check certificates in parallel on every core.
+    _ = sig_engine;
+    cfg.cert_batch = cert_batch orelse 0;
     // The stream races tip polling of a network source; a local directory has no tip to race.
-    if (cfg.source != .dir) cfg.stream = stream_url;
+    if (cfg.source != .dir and cfg.source != .zui1) cfg.stream = stream_url;
+    if (cfg.source == .zui1) {
+        cfg.stream = if (stream_set) stream_url else null; // an edge follows its cores, not a public full node
+        const ps = edge.profile.settings(profile orelse .edge);
+        cfg.source.zui1.max_conns = edge_conns orelse ps.max_conns;
+        cfg.source.zui1.zstd = edge_zstd;
+        // The feed carries no input objects, so input read sets (and the package floor rows for
+        // system packages upgraded in place) cannot be built from it: off, not silently partial.
+        if (cfg.read_sets) std.log.info("read sets: off (a zui1 source carries no input objects)", .{});
+        cfg.read_sets = false;
+        if (cfg.poll_ms == null and profile != null) cfg.poll_ms = ps.poll_ms;
+    }
 
     policy_flags.install() catch |e| {
         std.log.err("start: transaction-deny-config / policy-config: {s}", .{@errorName(e)});
@@ -615,6 +830,23 @@ pub fn main(init: std.process.Init) !u8 {
     // Live bytes are counted (status line `mem ... node gpa`).
     node.memstat.node_gpa.parent = nodeAllocator();
     if (std.c.getenv("ZUI_MEMTRACE")) |v| node.memstat.trace_min = (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 32) << 20;
+    if (cfg.handoff_sock) |sock| {
+        node.node.handoff.setSuccessorArgs(std.heap.page_allocator, args) catch {};
+        node.node.handoff.installUsr2();
+        _ = node.node.handoff.begin(.{ .dir = cfg.dir, .sock = sock }) catch |e| {
+            std.log.err("handoff: {s}: another deepwave owns {s}, or the takeover from {s} failed", .{ @errorName(e), cfg.dir, sock });
+            return 1;
+        };
+        // Rehearsal knob (tools/handoff/systemd-rehearsal.sh): a slow store open, as a big store has.
+        if (std.c.getenv("ZUI_HANDOFF_TEST_INIT_DELAY_S")) |v| {
+            const secs = std.fmt.parseInt(c_uint, std.mem.span(v), 10) catch 0;
+            std.log.warn("handoff: test delay of {d} s before the store open", .{secs});
+            var ts: std.c.timespec = .{ .sec = @intCast(secs), .nsec = 0 };
+            _ = std.c.nanosleep(&ts, &ts);
+        }
+    }
+    // Runs after the node's own deinit below (defers are LIFO): the store is closed by then.
+    defer node.node.handoff.finishActive();
     const n = node.Node.init(node.memstat.node_gpa.allocator(), io, cfg) catch |e| {
         std.log.err("start: {s}", .{@errorName(e)});
         return 1;
@@ -671,7 +903,7 @@ fn s3Spec(cfg: *node.Config) ?*node.node.S3Spec {
     return switch (cfg.source) {
         .s3 => |*sp| sp,
         .http => |*h| if (h.fallback) |*fb| fb else null,
-        .dir => null,
+        .dir, .zui1 => null,
     };
 }
 
@@ -699,7 +931,7 @@ fn convertCmd(gpa: std.mem.Allocator, io: Io, in: []const u8, out_path: []const 
 /// (store/convert.zig). Safe to interrupt and rerun: each segment switches with two renames.
 fn storeCompressCmd(gpa: std.mem.Allocator, io: Io, args: []const []const u8) !u8 {
     const st = node.store;
-    var threads: u32 = @intCast(@max(1, std.Thread.getCpuCount() catch 8));
+    var threads: u32 = node.Node.usableCpus(); // the cgroup CPU quota included
     if (args.len >= 2) threads = try std.fmt.parseInt(u32, args[1], 10);
     var copts: st.convert.Options = .{ .threads = threads };
     if (args.len >= 3) copts.chunk_bytes = (try std.fmt.parseInt(u32, args[2], 10)) << 10;
@@ -751,7 +983,7 @@ fn storeChunkBenchCmd(gpa: std.mem.Allocator, io: Io, args: []const []const u8) 
     const st = node.store;
     const epoch = try std.fmt.parseInt(u64, args[1], 10);
     const sample: u64 = (if (args.len >= 3) try std.fmt.parseInt(u64, args[2], 10) else 1024) << 20;
-    const threads: u32 = if (args.len >= 4) try std.fmt.parseInt(u32, args[3], 10) else @intCast(@max(1, std.Thread.getCpuCount() catch 8));
+    const threads: u32 = if (args.len >= 4) try std.fmt.parseInt(u32, args[3], 10) else node.Node.usableCpus();
     var pb: [std.fs.max_path_bytes]u8 = undefined;
     const sub = try std.fmt.bufPrint(&pb, "{s}/store", .{args[0]});
     const path = if (Io.Dir.cwd().access(io, sub, .{})) |_| sub else |_| args[0];

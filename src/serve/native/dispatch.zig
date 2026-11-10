@@ -9,6 +9,7 @@ const serve = @import("serve");
 const index = @import("index");
 const proto = @import("proto.zig");
 const indexq = @import("indexq.zig");
+const edgefeed = @import("edgefeed.zig");
 const W = proto.W;
 const R = proto.R;
 const Code = proto.Code;
@@ -44,9 +45,19 @@ pub fn txDigest(tx_data: []const u8) [32]u8 {
     return out;
 }
 
+/// Hello feature bit of the edge feed (`get_checkpoint_feed`, `get_dictionary`). Bits 8..31 are
+/// reserved for subscription filter variants (8 + k), so this one sits outside that range.
+pub const feature_edge_feed_bit: u6 = 32;
+
 /// Methods that may block for long (execution): the listener runs them on worker threads.
 pub fn slowMethod(m: proto.Method) bool {
     return m == .dry_run or m == .submit_transaction;
+}
+
+/// Edge feed assembly (a checkpoint's whole transactions and objects, then compression): its own
+/// worker pool, so feed traffic never queues in front of a wallet's submit_transaction.
+pub fn feedMethod(m: proto.Method) bool {
+    return m == .get_checkpoint_feed;
 }
 
 /// Token check (section 6). Null: everyone is anonymous.
@@ -85,6 +96,8 @@ pub const Dispatcher = struct {
     server: []const u8 = "zui/0.1",
     /// The node's owner/balance index (`--indexes`); null: index methods answer UNAVAILABLE.
     ix: ?*index.Index = null,
+    /// Edge feed and dictionary (`--edge-feed`, docs/EDGE.md); null: those methods are UNIMPLEMENTED.
+    edge: ?*edgefeed.Feeder = null,
 
     /// Answers one request into `out` (a whole response: header, body, proof).
     pub fn handle(d: *Dispatcher, a: Allocator, req: proto.Request, principal: ?Principal, out: *std.ArrayList(u8)) void {
@@ -133,6 +146,10 @@ pub const Dispatcher = struct {
                 if (d.ix != null) feat |= 1 << 2;
                 if (d.hooks.simulator != null) feat |= 1 << 3;
                 if (d.hooks.submitter != null) feat |= 1 << 4;
+                if (d.edge) |fd| {
+                    feat |= @as(u64, 1) << feature_edge_feed_bit;
+                    if (fd.peek() != null) feat |= 1 << 1; // zstd frames
+                }
                 try w.int(u64, feat);
                 // Limits
                 try w.int(u32, 128);
@@ -140,7 +157,14 @@ pub const Dispatcher = struct {
                 try w.int(u32, proto.max_request_bytes);
                 try w.int(u32, proto.max_batch_objects);
                 try w.int(u64, 0);
-                try w.uleb(0); // dictionaries
+                const dc: ?*const @import("edgewire").dict.Dictionary = if (d.edge) |fd| fd.peek() else null;
+                if (dc) |x| {
+                    try w.uleb(1);
+                    try w.int(u32, x.id);
+                    try w.u8_(1); // kind: checkpoint (the whole feed frame)
+                    try w.fixed(&x.sha256);
+                    try w.int(u32, @intCast(x.content.len));
+                } else try w.uleb(0);
                 try w.int(u64, if (ei) |e| e.reference_gas_price else 0);
                 try w.u8_(if (authed or principal != null) 1 else 0);
                 return;
@@ -254,7 +278,16 @@ pub const Dispatcher = struct {
                 } else try w.u8_(0);
                 return;
             },
-            .get_dictionary => return error.Unimplemented,
+            .get_dictionary => {
+                const fd = d.edge orelse return error.Unimplemented;
+                const id = try r.int(u32);
+                try r.done();
+                return fd.handleDict(a, &snap, id, out);
+            },
+            .get_checkpoint_feed => {
+                const fd = d.edge orelse return error.Unimplemented;
+                return fd.handle(a, &snap, req, out);
+            },
             .subscribe, .pair_relay => return error.Malformed, // handled by the listener
             _ => return error.Unimplemented,
         }

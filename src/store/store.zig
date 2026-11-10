@@ -49,6 +49,7 @@ const chunk = @import("chunk.zig");
 const zstd_c = @import("zstd_c.zig");
 const cache_mod = @import("cache.zig");
 const readstats = @import("readstats.zig");
+const txfix = @import("txfix.zig");
 const hash = @import("hash");
 
 const Backend = io_mod.Backend;
@@ -1108,6 +1109,8 @@ pub const Store = struct {
 
     /// committed checkpoint + 1 (0: nothing committed yet).
     committed1: std.atomic.Value(u64) = .init(0),
+    /// Envelopes served in place of stored ones (submitted signature order, txfix.zig).
+    tx_fix: txfix.Table = .{},
     /// Checksum of the newest commit record (the chain anchor for the next group).
     last_commit: ?u64 = null,
     /// Highest committed checkpoint some meta ever recorded (never written lower).
@@ -1245,6 +1248,7 @@ pub const Store = struct {
             .age_debug = backend == .sim and std.c.getenv("ZUI_DST_DEBUG") != null,
         };
         s.cfg.dir = "";
+        s.tx_fix = .{ .gpa = gpa, .readers = &s.creaders };
         if (cfg.uaf_guard orelse (uaf_guard.default_on or uaf_guard.fromEnv())) {
             s.cache.mem = uaf_guard.allocator;
             switch (backend) {
@@ -1302,6 +1306,14 @@ pub const Store = struct {
         s.ageHandoff();
         s.chunkReclaim();
         s.rcu.poll(s, reclaim);
+        s.tx_fix.collect();
+    }
+
+    /// Drops the transaction fixes (txfix.zig) of checkpoints below `floor`, no longer served.
+    fn dropFixesBelow(s: *Store, floor: u64) void {
+        if (s.tx_fix.count() == 0) return;
+        const n = s.tx_fix.dropBelow(floor) catch return; // memory only: retried at the next prune
+        if (n > 0) std.log.info("transaction fixes: dropped {d} below checkpoint {d}", .{ n, floor });
     }
 
     const Kept = struct { it: *cache_mod.Item, holder: u64 };
@@ -1375,6 +1387,7 @@ pub const Store = struct {
     fn releaseAll(s: *Store) void {
         const gpa = s.gpa;
         s.pending_frees.deinit(gpa);
+        s.tx_fix.deinit();
         s.stopAger();
         s.ager.batch_c = null;
         s.ageHandoffLocked();
@@ -4345,6 +4358,13 @@ pub const Store = struct {
         s.ep_head.store(head, .release);
         try s.backend.syncDir();
         s.clean.due = true;
+        // Checkpoints in the aged segments are gone: so are their transaction fixes.
+        if (s.tx_fix.count() > 0) {
+            var snap = s.snapshot();
+            const low = snap.lowestCheckpoint();
+            snap.release();
+            if (low) |l| s.dropFixesBelow(l);
+        }
         s.rcuPoll();
         rep.ns = clock.now() - t0;
         return rep;
@@ -4375,6 +4395,7 @@ pub const Store = struct {
         if (s.batch_active) return error.BatchActive;
         if (s.poisoned) return error.Poisoned;
         if (f.cp_pruned) |hp| if (hp + 1 > s.cp_floor.load(.monotonic)) s.cp_floor.store(hp + 1, .release);
+        s.dropFixesBelow(s.cp_floor.load(.monotonic));
         if (f.obj_pruned) |hp| if (hp + 1 > s.obj_floor.load(.monotonic)) s.obj_floor.store(hp + 1, .release);
         if (!s.has_segment) return .{};
         const oe = @min(f.obj_epoch, s.cur_epoch);
@@ -6863,11 +6884,14 @@ pub const Snapshot = struct {
         const a = @as(usize, f.tx_len);
         const b2 = a + f.effects_len;
         if (p.len != b2 + f.events_len) return error.Corrupt;
+        // The submitted signature order, when the sweep found the stored one to be the contents'
+        // (txfix.zig): same length and TransactionData, so only the signatures' order changes.
+        const tx = if (s.store.tx_fix.find(digest)) |fx| (if (fx.tx.len == a) fx.tx else p[0..a]) else p[0..a];
         return .{ .hit = .{
             .checkpoint = h.seq,
             .digest = &f.digest,
             .effects_digest = &f.effects_digest,
-            .tx = p[0..a],
+            .tx = tx,
             .effects = p[a..b2],
             .events = if (f.has_events != 0) p[b2..] else null,
             .loc = l,

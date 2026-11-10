@@ -295,6 +295,24 @@ pub const Readers = struct {
         std.mem.sortUnstable(u64, v.gone[0..v.gone_n], {}, std.sort.asc(u64));
     }
 
+    /// For reclaimers outside the chunk cache (store txfix.zig): advances the epoch and returns
+    /// the one handed out before. A reader registered at or below it may hold what was
+    /// unpublished before this call; every later reader registers above it.
+    pub fn bump(r: *Readers) u64 {
+        r.lock.lock();
+        defer r.lock.unlock();
+        const e = r.cur;
+        r.cur += 1;
+        return e;
+    }
+
+    /// The oldest live epoch, or null with no live snapshot.
+    pub fn oldest(r: *Readers) ?u64 {
+        r.lock.lock();
+        defer r.lock.unlock();
+        return if (r.n > 0) r.ep[0] else null;
+    }
+
     /// Live snapshots (a gauge; racy).
     pub fn live(r: *Readers) u64 {
         r.lock.lock();

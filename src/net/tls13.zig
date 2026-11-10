@@ -41,6 +41,9 @@ pub const Config = struct {
     now_unix: i64,
     random: [32]u8,
     x25519_secret: [32]u8,
+    /// TLS over TCP (consensus gRPC), not QUIC: no quic_transport_parameters extension is sent
+    /// and none is required from the server. Default off: the anemo/QUIC path is unchanged.
+    tcp: bool = false,
 };
 
 const State = enum { wait_sh, wait_ee, wait_cert_or_req, wait_cert, wait_cert_verify, wait_finished, connected };
@@ -141,10 +144,11 @@ pub const Client = struct {
             try l.append(gpa, @intCast(c.cfg.alpn.len));
             try l.appendSlice(gpa, c.cfg.alpn);
         }
-        // quic_transport_parameters
-        try appendU16(&l, gpa, 0x0039);
-        try appendU16(&l, gpa, @intCast(c.cfg.local_tp.len));
-        try l.appendSlice(gpa, c.cfg.local_tp);
+        if (!c.cfg.tcp) { // quic_transport_parameters
+            try appendU16(&l, gpa, 0x0039);
+            try appendU16(&l, gpa, @intCast(c.cfg.local_tp.len));
+            try l.appendSlice(gpa, c.cfg.local_tp);
+        }
         const ext_total = l.items.len - ext_start;
         std.mem.writeInt(u16, l.items[ext_len_pos..][0..2], @intCast(ext_total), .big);
         const body_len = l.items.len - 4;
@@ -304,7 +308,7 @@ pub const Client = struct {
     fn encryptedExtensions(c: *Client, b: []const u8) Error!void {
         if (b.len < 2) return error.DecodeError;
         const tl = std.mem.readInt(u16, b[0..2], .big);
-        if (b.len != 2 + tl) return error.DecodeError;
+        if (b.len != 2 + @as(usize, tl)) return error.DecodeError;
         var p: usize = 2;
         var got = false;
         while (p < b.len) {
@@ -321,7 +325,7 @@ pub const Client = struct {
             }
             p += el;
         }
-        if (!got) return error.MissingTransportParameters;
+        if (!got and !c.cfg.tcp) return error.MissingTransportParameters;
     }
 
     fn certificate(c: *Client, b: []const u8) Error!void {
@@ -344,7 +348,7 @@ pub const Client = struct {
         if (b.len < 4) return error.DecodeError;
         const scheme = std.mem.readInt(u16, b[0..2], .big);
         const sl = std.mem.readInt(u16, b[2..4], .big);
-        if (scheme != 0x0807 or b.len != 4 + sl or sl != 64) return error.BadSignature;
+        if (scheme != 0x0807 or b.len != 4 + @as(usize, sl) or sl != 64) return error.BadSignature;
         const th = c.transcriptHash();
         var msg: [64 + 34 + 32]u8 = undefined;
         @memset(msg[0..64], 0x20);
@@ -418,3 +422,20 @@ pub const Client = struct {
         c.complete = true;
     }
 };
+
+test "server EncryptedExtensions and CertificateVerify length fields at their maximum are refused, not an overflow" {
+    const gpa = std.testing.allocator;
+    var c = Client.init(.{ .server_name = "zui", .local_tp = "", .identity = try Ed25519.KeyPair.generateDeterministic(@splat(1)), .cert_der = "", .now_unix = 0, .random = @splat(0), .x25519_secret = @splat(5) });
+    defer c.deinit(gpa);
+    for ([_]u16{ 0xffff, 0xfffe }) |v| {
+        var ee: [6]u8 = @splat(0);
+        std.mem.writeInt(u16, ee[0..2], v, .big);
+        try std.testing.expectError(error.DecodeError, c.encryptedExtensions(&ee));
+    }
+    for ([_]u16{ 0xffff, 0xfffd, 0xfffc }) |v| {
+        var b: [68]u8 = @splat(0);
+        std.mem.writeInt(u16, b[0..2], 0x0807, .big);
+        std.mem.writeInt(u16, b[2..4], v, .big);
+        try std.testing.expectError(error.BadSignature, c.certificateVerify(&b));
+    }
+}

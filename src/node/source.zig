@@ -19,6 +19,7 @@ const convert = @import("convert.zig");
 const sigorder = @import("sigorder.zig");
 const s3 = @import("s3.zig");
 const http = @import("http.zig");
+const edge = @import("edge");
 const Atomic = std.atomic.Value;
 const Metrics = struct {
     fn max(slot: *Atomic(u64), n: u64) void {
@@ -34,6 +35,9 @@ pub const Kind = union(enum) {
     s3: *s3.Bucket,
     /// Mysten's public bucket (checkpoints.mainnet.sui.io), with an optional S3 fallback.
     http: *http.Public,
+    /// Core nodes over zui/1 (`--source zui1:ADDR/KEY,...`, src/edge, docs/EDGE.md): edge feeds
+    /// rebuilt into blobs. Untrusted like every source: the follower verifies each blob.
+    zui1: *edge.client.Pool,
     /// No source (`--p2p-only`): every checkpoint is missing.
     none,
 };
@@ -113,8 +117,21 @@ pub const Source = struct {
             .s3 => |b| {
                 const key = std.fmt.bufPrint(&nb, "{d}.binpb.zst", .{seq}) catch unreachable;
                 if (try b.get(key, &sc.raw) == .missing) return .missing;
+                // The download cap (--net-max-mbps): s3.zig cannot pace inside a body, so the
+                // object is booked once it is in and this thread waits until it is paid for.
+                // (The public bucket books inside its own read loop, http.zig.)
+                http.net_cap.charge(s.io, sc.raw.items.len);
             },
             .http => |h| if (try h.get(seq, &sc.raw) == .missing) return .missing,
+            .zui1 => |p| {
+                const r = p.fetchBlob(sc.arena.allocator(), seq, out) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.BadData, error.TooLarge => return error.BadData,
+                    else => return error.SourceUnavailable,
+                };
+                if (r == .missing) return .missing;
+                return .blob;
+            },
             .none => return .missing,
         }
         return .zst;
@@ -161,6 +178,17 @@ pub const Source = struct {
             },
             .s3 => |b| return b.exists(std.fmt.bufPrint(&nb, "{d}.binpb.zst", .{seq}) catch unreachable),
             .http => |h| return h.exists(seq),
+            .zui1 => |p| {
+                var arena = std.heap.ArenaAllocator.init(s.gpa);
+                defer arena.deinit();
+                return p.exists(arena.allocator(), seq) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {
+                        std.log.warn("source zui/1: checkpoint {d}: {s}", .{ seq, @errorName(e) });
+                        return error.SourceUnavailable;
+                    },
+                };
+            },
             .none => return false,
         }
     }
@@ -169,10 +197,24 @@ pub const Source = struct {
     /// doubling steps, then bisection. About 2 log2(tip - lo) requests.
     pub fn latest(s: *const Source, lo_in: u64) !u64 {
         var lo = lo_in;
+        if (s.kind == .zui1) {
+            var arena = std.heap.ArenaAllocator.init(s.gpa);
+            defer arena.deinit();
+            const held = s.kind.zui1.lowestHeld(arena.allocator()) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    std.log.warn("source zui/1: no core answered hello ({s})", .{@errorName(e)});
+                    return error.SourceUnavailable;
+                },
+            };
+            lo = @max(lo, held);
+        }
         if (!try s.exists(lo)) return error.SourceMissing;
         var step: u64 = 1;
-        var hi: u64 = lo + step;
+        var hi: u64 = lo +| step;
         while (try s.exists(hi)) {
+            // No real chain gets here; a source that says every number exists would spin forever.
+            if (hi == std.math.maxInt(u64)) return error.SourceUnavailable;
             lo = hi;
             step *|= 2;
             hi = lo +| step;
@@ -318,6 +360,16 @@ pub const Fetcher = struct {
     /// The submitted signature order for bucket checkpoints with sponsored or multi-signer
     /// transactions, from the stream's full node (sigorder.zig; null: contents order).
     sig_order: ?*sigorder.Overlay = null,
+    /// Called after a checkpoint's `.chk` is renamed into the spool. Every spool writer (the
+    /// fetch threads, the live stream, p2p, an edge refetch) goes through `writeSpool`, so the
+    /// node points this at the follower, whose workers then block on the wake instead of
+    /// trying to open the file every 2 ms.
+    on_spooled: ?Spooled = null,
+
+    pub const Spooled = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, seq: u64) void,
+    };
 
     pub fn start(f: *Fetcher, n: u32) !void {
         f.threads = try f.gpa.alloc(std.Thread, n);
@@ -686,6 +738,8 @@ pub const Fetcher = struct {
         const name = std.fmt.bufPrint(&nb, "{d}.chk", .{seq}) catch unreachable;
         try f.spool.writeFile(f.io, .{ .sub_path = tmp, .data = bytes });
         try f.spool.rename(tmp, f.spool, name, f.io);
+        // After the rename: a reader woken here finds the file.
+        if (f.on_spooled) |h| h.call(h.ctx, seq);
         // A duplicate that lands after the checkpoint was applied and cleaned would stay forever.
         if (!f.keep and seq < f.applied_next.load(.acquire)) {
             f.spool.deleteFile(f.io, name) catch {};

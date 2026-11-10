@@ -259,7 +259,7 @@ pub const Server = struct {
             p += elen;
             switch (et) {
                 0x002b => { // supported_versions
-                    if (ed.len < 1 or ed[0] + 1 != ed.len or ed[0] % 2 != 0) return error.DecodeError;
+                    if (ed.len < 1 or @as(usize, ed[0]) + 1 != ed.len or ed[0] % 2 != 0) return error.DecodeError;
                     var k: usize = 1;
                     while (k < ed.len) : (k += 2) if (ed[k] == 0x03 and ed[k + 1] == 0x04) {
                         tls13 = true;
@@ -268,7 +268,7 @@ pub const Server = struct {
                 0x000d => { // signature_algorithms
                     if (ed.len < 2) return error.DecodeError;
                     const l = std.mem.readInt(u16, ed[0..2], .big);
-                    if (l + 2 != ed.len or l % 2 != 0) return error.DecodeError;
+                    if (@as(usize, l) + 2 != ed.len or l % 2 != 0) return error.DecodeError;
                     var k: usize = 2;
                     while (k < ed.len) : (k += 2) {
                         if (ed[k] == 0x08 and ed[k + 1] == 0x07) ed25519 = true;
@@ -280,7 +280,7 @@ pub const Server = struct {
                 0x0033 => { // key_share
                     if (ed.len < 2) return error.DecodeError;
                     const l = std.mem.readInt(u16, ed[0..2], .big);
-                    if (l + 2 != ed.len) return error.DecodeError;
+                    if (@as(usize, l) + 2 != ed.len) return error.DecodeError;
                     var k: usize = 2;
                     while (k + 4 <= ed.len) {
                         const g = std.mem.readInt(u16, ed[k..][0..2], .big);
@@ -293,7 +293,7 @@ pub const Server = struct {
                 },
                 0x0039 => tp = ed, // quic_transport_parameters
                 0x0010 => { // application_layer_protocol_negotiation
-                    if (ed.len < 2 or std.mem.readInt(u16, ed[0..2], .big) + 2 != ed.len) return error.DecodeError;
+                    if (ed.len < 2 or @as(usize, std.mem.readInt(u16, ed[0..2], .big)) + 2 != ed.len) return error.DecodeError;
                     alpn = ed[2..];
                 },
                 else => {}, // server_name, supported_groups, alpn, psk modes...: nothing to do
@@ -437,7 +437,7 @@ pub const Server = struct {
         if (b.len < 4) return error.DecodeError;
         const scheme = std.mem.readInt(u16, b[0..2], .big);
         const sl = std.mem.readInt(u16, b[2..4], .big);
-        if (scheme != 0x0807 or b.len != 4 + sl or sl != 64) return error.BadSignature;
+        if (scheme != 0x0807 or b.len != 4 + @as(usize, sl) or sl != 64) return error.BadSignature;
         const th = s.transcriptHash();
         var m: [64 + 34 + 32]u8 = undefined;
         @memset(m[0..64], 0x20);
@@ -513,5 +513,93 @@ test "tls13 server over TCP with a loaded chain refuses a client whose ALPN list
             try std.testing.expectError(error.HandshakeFailure, r);
             try std.testing.expectEqual(@as(?u8, 0), s.alpn);
         }
+    }
+}
+
+/// Offset, in a ClientHello handshake message (its 4-byte header included), of the data of
+/// extension `et`, or null when the message does not carry it. For tests that rewrite one length
+/// field of a real ClientHello (here, fuzz_test.zig and conn.zig).
+pub fn helloExtOffset(m: []const u8, et: u16) ?usize {
+    var p: usize = 4 + 2 + 32;
+    if (m.len <= p) return null;
+    p += 1 + @as(usize, m[p]);
+    if (m.len < p + 2) return null;
+    p += 2 + @as(usize, std.mem.readInt(u16, m[p..][0..2], .big));
+    if (m.len <= p) return null;
+    p += 1 + @as(usize, m[p]);
+    p += 2;
+    while (p + 4 <= m.len) {
+        const t = std.mem.readInt(u16, m[p..][0..2], .big);
+        const l = std.mem.readInt(u16, m[p + 2 ..][0..2], .big);
+        if (t == et) return p + 4;
+        p += 4 + @as(usize, l);
+    }
+    return null;
+}
+
+/// The extension length fields that once overflowed a narrow integer (a remote crash in
+/// ReleaseSafe): extension type, the value written at the start of its data, and its width.
+pub const hostile_hello_lengths = [_]struct { et: u16, v: u16, w: u8 }{
+    .{ .et = 0x002b, .v = 0xff, .w = 1 }, // supported_versions: u8 list length
+    .{ .et = 0x002b, .v = 0xfe, .w = 1 },
+    .{ .et = 0x000d, .v = 0xffff, .w = 2 }, // signature_algorithms
+    .{ .et = 0x000d, .v = 0xfffe, .w = 2 },
+    .{ .et = 0x0033, .v = 0xffff, .w = 2 }, // key_share
+    .{ .et = 0x0033, .v = 0xfffe, .w = 2 },
+    .{ .et = 0x0010, .v = 0xffff, .w = 2 }, // ALPN
+    .{ .et = 0x0010, .v = 0xfffe, .w = 2 },
+};
+
+pub fn pokeLength(m: []u8, at: usize, v: u16, w: u8) void {
+    if (w == 1) m[at] = @truncate(v) else std.mem.writeInt(u16, m[at..][0..2], v, .big);
+}
+
+fn testHello(gpa: Allocator, out: *std.ArrayList(u8)) !void {
+    const ckp = try Ed25519.KeyPair.generateDeterministic(@splat(1));
+    var c = tls.Client.init(.{ .server_name = "zui", .local_tp = "ctp", .identity = ckp, .cert_der = "", .now_unix = 0, .random = @splat(7), .x25519_secret = @splat(8), .alpn = "zui/1" });
+    defer c.deinit(gpa);
+    try c.start(gpa);
+    try out.appendSlice(gpa, c.takeOutput(.initial));
+}
+
+test "ClientHello extension lengths at their maximum are a decode error, not an integer overflow" {
+    const gpa = std.testing.allocator;
+    var hello: std.ArrayList(u8) = .empty;
+    defer hello.deinit(gpa);
+    try testHello(gpa, &hello);
+    const skp = try Ed25519.KeyPair.generateDeterministic(@splat(2));
+    var scert: [x509.max_cert_len]u8 = undefined;
+    const sl = x509.generateSelfSigned(&scert, skp, @splat(6), "zui");
+    const cfg: Config = .{ .server_name = "zui", .local_tp = "stp", .identity = skp, .cert_der = scert[0..sl], .now_unix = 1_800_000_000, .random = @splat(9), .x25519_secret = @splat(10), .alpn = &.{"zui/1"}, .client_auth = false };
+    {
+        // the unmodified hello is accepted
+        var s = Server.init(cfg);
+        defer s.deinit(gpa);
+        try s.feed(gpa, .initial, hello.items);
+        try std.testing.expect(s.state == .wait_finished);
+    }
+    for (hostile_hello_lengths) |h| {
+        const m = try gpa.dupe(u8, hello.items);
+        defer gpa.free(m);
+        pokeLength(m, helloExtOffset(m, h.et).?, h.v, h.w);
+        var s = Server.init(cfg);
+        defer s.deinit(gpa);
+        try std.testing.expectError(error.DecodeError, s.feed(gpa, .initial, m));
+        var tcp = Server.init(.{ .server_name = "zui", .local_tp = "", .identity = skp, .cert_der = scert[0..sl], .now_unix = 0, .random = @splat(9), .x25519_secret = @splat(10), .alpn = &.{"h2"}, .client_auth = false, .tcp = true });
+        defer tcp.deinit(gpa);
+        try std.testing.expectError(error.DecodeError, tcp.feed(gpa, .initial, m));
+    }
+}
+
+test "client CertificateVerify with a maximum signature length is refused, not an overflow" {
+    const gpa = std.testing.allocator;
+    const skp = try Ed25519.KeyPair.generateDeterministic(@splat(2));
+    var s = Server.init(.{ .server_name = "zui", .local_tp = "", .identity = skp, .cert_der = "", .now_unix = 0, .random = @splat(9), .x25519_secret = @splat(10) });
+    defer s.deinit(gpa);
+    for ([_]u16{ 0xffff, 0xfffd, 0xfffc }) |v| {
+        var b: [68]u8 = @splat(0);
+        std.mem.writeInt(u16, b[0..2], 0x0807, .big);
+        std.mem.writeInt(u16, b[2..4], v, .big);
+        try std.testing.expectError(error.BadSignature, s.certificateVerify(&b));
     }
 }

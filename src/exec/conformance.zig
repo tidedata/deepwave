@@ -164,6 +164,7 @@ fn runReplayWith(ctx: *harness.Ctx, only_system: bool) !void {
         }
     }
     var tally: Tally = .{ .pv = pv, .rgp = rgp, .start_ms = start_ms, .pkgs = try packages.load(ctx, arena, last), .objs = try replay.ObjectDb.load(ctx, arena), .children = try system_replay.Children.load(ctx, arena), .only_system = only_system };
+    if (try @import("perf.zig").setup(ctx.io, &tally.pkgs)) |m| ctx.stderr.print("exec-replay perf: {s}\n", .{m}) catch {};
     ctx.stderr.print("exec-replay: {d} non-system packages, {d} system package ids, {d} read-only objects from the corpus\n", .{ tally.pkgs.user.count(), tally.pkgs.system.count(), tally.objs.map.count() }) catch {};
     if (ctx.opts.filter) |f| if (std.mem.startsWith(u8, f, "cut=")) {
         var rest = f[4..];
@@ -187,6 +188,7 @@ fn runReplayWith(ctx: *harness.Ctx, only_system: bool) !void {
         ctx.opts.filter = sub;
     };
     try ctx.forEachFile("chk", ".chk", &tally, replayFile);
+    @import("perf.zig").finish(ctx.io) catch |e| ctx.stderr.print("exec-replay perf: writing the output failed: {s}\n", .{@errorName(e)}) catch {};
     tally.print(ctx.stderr);
 }
 

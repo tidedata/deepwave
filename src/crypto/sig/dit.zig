@@ -10,25 +10,29 @@
 //! Apple M core); on any other target both calls compile to nothing.
 const std = @import("std");
 const builtin = @import("builtin");
+const cpu = @import("core").cpu;
 
 pub const available = builtin.cpu.arch == .aarch64 and
     std.Target.aarch64.featureSetHas(builtin.cpu.features, .dit);
 
 pub const Guard = struct {
     was_set: bool,
+    /// False when DIT is switched off at run time (core/hw.zig `dit=off`): enter/leave do nothing.
+    active: bool = true,
 
     pub inline fn enter() Guard {
-        if (comptime !available) return .{ .was_set = false };
+        if (comptime !available) return .{ .was_set = false, .active = false };
+        if (!cpu.ditAllowed()) return .{ .was_set = false, .active = false };
         const prev = asm volatile ("mrs %[r], dit"
             : [r] "=r" (-> u64),
         );
         asm volatile ("msr dit, #1" ::: .{ .memory = true });
-        return .{ .was_set = prev != 0 };
+        return .{ .was_set = prev != 0, .active = true };
     }
 
     pub inline fn leave(g: Guard) void {
         if (comptime !available) return;
-        if (!g.was_set) asm volatile ("msr dit, #0" ::: .{ .memory = true });
+        if (g.active and !g.was_set) asm volatile ("msr dit, #0" ::: .{ .memory = true });
     }
 };
 

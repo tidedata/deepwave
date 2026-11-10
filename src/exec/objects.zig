@@ -209,14 +209,24 @@ pub const ObjectDb = struct {
     }
 };
 
+/// The metadata part of `object_size_for_gas_metering`: owner 40, previous transaction 32,
+/// storage rebate 8.
+const gas_meta: u64 = 40 + 32 + 8;
+
+/// `object_size_for_gas_metering` of a Move object from its parts, without the object's bytes:
+/// `type_size` is the length of its serialized `MoveObjectType`.
+pub fn moveSizeForGasMetering(type_size: u64, contents_len: u64) u64 {
+    return gas_meta + contents_len + type_size + 1 + 8;
+}
+
 /// `Object::object_size_for_gas_metering`: 80 bytes of metadata (owner 40, previous transaction
 /// 32, storage rebate 8) plus the data size. Move objects: contents + serialized type + 1 + 8.
 /// Packages: `MovePackage::size` (module names and bytes, type origins, linkage entries).
 pub fn sizeForGasMetering(arena: Allocator, v: *const ObjectView) !u64 {
-    const meta: u64 = 40 + 32 + 8;
+    const meta = gas_meta;
     if (!v.is_package) {
         const type_size: u64 = v.version_at - 2; // raw[1 .. version_at - 1] is the type
-        return meta + v.contents_len + type_size + 1 + 8;
+        return moveSizeForGasMetering(type_size, v.contents_len);
     }
     var r = Reader.init(v.raw[1..]);
     const p = try bcs.decodeFrom(types.MovePackage, arena, &r);

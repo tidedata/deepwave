@@ -175,6 +175,29 @@ pub fn run(ctx: *harness.Ctx) anyerror!void {
         } else |e| c.failf("request: {s}", .{@errorName(e)});
         _ = c.finish();
     }
+    // ---- key updates we start (quinn follows): every 64 packets through a 3 MiB response
+    {
+        const item = "key-update/ours";
+        if (ctx.selected(item)) {
+            ctx.nextItem();
+            if (anemo.Peer.connect(ctx.gpa, ctx.io, addr, .{ .server_name = ss.mainnet_server_name, .expected = rust.peer_id, .key_update_pkts = 64 })) |kp| {
+                defer kp.deinit();
+                var c = ctx.check(item);
+                var size_buf: [8]u8 = undefined;
+                std.mem.writeInt(u64, &size_buf, 3 << 20, .little);
+                for (0..3) |_| {
+                    if (kp.request(ctx.scratch(), "/zui.Test/Big", &.{}, &size_buf, 60_000)) |r| {
+                        c.eql("status", wire.Status.success, r.status);
+                        c.eql("len", @as(usize, 3 << 20), r.body.len);
+                        c.eql("body", true, bigOk(r.body));
+                    } else |e| c.failf("request: {s}", .{@errorName(e)});
+                }
+                c.eql("updated", true, kp.conn.key_updates >= 2);
+                c.eql("open", false, kp.conn.isClosed());
+                _ = c.finish();
+            } else |e| ctx.fail(item, "connect: {s}", .{@errorName(e)});
+        }
+    }
     // the Rust log must show every request it decoded
     checkLog(ctx, a, try std.fmt.allocPrint(a, "{s}/requests-main.jsonl", .{run_rel}));
 }

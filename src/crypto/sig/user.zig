@@ -17,6 +17,7 @@ const std = @import("std");
 const verdict = @import("verdict.zig");
 const ed25519 = @import("ed25519.zig");
 const ecdsa = @import("ecdsa.zig");
+const fast = @import("fast.zig");
 const json = @import("json.zig");
 const Verdict = verdict.Verdict;
 const Reason = verdict.Reason;
@@ -629,7 +630,7 @@ fn parsePasskey(payload: []const u8) ?Passkey {
     @memcpy(&challenge, tmp[0..32]);
     if (us[0] != 2) return null;
     const pk = us[65..98];
-    _ = ecdsa.secp256r1.parsePublicKey(pk) orelse return null;
+    _ = fast.ecdsaDecodeKey(.r1, pk) orelse return null;
     const sig = us[1..65];
     const rr = std.mem.readInt(u256, sig[0..32], .big);
     const ss = std.mem.readInt(u256, sig[32..64], .big);
@@ -760,8 +761,8 @@ fn addressOf(flag: u8, pk: []const u8) Address {
 fn pkValid(scheme: Scheme, pk: []const u8) bool {
     return switch (scheme) {
         .ed25519 => pk.len == 32 and ed25519.decompress(pk[0..32]) != null,
-        .secp256k1 => ecdsa.secp256k1.parsePublicKey(pk) != null,
-        .secp256r1 => ecdsa.secp256r1.parsePublicKey(pk) != null,
+        .secp256k1 => fast.ecdsaDecodeKey(.k1, pk) != null,
+        .secp256r1 => fast.ecdsaDecodeKey(.r1, pk) != null,
         .mldsa65 => pk.len == mldsa65_pk_bytes, // TODO(crypto-sig): fastcrypto-pq key checks
         else => false,
     };
@@ -827,9 +828,19 @@ fn verifyZkClaims(env: *const UserSigEnv, z: *const ZkLogin, digest: *const [32]
     if (v != .valid) return v;
     if (proof_ok) |po| if (po.*) return .valid;
     const zenv = env.zklogin orelse return error.Unsupported;
-    if (zkl.verify(&zenv, &z.auth) != .none) return bad;
+    if (fast.zkVerify(&zenv, &z.auth) != .none) return bad;
     if (proof_ok) |po| po.* = true;
     return .valid;
+}
+
+/// A and R of an Ed25519 signature: together when the key cache is off (their square roots
+/// interleave), A from the cache and R alone when it is on. Same points either way.
+fn decodeEdPair(pk: *const [32]u8, r: *const [32]u8) [2]?ed25519.Point {
+    if (!fast.pkCacheOn()) return ed25519.decompress2(pk, r);
+    if (fast.edGetKey(pk)) |a| return .{ a, ed25519.decompress(r) };
+    const pts = ed25519.decompress2(pk, r);
+    fast.edPutKey(pk, pts[0]);
+    return pts;
 }
 
 /// Signature::verify_claims -> verify_secure. Each key is decoded once: Ed25519 decodes A and R
@@ -844,13 +855,24 @@ fn verifySingle(env: *const UserSigEnv, scheme: Scheme, sig: []const u8, pk: []c
     switch (scheme) {
         .ed25519 => {
             if (pk.len != 32) return bad_key;
-            const pts = ed25519.decompress2(pk[0..32], sig[0..32]);
+            // Verified cache (off by default): a hit means `ed25519.verify(pk, digest, sig)`
+            // accepted this exact triple, so A decodes and the equation holds; only the author
+            // check is left, in the order the plain path runs it.
+            // A batch pass of the same call (sig.batch, `fast.setScope`) counts the same way.
+            const vkey: ?[32]u8 = if (fast.edVerifiedOn() or fast.scopeOn()) fast.edVerifiedKey(pk[0..32], digest, sig[0..64]) else null;
+            if (vkey) |*k| if (fast.scopeHas(k) or (fast.edVerifiedOn() and fast.edVerifiedGet(k))) {
+                if (check_author and !std.mem.eql(u8, author, &addressOf(0, pk))) return wrong_signer;
+                return .valid;
+            };
+            const pts = decodeEdPair(pk[0..32], sig[0..32]);
             const a = pts[0] orelse return bad_key;
             if (check_author and !std.mem.eql(u8, author, &addressOf(0, pk))) return wrong_signer;
-            return if (ed25519.verifyDecoded(a, pts[1], pk[0..32], digest, sig[0..64])) .valid else bad_sig;
+            if (!ed25519.verifyDecoded(a, pts[1], pk[0..32], digest, sig[0..64])) return bad_sig;
+            if (vkey) |*k| if (fast.edVerifiedOn()) fast.edVerifiedPut(k);
+            return .valid;
         },
         .secp256k1 => {
-            const q = ecdsa.secp256k1.parsePublicKey(pk) orelse return bad_key;
+            const q = fast.ecdsaDecodeKey(.k1, pk) orelse return bad_key;
             const r = std.mem.readInt(u256, sig[0..32], .big);
             const s = std.mem.readInt(u256, sig[32..64], .big);
             const n: u256 = std.crypto.ecc.Secp256k1.scalar.field_order;
@@ -860,7 +882,7 @@ fn verifySingle(env: *const UserSigEnv, scheme: Scheme, sig: []const u8, pk: []c
             return if (ecdsa.secp256k1.verifyDigestParsed(q, &d, sig) == .valid) .valid else bad_sig;
         },
         .secp256r1 => {
-            const q = ecdsa.secp256r1.parsePublicKey(pk) orelse return bad_key;
+            const q = fast.ecdsaDecodeKey(.r1, pk) orelse return bad_key;
             const r = std.mem.readInt(u256, sig[0..32], .big);
             const s = std.mem.readInt(u256, sig[32..64], .big);
             const n: u256 = std.crypto.ecc.P256.scalar.field_order;
@@ -886,6 +908,37 @@ fn zkLoginPkValid(b: []const u8) bool {
     return b.len - (1 + iss_len) <= 32;
 }
 
+/// True when every member signature is Ed25519, well formed for the member loop's checks, and the
+/// whole set passes one batch verification. Never the reason for a verdict: false means "run the
+/// single checks".
+fn msEdBatch(env: *const UserSigEnv, m: *const MultiSig, digest: *const [32]u8) bool {
+    const min = fast.multisigBatchMin();
+    if (min == 0 or m.n_sigs < min) return false;
+    var items: [10]ed25519.BatchItem = undefined;
+    var n: usize = 0;
+    var bit: u5 = 0;
+    for (m.sigs[0..m.n_sigs]) |s| {
+        while (bit < 10 and (m.bitmap >> @as(u4, @intCast(bit))) & 1 == 0) bit += 1;
+        if (bit >= 10) return false;
+        const idx: usize = bit;
+        bit += 1;
+        if (idx >= m.n_pks or n >= items.len) return false;
+        const pk = m.pks[idx];
+        if (s.kind != .ed25519 or pk.bytes.len != 32 or s.bytes.len != 64) return false;
+        if (env.flags.additional_multisig_checks and pk.kind != .ed25519) return false;
+        items[n] = .{ .pk = pk.bytes[0..32], .msg = digest, .sig = s.bytes[0..64] };
+        n += 1;
+    }
+    if (n < 2) return false;
+    return msBatchRun(items[0..n]);
+}
+
+/// Holds the ~32 KB batch scratch in its own frame, so only a call that reaches a batch pays it.
+noinline fn msBatchRun(items: []const ed25519.BatchItem) bool {
+    var buf: [fast.ms_scratch_len]u8 align(64) = undefined;
+    return fast.batchAllValid(items, &buf);
+}
+
 /// MultiSig::verify_user_authenticator_epoch + verify_claims (legacy converts to MultiSig first).
 fn verifyMultiSig(env: *const UserSigEnv, m: *const MultiSig, digest: *const [32]u8, author: *const Address, scratch: []u8) Error!Verdict {
     const bad: Verdict = .{ .invalid = .InvalidSignature };
@@ -907,6 +960,9 @@ fn verifyMultiSig(env: *const UserSigEnv, m: *const MultiSig, digest: *const [32
     if (m.hasZkLoginSigs() and !env.flags.accept_zklogin_in_multisig) return bad;
     if (m.hasPasskeySigs() and !env.flags.accept_passkey_in_multisig) return bad;
     if (m.hasMldsaMember() and !env.flags.accept_mldsa65_in_multisig) return bad;
+    // Fast path (off by default): every Ed25519 member in one batch. Only a passing batch is
+    // used, to skip the single checks below; anything else runs them and they decide.
+    const ed_batched = msEdBatch(env, m, digest);
     var weight: u32 = 0;
     // zip(sigs, as_indices(bitmap)): the shorter one ends it
     var idx: usize = 0;
@@ -923,13 +979,16 @@ fn verifyMultiSig(env: *const UserSigEnv, m: *const MultiSig, digest: *const [32
             .ed25519 => blk: {
                 if (strict and pk.kind != .ed25519) return bad;
                 if (pk.bytes.len != 32) return bad;
-                const pts = ed25519.decompress2(pk.bytes[0..32], s.bytes[0..32]);
+                if (ed_batched) break :blk true;
+                // verified by this call's batch pass (sig.batch): A decodes and the equation holds
+                if (fast.scopeOn() and s.bytes.len == 64 and fast.scopeHas(&fast.edVerifiedKey(pk.bytes[0..32], digest, s.bytes[0..64]))) break :blk true;
+                const pts = decodeEdPair(pk.bytes[0..32], s.bytes[0..32]);
                 const a = pts[0] orelse return bad;
                 break :blk ed25519.verifyDecoded(a, pts[1], pk.bytes[0..32], digest, s.bytes[0..64]);
             },
             .secp256k1 => blk: {
                 if (strict and pk.kind != .secp256k1) return bad;
-                const q = ecdsa.secp256k1.parsePublicKey(pk.bytes) orelse return bad;
+                const q = fast.ecdsaDecodeKey(.k1, pk.bytes) orelse return bad;
                 const r = std.mem.readInt(u256, s.bytes[0..32], .big);
                 const sv = std.mem.readInt(u256, s.bytes[32..64], .big);
                 const n: u256 = std.crypto.ecc.Secp256k1.scalar.field_order;
@@ -939,7 +998,7 @@ fn verifyMultiSig(env: *const UserSigEnv, m: *const MultiSig, digest: *const [32
             },
             .secp256r1 => blk: {
                 if (strict and pk.kind != .secp256r1) return bad;
-                const q = ecdsa.secp256r1.parsePublicKey(pk.bytes) orelse return bad;
+                const q = fast.ecdsaDecodeKey(.r1, pk.bytes) orelse return bad;
                 const r = std.mem.readInt(u256, s.bytes[0..32], .big);
                 const sv = std.mem.readInt(u256, s.bytes[32..64], .big);
                 const n: u256 = std.crypto.ecc.P256.scalar.field_order;
@@ -1251,4 +1310,51 @@ test "zkLogin without an environment fails closed" {
     var sc: [256]u8 = undefined;
     const v = try verifyUserSignatureDigest(&env, &@as([32]u8, @splat(0)), &@as(Address, @splat(0)), &.{ 5, 1, 2, 3 }, &sc);
     try std.testing.expect(v == .invalid);
+}
+
+test "ed25519 verified cache: verdicts unchanged, a hit only for the exact triple" {
+    const env: UserSigEnv = .{ .epoch = 0 };
+    fast.configure(.{});
+    fast.clearCaches();
+    defer fast.configure(.{});
+    defer fast.clearCaches();
+    var sc: [256]u8 = undefined;
+    const digest: [32]u8 = @splat(9);
+    const other: [32]u8 = @splat(10);
+    const a = testEdSig(3, &digest);
+    const b = testEdSig(4, &digest);
+    // the plain verdict of every case first (cache off)
+    const Case = struct { d: *const [32]u8, author: *const Address, sig: [ed_sig_len]u8 };
+    var cases: [8]Case = undefined;
+    cases[0] = .{ .d = &digest, .author = &a.addr, .sig = a.sig }; // valid
+    cases[1] = .{ .d = &other, .author = &a.addr, .sig = a.sig }; // other message
+    cases[2] = .{ .d = &digest, .author = &b.addr, .sig = a.sig }; // wrong signer
+    cases[3] = .{ .d = &digest, .author = &a.addr, .sig = a.sig };
+    cases[3].sig[1 + 40] ^= 1; // s changed
+    cases[4] = .{ .d = &digest, .author = &a.addr, .sig = a.sig };
+    cases[4].sig[1 + 3] ^= 1; // R changed
+    cases[5] = .{ .d = &digest, .author = &a.addr, .sig = a.sig };
+    cases[5].sig[66] ^= 1; // pk changed (address no longer matches either)
+    cases[6] = .{ .d = &digest, .author = &b.addr, .sig = b.sig }; // valid, other key
+    cases[7] = .{ .d = &digest, .author = &a.addr, .sig = b.sig }; // b's signature for a
+    var want: [cases.len]Verdict = undefined;
+    for (cases, &want) |c, *w| w.* = try verifyUserSignatureDigest(&env, c.d, c.author, &c.sig, &sc);
+    try std.testing.expect(want[0] == .valid and want[6] == .valid);
+    try std.testing.expect(want[1] != .valid and want[3] != .valid and want[4] != .valid and want[7] != .valid);
+    try std.testing.expectEqual(Reason.IncorrectSigner, want[2].invalid);
+    // cache on, twice over (the second round sees the entries the first one put)
+    fast.configure(.{ .ed_verified_cache = true });
+    for (0..2) |_| for (cases, want) |c, w| {
+        const got = try verifyUserSignatureDigest(&env, c.d, c.author, &c.sig, &sc);
+        try std.testing.expectEqual(w, got);
+    };
+    const st = fast.edVerifiedStats();
+    // only the two accepted triples were ever stored; a's triple also hit under the wrong author
+    try std.testing.expectEqual(@as(u64, 2), st.inserts);
+    try std.testing.expect(fast.edVerifiedContains(&fast.edVerifiedKey(a.sig[65..97], &digest, a.sig[1..65])));
+    try std.testing.expect(!fast.edVerifiedContains(&fast.edVerifiedKey(a.sig[65..97], &other, a.sig[1..65])));
+    // a cached entry is never consulted while the switch is off
+    fast.configure(.{});
+    try std.testing.expectEqual(want[0], try verifyUserSignatureDigest(&env, &digest, &a.addr, &a.sig, &sc));
+    try std.testing.expectEqual(st.hits, fast.edVerifiedStats().hits);
 }

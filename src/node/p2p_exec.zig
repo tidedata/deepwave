@@ -8,6 +8,13 @@
 //! them. Input objects come from the store (the checkpoint before this one is committed, so its
 //! live set is the pre-state) overlaid with the writes of the checkpoint's earlier transactions.
 //!
+//! Read sets. The aux record holds what the bucket's and the stream's hold, made from this
+//! execution: each transaction's `unchanged_loaded_runtime_objects` as sui-node lists them
+//! (`unchangedLoaded`, over every object the execution read through the store the way sui-node's
+//! `TrackingBackingStore` records it), and every object version read from the store that the blob
+//! does not carry (read-only and immutable inputs, the loaded objects). history.zig stores both,
+//! so serving answers the same bytes whichever source delivered the checkpoint.
+//!
 //! Trust. Nothing here is trusted by the store. A transaction is accepted only when deepwave's
 //! effects bytes equal the certified effects bytes (whose digest the contents carry) and its
 //! events hash to the effects' events digest; the follower then verifies the whole blob like any
@@ -66,6 +73,13 @@ const Overlay = struct {
     snap: *const store.Snapshot,
     /// Objects read through `get` (the blob's input objects and aux extras come from here).
     reads: std.AutoArrayHashMapUnmanaged(Key, []const u8) = .empty,
+    /// One transaction's reads of the store that sui-node's `TrackingBackingStore` records and
+    /// the Move executor's own list (`ptb.Output.loaded`: children and received objects) does
+    /// not hold: the store's latest object (`readLatest`) and a system transaction's child reads
+    /// (`sysChild`). Packages are left out. See `unchangedLoaded`.
+    loads: std.ArrayList(ptb.Ref) = .empty,
+    /// A read could not be recorded (out of memory): the transaction's lists would be short.
+    lost: bool = false,
     arena: Allocator,
 
     fn self(p: *const anyopaque) *Overlay {
@@ -95,6 +109,25 @@ const Overlay = struct {
         return self(p).latestOf(id);
     }
 
+    fn track(o: *Overlay, raw: []const u8) void {
+        const v = exec.objects.ObjectView.parse(raw) catch return;
+        if (v.is_package) return;
+        o.loads.append(o.arena, .{ .id = v.id, .version = v.version }) catch {
+            o.lost = true;
+        };
+    }
+
+    /// The executors' read of the store's latest object (`ObjectLookup.latest`): Rust's
+    /// `ObjectStore::get_object` (the coin deny list v2 config of a coin type and its settings,
+    /// deny_list_v2.rs) and `read_child_object` at `SequenceNumber::MAX` (a config setting).
+    /// Both go through the tracking store, so what they find is a loaded runtime object.
+    fn readLatest(p: *const anyopaque, id: *const Id) ?[]const u8 {
+        const o = self(p);
+        const raw = o.latestOf(id) orelse return null;
+        o.track(raw);
+        return raw;
+    }
+
     fn childAtMost(p: *const anyopaque, id: *const Id, upper: u64) ?[]const u8 {
         const o = self(p);
         const raw = o.latestOf(id) orelse return null;
@@ -113,8 +146,13 @@ const Overlay = struct {
         return null;
     }
 
+    /// A system transaction's `read_child_object` (settlement fields, the system state's
+    /// dynamic fields): tracked like the Move executor's child loads, also when the transaction
+    /// fails afterwards (the tracking store sits outside the temporary store).
     fn sysChild(p: *const anyopaque, _: *const Id, id: *const Id, bound: u64) error{NotAvailable}!?[]const u8 {
-        return childAtMost(p, id, bound);
+        const raw = childAtMost(p, id, bound) orelse return null;
+        self(p).track(raw);
+        return raw;
     }
 
     fn sysPackage(p: *const anyopaque, id: *const Id) ?[]const u8 {
@@ -153,13 +191,24 @@ const Overlay = struct {
 
 /// Package source over the store and the overlay (packages published earlier in the checkpoint).
 /// The package bytes are copied into `keep`: exec's per-thread package caches hold them for the
-/// whole epoch, past the checkpoint's arena and the store snapshot.
+/// whole epoch, past the checkpoint's arena and the store snapshot. One copy per package
+/// version (`copies`, as node rpc.zig's `pkg_cache`): every lookup used to copy again, and the
+/// arena is only freed at p2p shutdown.
 pub const PackageSource = struct {
     pkgs: exec.packages.Store = .{},
     overlay: ?*const Overlay = null,
     snap: ?*const store.Snapshot = null,
     keep: std.heap.ArenaAllocator,
     lock: std.atomic.Mutex = .unlocked,
+    copies: std.AutoHashMapUnmanaged(PkgKey, []const u8) = .empty,
+
+    /// A package version: published bytes never change for an (id, version).
+    const PkgKey = struct { Id, u64 };
+
+    pub fn deinit(s: *PackageSource) void {
+        s.copies.deinit(s.keep.child_allocator);
+        s.keep.deinit();
+    }
 
     fn get(p: *const anyopaque, id: *const Id, epoch: u64) ?[]const u8 {
         _ = epoch;
@@ -169,9 +218,15 @@ pub const PackageSource = struct {
             const r = snap.liveObject(id) orelse return null;
             break :blk @as(?[]const u8, r.bytes);
         }) orelse return null;
+        const v = exec.objects.ObjectView.parse(raw) catch null;
         while (!s.lock.tryLock()) std.atomic.spinLoopHint();
         defer s.lock.unlock();
-        return s.keep.allocator().dupe(u8, raw) catch null;
+        // Not a parseable object: copied as before (never cached under a made-up version).
+        const k: PkgKey = .{ id.*, (v orelse return s.keep.allocator().dupe(u8, raw) catch null).version };
+        if (s.copies.get(k)) |b| if (std.mem.eql(u8, b, raw)) return b;
+        const owned = s.keep.allocator().dupe(u8, raw) catch return null;
+        s.copies.put(s.keep.child_allocator, k, owned) catch {};
+        return owned;
     }
 
     pub fn bind(s: *PackageSource) void {
@@ -329,6 +384,8 @@ const TxOut = struct {
     effects: []const u8 = &.{},
     events: ?[]const u8 = null,
     written: []const exec.coin_ptb.Written = &.{},
+    /// Every object the transaction read through the store at runtime, as read (any order,
+    /// repeats allowed, changed objects included): `unchangedLoaded` makes the served list.
     loaded: []const ptb.Ref = &.{},
     /// Objects it read below the checkpoint (store or parent), in order (merged into the aux
     /// record in transaction order).
@@ -360,6 +417,8 @@ const Run = struct {
     fn execInner(r: *Run, arena: Allocator, i: usize) !TxOut {
         var ov = r.master.*;
         ov.reads = .empty;
+        ov.loads = .empty;
+        ov.lost = false;
         ov.arena = arena;
         const t = r.txs[i];
         const tx_raw = r.tx_raw[i];
@@ -377,7 +436,9 @@ const Run = struct {
             const raw = ov.getAt(&k.id, k.version) orelse return .{ .fallback = "input object not in the store" };
             try ins.append(arena, raw);
         }
-        const lookup: exec.coin_ptb.ObjectLookup = .{ .ctx = &ov, .get = Overlay.get, .latest = Overlay.latest };
+        const lookup: exec.coin_ptb.ObjectLookup = .{ .ctx = &ov, .get = Overlay.get, .latest = Overlay.readLatest };
+        var vm_loaded: []const ptb.Ref = &.{};
+        var vm_implicit: []const ptb.Ref = &.{};
 
         if (system.handles(&data.kind)) {
             out.kind = .system;
@@ -448,7 +509,8 @@ const Run = struct {
                         out.effects = o.effects;
                         out.events = o.events;
                         out.written = o.written;
-                        out.loaded = o.loaded;
+                        vm_loaded = o.loaded;
+                        if (r.v1[i] == null) vm_implicit = try implicitReads(arena, data, fx);
                     },
                 }
             }
@@ -460,6 +522,8 @@ const Run = struct {
             const ev = out.events orelse return .{ .fallback = "certified events, zui none" };
             if (!std.mem.eql(u8, &hash.blake2b256(&.{ "TransactionEvents::", ev }), &d.@"0".@"0")) return .{ .fallback = "events digest differs" };
         } else if (out.events != null) return .{ .fallback = "zui events, certified none" };
+        if (ov.lost) return error.OutOfMemory;
+        out.loaded = try std.mem.concat(arena, ptb.Ref, &.{ vm_loaded, vm_implicit, ov.loads.items });
         out.reads = ov.reads.keys();
         out.read_bytes = ov.reads.values();
         return out;
@@ -539,10 +603,10 @@ pub fn run(
     for (txs, 0..) |t, i| {
         tx_raw[i] = txDataOf(t.tx) catch return .{ .fallback = "transaction does not parse" };
         const td = try arena.create(types.TransactionData);
-        td.* = bcs.decode(types.TransactionData, arena, tx_raw[i]) catch return .{ .fallback = "transaction does not decode" };
+        td.* = bcs.decode(types.TransactionData, arena, tx_raw[i]) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else .{ .fallback = "transaction does not decode" };
         data[i] = &td.V1;
         const fx_all = try arena.create(types.TransactionEffects);
-        fx_all.* = bcs.decode(types.TransactionEffects, arena, t.effects) catch return .{ .fallback = "effects do not decode" };
+        fx_all.* = bcs.decode(types.TransactionEffects, arena, t.effects) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else .{ .fallback = "effects do not decode" };
         v1s[i] = null;
         fxs[i] = switch (fx_all.*) {
             .V2 => |*v| v,
@@ -611,12 +675,16 @@ pub fn run(
         }
         var outs: std.ArrayList([]const u8) = .empty;
         // mutated (input exists), created, unwrapped: the order of `effectKeys`
-        if (v1) |v| inline for (.{ "mutated", "created", "unwrapped" }) |list| {
-            for (@field(v, list)) |e| {
-                const raw = for (o.written) |w| {
-                    if (std.mem.eql(u8, &w.id, &e[0][0].@"0".@"0")) break w.bytes;
-                } else return .{ .fallback = "output object missing" };
-                try outs.append(arena, raw);
+        // (braces: `if (v1) |v| inline for (...) {...} else ...` gives the else to the for, so
+        // V2 effects listed no outputs and V1 effects listed them twice)
+        if (v1) |v| {
+            inline for (.{ "mutated", "created", "unwrapped" }) |list| {
+                for (@field(v, list)) |e| {
+                    const raw = for (o.written) |w| {
+                        if (std.mem.eql(u8, &w.id, &e[0][0].@"0".@"0")) break w.bytes;
+                    } else return .{ .fallback = "output object missing" };
+                    try outs.append(arena, raw);
+                }
             }
         } else inline for (.{ 0, 1, 2 }) |pass| {
             for (fx.changed_objects) |c| {
@@ -636,7 +704,7 @@ pub fn run(
                 } else return .{ .fallback = "output object missing" };
                 try outs.append(arena, raw);
             }
-        };
+        }
         if (outs.items.len != o.written.len) return .{ .fallback = "output object count differs" };
         try putUleb(&blob, arena, outs.items.len);
         for (outs.items) |raw| {
@@ -645,11 +713,10 @@ pub fn run(
             try in_blob.put(arena, .{ .id = k.id, .version = k.version }, {});
         }
 
-        // aux: the transaction's loaded runtime objects it did not change
-        var kept: usize = 0;
-        for (o.loaded) |l| kept += @intFromBool(!changed(fx, v1, &l.id));
-        try putUleb(&aux, arena, kept);
-        for (o.loaded) |l| if (!changed(fx, v1, &l.id)) {
+        // aux: the transaction's unchanged loaded runtime objects, as sui-node lists them
+        const unchanged = try unchangedLoaded(arena, o.loaded, fx, v1);
+        try putUleb(&aux, arena, unchanged.len);
+        for (unchanged) |l| {
             try aux.appendSlice(arena, &l.id);
             var vb: [8]u8 = undefined;
             std.mem.writeInt(u64, &vb, l.version, .little);
@@ -659,7 +726,7 @@ pub fn run(
                 try aux.append(arena, 1);
                 try aux.appendSlice(arena, &hash.blake2b256(&.{ "Object::", rw }));
             } else try aux.append(arena, 0);
-        };
+        }
     }
     // aux extras: objects read from the store that the blob does not carry
     var extra: usize = 0;
@@ -701,16 +768,83 @@ fn execAll(r: *Run, arena: Allocator, pool: ?*Pool, lv: ?[]const u32) !bool {
     return true;
 }
 
+/// `id` is in the effects' `object_changes()` (sui-types effects_v2.rs / effects_v1.rs). V2:
+/// every changed object but an accumulator write, which names the accumulator field without
+/// being a change of that object. V1: created, mutated, unwrapped, deleted,
+/// unwrapped_then_deleted and wrapped.
 fn changed(fx: *const types.TransactionEffectsV2, v1: ?*const types.TransactionEffectsV1, id: *const Id) bool {
     if (v1) |v| {
-        for (v.modified_at_versions) |m| if (std.mem.eql(u8, &m[0].@"0".@"0", id)) return true;
-        inline for (.{ "created", "unwrapped" }) |list| {
+        inline for (.{ "created", "mutated", "unwrapped" }) |list| {
             for (@field(v, list)) |e| if (std.mem.eql(u8, &e[0][0].@"0".@"0", id)) return true;
+        }
+        inline for (.{ "deleted", "unwrapped_then_deleted", "wrapped" }) |list| {
+            for (@field(v, list)) |e| if (std.mem.eql(u8, &e[0].@"0".@"0", id)) return true;
         }
         return false;
     }
-    for (fx.changed_objects) |c| if (std.mem.eql(u8, &c[0].@"0".@"0", id)) return true;
+    for (fx.changed_objects) |c| {
+        if (c[1].output_state != .AccumulatorWriteV1 and std.mem.eql(u8, &c[0].@"0".@"0", id)) return true;
+    }
     return false;
+}
+
+/// The system objects a Move transaction read implicitly through the store
+/// (`TemporaryStore::load_implicitly_read_system_object`, which the tracking store records like
+/// any other read): the accumulator root of an object funds check (`object_available_balance`,
+/// protocol 140 on mainnet) and the Clock of `clock::borrow`. The executor lists such a read in
+/// the effects as a read-only consensus object (`loaded_system_objects`), and the effects equal
+/// the certified ones, so it is every read-only root entry of one of the two that the
+/// transaction does not declare as an input. (A declared input also read implicitly is not told
+/// apart: the effects list it once.)
+pub fn implicitReads(arena: Allocator, data: *const types.TransactionDataV1, fx: *const types.TransactionEffectsV2) ![]const ptb.Ref {
+    const pt = switch (data.kind) {
+        .ProgrammableTransaction => |*p| p,
+        else => return &.{},
+    };
+    var out: std.ArrayList(ptb.Ref) = .empty;
+    for (fx.unchanged_consensus_objects) |*u| {
+        const id = &u[0].@"0".@"0";
+        if (!std.mem.eql(u8, id[0..30], &@as([30]u8, @splat(0)))) continue;
+        const clock_or_root = (id[30] == 0 and id[31] == 6) or (id[30] == 0x0a and id[31] == 0xcc);
+        if (!clock_or_root) continue;
+        const version = switch (u[1]) {
+            .ReadOnlyRoot => |vd| vd[0].@"0",
+            else => continue,
+        };
+        const declared = for (pt.inputs) |*in| switch (in.*) {
+            .Object => |*o| switch (o.*) {
+                .SharedObject => |*sh| if (std.mem.eql(u8, &sh.id.@"0".@"0", id)) break true,
+                else => {},
+            },
+            else => {},
+        } else false;
+        if (!declared) try out.append(arena, .{ .id = id.*, .version = version });
+    }
+    return out.items;
+}
+
+fn lessRef(_: void, a: ptb.Ref, b: ptb.Ref) bool {
+    const o = std.mem.order(u8, &a.id, &b.id);
+    return if (o == .eq) a.version < b.version else o == .lt;
+}
+
+/// A transaction's `unchanged_loaded_runtime_objects` as sui-node 1.83.1 makes it (sui-core
+/// transaction_outputs.rs `unchanged_loaded_runtime_objects`, over what `TrackingBackingStore`
+/// recorded, sui-types storage/mod.rs): of every object `loads` names (the store reads of the
+/// execution, packages already left out), one entry per id at the highest version read (the
+/// `ObjectSet` is walked in (id, version) order into a map by id), without the ids of the
+/// effects' object changes, in id order.
+pub fn unchangedLoaded(arena: Allocator, loads: []const ptb.Ref, fx: *const types.TransactionEffectsV2, v1: ?*const types.TransactionEffectsV1) ![]const ptb.Ref {
+    const all = try arena.dupe(ptb.Ref, loads);
+    std.mem.sort(ptb.Ref, all, {}, lessRef);
+    var n: usize = 0;
+    for (all, 0..) |l, i| {
+        if (i + 1 < all.len and std.mem.eql(u8, &all[i + 1].id, &l.id)) continue;
+        if (changed(fx, v1, &l.id)) continue;
+        all[n] = l;
+        n += 1;
+    }
+    return all[0..n];
 }
 
 /// The blob's input object keys of one transaction (convert.zig `effectKeys`): V2 the changed

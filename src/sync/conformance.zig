@@ -164,6 +164,76 @@ fn committeeChain(ctx: *harness.Ctx, cache: *CommitteeCache) !void {
     }
 }
 
+/// ZUI_SYNC_CERT_BATCH=N runs the suite's followers with `Config.cert_batch = N` (default 0), so
+/// the same windows are checked with and without certificate batching.
+fn certBatchEnv() u32 {
+    const v = std.c.getenv("ZUI_SYNC_CERT_BATCH") orelse return 0;
+    return std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
+}
+
+/// Batched certificate checks (`verify.checkCerts`) against `verify.checkCert`, item by item, over
+/// the blobs of a group that pass `verify.check`: one check item per group.
+const BatchCmp = struct {
+    arena: std.heap.ArenaAllocator,
+    jobs: std.ArrayList(verify.CertJob) = .empty,
+    names: std.ArrayList([]const u8) = .empty,
+    single: std.ArrayList(verify.Verdict) = .empty,
+    comms: std.ArrayList(*const Committee) = .empty,
+
+    fn init(gpa: std.mem.Allocator) BatchCmp {
+        return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+    }
+    fn deinit(b: *BatchCmp) void {
+        b.arena.deinit();
+    }
+
+    fn add(b: *BatchCmp, name: []const u8, comm: *const Committee, blob: []const u8, idx: *types.CheckpointIndex) !void {
+        const a = b.arena.allocator();
+        types.indexCheckpointData(blob, idx) catch return;
+        const r = try verify.check(a, blob, idx);
+        if (r != .ok) return;
+        const summary = try a.dupe(u8, idx.summary.slice(blob));
+        const sig = try a.dupe(u8, idx.sig.slice(blob));
+        try b.jobs.append(a, .{ .committee = comm, .summary_epoch = r.ok.epoch, .summary = summary, .sig = sig });
+        try b.names.append(a, try a.dupe(u8, name));
+        try b.single.append(a, try verify.checkCert(a, comm, r.ok.epoch, summary, sig));
+        for (b.comms.items) |c| {
+            if (c == comm) break;
+        } else try b.comms.append(a, comm);
+    }
+
+    fn finish(b: *BatchCmp, ctx: *harness.Ctx, item: []const u8) !void {
+        if (b.jobs.items.len == 0 or !ctx.selected(item)) return;
+        ctx.nextItem();
+        const a = b.arena.allocator();
+        var in_g2 = true;
+        for (b.comms.items) |c| in_g2 = in_g2 and verify.keysInG2(c);
+        var seed: [32]u8 = undefined;
+        ctx.io.random(&seed);
+        var chacha = std.Random.ChaCha.init(seed);
+        const out = try a.alloc(verify.Verdict, b.jobs.items.len);
+        var c = ctx.check(item);
+        var bad: usize = 0;
+        for ([_]bool{ false, true }) |kig| {
+            if (kig and !in_g2) continue;
+            try verify.checkCerts(ctx.gpa, a, b.jobs.items, chacha.random(), .{ .keys_in_group = kig }, out);
+            for (b.names.items, b.single.items, out) |n, want, got| {
+                if (std.meta.eql(want, got)) continue;
+                bad += 1;
+                if (bad <= 8) c.failf("{s} (keys_in_group {}): checkCert {s}, batch {s}", .{ n, kig, want.name(), got.name() });
+            }
+        }
+        c.eql("committees in G2", true, in_g2);
+        c.eql("batch mismatches", @as(usize, 0), bad);
+        var okn: usize = 0;
+        for (b.single.items) |v| okn += @intFromBool(v.isOk());
+        // per-epoch groups stay quiet unless they hold a rejection or a mismatch
+        if (bad > 0 or okn != b.jobs.items.len or !std.mem.startsWith(u8, item, "all-batch/"))
+            try ctx.stderr.print("sync-follow {s}: {d} certificates batched ({d} ok, {d} rejected), {d} mismatches\n", .{ item, b.jobs.items.len, okn, b.jobs.items.len - okn, bad });
+        _ = c.finish();
+    }
+};
+
 fn selectedItem(ctx: *harness.Ctx, item: []const u8) bool {
     return ctx.selected(item);
 }
@@ -239,7 +309,7 @@ fn liveTail(ctx: *harness.Ctx, cache: *CommitteeCache) !void {
     var arch = try archive.Archive.open(ctx.io, dir);
     defer arch.close(ctx.io);
     const comm = try cache.get(ctx, 1303);
-    var f = try follower.Follower.init(gpa, ctx.io, h.store, .{ .archive = &arch }, .{ .poll_ms = 20 }, .{ .committee = comm.*, .first_seq = first });
+    var f = try follower.Follower.init(gpa, ctx.io, h.store, .{ .archive = &arch }, .{ .poll_ms = 20, .cert_batch = certBatchEnv() }, .{ .committee = comm.*, .first_seq = first });
     defer f.deinit();
     var prod: Producer = .{ .ctx = ctx, .dir = dir, .first = first, .count = count, .f = f };
     const th = try std.Thread.spawn(.{}, Producer.main, .{&prod});
@@ -300,6 +370,10 @@ fn scanEpoch(st: *const ScanState, ctx: *harness.Ctx, name: []const u8) !void {
     const comm = try committee_mod.fromJsonLine(carena.allocator(), text[0..nl]);
     var idx = try types.CheckpointIndex.init(ctx.gpa);
     defer idx.deinit(ctx.gpa);
+    var bc = BatchCmp.init(ctx.gpa);
+    defer bc.deinit();
+    var bib: [64]u8 = undefined;
+    defer bc.finish(ctx, std.fmt.bufPrint(&bib, "all-batch/{d}", .{epoch}) catch unreachable) catch |e| ctx.fail("all-batch", "{s}", .{@errorName(e)});
     for (st.groups) |g| {
         if (st.lines[g[0]].epoch != epoch) continue;
         for (st.lines[g[0]..g[1]]) |l| {
@@ -311,6 +385,7 @@ fn scanEpoch(st: *const ScanState, ctx: *harness.Ctx, name: []const u8) !void {
             const a = ctx.scratch();
             const blob = try readBlob(ctx, l.seq);
             const v = try verify.full(a, blob, &idx, &comm, null);
+            try bc.add(item, &comm, blob, &idx);
             var c = ctx.check(item);
             c.eql("accepted", std.mem.eql(u8, l.verify, "ok"), v.isOk());
             if (!std.mem.eql(u8, verify.class(v), l.verify)) c.failf("zui verdict {s}, truth {s}", .{ verify.class(v), l.verify });
@@ -466,7 +541,7 @@ fn window(ctx: *harness.Ctx, cache: *CommitteeCache, prefix: []const u8) !void {
     const anchor_committee = try cache.get(ctx, first.epoch);
     var col: Collect = .{ .gpa = gpa };
     defer col.seen.deinit(gpa);
-    var f = try follower.Follower.init(gpa, ctx.io, h.store, .{ .archive = &arch }, .{}, .{ .committee = anchor_committee.*, .first_seq = first.seq });
+    var f = try follower.Follower.init(gpa, ctx.io, h.store, .{ .archive = &arch }, .{ .cert_batch = certBatchEnv() }, .{ .committee = anchor_committee.*, .first_seq = first.seq });
     defer f.deinit();
     f.observer = .{ .ctx = &col, .on_checkpoint = Collect.on };
     const t0 = follower.now();
@@ -587,6 +662,10 @@ fn mutants(ctx: *harness.Ctx, cache: *CommitteeCache, prefix: []const u8) !void 
     defer ctx.gpa.free(text);
     var idx = try types.CheckpointIndex.init(ctx.gpa);
     defer idx.deinit(ctx.gpa);
+    var bc = BatchCmp.init(ctx.gpa);
+    defer bc.deinit();
+    var bib: [128]u8 = undefined;
+    defer bc.finish(ctx, std.fmt.bufPrint(&bib, "{s}/mutant-batch", .{prefix}) catch unreachable) catch |e| ctx.fail("mutant-batch", "{s}", .{@errorName(e)});
     var it = std.mem.splitScalar(u8, text, '\n');
     var n: u64 = 0;
     while (it.next()) |l| {
@@ -608,6 +687,7 @@ fn mutants(ctx: *harness.Ctx, cache: *CommitteeCache, prefix: []const u8) !void 
         _ = try std.fmt.hexToBytes(&prev, m.prev);
         // The epoch-mismatch classes depend on the committee passed, as in the truth tool.
         const v = try verify.full(a, blob, &idx, comm, prev);
+        try bc.add(item, comm, blob, &idx);
         const got = verify.class(v);
         var c = ctx.check(item);
         c.eql("accepted", std.mem.eql(u8, m.expect, "ok"), v.isOk());
@@ -624,6 +704,9 @@ fn edges(ctx: *harness.Ctx, cache: *CommitteeCache) !void {
     defer ctx.gpa.free(text);
     var idx = try types.CheckpointIndex.init(ctx.gpa);
     defer idx.deinit(ctx.gpa);
+    var bc = BatchCmp.init(ctx.gpa);
+    defer bc.deinit();
+    defer bc.finish(ctx, "edge/cert-batch") catch |e| ctx.fail("edge/cert-batch", "{s}", .{@errorName(e)});
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |l| {
         if (l.len == 0) continue;
@@ -640,6 +723,7 @@ fn edges(ctx: *harness.Ctx, cache: *CommitteeCache) !void {
         var prev: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(&prev, e.prev);
         const v = try verify.full(a, blob, &idx, comm, prev);
+        try bc.add(item, comm, blob, &idx);
         var c = ctx.check(item);
         c.eql("accepted", std.mem.eql(u8, e.expect, "ok"), v.isOk());
         if (!std.mem.eql(u8, verify.class(v), e.class)) c.failf("class: truth {s}, zui {s}", .{ e.class, verify.class(v) });

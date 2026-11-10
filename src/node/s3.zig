@@ -75,6 +75,14 @@ pub const Bucket = struct {
     stats: Stats = .{},
     /// Hard stop: no more requests once the estimated spend reaches this (USD).
     budget_usd: f64 = 5.0,
+    /// Each attempt (connect, TLS, request, whole body) is bounded by this: std.http has no read
+    /// timeout, and a connection that went silent (no FIN, no RST) blocked a GET for ever, with
+    /// the fetcher thread that waits on it. netguard.timed cancels it; the call fails Timeout.
+    timeout_ms: u64 = 60_000,
+    /// Requests canceled at `timeout_ms`.
+    timeouts: std.atomic.Value(u64) = .init(0),
+    /// Tests: `http://host:port` instead of the bucket's https endpoint.
+    endpoint: ?[]const u8 = null,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, creds: Credentials) Bucket {
         return .{ .gpa = gpa, .io = io, .creds = creds, .client = .{ .allocator = gpa, .io = io } };
@@ -110,7 +118,10 @@ pub const Bucket = struct {
         var host_buf: [128]u8 = undefined;
         const host = try std.fmt.bufPrint(&host_buf, "{s}.s3.{s}.amazonaws.com", .{ b.bucket, b.region });
         var url_buf: [256]u8 = undefined;
-        const url = try std.fmt.bufPrint(&url_buf, "https://{s}/{s}", .{ host, key });
+        const url = if (b.endpoint) |e|
+            try std.fmt.bufPrint(&url_buf, "{s}/{s}", .{ e, key })
+        else
+            try std.fmt.bufPrint(&url_buf, "https://{s}/{s}", .{ host, key });
 
         const now_s: i64 = Io.Clock.real.now(b.io).toSeconds();
         var amz_date: [16]u8 = undefined;
@@ -176,9 +187,15 @@ pub const Bucket = struct {
         // A pooled keep-alive connection the server has closed fails on first use; S3 closes idle
         // connections, so retry at once on a fresh one (the request is idempotent).
         var attempt: u32 = 0;
-        const res = while (true) : (attempt += 1) {
+        var ab: netguard.Abort = .{};
+        const status = while (true) : (attempt += 1) {
             if (out) |_| aw.writer.end = 0;
-            break fetchOnce(b, url, method, hdrs[0..nh], auth, &aw.writer) catch |e| {
+            ab.reset();
+            break netguard.timed(b.io, b.timeout_ms, null, &ab, fetchOnce, .{ &b.client, url, hdrs[0..nh], auth, &aw.writer, &ab }) catch |e| {
+                if (e == error.Timeout) {
+                    _ = b.timeouts.fetchAdd(1, .monotonic);
+                    netguard.dropIdle(&b.client);
+                }
                 if (attempt < 32 and transient(@errorName(e))) {
                     // std.http may have put the failed connection back in the pool: never
                     // retry on it (netguard.dropIdle).
@@ -190,7 +207,7 @@ pub const Bucket = struct {
             };
         };
         _ = b.stats.bytes.fetchAdd(aw.writer.end, .monotonic);
-        switch (res.status) {
+        switch (status) {
             .ok => return .ok,
             .partial_content => return if (first_byte) .ok else error.HttpStatus,
             .not_found => {
@@ -200,7 +217,7 @@ pub const Bucket = struct {
             else => {
                 _ = b.stats.errors.fetchAdd(1, .monotonic);
                 const body = if (out) |_| aw.writer.buffered() else "";
-                std.log.warn("s3 {s} {s}: HTTP {d} {s}", .{ @tagName(method), key, @intFromEnum(res.status), body[0..@min(body.len, 300)] });
+                std.log.warn("s3 {s} {s}: HTTP {d} {s}", .{ @tagName(method), key, @intFromEnum(status), body[0..@min(body.len, 300)] });
                 return error.HttpStatus;
             },
         }
@@ -213,15 +230,33 @@ fn transient(name: []const u8) bool {
     return false;
 }
 
-fn fetchOnce(b: *Bucket, url: []const u8, method: std.http.Method, hdrs: []const std.http.Header, auth: []const u8, w: *std.Io.Writer) !std.http.Client.FetchResult {
-    return b.client.fetch(.{
-        .location = .{ .url = url },
-        .method = method,
-        .extra_headers = hdrs,
-        .response_writer = w,
+/// One GET (as http.zig's): the connection's socket is armed in `abort`, so a timeout wakes a
+/// blocked read at once.
+fn fetchOnce(c: *std.http.Client, url: []const u8, hdrs: []const std.http.Header, auth: []const u8, w: *std.Io.Writer, abort: *netguard.Abort) !std.http.Status {
+    const uri = try std.Uri.parse(url);
+    var req = try c.request(.GET, uri, .{
+        .redirect_behavior = .unhandled,
         // (std.http sends `privileged_headers` nowhere; the authorization header goes here.)
         .headers = .{ .accept_encoding = .omit, .authorization = .{ .override = auth } },
+        .extra_headers = hdrs,
     });
+    defer req.deinit();
+    // Any failure from here on: the connection is not reused (std returns one whose request
+    // failed before the response head to the pool as healthy). Runs before `req.deinit`.
+    errdefer if (req.connection) |conn| {
+        conn.closing = true;
+    };
+    try abort.arm(netguard.socketOf(req.connection.?));
+    defer abort.disarm();
+    try req.sendBodiless();
+    var response = try req.receiveHead(&.{});
+    if (response.head.content_encoding != .identity) return error.UnsupportedCompressionMethod;
+    const reader = response.reader(&.{});
+    _ = reader.streamRemaining(w) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+        else => |e| return e,
+    };
+    return response.head.status;
 }
 
 /// `YYYYMMDDTHHMMSSZ` and `YYYYMMDD` (UTC) for SigV4.
@@ -263,4 +298,41 @@ test "sigv4 signing key chain" {
     var hex: [64]u8 = undefined;
     _ = try std.fmt.bufPrint(&hex, "{x}", .{&sig});
     try std.testing.expectEqualStrings("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41", &hex);
+}
+
+test "requester-pays bucket: a GET from a server that never answers fails at the timeout" {
+    var srv: netguard.TestServer = undefined;
+    try srv.start(std.testing.io, null);
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    var b = Bucket.init(std.testing.allocator, std.testing.io, .{ .access_key = "AKIDEXAMPLE", .secret_key = "secret" });
+    defer b.deinit();
+    b.endpoint = srv.url(&ub);
+    b.timeout_ms = 300;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const t0 = netguard.wallMs();
+    try std.testing.expectError(error.Timeout, b.get("ingestion/1.chk", &out));
+    try std.testing.expect(netguard.wallMs() - t0 < 3000);
+    try std.testing.expectEqual(@as(u64, 1), b.timeouts.load(.monotonic));
+}
+
+test "requester-pays bucket: a 404 and a hit" {
+    var srv404: netguard.TestServer = undefined;
+    try srv404.start(std.testing.io, "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+    defer srv404.stop();
+    var ub: [64]u8 = undefined;
+    var b = Bucket.init(std.testing.allocator, std.testing.io, .{ .access_key = "AKIDEXAMPLE", .secret_key = "secret" });
+    defer b.deinit();
+    b.endpoint = srv404.url(&ub);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Bucket.Result.missing, try b.get("k", &out));
+    var srv: netguard.TestServer = undefined;
+    try srv.start(std.testing.io, "HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nabc");
+    defer srv.stop();
+    var ub2: [64]u8 = undefined;
+    b.endpoint = srv.url(&ub2);
+    try std.testing.expectEqual(Bucket.Result.ok, try b.get("k", &out));
+    try std.testing.expectEqualStrings("abc", out.items);
 }

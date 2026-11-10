@@ -1265,7 +1265,12 @@ fn protoSignature(p: *Parser, q: *const Request) E!?UserSig {
             // the wrapped form parsed: that is the signature
             var r2: Rd = .{ .b = q.sig_bcs };
             const inner = r2.bytesV() catch unreachable;
-            return p.userSig(inner) catch unreachable;
+            // It parsed a moment ago; only an allocation failure can differ now, and that is an
+            // error to the caller, never an abort.
+            return p.userSig(inner) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Parse => return null,
+            };
         }
         p.err = try std.fmt.allocPrint(p.arena, "error converting from protobuf: field: bcs reason: FIELD_INVALID description: {s}", .{text});
         return null;

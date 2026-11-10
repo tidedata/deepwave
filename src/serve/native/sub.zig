@@ -164,7 +164,7 @@ pub fn bodyLen(body: []const u8) ParseError!usize {
         },
         2 => {
             const n = try r.uleb();
-            if (n * 32 > r.b.len - r.p) return error.Malformed;
+            if (n > 1024 or n * 32 > r.b.len - r.p) return error.Malformed;
             r.p += @intCast(n * 32);
         },
         3 => _ = try r.str(),

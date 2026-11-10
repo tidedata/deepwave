@@ -23,6 +23,7 @@ const types = @import("types");
 const hash = @import("hash");
 const cp = @import("checkpoint");
 pub const pb = @import("pb.zig");
+pub const proof = @import("proof.zig");
 pub const bls = @import("bls");
 
 const Allocator = std.mem.Allocator;
@@ -214,6 +215,14 @@ pub const Client = struct {
         if (st != .ok) return st;
         c.remember(record(&s, d));
         return .ok;
+    }
+
+    /// `trustPinned` from a BCS `CertifiedCheckpointSummary` (what `get_epoch_proof` and the
+    /// native protocol's checkpoints carry): the pin names the summary part.
+    pub fn trustPinnedCertified(c: *Client, certified: []const u8, pin: *const [32]u8) Status {
+        var r = bcs.Reader.init(certified);
+        bcs.skip(types.CheckpointSummary, &r) catch return .decode;
+        return c.trustPinned(certified[0..r.at], pin);
     }
 
     /// Verifies a certified summary: `sig` is BCS `AuthorityStrongQuorumSignInfo`.
@@ -663,6 +672,7 @@ const testing = std.testing;
 
 test {
     _ = pb;
+    _ = proof;
 }
 
 test "synthetic committee: verify, cache, epoch change, tamper" {

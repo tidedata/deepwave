@@ -16,6 +16,7 @@
 //!
 //! Anything outside the modeled set returns `.unsupported` with a reason (counted as a skip).
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types");
 const protocol = @import("protocol");
 const bcs = @import("bcs");
@@ -603,6 +604,9 @@ fn setCoinValue(arena: Allocator, contents: []const u8, v: u64) ![]const u8 {
 
 fn writeBytes(arena: Allocator, w: *const Write, version: u64, prev_tx: *const Id) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
+    // One allocation for the whole object in all but one case (a length is at most 10 bytes,
+    // an owner at most 41 unless it is a party owner; the list grows for that one).
+    try buf.ensureTotalCapacityPrecise(arena, w.type_bytes.len + w.contents.len + (if (w.package) |pk| pk.bcs.len else 0) + 1 + 8 + 10 + 41 + 33 + 8);
     if (w.package) |pk| {
         try buf.append(arena, 1);
         try buf.appendSlice(arena, pk.bcs);
@@ -641,7 +645,23 @@ fn appendUleb(arena: Allocator, buf: *std.ArrayList(u8), n: usize) !void {
     }
 }
 
+/// `Object::object_size_for_gas_metering` of a write. The version, the previous transaction and
+/// the rebate do not bear on it, so a Move object's size is known from its parts: `type_bytes`
+/// is the data tag, the serialized type and has_public_transfer (the type is 2 bytes less).
+/// Nothing is assembled or parsed for it; `writeBytes` builds the object once, for the effects.
+/// A published package is sized from its decoded `MovePackage` as before (rare), and so is a
+/// write the object parser would refuse (contents without the 32-byte id), which keeps its
+/// error.
 fn writeSizeForGasMetering(arena: Allocator, w: *const Write) !u64 {
+    if (w.package != null or w.type_bytes.len < 3 or w.contents.len < 32) return writeSizeByParse(arena, w);
+    const size = objects.moveSizeForGasMetering(w.type_bytes.len - 2, w.contents.len);
+    if (builtin.mode == .debug) std.debug.assert(size == try writeSizeByParse(arena, w));
+    return size;
+}
+
+/// The size of a write by assembling the object and parsing it back: packages, and the
+/// reference `writeSizeForGasMetering` is checked against (debug builds and the unit tests).
+fn writeSizeByParse(arena: Allocator, w: *const Write) !u64 {
     const raw = try writeBytes(arena, w, 0, &zero32);
     const v = try ObjectView.parse(raw);
     return objects.sizeForGasMetering(arena, &v);
@@ -1517,7 +1537,8 @@ fn runPtb(e: *Exec, p: *typing.Ptb, srcs: []const ?typing.ObjSource, host: *move
         lc.* = move_vm.LinkCtx.init(cache.rt, try pkgs.rootPackage(arena, cache.rt, p.unified));
         break :blk lc;
     } else try cache.linkCtx(p.unified);
-    defer if (own_link) link.deinit();
+    // A shared context keeps what this transaction's calls resolved: counted in the cache's size.
+    defer if (own_link) link.deinit() else cache.linkUsed(link);
     const ecfg = versions.execConfig(p.cfg) catch return p.diag.unsupported("execution config");
     var sess = try move_vm.Session.init(arena, link, p.meter, ecfg);
     sess.natives = try versions.nativeTable(arena, p.cfg, host.table());
@@ -1978,4 +1999,120 @@ pub fn v2View(arena: Allocator, v1: *const types.TransactionEffectsV1) !*types.T
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+fn testAddr(b: u8) types.AccountAddress {
+    var a: Id = @splat(0);
+    a[31] = b;
+    return .{ .@"0" = a };
+}
+
+test "a write's gas-metering size from its parts equals the size of the assembled object" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // One struct tag per `MoveObjectType` form a write can have: GasCoin, Coin, StakedSui, Other
+    // (they serialize to different lengths).
+    const sui: types.TypeTag = .{ .@"struct" = .{ .address = testAddr(2), .module = .{ .@"0" = "sui" }, .name = .{ .@"0" = "SUI" }, .type_args = &.{} } };
+    const usdc: types.TypeTag = .{ .@"struct" = .{ .address = testAddr(0xaa), .module = .{ .@"0" = "usdc" }, .name = .{ .@"0" = "USDC" }, .type_args = &.{} } };
+    const coin_usdc: types.TypeTag = .{ .@"struct" = .{ .address = testAddr(2), .module = .{ .@"0" = "coin" }, .name = .{ .@"0" = "Coin" }, .type_args = &.{usdc} } };
+    const tags = [_]types.StructTag{
+        .{ .address = testAddr(2), .module = .{ .@"0" = "coin" }, .name = .{ .@"0" = "Coin" }, .type_args = &.{sui} },
+        coin_usdc.@"struct",
+        .{ .address = testAddr(3), .module = .{ .@"0" = "staking_pool" }, .name = .{ .@"0" = "StakedSui" }, .type_args = &.{} },
+        .{ .address = testAddr(2), .module = .{ .@"0" = "dynamic_field" }, .name = .{ .@"0" = "Field" }, .type_args = &.{ .u64, .{ .vector = &coin_usdc } } },
+    };
+    const forms = [_]u8{ 1, 3, 2, 0 };
+    const owners = [_]types.Owner{
+        .{ .AddressOwner = .{ .@"0" = @splat(1) } },
+        .{ .ObjectOwner = .{ .@"0" = @splat(2) } },
+        .{ .Shared = .{ .initial_shared_version = .{ .@"0" = 9 } } },
+        .Immutable,
+        .{ .ConsensusAddressOwner = .{ .start_version = .{ .@"0" = 9 }, .owner = .{ .@"0" = @splat(3) } } },
+    };
+    // Contents from the bare id up, across the lengths where the ULEB prefix grows.
+    const lens = [_]usize{ 32, 40, 127, 128, 129, 16383, 16384, 250_000 };
+    const prev: Id = @splat(0x77);
+    for (&tags, forms) |*st, form| for ([_]bool{ false, true }) |has_public_transfer| {
+        const tb = try typeBytes(a, st, has_public_transfer);
+        try std.testing.expectEqual(form, tb[1]);
+        for (lens) |len| {
+            const contents = try a.alloc(u8, len);
+            @memset(contents, 0x5a);
+            for (owners) |owner| {
+                const w: Write = .{ .id = @splat(0x5a), .type_bytes = tb, .contents = contents, .owner = owner, .storage_rebate = 12345 };
+                const want = try writeSizeByParse(a, &w);
+                try std.testing.expectEqual(want, try writeSizeForGasMetering(a, &w));
+                // It is the size of the object as written (any version, digest and rebate).
+                const v = try ObjectView.parse(try writeBytes(a, &w, 77, &prev));
+                try std.testing.expectEqual(want, try objects.sizeForGasMetering(a, &v));
+                try std.testing.expectEqual(@as(u64, 80 + 1 + 8) + len + (tb.len - 2), want);
+            }
+        }
+    };
+    // Contents without the 32-byte id: the object parser's refusal, as before.
+    const short: Write = .{ .id = @splat(0), .type_bytes = try typeBytes(a, &tags[0], true), .contents = &(@as([31]u8, @splat(0))), .owner = .Immutable };
+    try std.testing.expectError(error.InvalidValue, writeSizeByParse(a, &short));
+    try std.testing.expectError(error.InvalidValue, writeSizeForGasMetering(a, &short));
+    // A published package: id, version, one module "m" of 4 bytes, one type origin (m, T) and
+    // one linkage entry. `MovePackage::size`: 80 + (1 + 4) + (1 + 1 + 32) + 72 + 8.
+    var pk: std.ArrayList(u8) = .empty;
+    try pk.appendSlice(a, &(@as(Id, @splat(0x11))));
+    try pk.appendSlice(a, &.{ 3, 0, 0, 0, 0, 0, 0, 0 });
+    try pk.appendSlice(a, &.{ 1, 1, 'm', 4, 0xa1, 0x1c, 0xeb, 0x0b });
+    try pk.appendSlice(a, &.{ 1, 1, 'm', 1, 'T' });
+    try pk.appendSlice(a, &(@as(Id, @splat(0x11))));
+    try pk.append(a, 1);
+    try pk.appendSlice(a, &(@as(Id, @splat(0x22))));
+    try pk.appendSlice(a, &(@as(Id, @splat(0x33))));
+    try pk.appendSlice(a, &.{ 5, 0, 0, 0, 0, 0, 0, 0 });
+    const pw: Write = .{ .id = @splat(0x11), .type_bytes = &.{}, .contents = &.{}, .owner = .Immutable, .package = .{ .version = 3, .bcs = pk.items } };
+    try std.testing.expectEqual(@as(u64, 199), try writeSizeForGasMetering(a, &pw));
+    try std.testing.expectEqual(@as(u64, 199), try writeSizeByParse(a, &pw));
+}
+
+test "gas-metering sizes from parts equal the parsed sizes on corpus objects, which rebuild to the same bytes" {
+    // Every input and output object of a spread of corpus checkpoints (genesis, the strata,
+    // the dense window), taken apart into a `Write` as the executor holds one: the size from
+    // its parts, the size by assembling and parsing, and the size of the object itself are
+    // equal, and `writeBytes` gives back the object's exact bytes.
+    const c = std.c.getenv("ZUI_CORPUS") orelse return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var idx = try types.CheckpointIndex.init(gpa);
+    defer idx.deinit(gpa);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const seqs = [_]u64{ 0, 13301887, 27104297, 42693343, 99032897, 157054136, 214777573, 270515094, 330857676, 342448960, 342451162, 342452223, 342455960 };
+    var forms: [6]usize = @splat(0);
+    var n_packages: usize = 0;
+    var read: usize = 0;
+    for (seqs) |seq| {
+        _ = arena_state.reset(.retain_capacity);
+        const a = arena_state.allocator();
+        var pb: [512]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "{s}/chk/{d}.chk", .{ std.mem.span(c), seq });
+        const blob = std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1 << 30)) catch continue;
+        try types.indexCheckpointData(blob, &idx);
+        read += 1;
+        for (idx.objs[0..idx.obj_total]) |r| {
+            const raw = r.slice(blob);
+            const v = try ObjectView.parse(raw);
+            const owner = try bcs.decode(types.Owner, a, raw[v.owner_at..v.prev_tx_at]);
+            const w: Write = if (v.is_package)
+                .{ .id = v.id, .type_bytes = &.{}, .contents = &.{}, .owner = owner, .storage_rebate = v.storageRebate(), .package = .{ .version = v.version, .bcs = raw[1..v.owner_at] } }
+            else
+                .{ .id = v.id, .type_bytes = raw[0..v.version_at], .contents = v.contents(), .owner = owner, .storage_rebate = v.storageRebate() };
+            const want = try objects.sizeForGasMetering(a, &v);
+            try std.testing.expectEqual(want, try writeSizeByParse(a, &w));
+            try std.testing.expectEqual(want, try writeSizeForGasMetering(a, &w));
+            try std.testing.expectEqualSlices(u8, raw, try writeBytes(a, &w, v.version, raw[v.prev_tx_at + 1 ..][0..32]));
+            if (v.is_package) n_packages += 1 else if (raw[1] < forms.len) {
+                forms[raw[1]] += 1;
+            }
+        }
+    }
+    if (read == 0) return error.SkipZigTest;
+    std.debug.print("write sizes: {d} corpus checkpoints, objects by type form: other {d}, gas coin {d}, staked sui {d}, coin {d}, sui accumulator field {d}, accumulator field {d}, packages {d}\n", .{ read, forms[0], forms[1], forms[2], forms[3], forms[4], forms[5], n_packages });
+    // The sample holds the common forms (the vectors above cover each one's arithmetic).
+    try std.testing.expect(forms[0] > 0 and forms[1] > 0 and forms[3] > 0 and n_packages > 0);
 }

@@ -15,6 +15,7 @@ const std = @import("std");
 const move_format = @import("move_format");
 const value = @import("value.zig");
 const gas = @import("gas.zig");
+const types_mod = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 const ff = move_format.file_format;
@@ -191,6 +192,9 @@ pub const Function = struct {
     /// whose `memo_key` it was looked up in (0: none).
     native_memo_key: u64 = 0,
     native_memo: [2]?*const anyopaque = .{ null, null },
+    /// The compiled code (interp.AotFn) of this function when the aot tier is on and the
+    /// module's bytecode digest matched a compiled module (aot.attach); null: interpreted.
+    aot: ?*const anyopaque = null,
 };
 
 pub const Module = struct {
@@ -205,6 +209,9 @@ pub const Module = struct {
     dt_handles: []?*Datatype,
     /// Function handle -> target when it is in the same package (null: other package).
     local_calls: []?*Function,
+    /// Function instantiation -> its signature mentions no type parameter (so the type
+    /// arguments are the same at every call; see `Session.callTypeArgs`).
+    gen_concrete: []bool,
 
     pub fn functionByName(m: *const Module, name: []const u8) ?*Function {
         for (m.functions) |*f| if (std.mem.eql(u8, f.name, name)) return f;
@@ -339,6 +346,9 @@ pub const VerifiedSet = struct {
 pub var verified: VerifiedSet = .{};
 pub var verified_enabled: bool = true;
 
+/// Called with every newly loaded, accepted package (aot.zig sets it when the tier is on).
+pub var aot_hook: ?*const fn (*Package) void = null;
+
 /// Rust `StatusType` by code range.
 fn statusType(code: ff.StatusCode) enum { validation, verification, invariant, deserialization, execution, unknown } {
     const c = @intFromEnum(code);
@@ -467,6 +477,7 @@ pub const Runtime = struct {
         p.modules = mods;
         // Same-package call targets need every module of the package.
         for (mods) |*m| try linkLocalCalls(m);
+        if (aot_hook) |h| h(p);
         const gop = try rt.by_original.getOrPut(rt.gpa, in.original_id);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(rt.gpa, p);
@@ -607,7 +618,15 @@ fn initModule(arena: Allocator, p: *Package, m: *Module, cm: ff.CompiledModule) 
         .constants = try arena.alloc(Constant, cm.constant_pool.len),
         .dt_handles = try arena.alloc(?*Datatype, cm.datatype_handles.len),
         .local_calls = try arena.alloc(?*Function, cm.function_handles.len),
+        .gen_concrete = try arena.alloc(bool, cm.function_instantiations.len),
     };
+    for (cm.function_instantiations, m.gen_concrete) |fi, *c| {
+        c.* = true;
+        for (cm.signatures[fi.type_parameters]) |t| if (types_mod.tokenIsGeneric(t)) {
+            c.* = false;
+            break;
+        };
+    }
     @memset(m.dt_handles, null);
     @memset(m.local_calls, null);
     for (cm.struct_defs, m.structs, 0..) |sd, *d, i| {

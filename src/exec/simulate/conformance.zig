@@ -20,6 +20,7 @@ const exec = @import("exec");
 const serve = @import("serve");
 const rpc_exec = @import("rpc_exec");
 const api = @import("api.zig");
+const batch = @import("batch.zig");
 
 const Allocator = std.mem.Allocator;
 const rconf = rpc_exec.conformance;
@@ -259,6 +260,24 @@ fn chainItems(sh: *Shared, ctx: *harness.Ctx, seq: []const u8, blocks: []const r
                 .rejected => |rj| if (rj.code == 12) ctx.skip(oid, rj.message) else ctx.pass(oid), // a budget the coin cannot cover is a valid answer
             }
         }
+        const bid = try std.fmt.allocPrint(a, "batch/{s}", .{seq});
+        if (ctx.selected(bid)) {
+            // the same jobs sequentially and through a 4-worker pool (core.io is null here: no random nonce)
+            const jobs = [_]batch.Job{ &.{one}, &.{ one, one }, &.{one}, &.{ one, one }, &.{one}, &.{one} };
+            var pool: batch.Pool = undefined;
+            try pool.init(std.heap.smp_allocator, ctx.io, .{ .workers = 4, .on_exit = api.releaseThreadCaches });
+            defer pool.deinit();
+            var bt = try pool.runAt(&sh.engine, &env, ms.state(), &jobs);
+            defer bt.deinit();
+            var diffs: usize = 0;
+            for (jobs, 0..) |j, i| {
+                const want = try sh.engine.simulateChainAt(a, &env, ms.state(), j);
+                if (bt.results[i].len != want.len) diffs += 1 else for (want, bt.results[i]) |w, g| {
+                    if (!batch.sameResult(w, g)) diffs += 1;
+                }
+            }
+            if (diffs == 0) ctx.pass(bid) else ctx.fail(bid, "{d} batch answers differ from sequential", .{diffs});
+        }
         return;
     };
 }
@@ -419,7 +438,19 @@ fn bench(ctx: *harness.Ctx) !void {
 
     // ---- throughput: T workers, each warmed, then a shared queue of passes over the items
     const passes = @max(1, ctx.opts.iters);
-    for ([_]usize{ 1, 4, 16 }) |nt| {
+    // ZUI_SIM_THREADS="1,2,4" picks the thread counts (default 1,4,16)
+    var nts_buf: [8]usize = .{ 1, 4, 16, 0, 0, 0, 0, 0 };
+    var nts: []const usize = nts_buf[0..3];
+    if (std.c.getenv("ZUI_SIM_THREADS")) |v| {
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+        while (it.next()) |x| if (n < nts_buf.len) {
+            nts_buf[n] = std.fmt.parseInt(usize, x, 10) catch continue;
+            if (nts_buf[n] > 0) n += 1;
+        };
+        if (n > 0) nts = nts_buf[0..n];
+    }
+    for (nts) |nt| {
         var b: Bench = .{ .sh = sh, .items = items.items, .total = items.items.len * passes * @max(1, nt / 2) };
         const threads = try arena.alloc(std.Thread, nt);
         for (threads) |*t| t.* = try std.Thread.spawn(.{}, worker, .{&b});
@@ -431,6 +462,43 @@ fn bench(ctx: *harness.Ctx) !void {
         const per_s = @as(f64, @floatFromInt(b.total)) * 1e9 / @as(f64, @floatFromInt(dt));
         ctx.stderr.print("  throughput {d} threads: {d} simulations in {d} ms = {d:.0} sims/s ({d} executed)\n", .{ nt, b.total, dt / 1_000_000, per_s, b.done_ok.load(.monotonic) }) catch {};
         ctx.benchRecord(try std.fmt.allocPrint(arena, "simulate-{d}t", .{nt}), "tx", b.total, dt * nt);
+    }
+    // ---- batch.Pool: each item as one batch of `per` independent copies at its own pre-state,
+    // W pool workers; every batch answer is checked against the sequential answer of that item
+    const per = 8;
+    for (nts) |w| {
+        var pool: batch.Pool = undefined;
+        try pool.init(std.heap.smp_allocator, ctx.io, .{ .workers = w, .on_exit = api.releaseThreadCaches });
+        defer pool.deinit();
+        var diffs: usize = 0;
+        var executed: usize = 0;
+        var a: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer a.deinit();
+        // warm pass (fills every worker's package cache), compared with the sequential answer
+        for (items.items) |*it| {
+            _ = a.reset(.retain_capacity);
+            const one = [_]api.Request{.{ .tx = .{ .data = it.tx_raw } }};
+            const jobs: [per]batch.Job = @splat(&one);
+            var bt = try pool.runAt(&sh.engine, &it.env, it.state.state(), &jobs);
+            defer bt.deinit();
+            const want = try sh.engine.simulateAt(a.allocator(), &it.env, it.state.state(), one[0]);
+            for (0..per) |i| {
+                if (!batch.sameResult(want, bt.one(i))) diffs += 1;
+                if (bt.one(i) == .executed) executed += 1;
+            }
+        }
+        const t0 = nowNs(ctx.io);
+        for (0..passes) |_| for (items.items) |*it| {
+            const one = [_]api.Request{.{ .tx = .{ .data = it.tx_raw } }};
+            const jobs: [per]batch.Job = @splat(&one);
+            var bt = try pool.runAt(&sh.engine, &it.env, it.state.state(), &jobs);
+            bt.deinit();
+        };
+        const dt: u64 = @intCast(nowNs(ctx.io) - t0);
+        const total = items.items.len * passes * per;
+        const per_s = @as(f64, @floatFromInt(total)) * 1e9 / @as(f64, @floatFromInt(dt));
+        ctx.stderr.print("  batch.Pool {d} workers: {d} batches of {d} = {d} simulations in {d} ms = {d:.0} sims/s; warm pass vs sequential: {d} diffs, {d} executed of {d}\n", .{ w, items.items.len * passes, per, total, dt / 1_000_000, per_s, diffs, executed, items.items.len * per }) catch {};
+        ctx.benchRecord(try std.fmt.allocPrint(arena, "batch-pool-{d}w", .{w}), "tx", total, dt * w);
     }
     const vs = api.verifiedStats();
     ctx.stderr.print("  verifier shared: {d} packages verified once, {d} loads skipped the verifier, {d} ran it\n", .{ vs.packages, vs.hits, vs.misses }) catch {};

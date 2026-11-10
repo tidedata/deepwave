@@ -739,9 +739,15 @@ fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: [
         try cpcache.maskKey(arena, mask_field.parts.items)
     else
         null;
+    // A transaction of this checkpoint whose submitted signature order was learned after the
+    // response was cached (store txfix.zig) makes the cached bytes stale. The generation is read
+    // before the transactions are, so a fix landing during the render only marks this entry stale.
+    const fixes = &snap.store.tx_fix;
+    const fix_gen = fixes.generation();
     if (key) |k| if (svc.cp_cache.get(want_seq, k)) |e| {
         defer cpcache.release(svc.gpa, e);
-        return sendCached(svc, rs, e);
+        if (!fixes.changedSince(want_seq, e.gen)) return sendCached(svc, rs, e);
+        svc.cp_cache.drop(svc.gpa, want_seq, k);
     };
     const d = try loadCheckpointData(svc, arena, snap, found, want_txs, want_objects);
     const budget = try arena.create(usize);
@@ -754,7 +760,7 @@ fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: [
         for (d.txs) |*t| t.render = rctx;
     }
     const bytes = try renderBytes(arena, 4096 + found.contents.len * 2, CpCtx{ .arena = arena, .m = m, .d = d, .budget = budget }, renderCheckpoint);
-    if (key) |k| svc.cp_cache.put(svc.gpa, want_seq, k, bytes);
+    if (key) |k| svc.cp_cache.putGen(svc.gpa, want_seq, k, bytes, fix_gen);
     return rs.message(bytes);
 }
 

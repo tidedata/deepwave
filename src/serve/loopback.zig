@@ -141,6 +141,8 @@ pub const StreamReply = struct {
     ended: bool = false,
     /// RST_STREAM error code, when the server reset the stream.
     reset: ?u32 = null,
+    /// Every DATA payload as received (gRPC-web text replies are read from here).
+    data: std.ArrayList(u8) = .empty,
 };
 
 pub const StreamOptions = struct {
@@ -151,6 +153,8 @@ pub const StreamOptions = struct {
     /// Called between reads (every 50 ms of quiet): the caller drives the server, e.g. publishes
     /// the next checkpoint. Returns false once it has nothing more to do.
     tick: ?Tick = null,
+    /// Send the framed request messages base64 encoded (a gRPC-web text request).
+    text_body: bool = false,
     pub const Tick = struct { ctx: *anyopaque, f: *const fn (*anyopaque) bool };
 };
 
@@ -199,6 +203,12 @@ pub fn call(arena: Allocator, io: std.Io, port: u16, path: []const u8, headers: 
         try body.append(arena, 0);
         try body.appendSlice(arena, &len);
         try body.appendSlice(arena, m);
+    }
+    if (opts.text_body and body.items.len > 0) {
+        const e = std.base64.standard.Encoder;
+        const t = try arena.alloc(u8, e.calcSize(body.items.len));
+        _ = e.encode(t, body.items);
+        body = .fromOwnedSlice(t);
     }
     try frame(&out, arena, 1, if (body.items.len == 0) 5 else 4, 1, hb.items);
     var off: usize = 0;
@@ -259,6 +269,7 @@ pub fn call(arena: Allocator, io: std.Io, port: u16, path: []const u8, headers: 
                         p = p[1 .. p.len - pad];
                     }
                     try data.appendSlice(arena, p);
+                    try rep.data.appendSlice(arena, p);
                     while (data.items.len - dpos >= 5) {
                         const n = std.mem.readInt(u32, data.items[dpos + 1 ..][0..4], .big);
                         if (data.items.len - dpos < 5 + n) break;

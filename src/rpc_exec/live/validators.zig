@@ -312,17 +312,24 @@ pub const Pool = struct {
     /// when its address does not parse. A dead connection is handed out (it fails calls at once)
     /// until the reconnect cooldown has passed; then the pool drops its own reference and opens a
     /// new one, while callers still holding the old one keep it alive until they unref it.
+    ///
+    /// The pool lock is never held while a connection lock is taken or waited for (a writer stuck
+    /// on one validator's socket holds that connection's lock): the liveness questions are
+    /// lock-free, the old connection is released after the pool lock, and opening one takes no
+    /// connection lock.
     pub fn get(p: *Pool, i: u32) ?*grpc.Conn {
+        var stale: ?*grpc.Conn = null;
+        defer if (stale) |c| c.release();
         p.mu.lockUncancelable(p.io);
         defer p.mu.unlock(p.io);
         if (p.conns[i]) |c| {
             const cooldown = @min(p.reconnect_cooldown << @intCast(@min(p.connect_fails[i], 8)), @max(p.max_reconnect_cooldown, p.reconnect_cooldown));
-            if (!c.isDead() or monotonicNs(p.io) -| c.died_at < cooldown) {
+            if (!c.isDead() or monotonicNs(p.io) -| c.diedAt() < cooldown) {
                 c.retain();
                 return c;
             }
-            p.connect_fails[i] = if (c.was_ready) 0 else p.connect_fails[i] +| 1;
-            c.release();
+            p.connect_fails[i] = if (c.wasReady()) 0 else p.connect_fails[i] +| 1;
+            stale = c;
             p.conns[i] = null;
         }
         const m = p.committee.members[i];
@@ -1732,6 +1739,67 @@ test "pool connections are retained by callers across a reconnect" {
     try waitReaderDone(c2);
     c1.unref();
     c2.unref();
+}
+
+test "the pool never waits for a connection lock while it holds its own" {
+    const gpa = std.heap.smp_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const members = try a.alloc(cm.Member, 2);
+    for (members, 0..) |*m, k| {
+        m.* = .{ .name = @splat(@intCast(k + 1)), .stake = 5000 };
+        m.network_address = "/ip4/127.0.0.1/tcp/1/http";
+        m.network_key = @splat(0);
+    }
+    const committee = try cm.Committee.init(a, 1, members);
+    var pool = try Pool.init(gpa, testing.io, &committee);
+    defer pool.deinit();
+    pool.reconnect_cooldown = 60 * std.time.ns_per_s;
+    const c0 = pool.get(0).?;
+    const c1 = pool.get(1).?;
+    var spins: u32 = 0;
+    while (!(c0.isDead() and c1.isDead()) and spins < 5000) : (spins += 1) try Io.sleep(testing.io, .fromMilliseconds(1), .awake);
+    try testing.expect(c0.isDead() and c1.isDead());
+
+    const T = struct {
+        pool: *Pool,
+        got: [2]?*grpc.Conn = .{ null, null },
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(t: *@This()) void {
+            t.got[0] = t.pool.get(0);
+            t.got[1] = t.pool.get(1);
+            t.done.store(true, .release);
+        }
+        fn wait(t: *@This(), ms: u32) bool {
+            var i: u32 = 0;
+            while (!t.done.load(.acquire) and i < ms) : (i += 1) Io.sleep(testing.io, .fromMilliseconds(1), .awake) catch {};
+            return t.done.load(.acquire);
+        }
+    };
+    // a writer stuck on member 0's socket holds that connection's lock like this
+    c0.mu.lockUncancelable(testing.io);
+    // inside the cooldown the pool hands out the connections it has
+    var t1: T = .{ .pool = &pool };
+    const th1 = try std.Thread.spawn(.{}, T.run, .{&t1});
+    const ok1 = t1.wait(2000);
+    // past it the pool replaces them, the locked one included
+    if (ok1) pool.reconnect_cooldown = 0;
+    var t2: T = .{ .pool = &pool };
+    const th2 = try std.Thread.spawn(.{}, T.run, .{&t2});
+    const ok2 = t2.wait(2000);
+    c0.mu.unlock(testing.io);
+    // with the lock free both threads end; one that does not would hang the join and the run
+    if (!t1.wait(20_000) or !t2.wait(20_000)) @panic("validators test: a pool.get thread did not end within 20 s");
+    th1.join();
+    th2.join();
+    defer for ([_]?*grpc.Conn{ c0, c1, t1.got[0], t1.got[1], t2.got[0], t2.got[1] }) |g| if (g) |c| {
+        waitReaderDone(c) catch {};
+        c.unref();
+    };
+    try testing.expect(ok1 and ok2);
+    try testing.expect(t1.got[0].? == c0 and t1.got[1].? == c1);
+    try testing.expect(t2.got[0].? != c0 and t2.got[1].? != c1);
 }
 
 test "a call cancelled unanswered at its deadline counts as a validator failure" {

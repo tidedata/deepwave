@@ -122,6 +122,8 @@ pub const Executor = struct {
     /// `--packages-from URL`: a full node asked (GetObject bcs, 20 req/s) for packages found
     /// nowhere else; fetched packages are saved to `pkg_dir` when it is writable.
     pkg_fetch: ?*@import("pkgfetch.zig").Fetcher = null,
+    /// Holds `pkg_fetch` off while its full node does not answer (ordered step only).
+    fetch_gate: FetchGate = .{},
     /// The network followed: selects the protocol table (`--network`).
     chain: protocol.Chain = .mainnet,
     /// Mismatches logged with both effects in hex (the first 3).
@@ -237,7 +239,8 @@ pub const Executor = struct {
         blob: []const u8,
         /// The checkpoint's transactions before the executing one (set per transaction).
         earlier: []const types.index.Tx = &.{},
-        objs: []const types.index.Range,
+        /// What the checkpoint's transactions left of each object (the job's, built in `decode`).
+        changes: *const Changes,
         /// Set when `latest` could not answer exactly: the transaction's result is discarded and
         /// it stays verify-only with this reason.
         gap: ?[]const u8 = null,
@@ -259,7 +262,7 @@ pub const Executor = struct {
         /// state file answers, or the read is a gap.
         fn latest(p: *const anyopaque, id: *const [32]u8) ?[]const u8 {
             const l: *Lookup = @ptrCast(@alignCast(@constCast(p)));
-            switch (lastInCheckpoint(l.blob, l.objs, l.earlier, id)) {
+            switch (l.changes.last(l.blob, l.earlier.len, id)) {
                 .found => |b| return b,
                 .removed => return null,
                 .none => {},
@@ -285,7 +288,7 @@ pub const Executor = struct {
         /// has never seen without the full live set, unless the deny-list state file covers it).
         fn unstable(p: *const anyopaque, id: *const [32]u8) bool {
             const l: *const Lookup = @ptrCast(@alignCast(p));
-            switch (lastInCheckpoint(l.blob, l.objs, l.earlier, id)) {
+            switch (l.changes.last(l.blob, l.earlier.len, id)) {
                 .found, .removed => return true,
                 .none => {},
             }
@@ -425,33 +428,33 @@ pub const Executor = struct {
     /// The package ids a checkpoint's transactions name directly: the framework, the packages and
     /// type arguments of their commands, and the types of every object they read or write (its
     /// own and the archive's object set). Pure: runs on any thread before the ordered step.
-    fn packageIds(arena: std.mem.Allocator, blob: []const u8, idx: *const types.CheckpointIndex, txs: []const types.CheckpointTransaction, extra: *const exec.objects.ObjectTable) []const [32]u8 {
+    fn packageIds(arena: std.mem.Allocator, blob: []const u8, idx: *const types.CheckpointIndex, txs: []const types.CheckpointTransaction, extra: *const exec.objects.ObjectTable) std.mem.Allocator.Error![]const [32]u8 {
         var work: std.ArrayList([32]u8) = .empty;
         for ([_]u8{ 1, 2, 3 }) |b| {
             var id: [32]u8 = @splat(0);
             id[31] = b;
-            work.append(arena, id) catch return work.items;
+            try work.append(arena, id);
         }
         for (txs) |*t| switch (t.transaction.data.@"0".element().intent_message.value.V1.kind) {
             .ProgrammableTransaction => |*pt| for (pt.commands) |*cmd| switch (cmd.*) {
                 .MoveCall => |*mc| {
-                    work.append(arena, mc.package.@"0".@"0") catch return work.items;
-                    for (mc.type_arguments) |*ty| typeInputIds(arena, &work, ty);
+                    try work.append(arena, mc.package.@"0".@"0");
+                    for (mc.type_arguments) |*ty| try typeInputIds(arena, &work, ty);
                 },
-                .MakeMoveVec => |*mv| if (mv[0]) |*ty| typeInputIds(arena, &work, ty),
+                .MakeMoveVec => |*mv| if (mv[0]) |*ty| try typeInputIds(arena, &work, ty),
                 else => {},
             },
             else => {},
         };
-        for (idx.objs[0..idx.obj_total]) |r| objectTypeIds(arena, &work, r.slice(blob));
+        for (idx.objs[0..idx.obj_total]) |r| try objectTypeIds(arena, &work, r.slice(blob));
         var it = extra.map.valueIterator();
-        while (it.next()) |raw| objectTypeIds(arena, &work, raw.*);
+        while (it.next()) |raw| try objectTypeIds(arena, &work, raw.*);
         // Distinct ids only (most objects of a checkpoint share a handful of types).
         var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
         var out: std.ArrayList([32]u8) = .empty;
         for (work.items) |id| {
-            if ((seen.getOrPut(arena, id) catch return work.items).found_existing) continue;
-            out.append(arena, id) catch return work.items;
+            if ((try seen.getOrPut(arena, id)).found_existing) continue;
+            try out.append(arena, id);
         }
         return out.items;
     }
@@ -505,9 +508,22 @@ pub const Executor = struct {
             .removed => {},
         };
         if (x.pkg_fetch) |f| {
+            // This is the ordered step: every later checkpoint waits on it. One request is cut
+            // at the fetcher's timeout, and a full node that does not answer is left alone for
+            // a while, so a dead or slow one costs one timeout per pause, not one per package.
+            // Not asked is not absent: the id is asked for again once the pause is over.
+            if (!x.fetch_gate.open(nowMs())) return null;
             var fa: std.heap.ArenaAllocator = .init(x.gpa);
             defer fa.deinit();
-            if (f.get(fa.allocator(), id)) |raw| {
+            const errors = f.errors;
+            const fetched = f.get(fa.allocator(), id);
+            if (f.errors != errors) {
+                const pause = x.fetch_gate.failed(nowMs());
+                std.log.warn("execute: --packages-from did not answer for package {x} (within {d} ms); not asked again for {d} s, transactions that need a package it holds stay verify-only meanwhile", .{ id, f.timeout_ms, pause / 1000 });
+                return null;
+            }
+            x.fetch_gate.answered();
+            if (fetched) |raw| {
                 const ok = if (exec.objects.ObjectView.parse(raw)) |v| v.is_package and std.mem.eql(u8, &v.id, id) else |_| false;
                 if (ok) {
                     x.addPackage(raw, epoch);
@@ -586,7 +602,7 @@ pub const Executor = struct {
     const FoundPkg = struct { raw: []const u8, output: bool };
 
     /// The package objects among a checkpoint's objects and its archive set (any thread).
-    fn findPackages(arena: std.mem.Allocator, blob: []const u8, idx: *const types.CheckpointIndex, aux: ?convert.Aux) []const FoundPkg {
+    fn findPackages(arena: std.mem.Allocator, blob: []const u8, idx: *const types.CheckpointIndex, aux: ?convert.Aux) std.mem.Allocator.Error![]const FoundPkg {
         var out: std.ArrayList(FoundPkg) = .empty;
         const S = struct {
             fn isPkg(raw: []const u8) bool {
@@ -594,11 +610,11 @@ pub const Executor = struct {
                 return v.is_package;
             }
         };
-        if (aux) |a| for (a.objects) |raw| if (S.isPkg(raw)) out.append(arena, .{ .raw = raw, .output = false }) catch {};
+        if (aux) |a| for (a.objects) |raw| if (S.isPkg(raw)) try out.append(arena, .{ .raw = raw, .output = false });
         for (0..idx.tx_count) |i| {
             const t = idx.txAt(i);
-            for (idx.objs[t.in_first..][0..t.in_count]) |r| if (S.isPkg(r.slice(blob))) out.append(arena, .{ .raw = r.slice(blob), .output = false }) catch {};
-            for (idx.objs[t.out_first..][0..t.out_count]) |r| if (S.isPkg(r.slice(blob))) out.append(arena, .{ .raw = r.slice(blob), .output = true }) catch {};
+            for (idx.objs[t.in_first..][0..t.in_count]) |r| if (S.isPkg(r.slice(blob))) try out.append(arena, .{ .raw = r.slice(blob), .output = false });
+            for (idx.objs[t.out_first..][0..t.out_count]) |r| if (S.isPkg(r.slice(blob))) try out.append(arena, .{ .raw = r.slice(blob), .output = true });
         }
         return out.items;
     }
@@ -887,7 +903,8 @@ pub const Executor = struct {
         j.indexed = true;
         const cp = bcs.decode(types.CheckpointData, arena, blob[1..]) catch |e| {
             _ = x.stats.errors.fetchAdd(1, .monotonic);
-            return x.verdict(seq, no_tx, .mismatch, @errorName(e));
+            // Out of memory says nothing about the checkpoint: not a divergence.
+            return x.verdict(seq, no_tx, if (e == error.OutOfMemory) .verify_only else .mismatch, @errorName(e));
         };
         _ = x.stats.transactions.fetchAdd(cp.transactions.len, .monotonic);
         const cfg = protocol.get(j.pv, x.chain) catch {
@@ -897,7 +914,15 @@ pub const Executor = struct {
         };
         j.table.addCheckpoint(arena, blob, &j.idx) catch |e| {
             _ = x.stats.errors.fetchAdd(1, .monotonic);
-            return x.verdict(seq, no_tx, .mismatch, @errorName(e));
+            // Out of memory says nothing about the checkpoint: not a divergence.
+            return x.verdict(seq, no_tx, if (e == error.OutOfMemory) .verify_only else .mismatch, @errorName(e));
+        };
+        // An allocation failure is not a divergence: without the index a `latest` read would
+        // miss an earlier transaction's write, so the checkpoint is not executed.
+        j.changes = Changes.build(arena, blob, j.idx.objs, j.idx.txs[0..j.idx.tx_count]) catch {
+            _ = x.stats.errors.fetchAdd(1, .monotonic);
+            for (0..cp.transactions.len) |i| x.verdict(seq, i, .verify_only, "out of memory");
+            return;
         };
         const aux: ?convert.Aux = if (j.has_aux) convert.Aux.parse(arena, j.aux_raw.items) catch null else null;
         if (aux == null) _ = x.stats.no_aux.fetchAdd(1, .monotonic);
@@ -907,13 +932,28 @@ pub const Executor = struct {
         };
         if (aux) |a| for (a.objects) |raw| {
             const k = exec.objects.keyOf(raw) catch continue;
-            j.extra.map.put(arena, k, raw) catch {};
+            // `extra` is an input-object source: a dropped entry is a missing input.
+            j.extra.map.put(arena, k, raw) catch {
+                _ = x.stats.errors.fetchAdd(1, .monotonic);
+                for (0..cp.transactions.len) |i| x.verdict(seq, i, .verify_only, "out of memory");
+                return;
+            };
         };
-        j.found = findPackages(arena, blob, &j.idx, aux);
-        j.pkg_ids = packageIds(arena, blob, &j.idx, cp.transactions, &j.extra);
+        // An allocation failure is not a divergence: the checkpoint is not executed (a missing
+        // package or marker would otherwise read as wrong effects).
+        j.found = findPackages(arena, blob, &j.idx, aux) catch {
+            _ = x.stats.errors.fetchAdd(1, .monotonic);
+            for (0..cp.transactions.len) |i| x.verdict(seq, i, .verify_only, "out of memory");
+            return;
+        };
+        j.pkg_ids = packageIds(arena, blob, &j.idx, cp.transactions, &j.extra) catch {
+            _ = x.stats.errors.fetchAdd(1, .monotonic);
+            for (0..cp.transactions.len) |i| x.verdict(seq, i, .verify_only, "out of memory");
+            return;
+        };
         j.results = arena.alloc(TxResult, cp.transactions.len) catch {
             _ = x.stats.errors.fetchAdd(1, .monotonic);
-            return x.verdict(seq, no_tx, .mismatch, "OutOfMemory");
+            return x.verdict(seq, no_tx, .verify_only, "OutOfMemory");
         };
         @memset(j.results, .{});
         j.aux = aux;
@@ -1020,7 +1060,7 @@ pub const Executor = struct {
         const blob = j.blob.items;
         const tx = j.idx.txAt(i);
         const data = &j.txs[i].transaction.data.@"0".element().intent_message.value.V1;
-        var lookup: Lookup = .{ .table = &j.table, .extra = &j.extra, .snap = &j.snap, .x = x, .epoch = j.epoch, .blob = blob, .objs = j.idx.objs, .earlier = j.idx.txs[0..i], .txs = j.idx.txs[0..j.txs.len], .arena = arena };
+        var lookup: Lookup = .{ .table = &j.table, .extra = &j.extra, .snap = &j.snap, .x = x, .epoch = j.epoch, .blob = blob, .changes = &j.changes, .earlier = j.idx.txs[0..i], .txs = j.idx.txs[0..j.txs.len], .arena = arena };
         const ctx: Ctx = .{ .cfg = j.cfg.?, .epoch = j.epoch, .pv = j.pv, .params = j.params, .blob = blob, .idx = &j.idx, .lookup = &lookup, .aux = j.aux, .extra = &j.extra };
         last_why = "";
         const res = x.run(arena, &ctx, i, tx, data) catch |e| return .{ .v = .mismatch, .why = @errorName(e), .err = true };
@@ -1347,6 +1387,8 @@ const Job = struct {
     txs: []const types.CheckpointTransaction = &.{},
     table: exec.objects.ObjectTable = .{},
     extra: exec.objects.ObjectTable = .{},
+    /// What the checkpoint's transactions left of each object (`Lookup.latest`), in `arena`.
+    changes: Changes = .{},
     aux: ?convert.Aux = null,
     found: []const Executor.FoundPkg = &.{},
     pkg_ids: []const [32]u8 = &.{},
@@ -1382,6 +1424,7 @@ const Job = struct {
         j.txs = &.{};
         j.table = .{};
         j.extra = .{};
+        j.changes = .{};
         j.aux = null;
         j.found = &.{};
         j.pkg_ids = &.{};
@@ -1414,12 +1457,125 @@ const Pool = struct {
     room: Io.Condition = .init,
 };
 
+/// When the package fetcher's full node may be asked. A request it did not answer (not
+/// reachable, an HTTP error, cut at the timeout) closes the gate for a pause that doubles with
+/// every failure in a row, from `min_ms` to `max_ms`; any answer, a package or none, resets it.
+/// While it is closed nothing is fetched, so the ordered step that asks spends at most one
+/// request timeout per pause on a full node that is down.
+const FetchGate = struct {
+    /// No request before this time (ms, monotonic).
+    closed_until_ms: u64 = 0,
+    /// The current pause (0: the last request was answered).
+    pause_ms: u64 = 0,
+
+    const min_ms: u64 = 5_000;
+    const max_ms: u64 = 5 * 60_000;
+
+    fn open(g: *const FetchGate, now_ms: u64) bool {
+        return now_ms >= g.closed_until_ms;
+    }
+
+    /// A request went unanswered: closes the gate; returns the pause.
+    fn failed(g: *FetchGate, now_ms: u64) u64 {
+        g.pause_ms = std.math.clamp(g.pause_ms * 2, min_ms, max_ms);
+        g.closed_until_ms = now_ms + g.pause_ms;
+        return g.pause_ms;
+    }
+
+    fn answered(g: *FetchGate) void {
+        g.pause_ms = 0;
+    }
+};
+
+fn nowMs() u64 {
+    return @import("source.zig").nowNs() / std.time.ns_per_ms;
+}
+
 const Last = union(enum) { none, found: []const u8, removed };
 
-/// What the checkpoint's `earlier` transactions left of `id`: the newest one that changed it
-/// wrote it (an output object) or removed it (a modified input without an output: deleted or
-/// wrapped). Checkpoint order is causal, so the last such transaction decides.
-fn lastInCheckpoint(blob: []const u8, objs: []const types.index.Range, earlier: []const types.index.Tx, id: *const [32]u8) Last {
+/// What a checkpoint's transactions left of each object, for `Lookup.latest` and `unstable`:
+/// id -> the transactions that changed it, in checkpoint order, each with what it left of the
+/// object: the output object it wrote, or a removal (a modified input without an output: deleted
+/// or wrapped). Checkpoint order is causal, so the newest change by a transaction before the
+/// executing one decides. Built once per checkpoint from its certified objects (`decode`) and
+/// read-only while its transactions run: a read is one hash lookup and a binary search, where a
+/// scan parsed every object of every earlier transaction (quadratic over a checkpoint, on every
+/// coin deny list read).
+const Changes = struct {
+    spans: std.AutoHashMapUnmanaged([32]u8, Span) = .empty,
+    /// Each id's changes side by side (`Span`), by transaction index ascending.
+    list: []const Change = &.{},
+
+    const Span = struct { first: u32, len: u32, last_tx: u32 };
+    const Change = struct {
+        tx: u32,
+        /// The object the transaction wrote; null: it removed the object.
+        raw: ?types.index.Range,
+    };
+
+    /// Per transaction and id, as the scan decides (`lastInCheckpointScan`): the first output
+    /// object of that id, else a removal when an input has it. Objects that do not parse are
+    /// passed over.
+    fn build(arena: std.mem.Allocator, blob: []const u8, objs: []const types.index.Range, txs: []const types.index.Tx) std.mem.Allocator.Error!Changes {
+        var total: u32 = 0;
+        for (txs) |*t| total += t.in_count + t.out_count;
+        var c: Changes = .{};
+        // Reserved up front: a span's address is kept in `picks` while later ids are added.
+        try c.spans.ensureTotalCapacity(arena, total);
+        const Pick = struct { span: *Span, change: Change };
+        var picks: std.ArrayList(Pick) = try .initCapacity(arena, total);
+        for (txs, 0..) |*t, i| {
+            const tx: u32 = @intCast(i);
+            const sides = [2][]const types.index.Range{ objs[t.out_first..][0..t.out_count], objs[t.in_first..][0..t.in_count] };
+            for (sides, 0..) |side, input| for (side) |r| {
+                const k = exec.objects.keyOf(r.slice(blob)) catch continue;
+                const gop = c.spans.getOrPutAssumeCapacity(k.id);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{ .first = 0, .len = 0, .last_tx = tx };
+                } else if (gop.value_ptr.last_tx == tx) continue; // this transaction's answer is set
+                gop.value_ptr.last_tx = tx;
+                gop.value_ptr.len += 1;
+                picks.appendAssumeCapacity(.{ .span = gop.value_ptr, .change = .{ .tx = tx, .raw = if (input == 0) r else null } });
+            };
+        }
+        const list = try arena.alloc(Change, picks.items.len);
+        var at: u32 = 0;
+        var it = c.spans.valueIterator();
+        while (it.next()) |s| {
+            s.first = at;
+            at += s.len;
+            s.len = 0;
+        }
+        // `picks` is in transaction order, so each span fills in transaction order.
+        for (picks.items) |p| {
+            list[p.span.first + p.span.len] = p.change;
+            p.span.len += 1;
+        }
+        c.list = list;
+        return c;
+    }
+
+    /// What the first `earlier` transactions of the checkpoint left of `id`.
+    fn last(c: *const Changes, blob: []const u8, earlier: usize, id: *const [32]u8) Last {
+        const s = c.spans.get(id.*) orelse return .none;
+        const l = c.list[s.first..][0..s.len];
+        // The number of changes by transactions before `earlier`; the newest of them decides.
+        var lo: usize = 0;
+        var hi: usize = l.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (l[mid].tx < earlier) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return .none;
+        return if (l[lo - 1].raw) |r| .{ .found = r.slice(blob) } else .removed;
+    }
+};
+
+/// The scan `Changes` replaced, kept as its reference (tests only). What the checkpoint's
+/// `earlier` transactions left of `id`: the newest one that changed it wrote it (an output
+/// object) or removed it (a modified input without an output: deleted or wrapped). Checkpoint
+/// order is causal, so the last such transaction decides.
+fn lastInCheckpointScan(blob: []const u8, objs: []const types.index.Range, earlier: []const types.index.Tx, id: *const [32]u8) Last {
     var j = earlier.len;
     while (j > 0) {
         j -= 1;
@@ -1437,37 +1593,42 @@ fn lastInCheckpoint(blob: []const u8, objs: []const types.index.Range, earlier: 
     return .none;
 }
 
-fn typeInputIds(a: std.mem.Allocator, out: *std.ArrayList([32]u8), t: *const types.TypeInput) void {
+fn typeInputIds(a: std.mem.Allocator, out: *std.ArrayList([32]u8), t: *const types.TypeInput) std.mem.Allocator.Error!void {
     switch (t.*) {
-        .vector => |e| typeInputIds(a, out, e),
+        .vector => |e| try typeInputIds(a, out, e),
         .@"struct" => |*st| {
-            out.append(a, st.address.@"0") catch return;
-            for (st.type_args) |*x| typeInputIds(a, out, x);
+            try out.append(a, st.address.@"0");
+            for (st.type_args) |*x| try typeInputIds(a, out, x);
         },
         else => {},
     }
 }
 
-fn typeTagIds(a: std.mem.Allocator, out: *std.ArrayList([32]u8), t: *const types.TypeTag) void {
+fn typeTagIds(a: std.mem.Allocator, out: *std.ArrayList([32]u8), t: *const types.TypeTag) std.mem.Allocator.Error!void {
     switch (t.*) {
-        .vector => |e| typeTagIds(a, out, e),
-        .@"struct" => |*st| structTagIds(a, out, st),
+        .vector => |e| try typeTagIds(a, out, e),
+        .@"struct" => |*st| try structTagIds(a, out, st),
         else => {},
     }
 }
 
-fn structTagIds(a: std.mem.Allocator, out: *std.ArrayList([32]u8), st: *const types.StructTag) void {
-    out.append(a, st.address.@"0") catch return;
-    for (st.type_args) |*x| typeTagIds(a, out, x);
+fn structTagIds(a: std.mem.Allocator, out: *std.ArrayList([32]u8), st: *const types.StructTag) std.mem.Allocator.Error!void {
+    try out.append(a, st.address.@"0");
+    for (st.type_args) |*x| try typeTagIds(a, out, x);
 }
 
 /// The packages named by a Move object's type (its struct and its type arguments).
-fn objectTypeIds(a: std.mem.Allocator, out: *std.ArrayList([32]u8), raw: []const u8) void {
-    const o = bcs.decode(types.Object, a, raw) catch return;
+fn objectTypeIds(a: std.mem.Allocator, out: *std.ArrayList([32]u8), raw: []const u8) std.mem.Allocator.Error!void {
+    const o = bcs.decode(types.Object, a, raw) catch |e| {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => {},
+        };
+    };
     switch (o.data) {
         .Move => |*m| switch (m.type_.@"0") {
-            .Other => |*st| structTagIds(a, out, st),
-            .Coin, .BalanceAccumulatorField => |*t| typeTagIds(a, out, t),
+            .Other => |*st| try structTagIds(a, out, st),
+            .Coin, .BalanceAccumulatorField => |*t| try typeTagIds(a, out, t),
             else => {},
         },
         .Package => {},
@@ -1803,4 +1964,128 @@ test "receive of an already received version (testnet 404267715 tx 10)" {
     const digest: [32]u8 = @splat(0);
     try std.testing.expect(receivedBefore(.{ .live = .{ .version = 1083805275, .digest = digest, .bytes = &.{} } }, 1082722667));
     try std.testing.expect(!receivedBefore(.{ .live = .{ .version = 1082722667, .digest = digest, .bytes = &.{} } }, 1082722667));
+}
+
+/// Test object bytes: a GasCoin Move object or an empty package of `id` at `version`.
+fn testObject(out: *std.ArrayList(u8), a: std.mem.Allocator, id: [32]u8, version: u64, package: bool) !void {
+    var v: [8]u8 = undefined;
+    std.mem.writeInt(u64, &v, version, .little);
+    if (package) {
+        try out.append(a, 1); // Data::Package
+        try out.appendSlice(a, &id);
+        try out.appendSlice(a, &v);
+        try out.appendSlice(a, &.{ 0, 0, 0 }); // no modules, type origins or linkage
+    } else {
+        try out.appendSlice(a, &.{ 0, 1, 1 }); // Data::Move, MoveObjectType::GasCoin, has_public_transfer
+        try out.appendSlice(a, &v);
+        try out.append(a, 40); // contents: id, balance
+        try out.appendSlice(a, &id);
+        try out.appendSlice(a, &v);
+    }
+    try out.append(a, 3); // Owner::Immutable
+    try out.append(a, 32); // previous_transaction
+    try out.appendNTimes(a, 0, 32);
+    try out.appendNTimes(a, 0, 8); // storage_rebate
+}
+
+test "Changes answers as the scan of earlier transactions does (repeated writes, removals, rewrites after a removal)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(0x1a57);
+    const rnd = prng.random();
+    var found: usize = 0;
+    var removed: usize = 0;
+    var none: usize = 0;
+    {
+        // Both test object forms parse (so the vectors below are not all passed over).
+        const id: [32]u8 = @splat(7);
+        inline for (.{ false, true }) |package| {
+            var one: std.ArrayList(u8) = .empty;
+            try testObject(&one, a, id, 5, package);
+            const k = try exec.objects.keyOf(one.items);
+            try std.testing.expectEqual(@as(u64, 5), k.version);
+            try std.testing.expectEqualSlices(u8, &id, &k.id);
+        }
+    }
+    for (0..40) |round| {
+        // A small id pool, so most ids are written, removed and written again many times.
+        var ids: [12][32]u8 = undefined;
+        for (&ids) |*id| rnd.bytes(id);
+        var blob: std.ArrayList(u8) = .empty;
+        var objs: std.ArrayList(types.index.Range) = .empty;
+        var txs: std.ArrayList(types.index.Tx) = .empty;
+        const ntx = rnd.uintLessThan(usize, 60);
+        var version: u64 = 1;
+        for (0..ntx) |_| {
+            var t: types.index.Tx = .{ .transaction = .{ .o = 0, .n = 0 }, .data = .{ .o = 0, .n = 0 }, .sig_first = 0, .sig_count = 0, .effects = .{ .o = 0, .n = 0 }, .events = null, .in_first = 0, .in_count = 0, .out_first = 0, .out_count = 0 };
+            inline for (.{ "in", "out" }) |side| {
+                @field(t, side ++ "_first") = @intCast(objs.items.len);
+                // Inputs only: a removal; both: a mutation; outputs only: a creation. The same id
+                // twice on one side also happens (the first one decides).
+                for (0..rnd.uintLessThan(usize, 5)) |_| {
+                    const o: u32 = @intCast(blob.items.len);
+                    if (rnd.uintLessThan(u8, 16) == 0) {
+                        // Bytes that do not parse: passed over by both.
+                        try blob.appendSlice(a, &.{ 0, 1, 1, 9 });
+                    } else {
+                        try testObject(&blob, a, ids[rnd.uintLessThan(usize, ids.len - 1)], version, round % 4 == 3 and rnd.boolean());
+                        version += 1;
+                    }
+                    try objs.append(a, .{ .o = o, .n = @intCast(blob.items.len - o) });
+                }
+                @field(t, side ++ "_count") = @intCast(objs.items.len - @field(t, side ++ "_first"));
+            }
+            try txs.append(a, t);
+        }
+        const c = try Changes.build(a, blob.items, objs.items, txs.items);
+        // Every id (the last of the pool is in no object) as every transaction sees it, and
+        // as one after the last would.
+        for (0..ntx + 1) |earlier| for (&ids) |*id| {
+            const want = lastInCheckpointScan(blob.items, objs.items, txs.items[0..earlier], id);
+            const got = c.last(blob.items, earlier, id);
+            try std.testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
+            switch (want) {
+                .found => |w| {
+                    // The same object of the blob, not only equal bytes.
+                    try std.testing.expectEqual(w.ptr, got.found.ptr);
+                    try std.testing.expectEqual(w.len, got.found.len);
+                    found += 1;
+                },
+                .removed => removed += 1,
+                .none => none += 1,
+            }
+        };
+    }
+    // The vectors reach every answer.
+    try std.testing.expect(found > 1000 and removed > 1000 and none > 1000);
+}
+
+test "FetchGate: an unanswered request pauses the fetcher, longer each time in a row, and an answer resets it" {
+    var g: FetchGate = .{};
+    try std.testing.expect(g.open(0));
+    // The first failure: closed for the minimum, then one more request is let through.
+    try std.testing.expectEqual(FetchGate.min_ms, g.failed(1_000));
+    try std.testing.expect(!g.open(1_000));
+    try std.testing.expect(!g.open(1_000 + FetchGate.min_ms - 1));
+    try std.testing.expect(g.open(1_000 + FetchGate.min_ms));
+    // Failures in a row double the pause up to the maximum.
+    var now: u64 = 1_000 + FetchGate.min_ms;
+    var want = FetchGate.min_ms * 2;
+    const start = now;
+    for (0..12) |_| {
+        const pause = g.failed(now);
+        try std.testing.expectEqual(@min(want, FetchGate.max_ms), pause);
+        try std.testing.expect(!g.open(now + pause - 1));
+        now += pause;
+        try std.testing.expect(g.open(now));
+        want *= 2;
+    }
+    try std.testing.expectEqual(FetchGate.max_ms, g.pause_ms);
+    // A full node down for that long (over half an hour) cost the ordered step 12 requests,
+    // however many packages were asked for meanwhile.
+    try std.testing.expect(now - start > 30 * 60_000);
+    // Any answer starts over.
+    g.answered();
+    try std.testing.expectEqual(FetchGate.min_ms, g.failed(now));
 }

@@ -3,6 +3,7 @@
 const std = @import("std");
 
 pub const ring = @import("ring.zig");
+pub const tile = @import("tile.zig");
 pub const conformance = @import("conformance.zig");
 
 test {

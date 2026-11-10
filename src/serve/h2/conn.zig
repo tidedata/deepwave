@@ -266,6 +266,11 @@ pub const Options = struct {
     max_header_list: usize = 16 << 10,
     /// Server default for `grpc-timeout` (sui-node `grpc-timeout-ms` 60 s).
     default_timeout_ns: ?u64 = 60 * std.time.ns_per_s,
+    /// A plain tonic `Routes` stack (sui-node's validator port, sui-network
+    /// `validator/server.rs`): no axum `/health` route, no CORS preflight, no gRPC-web layer, and
+    /// a path outside every service answers tonic's fallback (UNIMPLEMENTED, empty message)
+    /// instead of 404. Off: the full node's stack.
+    grpc_only: bool = false,
 };
 
 const FrameType = enum(u8) { data = 0, headers = 1, priority = 2, rst_stream = 3, settings = 4, push_promise = 5, ping = 6, goaway = 7, window_update = 8, continuation = 9, _ };
@@ -835,8 +840,13 @@ pub const Conn = struct {
     fn dispatch(c: *Conn, s: *Stream) ConnError!void {
         s.request_done = true;
         const path = meta.pathOnly(s.path);
-        const health_route = std.mem.eql(u8, path, "/health");
-        if (s.method == .options) return c.plainReply(s, if (health_route) .preflight_health else .preflight);
+        if (c.opts.grpc_only) {
+            // tonic Routes: every request is a gRPC call; unknown paths hit the fallback
+            s.web = .none;
+            if (!c.handler.isKnown(s.path)) return c.setTrailersEx(s, .unimplemented, "", "", false);
+        }
+        const health_route = !c.opts.grpc_only and std.mem.eql(u8, path, "/health");
+        if (s.method == .options and !c.opts.grpc_only) return c.plainReply(s, if (health_route) .preflight_health else .preflight);
         if (health_route) return switch (s.method) {
             .get => c.healthReply(s, true),
             .head => c.healthReply(s, false),

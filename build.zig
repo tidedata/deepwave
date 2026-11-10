@@ -27,6 +27,8 @@ const mods = [_]Mod{
     .{ .name = "bls", .path = "src/crypto/bls/root.zig", .deps = &.{"hash"} },
     .{ .name = "zk", .path = "src/crypto/zk/root.zig", .deps = &.{ "hash", "bcs", "types", "bls" } },
     .{ .name = "sig", .path = "src/crypto/sig/root.zig", .deps = &.{ "hash", "bcs", "types", "zk" } },
+    // Optional GPU accelerator: Metal / CUDA, off unless asked for.
+    .{ .name = "gpu", .path = "src/gpu/root.zig", .deps = &.{ "hash", "bcs", "types", "bls", "zk", "sig" } },
     .{ .name = "move_format", .path = "src/move/format/root.zig", .deps = &.{ "bcs", "types" } },
     .{ .name = "protocol", .path = "src/protocol/root.zig", .deps = &.{} },
     .{ .name = "store", .path = "src/store/root.zig", .deps = &.{"hash"} },
@@ -46,10 +48,14 @@ const mods = [_]Mod{
     .{ .name = "rpc_exec", .path = "src/rpc_exec/root.zig", .deps = &.{ "rt", "bcs", "types", "hash", "sig", "zk", "protocol", "store", "move_format", "move_vm", "natives", "exec", "serve" } },
     // Simulation engine: execution without commit, the native API.
     .{ .name = "simulate", .path = "src/exec/simulate/root.zig", .deps = &.{ "bcs", "types", "hash", "protocol", "store", "move_vm", "exec", "serve", "rpc_exec" } },
+    // Edge feed wire and zstd dictionaries (lane edge, docs/EDGE.md): pure bytes, no I/O.
+    .{ .name = "edgewire", .path = "src/edge/wire/root.zig", .deps = &.{ "bcs", "types", "hash", "store", "checkpoint" } },
     // zui/1 native serving protocol (lane native-proto, docs/NATIVE-PROTOCOL.md).
-    .{ .name = "native", .path = "src/serve/native/root.zig", .deps = &.{ "rt", "net", "bcs", "types", "hash", "store", "serve", "index", "rpc_exec" } },
+    .{ .name = "native", .path = "src/serve/native/root.zig", .deps = &.{ "rt", "net", "bcs", "types", "hash", "store", "serve", "index", "rpc_exec", "edgewire" } },
+    // Edge deepwave: zui/1 client, core pool and the node's edge source.
+    .{ .name = "edge", .path = "src/edge/root.zig", .deps = &.{ "rt", "net", "bcs", "types", "hash", "store", "checkpoint", "native", "edgewire" } },
     // Wave C: the full node composes every lane (node lane owns this row and the deepwave executable).
-    .{ .name = "node", .path = "src/node/root.zig", .deps = &.{ "rt", "net", "bcs", "types", "hash", "sig", "bls", "zk", "move_format", "protocol", "store", "checkpoint", "natives", "move_vm", "exec", "sync", "history", "serve", "index", "rpc_exec", "simulate", "native" } },
+    .{ .name = "node", .path = "src/node/root.zig", .deps = &.{ "rt", "net", "bcs", "types", "hash", "sig", "bls", "zk", "move_format", "protocol", "store", "checkpoint", "natives", "move_vm", "exec", "sync", "history", "serve", "index", "rpc_exec", "simulate", "native", "edgewire", "edge", "gpu" } },
 };
 
 pub fn build(b: *std.Build) void {
@@ -127,6 +133,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "node", .module = built[indexOf("node")] },
             // ExecuteTransaction (src/rpc_exec/live/node_exec.zig, DROP-IN G10)
             .{ .name = "rpc_exec", .module = built[indexOf("rpc_exec")] },
+            .{ .name = "move_vm", .module = built[indexOf("move_vm")] }, // --vm-aot (src/move/vm/aot.zig)
+            .{ .name = "edge", .module = built[indexOf("edge")] },
             .{ .name = "node_options", .module = node_test_opts.createModule() },
         },
     });
@@ -156,6 +164,43 @@ pub fn build(b: *std.Build) void {
     });
     const tool_step = b.step("tool", "Build deepwave-tool (sui-tool operator commands for a deepwave node directory)");
     tool_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-tool", .root_module = tool_mod }), .{}).step);
+
+    // deepwave-aot: compiler of the Move VM's ahead-of-time tier (tools/aot/main.zig, lane vm-aot).
+    // `./zig build aot`; usage in the file header.
+    const aot_mod = b.createModule(.{
+        .root_source_file = b.path("tools/aot/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "move_vm", .module = built[indexOf("move_vm")] },
+            .{ .name = "move_format", .module = built[indexOf("move_format")] },
+        },
+    });
+    const aot_step = b.step("aot", "Build deepwave-aot (Move bytecode to Zig compiler for the hot-package tier)");
+    aot_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-aot", .root_module = aot_mod }), .{}).step);
+
+    // deepwave-gpu-check: GPU-vs-CPU equality harness and bench (src/gpu/check.zig). `./zig build gpu-check`.
+    const gpu_check_mod = b.createModule(.{
+        .root_source_file = b.path("tools/gpu/check.zig"),
+        .link_libc = true,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "gpu", .module = built[indexOf("gpu")] }},
+    });
+    const gpu_check_step = b.step("gpu-check", "Build deepwave-gpu-check (GPU vs CPU equality harness and bench)");
+    gpu_check_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-gpu-check", .root_module = gpu_check_mod }), .{}).step);
+
+    // deepwave-dst: the node simulation tester over many seeds (src/node/dst/main.zig).
+    // `./zig build dst` (use -Doptimize=ReleaseFast for soaks).
+    const dst_mod = b.createModule(.{
+        .root_source_file = b.path("src/node/dst/main.zig"),
+        .link_libc = true,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "node", .module = built[indexOf("node")] }},
+    });
+    const dst_step = b.step("dst", "Build deepwave-dst (deterministic simulation tester of the node, many seeds)");
+    dst_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-dst", .root_module = dst_mod }), .{}).step);
 
     // deepwave-native: zui/1 test and bench client (tools/native/client.zig). `./zig build native-client`.
     const native_client_mod = b.createModule(.{
@@ -203,6 +248,25 @@ pub fn build(b: *std.Build) void {
     const exec_live_step = b.step("execute", "Build the deepwave-execute live ExecuteTransaction tool");
     exec_live_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-execute", .root_module = exec_live_mod }), .{}).step);
 
+    // deepwave-hw: hardware report and the every-path comparison harness (tools/hw/main.zig).
+    // `./zig build hw`.
+    const hw_mod = b.createModule(.{
+        .root_source_file = b.path("tools/hw/main.zig"),
+        .link_libc = true,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = g.core },
+            .{ .name = "hash", .module = built[indexOf("hash")] },
+            .{ .name = "sig", .module = built[indexOf("sig")] },
+            .{ .name = "bls", .module = built[indexOf("bls")] },
+            .{ .name = "zk", .module = built[indexOf("zk")] },
+            .{ .name = "gpu", .module = built[indexOf("gpu")] },
+        },
+    });
+    const hw_step = b.step("hw", "Build deepwave-hw (hardware report, every-path comparison harness)");
+    hw_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-hw", .root_module = hw_mod }), .{}).step);
+
     // deepwave-store-bench: restore-shaped commit bench and chunk codec level study
     // (tools/bench/restore_bench.zig, lane fast-compress). `./zig build store-bench -Doptimize=ReleaseFast`.
     const store_bench_mod = b.createModule(.{
@@ -219,6 +283,48 @@ pub fn build(b: *std.Build) void {
     const store_bench_step = b.step("store-bench", "Build deepwave-store-bench (restore-shaped commit bench, chunk codec study)");
     store_bench_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-store-bench", .root_module = store_bench_mod }), .{}).step);
 
+    // deepwave-standby: hot-standby lease agent/acceptor and the watchdog (src/standby, docs/STANDBY.md).
+    // Pure std, no lane modules. `./zig build standby`; its tests run under `./zig build test -Dlane=standby`.
+    const standby_mod = b.createModule(.{
+        .root_source_file = b.path("src/standby/main.zig"),
+        .link_libc = true,
+        .target = target,
+        .optimize = optimize,
+    });
+    const standby_step = b.step("standby", "Build deepwave-standby (lease agent, acceptor, watchdog)");
+    standby_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-standby", .root_module = standby_mod }), .{}).step);
+    const standby_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/standby/root.zig"),
+        .link_libc = true,
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // deepwave-move: Move tooling over deepwave's store and VM (tools/move/main.zig):
+    // gas report, gas profiler, storage-layout advisor, bytecode optimizer, superoptimizer.
+    // `./zig build move-tools`.
+    const move_tools_mod = b.createModule(.{
+        .root_source_file = b.path("tools/move/main.zig"),
+        .link_libc = true,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "node", .module = built[indexOf("node")] },
+            .{ .name = "exec", .module = built[indexOf("exec")] },
+            .{ .name = "bcs", .module = built[indexOf("bcs")] },
+            .{ .name = "types", .module = built[indexOf("types")] },
+            .{ .name = "store", .module = built[indexOf("store")] },
+            .{ .name = "serve", .module = built[indexOf("serve")] },
+            .{ .name = "move_format", .module = built[indexOf("move_format")] },
+            .{ .name = "move_vm", .module = built[indexOf("move_vm")] },
+            .{ .name = "protocol", .module = built[indexOf("protocol")] },
+            .{ .name = "rpc_exec", .module = built[indexOf("rpc_exec")] },
+            .{ .name = "simulate", .module = built[indexOf("simulate")] },
+        },
+    });
+    const move_tools_step = b.step("move-tools", "Build deepwave-move (gas report, profiler, layout advisor, optimizer, superoptimizer)");
+    move_tools_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-move", .root_module = move_tools_mod }), .{}).step);
+
     // Unit tests per module.
     const test_step = b.step("test", "Unit tests (all modules, or -Dlane=<module>)");
     const unit = [_]struct { name: []const u8, mod: *std.Build.Module }{
@@ -228,6 +334,18 @@ pub fn build(b: *std.Build) void {
     for (unit) |u| addTest(b, test_step, lane_filter, u.name, u.mod);
     addTestNamed(b, test_step, lane_filter, "harness", "runner", runner_mod);
     for (mods, 0..) |m, i| addTest(b, test_step, lane_filter, m.name, built[i]);
+    addTest(b, test_step, lane_filter, "standby", standby_test_mod);
+
+    // Validator (docs/VALIDATOR-DESIGN.md, unaudited): the consensus, consensus_net and validator
+    // modules and deepwave-validator. A separate table from `mods`, so deepwave, deepwave-tool, the
+    // conformance runners and the plain `test` step never compile them; they build only through
+    // `./zig build validator`, `./zig build test-validator` or `-Dlane=<one of them>`.
+    // -Dvalidator-unaudited=true (default false) compiles in the gate branch that may allow a
+    // non-local network with the runtime flag; off, local test committees are the only option.
+    const val_unaudited = b.option(bool, "validator-unaudited", "deepwave-validator: allow non-local networks behind a runtime flag (UNAUDITED; default false)") orelse false;
+    addValidator(b, target, optimize, core, harness, &built, test_step, lane_filter, val_unaudited, .{ .suite = suite, .limit = limit, .filter = filter, .jobs = jobs });
+
+    addTest(b, test_step, lane_filter, "move_tools", move_tools_mod); // tools/move (lane move-tools)
 
     // wasm-light: the verify-only light client. `./zig build wasm-light`
     // installs zig-out/wasm/deepwave-light.wasm; `./zig build test -Dlane=light` runs its unit tests.
@@ -245,6 +363,9 @@ pub fn build(b: *std.Build) void {
     });
     addTest(b, test_step, lane_filter, "light", light_native);
     addWasmLight(b);
+    // Cloudflare Workers (lane edge, clients/ts/light/worker): the same client, size-optimized.
+    // `./zig build wasm-worker` installs zig-out/wasm/deepwave-light-worker.wasm.
+    addWasmLightBuild(b, .ReleaseSmall, "deepwave-light-worker", "wasm-worker", "Build the wasm32 light client for Cloudflare Workers, size-optimized (zig-out/wasm/deepwave-light-worker.wasm)");
 
     const lean_step = b.step("lean", "Build Lean 4 specs and proofs, reject sorry (lean/check.sh)");
     const lean_run = b.addSystemCommand(&.{ "bash", "lean/check.sh" });
@@ -252,10 +373,125 @@ pub fn build(b: *std.Build) void {
     lean_step.dependOn(&lean_run.step);
 }
 
+const val_mods = [_]Mod{
+    .{ .name = "consensus", .path = "src/consensus/root.zig", .deps = &.{ "bcs", "types", "hash", "sig", "protocol", "store" } },
+    .{ .name = "consensus_net", .path = "src/consensus/net/root.zig", .deps = &.{ "rt", "net", "bcs", "types", "hash", "sig", "protocol", "store", "serve", "consensus" } },
+    .{ .name = "validator", .path = "src/validator/root.zig", .deps = &.{ "rt", "net", "bcs", "types", "hash", "sig", "bls", "zk", "move_format", "protocol", "store", "checkpoint", "natives", "move_vm", "exec", "sync", "history", "serve", "index", "rpc_exec", "simulate", "native", "node", "gpu", "consensus", "consensus_net" } },
+};
+
+/// The validator modules (val_mods), `./zig build validator` (deepwave-validator) and
+/// `./zig build test-validator`. Unit tests also run with `./zig build test -Dlane=<name>`.
+fn addValidator(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    core: *std.Build.Module,
+    harness: *std.Build.Module,
+    built: []const *std.Build.Module,
+    test_step: *std.Build.Step,
+    lane_filter: ?[]const u8,
+    unaudited: bool,
+    conf: struct { suite: []const u8, limit: u64, filter: []const u8, jobs: u32 },
+) void {
+    const opts = b.addOptions();
+    opts.addOption(bool, "validator_unaudited", unaudited);
+    const opts_mod = opts.createModule();
+    var vbuilt: [val_mods.len]*std.Build.Module = undefined;
+    for (val_mods, 0..) |m, i| {
+        const mod = b.createModule(.{ .root_source_file = b.path(m.path), .target = target, .optimize = optimize });
+        mod.addImport("core", core);
+        mod.addImport("harness", harness);
+        mod.addImport("validator_options", opts_mod);
+        dep: for (m.deps) |d| {
+            for (val_mods[0..i], 0..) |vm, j| if (std.mem.eql(u8, vm.name, d)) {
+                mod.addImport(d, vbuilt[j]);
+                continue :dep;
+            };
+            mod.addImport(d, built[indexOf(d)]);
+        }
+        vbuilt[i] = mod;
+    }
+    const vtest = b.step("test-validator", "Unit tests of consensus, consensus_net and validator");
+    for (val_mods, 0..) |m, i| {
+        vtest.dependOn(&b.addRunArtifact(addTestExe(b, .{ .name = b.fmt("test-{s}", .{m.name}), .root_module = vbuilt[i] })).step);
+        if (lane_filter) |f| if (std.mem.eql(u8, f, m.name)) addTest(b, test_step, f, m.name, vbuilt[i]);
+    }
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/validator/main.zig"),
+        .link_libc = true,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "validator", .module = vbuilt[val_mods.len - 1] }},
+    });
+    // Conformance of the consensus module: deepwave-conformance-consensus links the consensus suites only
+    // (consensus-block, consensus-replay) and reads vectors from $ZUI_CORPUS/consensus/. The shared
+    // runner root is src/harness/main.zig; `./zig build test-conformance-consensus` runs it.
+    {
+        const text = "//! Generated by build.zig: the validator lane modules this conformance runner links.\npub const harness_suites = false;\npub const lanes = .{ @import(\"consensus\") };\n";
+        const wf = b.addWriteFiles();
+        const lanes_mod = b.createModule(.{ .root_source_file = wf.add("zui_lanes.zig", text), .target = target, .optimize = optimize });
+        lanes_mod.addImport("consensus", vbuilt[0]);
+        const runner_mod = b.createModule(.{
+            .root_source_file = b.path("src/harness/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "harness", .module = harness }, .{ .name = "zui_lanes", .module = lanes_mod } },
+        });
+        const runner = addExe(b, .{ .name = "deepwave-conformance-consensus", .root_module = runner_mod });
+        const install_step = b.step("conformance-consensus", "Build and install deepwave-conformance-consensus (validator consensus suites)");
+        install_step.dependOn(&b.addInstallArtifact(runner, .{}).step);
+        const cconf = b.step("test-conformance-consensus", "Run the consensus conformance suites against $ZUI_CORPUS/consensus/ (UNAUDITED validator code)");
+        const run = b.addRunArtifact(runner);
+        run.has_side_effects = true;
+        run.addArgs(&.{ "--suite", "val-consensus-core", "--jobs", "1" });
+        cconf.dependOn(&run.step);
+    }
+    // Conformance runner of the validator suites (src/validator/conformance.zig): the same harness
+    // as deepwave-conformance, linking only the validator module. Pass the runner's own options after
+    // the usual -Dsuite, -Dlimit, -Dfilter and -Djobs, e.g.
+    // `./zig build test-validator-conformance -Dsuite=checkpoint-build -Djobs=16`.
+    const vconf_lanes = b.addWriteFiles().add("zui_lanes.zig", "pub const harness_suites = false;\npub const lanes = .{ @import(\"validator\") };\n");
+    const vconf_lanes_mod = b.createModule(.{ .root_source_file = vconf_lanes, .target = target, .optimize = optimize });
+    vconf_lanes_mod.addImport("validator", vbuilt[val_mods.len - 1]);
+    const vconf_mod = b.createModule(.{
+        .root_source_file = b.path("src/harness/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "harness", .module = harness }, .{ .name = "zui_lanes", .module = vconf_lanes_mod } },
+    });
+    const vconf = addExe(b, .{ .name = "deepwave-conformance-validator", .root_module = vconf_mod });
+    const vconf_step = b.step("test-validator-conformance", "Run the validator conformance suites against $ZUI_CORPUS (-Dsuite=<name>)");
+    const vconf_run = b.addRunArtifact(vconf);
+    vconf_run.has_side_effects = true;
+    vconf_run.setCwd(b.path("."));
+    vconf_run.addArgs(&.{ "--suite", conf.suite, "--limit", b.fmt("{d}", .{conf.limit}), "--filter", conf.filter, "--jobs", b.fmt("{d}", .{conf.jobs}) });
+    vconf_step.dependOn(&vconf_run.step);
+    const vconf_build = b.step("validator-conformance-runner", "Build deepwave-conformance-validator");
+    vconf_build.dependOn(&b.addInstallArtifact(vconf, .{}).step);
+
+    const step = b.step("validator", "Build deepwave-validator (UNAUDITED; gated to local test committees unless -Dvalidator-unaudited)");
+    step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-validator", .root_module = exe_mod }), .{}).step);
+
+    // deepwave-consensus-localnet (val-consensus-net): N consensus authorities on loopback, generated keys.
+    const ln_mod = b.createModule(.{
+        .root_source_file = b.path("src/consensus/net/localnet_main.zig"),
+        .link_libc = true,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "consensus_net", .module = vbuilt[1] }},
+    });
+    const ln_step = b.step("consensus-localnet", "Build deepwave-consensus-localnet (loopback test committee, generated keys)");
+    ln_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-consensus-localnet", .root_module = ln_mod }), .{}).step);
+}
+
 /// `zig build wasm-light [-Dwasm-optimize=fast|small]`: the lane modules the light
 /// client reaches, rebuilt for wasm32-freestanding with SIMD128 (no libc, no threads).
 fn addWasmLight(b: *std.Build) void {
     const wopt = b.option(std.builtin.OptimizeMode, "wasm-optimize", "wasm-light optimize mode (default fast)") orelse .fast;
+    addWasmLightBuild(b, wopt, "deepwave-light", "wasm-light", "Build the wasm32 verify-only light client (zig-out/wasm/deepwave-light.wasm)");
+}
+
+fn addWasmLightBuild(b: *std.Build, wopt: std.builtin.OptimizeMode, exe_name: []const u8, step_name: []const u8, step_doc: []const u8) void {
     const wt = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -284,11 +520,11 @@ fn addWasmLight(b: *std.Build) void {
         .strip = wopt != .debug,
         .imports = &.{.{ .name = "light", .module = lmod }},
     });
-    const exe = addExe(b, .{ .name = "deepwave-light", .root_module = root });
+    const exe = addExe(b, .{ .name = exe_name, .root_module = root });
     exe.entry = .disabled;
     exe.rdynamic = true;
     exe.stack_size = 1 << 20;
-    const step = b.step("wasm-light", "Build the wasm32 verify-only light client (zig-out/wasm/deepwave-light.wasm)");
+    const step = b.step(step_name, step_doc);
     step.dependOn(&b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "wasm" } } }).step);
 }
 

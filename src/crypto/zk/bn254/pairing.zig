@@ -168,6 +168,68 @@ pub fn multiMillerLoop(pairs: []const Pair) Fq12 {
     return f;
 }
 
+/// `multiMillerLoop` for any number of pairs (no 8-pair buffer): the same product, pairs with
+/// an identity point skipped. The Miller loop of a product is the product of the Miller loops,
+/// so a caller may split pairs over threads and multiply the partial results.
+pub fn multiMillerLoopAny(pairs: []const Pair) Fq12 {
+    var f = Fq12.one;
+    var idx: usize = 0;
+    var i: usize = ate_loop_count.len - 1;
+    while (i >= 1) : (i -= 1) {
+        if (i != ate_loop_count.len - 1) f = f.sq();
+        for (pairs) |pr| if (!pr.p.infinity and !pr.q.infinity) ell(&f, pr.q.coeffs[idx], pr.p);
+        idx += 1;
+        const bit = ate_loop_count[i - 1];
+        if (bit != 0) {
+            for (pairs) |pr| if (!pr.p.infinity and !pr.q.infinity) ell(&f, pr.q.coeffs[idx], pr.p);
+            idx += 1;
+        }
+    }
+    for (pairs) |pr| if (!pr.p.infinity and !pr.q.infinity) ell(&f, pr.q.coeffs[idx], pr.p);
+    idx += 1;
+    for (pairs) |pr| if (!pr.p.infinity and !pr.q.infinity) ell(&f, pr.q.coeffs[idx], pr.p);
+    return f;
+}
+
+/// x^e for x in the cyclotomic subgroup (every pairing value is), e little-endian limbs.
+pub fn cyclotomicPow(x: Fq12, e: []const u64) Fq12 {
+    var r = Fq12.one;
+    var started = false;
+    var i: usize = e.len;
+    while (i > 0) {
+        i -= 1;
+        var bit: u7 = 64;
+        while (bit > 0) {
+            bit -= 1;
+            if (started) r = r.cyclotomicSq();
+            if ((e[i] >> @intCast(bit)) & 1 == 1) {
+                r = if (started) r.mul(x) else x;
+                started = true;
+            }
+        }
+    }
+    return r;
+}
+
+/// x is in the order-r subgroup of Fq12* (the pairing's target group): x^r == 1, with
+/// generic squarings (x may be any element).
+pub fn inTargetGroup(x: Fq12) bool {
+    if (x.isZero()) return false;
+    const r_limbs = comptime fp.limbsOf(fp.r_modulus);
+    var acc = Fq12.one;
+    var i: usize = 4;
+    while (i > 0) {
+        i -= 1;
+        var bit: u7 = 64;
+        while (bit > 0) {
+            bit -= 1;
+            acc = acc.sq();
+            if ((r_limbs[i] >> @intCast(bit)) & 1 == 1) acc = acc.mul(x);
+        }
+    }
+    return acc.isOne();
+}
+
 /// f^x on the cyclotomic subgroup (x = BN parameter, positive).
 fn cyclotomicExpX(f: Fq12) Fq12 {
     var r = Fq12.one;

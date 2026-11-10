@@ -1,5 +1,5 @@
 //! Keccak-f[1600] and the three sponges Sui uses: SHA3-256, SHA3-512 (FIPS 202, pad 0x06) and
-//! Keccak-256 (original Keccak, pad 0x01; Ethereum / `sui::hash::keccak256`).
+//! Keccak-256 (original Keccak, pad 0x01; `sui::hash::keccak256`).
 //!
 //! The state is absorbed in place: input lanes are XORed straight into the 25-word state, there
 //! is no staging buffer. Whole blocks come from the caller's slice. The permutation is fully
@@ -41,6 +41,7 @@ pub const has_sha3_hw = builtin.cpu.arch == .aarch64 and builtin.zig_backend != 
 /// Runtime dispatched on x86-64 (core/cpu.zig): the BMI1 `andn`/`rorx` forms of the chi and
 /// rho steps in the AVX2 kernel object.
 pub fn permute(st: *[25]u64) void {
+    if (comptime has_sha3_hw) if (cpu.armSha3Wanted()) return permuteHw(st);
     cpu.call("keccak_f1600", permuteSoft, .{st});
 }
 
@@ -176,6 +177,16 @@ pub fn absorbSoft(a: *[25]u64, in: [*]const u8, rate_words: usize, blocks: usize
 }
 
 pub fn absorb(a: *[25]u64, in: [*]const u8, rate_words: usize, blocks: usize) void {
+    if (comptime has_sha3_hw) if (cpu.armSha3Wanted()) {
+        if (blocks == 0) return permuteHw(a);
+        var p = in;
+        for (0..blocks) |_| {
+            for (0..rate_words) |i| a[i] ^= std.mem.readInt(u64, p[i * 8 ..][0..8], .little);
+            permuteHw(a);
+            p += rate_words * 8;
+        }
+        return;
+    };
     cpu.call("keccak_absorb", absorbSoft, .{ a, in, rate_words, blocks });
 }
 

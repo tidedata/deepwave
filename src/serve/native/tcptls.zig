@@ -10,6 +10,7 @@ const net = @import("net");
 const serve = @import("serve");
 const cert_mod = @import("cert.zig");
 const tls_srv = net.tls13_server;
+const x509 = net.x509;
 const qc = net.qcrypto;
 const sock = serve.h2.sock;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
@@ -44,11 +45,16 @@ const Dir = struct {
 pub const Server = struct {
     gpa: Allocator,
     io: Io,
-    cert: cert_mod.Cert,
+    /// The P-256 certificate (`--serve-tls`); unused in Ed25519 mode.
+    cert: cert_mod.Cert = undefined,
     identity: Ed25519.KeyPair,
     /// sui-node `rpc.tls`: the operator's PEM chain and key (`--serve-tls-cert/-key`), served
     /// instead of the self-signed `cert`. Owned by the server.
     files: ?net.tls_identity.Identity = null,
+    /// Ed25519 mode (validator gRPC, sui-tls): the self-signed certificate of `identity` is served
+    /// and signs CertificateVerify. Null: the P-256 `cert`.
+    ed_cert: ?struct { der: [x509.max_cert_len]u8, len: usize } = null,
+    server_name: []const u8 = "zui",
 
     pub fn init(gpa: Allocator, io: Io, cert: cert_mod.Cert) Server {
         var seed: [32]u8 = undefined;
@@ -71,6 +77,17 @@ pub const Server = struct {
     pub fn deinit(s: *Server) void {
         if (s.files) |*f| f.deinit();
         s.files = null;
+    }
+
+    /// A server whose TLS identity is the Ed25519 key of `seed` with a self-signed certificate named
+    /// `name` (sui-tls `create_rustls_server_config`: no client authentication).
+    pub fn initEd25519(gpa: Allocator, io: Io, seed: [32]u8, name: []const u8) error{BadKey}!Server {
+        const kp = Ed25519.KeyPair.generateDeterministic(seed) catch return error.BadKey;
+        var s: Server = .{ .gpa = gpa, .io = io, .identity = kp, .ed_cert = .{ .der = undefined, .len = 0 }, .server_name = name };
+        var serial: [20]u8 = undefined;
+        io.random(&serial);
+        s.ed_cert.?.len = x509.generateSelfSigned(&s.ed_cert.?.der, kp, serial, name);
+        return s;
     }
 
     pub fn acceptor(s: *Server) sock.Acceptor {
@@ -111,17 +128,18 @@ pub const Conn = struct {
         errdefer c.out.deinit(gpa);
         var rnd: [64]u8 = undefined;
         srv.io.random(&rnd);
+        const ed = srv.ed_cert != null;
         var st = tls_srv.Server.init(.{
-            .server_name = "zui",
+            .server_name = srv.server_name,
             .local_tp = "",
             .identity = srv.identity,
-            .cert_der = srv.cert.bytes(),
+            .cert_der = if (srv.ed_cert) |*e| e.der[0..e.len] else srv.cert.bytes(),
             .now_unix = 0,
             .random = rnd[0..32].*,
             .x25519_secret = rnd[32..64].*,
             .alpn = &.{ "h2", "http/1.1" },
             .client_auth = false,
-            .alt = .{ .alpn_index = 0, .cert_der = srv.cert.bytes(), .key = srv.cert.key },
+            .alt = if (ed) null else .{ .alpn_index = 0, .cert_der = srv.cert.bytes(), .key = srv.cert.key },
             .tcp = true,
             .chain = if (srv.files) |*f| f else null,
         });

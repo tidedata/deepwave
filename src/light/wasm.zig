@@ -110,6 +110,11 @@ export fn lc_trust_pinned(summary: [*]const u8, len: usize, pin: *const [32]u8) 
     return done(cl().trustPinned(slice(summary, len), pin));
 }
 
+/// A pin checked against a BCS `CertifiedCheckpointSummary` (summary ++ signature info).
+export fn lc_trust_pinned_certified(certified: [*]const u8, len: usize, pin: *const [32]u8) u32 {
+    return done(cl().trustPinnedCertified(slice(certified, len), pin));
+}
+
 /// `sig`: BCS `AuthorityStrongQuorumSignInfo`.
 export fn lc_verify_summary(summary: [*]const u8, len: usize, sig: [*]const u8, sig_len: usize) u32 {
     var v: light.Verified = undefined;
@@ -155,6 +160,35 @@ export fn lc_verify_object(anchor: *const [32]u8, contents: [*]const u8, content
     put64(288, o.version);
     @memcpy(out[296..328], &o.digest);
     return done(st);
+}
+
+/// A zui/1 verified-mode `Proof` (docs/NATIVE-PROTOCOL.md section 7), item `index`, in one call.
+/// `kind` 0: transaction (`data` = TransactionData, `events` = TransactionEvents, both optional);
+/// 1: object (`data` = the object's BCS); 2: transaction with `data` the BCS Transaction envelope
+/// (`Tx.tx` of the native protocol). Fills the summary, tx and object slots.
+export fn lc_verify_native_item(proof: [*]const u8, proof_len: usize, index: u32, kind: u32, data: [*]const u8, data_len: usize, events: [*]const u8, events_len: usize) u32 {
+    if (kind > 2) return @intFromEnum(light.Status.decode);
+    const k: light.proof.Kind = switch (kind) {
+        0 => .tx,
+        1 => .object,
+        else => .tx_envelope,
+    };
+    const v = light.proof.verifyItem(cl(), slice(proof, proof_len), index, k, opt(data, data_len), opt(events, events_len));
+    if (v.status == .ok) {
+        putVerified(&v.checkpoint);
+        putTx(&v.tx);
+        if (kind == 1) {
+            @memcpy(out[256..288], &v.obj.id);
+            put64(288, v.obj.version);
+            @memcpy(out[296..328], &v.obj.digest);
+        }
+    }
+    return done(v.status);
+}
+
+/// Items in a `Proof` (for batch answers), or maxInt when it does not parse.
+export fn lc_native_item_count(proof: [*]const u8, proof_len: usize) u64 {
+    return light.proof.itemCount(slice(proof, proof_len)) orelse std.math.maxInt(u64);
 }
 
 /// Latest trusted committee epoch, or maxInt when none.

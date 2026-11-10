@@ -20,6 +20,7 @@ const anemo = @import("anemo.zig");
 const wire = @import("wire.zig");
 const p2pm = @import("core").p2p_metrics;
 const udpio = @import("udpio.zig");
+const retry_mod = @import("retry.zig");
 
 /// The I/O thread's batched socket state (net/udpio.zig, shared with the zui/1 server):
 /// allocated once at start, so receiving and sending a datagram never allocates.
@@ -44,9 +45,20 @@ pub const Options = struct {
     max_streams_per_connection: u32 = 500,
     idle_timeout_ms: u64 = 10_000,
     keep_alive_ms: u64 = 5_000,
-    stream_receive_window: u64 = 100 << 20,
-    receive_window: u64 = 200 << 20,
+    /// Receive windows are ours to choose (they only bound what a client may send us) and they
+    /// bound memory per connection: sui-node's 100 MiB / 200 MiB let one client make us hold
+    /// 200 MiB. A request is at most `max_request_frame` (1 MiB) plus its header, and the window
+    /// moves only as requests are answered and freed.
+    stream_receive_window: u64 = 2 << 20,
+    receive_window: u64 = 32 << 20,
     max_request_frame: usize = wire.sui_max_request_frame,
+    /// Half-open connections (handshake not finished) above which a new client must first come
+    /// back with a Retry token (stateless address validation; 0: always). Spoofed Initials then
+    /// cost no slot and no key derivation.
+    retry_threshold: usize = 64,
+    /// A connection that has not finished its handshake this long after its first Initial is
+    /// dropped (the idle timeout is 10 s).
+    handshake_timeout_ms: u64 = 5_000,
 };
 
 pub const Stats = struct {
@@ -60,6 +72,9 @@ pub const Stats = struct {
     bytes_out: Atomic(u64) = .init(0),
     datagrams_in: Atomic(u64) = .init(0),
     datagrams_out: Atomic(u64) = .init(0),
+    /// Retry packets sent, and Initials whose Retry token checked out.
+    retries: Atomic(u64) = .init(0),
+    retried_ok: Atomic(u64) = .init(0),
 };
 
 /// A peer we have an established connection with (for discovery and logs).
@@ -126,6 +141,8 @@ pub const Listener = struct {
 
     peers_mu: Io.Mutex = .init,
     peers: std.ArrayList(InboundPeer) = .empty,
+    /// I/O thread only.
+    guard: retry_mod.Guard = undefined,
 
     pub fn start(gpa: Allocator, io: Io, opts: Options) !*Listener {
         const l = try gpa.create(Listener);
@@ -143,6 +160,11 @@ pub const Listener = struct {
         const wake_send = try Io.net.IpAddress.bind(&lo, io, .{ .mode = .dgram });
         errdefer wake_send.close(io);
         l.* = .{ .gpa = gpa, .io = io, .opts = opts, .sock = sock, .wake_sock = wake_sock, .wake_send = wake_send };
+        var gk: [32]u8 = undefined;
+        io.random(&gk);
+        l.guard = retry_mod.Guard.init(gk);
+        // ZUI_P2P_RETRY_THRESHOLD=0 asks every new peer for a Retry token (interop checks).
+        if (std.c.getenv("ZUI_P2P_RETRY_THRESHOLD")) |v| l.opts.retry_threshold = std.fmt.parseInt(usize, std.mem.span(v), 10) catch l.opts.retry_threshold;
         l.bufs = try gpa.create(IoBufs);
         errdefer gpa.destroy(l.bufs);
         l.bufs.* = .{ .sock = udpio.Sock.init(sock.handle) };
@@ -391,6 +413,22 @@ pub const Listener = struct {
         if (version != 1) return; // no version negotiation: anemo speaks QUIC v1 only
         const ty = (d[0] >> 4) & 3;
         if (ty != 0 or d.len < 1200 or dl < 8) return; // only a full-size Initial opens a connection
+        // Address validation: under a handshake flood a client first proves it receives at its
+        // address (a Retry and its token), and nothing is kept until it does.
+        var ab: [19]u8 = undefined;
+        const abytes = retry_mod.addrBytes(&from, &ab);
+        const tok = retry_mod.initialToken(d) orelse return;
+        const now_s: u32 = @truncate(@as(u64, @intCast(@divTrunc(Io.Clock.real.now(l.io).toNanoseconds(), std.time.ns_per_s))));
+        var orig_buf: [20]u8 = undefined;
+        var orig: ?[]const u8 = null;
+        if (tok.len > 0) if (l.guard.check(tok, abytes, now_s)) |o| {
+            @memcpy(orig_buf[0..o.len], o);
+            orig = orig_buf[0..o.len];
+        };
+        if (orig == null and l.slots.count() -| l.stats.active.load(.monotonic) >= l.opts.retry_threshold) {
+            l.sendRetry(from, version, dcid, scid, abytes, now_s);
+            return;
+        }
         if (l.slots.count() >= l.opts.max_connections) {
             _ = l.stats.rejected.fetchAdd(1, .monotonic);
             return;
@@ -406,10 +444,16 @@ pub const Listener = struct {
             .max_streams_bidi = l.opts.max_streams_per_connection,
             .max_streams_uni = 500,
             .max_data = l.opts.receive_window,
-            .max_stream_data = l.opts.stream_receive_window,
+            .max_stream_data = @max(l.opts.stream_receive_window, l.opts.max_request_frame + (64 << 10)),
             .idle_timeout_ms = l.opts.idle_timeout_ms,
             .keep_alive_ms = l.opts.keep_alive_ms,
+            .handshake_timeout_ms = l.opts.handshake_timeout_ms,
         }, now, dcid, scid) catch return;
+        if (orig) |o| {
+            c.markRetried(o, dcid);
+            if (l.stats.retried_ok.fetchAdd(1, .monotonic) == 0)
+                std.log.info("p2p listener: address validation on (over {d} half-open handshakes): first peer back with a Retry token", .{l.opts.retry_threshold});
+        }
         const s = l.gpa.create(Slot) catch {
             c.deinit();
             return;
@@ -425,6 +469,19 @@ pub const Listener = struct {
         _ = l.stats.accepted.fetchAdd(1, .monotonic);
         c.handleDatagram(now, d);
         l.touch(s);
+    }
+
+    fn sendRetry(l: *Listener, to: Io.net.IpAddress, version: u32, dcid: []const u8, scid: []const u8, abytes: []const u8, now_s: u32) void {
+        var tb: [retry_mod.max_token]u8 = undefined;
+        const t = l.guard.token(&tb, abytes, now_s, dcid);
+        var nscid: [conn_mod.cid_len]u8 = undefined;
+        l.io.random(&nscid);
+        const b = &l.bufs.tx;
+        if (b.full()) b.flush(&l.bufs.sock);
+        const slot = b.slot();
+        const n = retry_mod.writeRetry(slot, version, scid, &nscid, t, dcid, @truncate(nscid[0]));
+        b.commit(n, &to);
+        _ = l.stats.retries.fetchAdd(1, .monotonic);
     }
 
     /// Queues `s`'s datagrams in the pass's batch (written in place); the batch leaves when it
@@ -512,8 +569,9 @@ pub const Listener = struct {
             c.streamWrite(id, &wire.version_frame, true) catch {};
             s.hello_stream = id;
         }
-        if (s.hello_stream) |id| if (c.stream(id)) |st| {
-            if (st.fin_sent and st.retx.items.len == 0 and st.send_off >= st.send_buf.items.len) {
+        if (s.hello_stream) |id| if (c.stream(id) != null) {
+            // acknowledged, not just sent: a lost version frame is resent from the stream
+            if (c.streamSettled(id)) {
                 c.streamFree(id);
                 s.hello_stream = null;
             }
@@ -532,7 +590,7 @@ pub const Listener = struct {
             defer arena_state.deinit();
             const parsed = wire.parseRequest(arena_state.allocator(), st.recv.contiguous(), l.opts.max_request_frame) catch {
                 _ = l.stats.bad_requests.fetchAdd(1, .monotonic);
-                c.streamFree(id);
+                c.streamAbort(id, 0); // the client gets a reset at once, not its request timeout
                 _ = s.inbound.orderedRemove(i);
                 continue;
             };
@@ -561,8 +619,9 @@ pub const Listener = struct {
         var j: usize = 0;
         while (j < s.answered.items.len) {
             const id = s.answered.items[j];
-            const st = c.stream(id);
-            if (st == null or (st.?.fin_sent and st.?.retx.items.len == 0 and st.?.send_off >= st.?.send_buf.items.len)) {
+            // freed once every packet of the response is acknowledged (conn.streamSettled): freeing
+            // on "all sent" lost the ranges of packets lost afterwards, and the peer timed out
+            if (c.streamSettled(id)) {
                 c.streamFree(id);
                 _ = s.answered.swapRemove(j);
             } else j += 1;
@@ -586,6 +645,33 @@ const TestHandler = struct {
         return .{ .status = .not_found };
     }
 };
+
+test "a listener under handshake load sends a Retry; the client comes back with the token and is served" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const skey = try Ed25519.KeyPair.generateDeterministic(@splat(42));
+    var dummy: u8 = 0;
+    const l = try Listener.start(gpa, io, .{
+        .listen = .{ .ip4 = Io.net.Ip4Address.loopback(0) },
+        .key = skey,
+        .server_name = "sui-35834a8a",
+        .handler = .{ .ctx = @ptrCast(&dummy), .serve = TestHandler.serve },
+        .threads = 1,
+        .retry_threshold = 0, // every new client is asked for a token
+    });
+    defer l.stop();
+    const p = try anemo.Peer.connect(gpa, io, l.address(), .{ .server_name = "sui-35834a8a", .expected = skey.public_key.toBytes(), .identity_seed = @splat(7) });
+    defer p.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const r = try p.request(arena_state.allocator(), "/zui.Test/Echo", &.{}, "after retry", 5_000);
+    try std.testing.expectEqualSlices(u8, "after retry", r.body);
+    try std.testing.expectEqual(@as(u64, 1), l.stats.retries.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), l.stats.retried_ok.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), l.stats.accepted.load(.monotonic));
+}
 
 test "zui client talks anemo to the zui listener over loopback" {
     const gpa = std.testing.allocator;

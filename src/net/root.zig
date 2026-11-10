@@ -22,6 +22,7 @@ pub const discovery = @import("discovery.zig");
 pub const peer_addr = @import("peer_addr.zig");
 pub const peer_score = @import("peer_score.zig");
 pub const server = @import("server.zig");
+pub const retry = @import("retry.zig");
 pub const peer_pool = @import("peer_pool.zig");
 pub const peer_cache = @import("peer_cache.zig");
 test {

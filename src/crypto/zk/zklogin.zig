@@ -335,12 +335,16 @@ pub const FixedVk = struct {
     delta_neg: bn.G2Prepared,
 
     fn init(vk: *FixedVk, comptime d: VkDec) void {
-        const alpha = g1Dec(d.alpha);
-        const beta = g2Dec(d.beta);
-        vk.ic = .{ g1Dec(d.ic0), g1Dec(d.ic1) };
+        vk.initPoints(g1Dec(d.alpha), g2Dec(d.beta), g2Dec(d.gamma), g2Dec(d.delta), g1Dec(d.ic0), g1Dec(d.ic1));
+    }
+
+    /// A one-input key from its points (the zkLogin keys come from `Keys.init`; tests build
+    /// their own).
+    pub fn initPoints(vk: *FixedVk, alpha: G1, beta: G2, gamma: G2, delta: G2, ic0: G1, ic1: G1) void {
+        vk.ic = .{ ic0, ic1 };
         vk.alpha_beta = bn.pairing(alpha, beta);
-        vk.gamma_neg = bn.G2Prepared.init(g2Dec(d.gamma).neg());
-        vk.delta_neg = bn.G2Prepared.init(g2Dec(d.delta).neg());
+        vk.gamma_neg = bn.G2Prepared.init(gamma.neg());
+        vk.delta_neg = bn.G2Prepared.init(delta.neg());
         var base = vk.ic[1].toJacobian();
         for (&vk.ic1_table) |*row| {
             var jac: [16]bn.G1J = undefined;
@@ -390,6 +394,31 @@ pub const FixedVk = struct {
     pub fn verify(vk: *const FixedVk, x: Fr, p: Proof) bool {
         return groth16.pairingEquation(vk.inputPoint(x), vk.alpha_beta, &vk.gamma_neg, &vk.delta_neg, p.a, p.b, p.c);
     }
+
+    /// `verify` on every item as one randomized batch (`groth16.batchVerify`): `out[i]` is the
+    /// verdict `verify(items[i].x, items[i].proof)` gives (a pass carries the batch's ~2^-128
+    /// soundness). `rng` must be a CSPRNG (`groth16.osRng`) outside tests.
+    pub fn verifyBatch(vk: *const FixedVk, gpa: std.mem.Allocator, items: []const BatchItem, rng: std.Random, opts: groth16.BatchOpts, out: []bool) void {
+        const Ctx = struct {
+            vk: *const FixedVk,
+            items: []const BatchItem,
+            pub fn proof(c: @This(), i: usize) groth16.BatchProof {
+                const p = c.items[i].proof;
+                return .{ .a = p.a, .b = p.b, .c = p.c };
+            }
+            pub fn inputs(c: @This(), i: usize) []const Fr {
+                return (&c.items[i].x)[0..1];
+            }
+            pub fn single(c: @This(), i: usize) bool {
+                return c.vk.verify(c.items[i].x, c.items[i].proof);
+            }
+        };
+        const key: groth16.BatchKey = .{ .abc = &vk.ic, .alpha_beta = vk.alpha_beta, .gamma_neg = &vk.gamma_neg, .delta_neg = &vk.delta_neg };
+        groth16.batchVerify(Ctx, gpa, key, .{ .vk = vk, .items = items }, items.len, rng, opts, out);
+    }
+
+    /// One proof for `verifyBatch`: the all-inputs hash and the proof points.
+    pub const BatchItem = struct { x: Fr, proof: Proof };
 };
 
 const VkDec = struct {
@@ -473,11 +502,25 @@ pub const Keys = struct {
     prod: FixedVk,
     test_v1: FixedVk,
     test_v2: FixedVk,
+    /// Digest of the verifying keys' defining constants: the same for any two `Keys` that hold the
+    /// same keys, so a cache can key on it (not on the address of the struct).
+    id: [32]u8 = @splat(0),
 
     pub fn init(k: *Keys) void {
         k.prod.init(prod_vk);
         k.test_v1.init(test_vk_v1);
         k.test_v2.init(test_vk_v2);
+        var h = Blake2b256.init();
+        h.update("zui zklogin keys v1");
+        inline for (.{ prod_vk, test_vk_v1, test_vk_v2 }) |vk| {
+            inline for (.{ vk.alpha[0..], vk.beta[0..], vk.gamma[0..], vk.delta[0..], vk.ic0[0..], vk.ic1[0..] }) |part| {
+                for (part) |d| {
+                    h.update(d);
+                    h.update(&.{0});
+                }
+            }
+        }
+        h.final(&k.id);
     }
 
     pub fn get(k: *const Keys, usage: Usage, v: Version) *const FixedVk {
@@ -631,9 +674,14 @@ fn longIss(a: *const Authenticator, cfg: Config, fail: *Fail) ?Fr {
 
 /// `verify_zk_login(inputs, max_epoch, eph, jwks, env, mode)`. Returns `.none` on success.
 pub fn verify(env: *const Env, a: *const Authenticator) Fail {
-    const eph = a.eph();
     const n = env.jwks.lookup(normalizeIss(a.iss), a.kid) orelse
         return .{ .jwk_not_found = .{ .iss = a.iss, .kid = a.kid } };
+    return verifyWithModulus(env, a, n);
+}
+
+/// `verify` after the JWK lookup: `n` is the base64url modulus the lookup returned.
+pub fn verifyWithModulus(env: *const Env, a: *const Authenticator, n: []const u8) Fail {
+    const eph = a.eph();
     var modulus: Modulus = .{};
     if (!modulus.decode(n)) return .{ .general = "Invalid Base64 encoded jwk modulus" };
     const proof = proofPoints(a) orelse return .invalid_input;
@@ -645,6 +693,37 @@ pub fn verify(env: *const Env, a: *const Authenticator) Fail {
             else => verifyVersion(env, a, eph, &modulus, proof, .v1),
         },
     };
+}
+
+/// The versions `verifyWithModulus` tries, in order. It succeeds iff one of them does.
+pub fn versionsOf(mode: Mode) []const Version {
+    return switch (mode) {
+        .v1_only => &.{.v1},
+        .v2_only => &.{.v2},
+        .both => &.{ .v2, .v1 },
+    };
+}
+
+/// The Groth16 check `verifyWithModulus` runs for one version: the key, the input and the proof.
+pub const PairingJob = struct { vk: *const FixedVk, x: Fr, proof: Proof };
+
+/// Everything `verifyWithModulus(env, a, n)` does before its pairings: `out[k]` is the pairing
+/// check of version `versionsOf(env.mode)[k]`, or null when that version fails before it (so
+/// the version fails). `verifyWithModulus` returns `.none` iff some non-null job's
+/// `vk.verify(x, proof)` holds. Returns the number of versions.
+pub fn pairingJobs(env: *const Env, a: *const Authenticator, n: []const u8, out: *[2]?PairingJob) usize {
+    const vs = versionsOf(env.mode);
+    for (out) |*o| o.* = null;
+    var modulus: Modulus = .{};
+    if (!modulus.decode(n)) return vs.len;
+    const proof = proofPoints(a) orelse return vs.len;
+    const eph = a.eph();
+    for (vs, 0..) |v, k| {
+        var fail: Fail = .none;
+        const h = allInputsHash(a, eph, &modulus, v, &fail) orelse continue;
+        out[k] = .{ .vk = env.keys.get(env.usage, v), .x = h, .proof = proof };
+    }
+    return vs.len;
 }
 
 fn verifyVersion(env: *const Env, a: *const Authenticator, eph: Eph, modulus: *const Modulus, proof: Proof, v: Version) Fail {
@@ -865,4 +944,233 @@ test "fastcrypto test_verify_zk_login: v1 proof under the insecure (Test) key" {
     var auth2: Authenticator = undefined;
     try std.testing.expect(Authenticator.parse(bcs2, &scratch, &auth2, &fail));
     try std.testing.expect(proofPoints(&auth2) == null);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Batch verification tests
+
+const Pool = @import("core").pool.Pool;
+const corpus_vectors = @import("corpus_vectors.zig");
+
+const Tamper = enum { none, a, b, c, x, swap };
+
+fn tampered(j: FixedVk.BatchItem, t: Tamper, other: FixedVk.BatchItem) FixedVk.BatchItem {
+    var o = j;
+    switch (t) {
+        .none => {},
+        .a => o.proof.a = bn.G1J.mulLimbs(j.proof.a, &.{ 2, 0, 0, 0 }).toAffine(),
+        .b => o.proof.b = bn.G2J.mulLimbs(j.proof.b, &.{ 3, 0, 0, 0 }).toAffine(),
+        .c => o.proof.c = j.proof.c.neg(),
+        .x => o.x = j.x.add(Fr.one),
+        .swap => o.proof = other.proof,
+    }
+    return o;
+}
+
+/// Runs `vk.verifyBatch` over `jobs` in batches of each size and checks every verdict against
+/// `want` (the single verifier's).
+fn expectBatchEqualsSingle(vk: *const FixedVk, jobs: []const FixedVk.BatchItem, want: []const bool, pool: *Pool, rng: std.Random, sizes: []const usize) !void {
+    const gpa = std.testing.allocator;
+    const out = try gpa.alloc(bool, jobs.len);
+    defer gpa.free(out);
+    for (sizes) |size| {
+        for ([_]usize{ 0, 1 }) |one_lane| {
+            var lo: usize = 0;
+            while (lo < jobs.len) : (lo += size) {
+                const hi = @min(jobs.len, lo + size);
+                vk.verifyBatch(gpa, jobs[lo..hi], rng, .{ .pool = pool, .max_lanes = one_lane }, out[lo..hi]);
+            }
+            for (want, out) |w, g| try std.testing.expectEqual(w, g);
+        }
+    }
+}
+
+test "FixedVk.verifyBatch: random valid and tampered proofs, batches of 1..64" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7a6b);
+    const rng = prng.random();
+    var tk: groth16.TestKey = undefined;
+    tk.init(rng, 1);
+    const vk = try gpa.create(FixedVk);
+    defer gpa.destroy(vk);
+    const T = groth16.TestKey;
+    vk.initPoints(T.g1(tk.alpha), T.g2(tk.beta), T.g2(tk.gamma), T.g2(tk.delta), tk.abc[0], tk.abc[1]);
+    const pool = try Pool.init(std.testing.io, gpa, 4);
+    defer pool.deinit();
+    const n = 64;
+    var jobs: [n]FixedVk.BatchItem = undefined;
+    for (&jobs) |*j| {
+        const x = T.randFr(rng);
+        const p = tk.prove(&.{x}, rng);
+        j.* = .{ .x = x, .proof = .{ .a = p.a, .b = p.b, .c = p.c } };
+    }
+    var want: [n]bool = undefined;
+    for (jobs, &want) |j, *w| {
+        w.* = vk.verify(j.x, j.proof);
+        try std.testing.expect(w.*);
+    }
+    try expectBatchEqualsSingle(vk, &jobs, &want, pool, rng, &.{ 1, 64 });
+    // tamper about a third, every kind
+    var mixed = jobs;
+    var bad: usize = 0;
+    for (&mixed, 0..) |*j, i| {
+        if (i % 3 != 1) continue;
+        const t: Tamper = @enumFromInt(1 + (i / 3) % 5);
+        j.* = tampered(jobs[i], t, jobs[(i + 7) % n]);
+        bad += 1;
+    }
+    for (mixed, &want) |j, *w| w.* = vk.verify(j.x, j.proof);
+    var n_false: usize = 0;
+    for (want) |w| n_false += @intFromBool(!w);
+    try std.testing.expectEqual(bad, n_false);
+    try expectBatchEqualsSingle(vk, &mixed, &want, pool, rng, &.{ 1, 2, 3, 4, 7, 16, 33, 64 });
+    // all bad
+    for (&mixed, 0..) |*j, i| j.* = tampered(jobs[i], .x, jobs[i]);
+    for (mixed, &want) |j, *w| w.* = vk.verify(j.x, j.proof);
+    try expectBatchEqualsSingle(vk, &mixed, &want, pool, rng, &.{64});
+}
+
+test "FixedVk.verifyBatch: zkLogin corpus proofs (prod key) and tampered copies" {
+    const gpa = std.testing.allocator;
+    const set = (try corpus_vectors.load(gpa, std.testing.io, &.{ "corpus000.items.jsonl", "edge.items.jsonl" }, 1000)) orelse return error.SkipZigTest;
+    defer set.deinit();
+    const pool = try Pool.init(std.testing.io, gpa, 4);
+    defer pool.deinit();
+    var prng = std.Random.DefaultPrng.init(0x636f);
+    const rng = prng.random();
+    // jobs grouped by key
+    var groups: [3]std.ArrayList(FixedVk.BatchItem) = @splat(.empty);
+    var wants: [3]std.ArrayList(bool) = @splat(.empty);
+    defer for (&groups, &wants) |*g, *w| {
+        g.deinit(gpa);
+        w.deinit(gpa);
+    };
+    var n_ok: usize = 0;
+    var n_items: usize = 0;
+    for (set.items) |*it| {
+        inline for (.{ Mode.v1_only, Mode.both, Mode.v2_only }) |mode| {
+            const env: Env = .{ .keys = &set.keys, .jwks = it.jwks(), .usage = .prod, .mode = mode };
+            if (env.jwks.lookup(normalizeIss(it.auth.iss), it.auth.kid)) |n| {
+                n_items += 1;
+                var jobs: [2]?PairingJob = undefined;
+                const nv = pairingJobs(&env, &it.auth, n, &jobs);
+                const single = verifyWithModulus(&env, &it.auth, n) == .none;
+                var any = false;
+                for (jobs[0..nv]) |mj| if (mj) |j| {
+                    const v = j.vk.verify(j.x, j.proof);
+                    any = any or v;
+                    const g: usize = if (j.vk == &set.keys.prod) 0 else if (j.vk == &set.keys.test_v1) 1 else 2;
+                    try groups[g].append(gpa, .{ .x = j.x, .proof = j.proof });
+                    try wants[g].append(gpa, v);
+                    if (v and mode == .v1_only) {
+                        // tampered copies of a valid proof
+                        inline for (.{ Tamper.a, Tamper.b, Tamper.c, Tamper.x }) |t| {
+                            const tj = tampered(.{ .x = j.x, .proof = j.proof }, t, undefined);
+                            try groups[g].append(gpa, tj);
+                            try wants[g].append(gpa, j.vk.verify(tj.x, tj.proof));
+                        }
+                    }
+                };
+                // pairingJobs describes verifyWithModulus exactly
+                try std.testing.expectEqual(single, any);
+                n_ok += @intFromBool(single);
+            }
+        }
+    }
+    try std.testing.expect(n_ok > 0);
+    try std.testing.expect(groups[0].items.len > 64);
+    // shuffle so batches mix valid, corpus-invalid and tampered proofs
+    const order = try gpa.alloc(usize, groups[0].items.len);
+    defer gpa.free(order);
+    for (order, 0..) |*o, i| o.* = i;
+    rng.shuffle(usize, order);
+    const jobs = try gpa.alloc(FixedVk.BatchItem, order.len);
+    defer gpa.free(jobs);
+    const want = try gpa.alloc(bool, order.len);
+    defer gpa.free(want);
+    for (order, 0..) |o, i| {
+        jobs[i] = groups[0].items[o];
+        want[i] = wants[0].items[o];
+    }
+    try expectBatchEqualsSingle(&set.keys.prod, jobs, want, pool, rng, &.{ 1, 5, 16, 64 });
+    std.debug.print("zklogin corpus batch: {d} items x modes, {d} ok, {d} prod-key pairing jobs\n", .{ n_items, n_ok, jobs.len });
+}
+
+// Bench (skipped unless ZUI_BATCH_BENCH is set; run the ReleaseFast test binary):
+//   ZUI_BATCH_BENCH=1 ./zig build test -Dlane=zk -Doptimize=ReleaseFast
+// µs per proof, single verifier vs batch, on 1 lane and on every lane of a pool.
+test "bench: zkLogin-shaped Groth16, single vs batch" {
+    if (!@import("builtin").link_libc) return error.SkipZigTest;
+    _ = std.c.getenv("ZUI_BATCH_BENCH") orelse return error.SkipZigTest;
+    const io = std.testing.io;
+    const gpa = std.heap.page_allocator;
+    var prng = std.Random.DefaultPrng.init(0xbe);
+    const rng = prng.random();
+    var tk: groth16.TestKey = undefined;
+    tk.init(rng, 1);
+    const vk = try gpa.create(FixedVk);
+    const T = groth16.TestKey;
+    vk.initPoints(T.g1(tk.alpha), T.g2(tk.beta), T.g2(tk.gamma), T.g2(tk.delta), tk.abc[0], tk.abc[1]);
+    const n = 256;
+    const items = try gpa.alloc(FixedVk.BatchItem, n);
+    for (items) |*j| {
+        const x = T.randFr(rng);
+        const p = tk.prove(&.{x}, rng);
+        j.* = .{ .x = x, .proof = .{ .a = p.a, .b = p.b, .c = p.c } };
+    }
+    const cpus = std.Thread.getCpuCount() catch 1;
+    const pool = try Pool.init(io, gpa, cpus);
+    defer pool.deinit();
+    const out = try gpa.alloc(bool, n);
+    var chacha = groth16.osRng(io);
+    const crng = chacha.random();
+    const Single = struct {
+        vk: *const FixedVk,
+        items: []const FixedVk.BatchItem,
+        out: []bool,
+        fn f(c: @This(), lo: usize, hi: usize) void {
+            for (lo..hi) |i| c.out[i] = c.vk.verify(c.items[i].x, c.items[i].proof);
+        }
+    };
+    for ([_]usize{ 1, cpus }) |lanes| {
+        // single verifier, best of 3 over 256 proofs
+        var best: u64 = std.math.maxInt(u64);
+        for (0..3) |_| {
+            const t0 = std.Io.Timestamp.now(io, .awake);
+            pool.forRange(n, 1, lanes, Single{ .vk = vk, .items = items, .out = out }, Single.f);
+            const t1 = std.Io.Timestamp.now(io, .awake);
+            best = @min(best, @as(u64, @intCast(t0.durationTo(t1).nanoseconds)));
+        }
+        for (out) |v| try std.testing.expect(v);
+        std.debug.print("groth16 zklogin lanes={d} single      us/proof={d:.1}\n", .{ lanes, @as(f64, @floatFromInt(best)) / 1000.0 / n });
+        for ([_]usize{ 1, 4, 16, 64, 256 }) |k| {
+            const reps = @max(1, 512 / k);
+            var bb: u64 = std.math.maxInt(u64);
+            for (0..3) |_| {
+                const t0 = std.Io.Timestamp.now(io, .awake);
+                for (0..reps) |rep| {
+                    const lo = (rep * k) % n;
+                    const hi = @min(n, lo + k);
+                    vk.verifyBatch(gpa, items[lo..hi], crng, .{ .pool = pool, .max_lanes = lanes }, out[lo..hi]);
+                }
+                const t1 = std.Io.Timestamp.now(io, .awake);
+                bb = @min(bb, @as(u64, @intCast(t0.durationTo(t1).nanoseconds)));
+            }
+            for (out[0..k]) |v| try std.testing.expect(v);
+            std.debug.print("groth16 zklogin lanes={d} batch k={d:<3} us/proof={d:.1}\n", .{ lanes, k, @as(f64, @floatFromInt(bb)) / 1000.0 / @as(f64, @floatFromInt(reps * k)) });
+        }
+        // one bad proof in 64: the bisection's cost
+        const saved = items[17];
+        items[17].x = items[17].x.add(Fr.one);
+        var bb: u64 = std.math.maxInt(u64);
+        for (0..3) |_| {
+            const t0 = std.Io.Timestamp.now(io, .awake);
+            vk.verifyBatch(gpa, items[0..64], crng, .{ .pool = pool, .max_lanes = lanes }, out[0..64]);
+            const t1 = std.Io.Timestamp.now(io, .awake);
+            bb = @min(bb, @as(u64, @intCast(t0.durationTo(t1).nanoseconds)));
+        }
+        try std.testing.expect(!out[17] and out[16] and out[18]);
+        items[17] = saved;
+        std.debug.print("groth16 zklogin lanes={d} batch k=64 one bad us/proof={d:.1}\n", .{ lanes, @as(f64, @floatFromInt(bb)) / 1000.0 / 64.0 });
+    }
 }

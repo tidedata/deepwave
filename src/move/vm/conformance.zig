@@ -74,6 +74,22 @@ pub const suites = [_]harness.Suite{
         },
         .inputs = .{ .dir = "vectors/move-vm-gas", .suffix = ".jsonl" },
     },
+    .{
+        .name = "move-vm-aot",
+        .lane = "move-vm",
+        .doc = "move-vm-gas with the ahead-of-time tier on: every call whose module is in src/move/vm/aot_gen.zig (deepwave-aot gen --packages vectors/move-vm-gas/packages.bin) runs compiled code and must equal Rust's status, locations, returns and gas exactly like the interpreter; fails when nothing compiled matched",
+        .run = runGasAot,
+        .bench = benchGasAot,
+        .baselines = &.{
+            .{ .name = "call", .argv = &.{ "{release}/zui-truth-move-vm", "bench", "call" } },
+            .{ .name = "instr", .argv = &.{ "{release}/zui-truth-move-vm", "bench", "instr" } },
+            .{ .name = "call-interp", .argv = &.{ "{release}/zui-truth-move-vm", "bench", "call-interp" } },
+            .{ .name = "instr-interp", .argv = &.{ "{release}/zui-truth-move-vm", "bench", "instr-interp" } },
+            .{ .name = "call-native", .argv = &.{ "{release}/zui-truth-move-vm", "bench", "call-native" } },
+            .{ .name = "instr-native", .argv = &.{ "{release}/zui-truth-move-vm", "bench", "instr-native" } },
+        },
+        .inputs = .{ .dir = "vectors/move-vm-gas", .suffix = ".jsonl" },
+    },
     // exec-history-vm (CONTRACTS 6.6b.2): the same calls run by Mysten's older cuts
     // (`tools/truth/move-vm cut`), each at a protocol version of its window with that
     // version's framework. Items are `<cut>/<id>/<module>::<fn>`.
@@ -132,7 +148,7 @@ fn loadCutVectors(ctx: *harness.Ctx, comptime suite_dir: []const u8, cut: []cons
     errdefer ctx.gpa.destroy(rt);
     rt.* = loader.Runtime.init(ctx.gpa, try binaryConfig(pv));
     errdefer rt.deinit();
-    rt.validation = try validation(rt.arena_state.allocator(), pv);
+    rt.validation = try validation(rt.arena_state.allocator(), pv, .mainnet);
     rt.jit_limits = false; // v0..v3 loaders
     try loadPackagesSkipping(rt, pk[0..overlay.len], false);
     try loadPackagesSkipping(rt, pk[overlay.len..], true);
@@ -260,14 +276,27 @@ fn loadVectorsAt(ctx: *harness.Ctx, comptime pk_path: []const u8, comptime calls
     errdefer ctx.gpa.destroy(rt);
     rt.* = loader.Runtime.init(ctx.gpa, try binaryConfig(pv));
     errdefer rt.deinit();
-    rt.validation = try validation(rt.arena_state.allocator(), pv);
+    rt.validation = try validation(rt.arena_state.allocator(), pv, .mainnet);
     try loadPackages(rt, pk);
     return .{ .rt = rt, .packages_bytes = pk, .calls_text = calls };
 }
 
-/// The VM's load-time validation for a protocol version (`verifier_config(None)`, Sui natives).
-pub fn validation(arena: Allocator, pv: u64) !*const loader.Validation {
-    const cfg = try protocol.get(pv, .mainnet);
+/// The VM's load-time validation for a protocol version on a chain (`verifier_config(None)`,
+/// Sui natives).
+///
+/// The chain matters to one field only. In sui 1.83.1 `ProtocolConfig::get_for_version_impl`
+/// (crates/sui-protocol-config/src/lib.rs) sets every value `verifier_config` reads outside its
+/// `chain` conditions, except `move_binary_format_version` (the config's `bytecode_version`):
+/// 7 from protocol 49 off mainnet and testnet (lib.rs:3686), from 52 off mainnet (lib.rs:3772)
+/// and from 55 everywhere (lib.rs:3853). So testnet's config differs from mainnet's at
+/// protocols 52 to 54, in `bytecode_version`. No verifier pass reads that field (its one reader
+/// in 1.83.1 is the test helper `verify_module_with_config_for_test`, move-bytecode-verifier
+/// src/verifier.rs:52, and deepwave's port has none), so the verifier's answer is the same on every
+/// chain and `VerifiedSet` may key it by the protocol version alone (`cache_pv`). The test
+/// "verifier config across chains" holds both halves: a new field that differs by chain fails
+/// it, and the chain must then join the `VerifiedSet` key.
+pub fn validation(arena: Allocator, pv: u64, chain: protocol.Chain) !*const loader.Validation {
+    const cfg = try protocol.get(pv, chain);
     const v = try protocol.derived.verifierConfig(cfg, null);
     var out: move_format.verifier.verify.Config = .{};
     inline for (@typeInfo(@TypeOf(v)).@"struct".field_names) |f| @field(out, f) = @field(v, f);
@@ -307,7 +336,7 @@ fn runLoad(ctx: *harness.Ctx) !void {
     defer ctx.gpa.free(items);
     var rt = loader.Runtime.init(ctx.gpa, try binaryConfig(protocol.max_protocol_version));
     defer rt.deinit();
-    rt.validation = try validation(rt.arena_state.allocator(), protocol.max_protocol_version);
+    rt.validation = try validation(rt.arena_state.allocator(), protocol.max_protocol_version, .mainnet);
     try loadPackages(&rt, pk);
     var it = harness.lines(items);
     var name_buf: [128]u8 = undefined;
@@ -746,6 +775,23 @@ fn runGas(ctx: *harness.Ctx) !void {
     }
 }
 
+fn runGasAot(ctx: *harness.Ctx) !void {
+    const aot = @import("aot.zig");
+    const n = try aot.enable(null);
+    defer aot.disable();
+    if (n == 0) {
+        // A clean checkout ships an empty registry: not a failure (it would fail every full run),
+        // the interpreter runs and the detail says the tier was not exercised.
+        ctx.detail("aot: registry empty, tier not exercised (deepwave-aot gen --packages <corpus>/vectors/move-vm-gas/packages.bin --out src/move/vm, rebuild)", .{});
+        try runGas(ctx);
+        return;
+    }
+    try runGas(ctx);
+    const attached = aot.stats.functions_attached.load(.monotonic);
+    ctx.detail("aot: {d} compiled modules, {d} matched, {d} functions attached, {d} digest misses", .{ n, aot.stats.modules_matched.load(.monotonic), attached, aot.stats.modules_digest_miss.load(.monotonic) });
+    if (attached == 0) ctx.fail("aot_gen", "the compiled modules matched no loaded module: the aot_gen registry is for other bytecode than the corpus", .{});
+}
+
 fn runGasOn(ctx: *harness.Ctx, vec: *Vectors, calls_text: []const u8, comptime prefix: []const u8) !void {
     var it = harness.lines(calls_text);
     var name_buf: [512]u8 = undefined;
@@ -896,7 +942,47 @@ fn benchGas(ctx: *harness.Ctx) !void {
         var st = BenchState{ .ctx = ctx, .rt = vec.rt, .calls = set.items, .arena = &scratch, .links = &links };
         try ctx.benchPasses(nm[0], "call", set.items.len, &st, benchPass);
         try ctx.benchPasses(nm[1], "instr", n, &st, benchPass);
+        try benchDist(ctx, nm[0], &st);
     }
+}
+
+/// Per-call latency of a bench set: every call timed on its own over `-Diters` passes (after the
+/// warm passes above), then p50 / p99 / mean over all samples and calls per second on one thread.
+fn benchDist(ctx: *harness.Ctx, name: []const u8, st: *BenchState) !void {
+    const iters = @max(1, ctx.opts.iters);
+    const n = st.calls.len * iters;
+    if (n == 0) return;
+    const ns = try ctx.gpa.alloc(u64, n);
+    defer ctx.gpa.free(ns);
+    var k: usize = 0;
+    var total: u64 = 0;
+    for (0..iters) |_| {
+        for (st.calls) |*c| {
+            _ = st.arena.reset(.retain_capacity);
+            const t0 = std.Io.Timestamp.now(ctx.io, .awake);
+            _ = try runCallWith(st.arena.allocator(), st.rt, st.links, c, null);
+            const d: u64 = @intCast(t0.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).nanoseconds);
+            ns[k] = d;
+            total += d;
+            k += 1;
+        }
+    }
+    std.mem.sort(u64, ns, {}, std.sort.asc(u64));
+    const mean = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(n));
+    try ctx.stdout.print(
+        "{{\"impl\":\"zui\",\"suite\":\"{s}\",\"bench\":\"{s}-dist\",\"mode\":\"{s}\",\"calls\":{d},\"samples\":{d},\"p50_ns\":{d},\"p90_ns\":{d},\"p99_ns\":{d},\"max_ns\":{d},\"mean_ns\":{d:.0},\"calls_per_s\":{d:.0}}}\n",
+        .{ ctx.suite.name, name, @tagName(@import("builtin").mode), st.calls.len, n, ns[n / 2], ns[n * 9 / 10], ns[@min(n - 1, n * 99 / 100)], ns[n - 1], mean, 1e9 / mean },
+    );
+}
+
+/// `bench -Dsuite=move-vm-aot`: move-vm-gas's bench with the AOT tier on (whatever the
+/// generated registry holds; the interpreter for everything else).
+fn benchGasAot(ctx: *harness.Ctx) !void {
+    const aot = @import("aot.zig");
+    const m = try aot.enable(null);
+    defer aot.disable();
+    try benchGas(ctx);
+    try ctx.stdout.print("{{\"impl\":\"zui\",\"suite\":\"move-vm-aot\",\"aot_modules\":{d},\"matched\":{d},\"functions_attached\":{d},\"digest_miss\":{d}}}\n", .{ m, aot.stats.modules_matched.load(.monotonic), aot.stats.functions_attached.load(.monotonic), aot.stats.modules_digest_miss.load(.monotonic) });
 }
 
 const TraceBench = struct {
@@ -967,6 +1053,46 @@ fn frameworkRuntime(gpa: Allocator) !*loader.Runtime {
     return rt;
 }
 
+test "verifier config across chains: only bytecode_version differs (testnet 52 to 54), and validation follows the chain" {
+    var differs: usize = 0;
+    var pv: u64 = protocol.min_protocol_version;
+    while (pv <= protocol.max_protocol_version) : (pv += 1) {
+        const main = protocol.derived.verifierConfig(try protocol.get(pv, .mainnet), null);
+        inline for (.{ protocol.Chain.testnet, protocol.Chain.unknown }) |chain| {
+            const other = protocol.derived.verifierConfig(try protocol.get(pv, chain), null);
+            // A version without a verifier config has none on any chain.
+            try std.testing.expectEqual(std.meta.isError(main), std.meta.isError(other));
+            if (main) |m| {
+                const o = try other;
+                inline for (@typeInfo(@TypeOf(m)).@"struct".field_names) |f| {
+                    if (comptime std.mem.eql(u8, f, "bytecode_version")) continue;
+                    // Every field a verifier pass reads is the same on every chain, so the
+                    // process-wide verified-package set is right to key by protocol version only.
+                    try std.testing.expectEqual(@field(m, f), @field(o, f));
+                }
+                if (chain == .testnet) {
+                    // Enums (binary format 7): testnet from protocol 52, mainnet from 55.
+                    const early = pv >= 52 and pv <= 54;
+                    try std.testing.expectEqual(early, m.bytecode_version != o.bytecode_version);
+                    if (early) {
+                        try std.testing.expectEqual(@as(u32, 6), m.bytecode_version);
+                        try std.testing.expectEqual(@as(u32, 7), o.bytecode_version);
+                        differs += 1;
+                    }
+                }
+            } else |_| {}
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), differs);
+    // `validation` hands the runtime the chain's own config.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectEqual(@as(u32, 6), (try validation(a, 53, .mainnet)).verifier.bytecode_version);
+    try std.testing.expectEqual(@as(u32, 7), (try validation(a, 53, .testnet)).verifier.bytecode_version);
+    try std.testing.expectEqual(@as(u32, 7), (try validation(a, 55, .mainnet)).verifier.bytecode_version);
+}
+
 test "object-runtime natives in a row keep their state (kiosk::default, kiosk::new)" {
     // kiosk::default: object::new twice (fresh_id), share_object, public_transfer to the sender.
     // Every native's state must outlive the call-scoped scratch the next native reuses.
@@ -1034,4 +1160,133 @@ test "object-runtime natives in a row keep their state (kiosk::default, kiosk::n
             try std.testing.expectEqual(@as(usize, 2), res.returns.len);
         }
     }
+}
+
+/// Runs `code` as `M::f() -> u64` (one u64 local) twice, traced (the unchanged `step` loop)
+/// and untraced (the `stepRun` fast paths), with the same budget. Returns both results.
+const DiffOut = struct { ok: bool, vals: [4]Value = undefined, n: usize = 0, err: interp.VmError = .{ .major = .EXECUTED }, gas_left: u64 };
+
+fn diffRun(gpa: Allocator, code: []const move_format.file_format.Instr, budget: u64, out: *[2]DiffOut) !void {
+    const ff = move_format.file_format;
+    const pv = protocol.max_protocol_version;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const u64_sig = [_]ff.Node{.{ .tag = .U64 }};
+    const u64_tok = [_]ff.Token{&u64_sig};
+    const sigs = [_][]const ff.Token{ &.{}, &u64_tok };
+    const idents = [_][]const u8{ "M", "f" };
+    const addrs = [_][32]u8{@splat(7)};
+    const mhs = [_]ff.ModuleHandle{.{ .address = 0, .name = 0 }};
+    const fhs = [_]ff.FunctionHandle{.{ .module = 0, .name = 1, .parameters = 0, .return_ = 1, .type_parameters = &.{} }};
+    const fds = [_]ff.FunctionDefinition{.{ .function = 0, .visibility = .Public, .is_entry = false, .acquires = &.{}, .code = .{ .locals = 1, .code = code, .jump_tables = &.{} } }};
+    const cm: ff.CompiledModule = .{
+        .version = 6,
+        .module_handles = &mhs,
+        .function_handles = &fhs,
+        .signatures = &sigs,
+        .identifiers = &idents,
+        .address_identifiers = &addrs,
+        .function_defs = &fds,
+    };
+    const bytes = try move_format.serializeAlloc(a, &cm, 6);
+    var rt = loader.Runtime.init(gpa, try binaryConfig(pv));
+    defer rt.deinit();
+    rt.jit_limits = false;
+    var id: loader.Address = @splat(7);
+    const mods = [_]loader.NamedModule{.{ .name = "M", .bytes = bytes }};
+    const link = [_][2]loader.Address{.{ id, id }};
+    const p = try rt.addPackage(.{ .version_id = id, .original_id = id, .version = 1, .linkage = &link, .type_origins = &.{}, .modules = &mods });
+    id[0] = 0;
+    if (p.refused != null) return error.Refused;
+    const func = p.module("M").?.functionByName("f").?;
+    const cfg = try protocol.get(pv, .mainnet);
+    const ecfg = try interp.ExecConfig.fromProtocolAnyCut(cfg);
+    const gm = try cfg.get("gas_model_version");
+    for (0..2) |i| {
+        var lc = interp.LinkCtx.init(&rt, p);
+        defer lc.deinit();
+        var meter = gas.Meter.init(gm, budget, 1);
+        var sess = try interp.Session.init(a, &lc, &meter, ecfg);
+        if (i == 0) {
+            const t = try a.create(trace.Tracer);
+            t.* = trace.Tracer.init(a, ecfg);
+            sess.tracer = t;
+        }
+        const res = try sess.run(func, &.{}, &.{});
+        out[i] = switch (res) {
+            .ok => |v| blk: {
+                var o: DiffOut = .{ .ok = true, .gas_left = meter.gas_left, .n = v.len };
+                if (v.len > o.vals.len) return error.TooMany;
+                @memcpy(o.vals[0..v.len], v);
+                break :blk o;
+            },
+            .err => |e| .{ .ok = false, .err = e, .gas_left = meter.gas_left },
+        };
+    }
+}
+
+fn expectSame(gpa: Allocator, code: []const move_format.file_format.Instr, budget: u64) !void {
+    var r: [2]DiffOut = undefined;
+    try diffRun(gpa, code, budget, &r);
+    try std.testing.expectEqual(r[0].gas_left, r[1].gas_left);
+    try std.testing.expectEqual(r[0].ok, r[1].ok);
+    if (r[0].ok) {
+        try std.testing.expectEqual(r[0].n, r[1].n);
+        for (r[0].vals[0..r[0].n], r[1].vals[0..r[1].n]) |x, y| {
+            try std.testing.expectEqual(x.tag, y.tag);
+            try std.testing.expectEqual(x.a, y.a);
+            try std.testing.expectEqual(x.b, y.b);
+        }
+    } else {
+        try std.testing.expectEqual(r[0].err.major, r[1].err.major);
+        try std.testing.expectEqual(r[0].err.sub, r[1].err.sub);
+        try std.testing.expectEqual(r[0].err.off, r[1].err.off);
+    }
+}
+
+fn mk(op: move_format.file_format.Opcode, idx: u16, imm: u64) move_format.file_format.Instr {
+    return .{ .op = op, .idx = idx, .imm = imm };
+}
+
+test "untraced fast paths match the traced loop (results, gas, error locations)" {
+    const gpa = std.testing.allocator;
+    const big: u64 = 1_000_000_000;
+    // happy path with locals
+    try expectSame(gpa, &.{ mk(.LdU64, 0, 9), mk(.StLoc, 0, 0), mk(.CopyLoc, 0, 0), mk(.MoveLoc, 0, 0), mk(.Add, 0, 0), mk(.Ret, 0, 0) }, big);
+    // arithmetic overflow and underflow for each width
+    try expectSame(gpa, &.{ mk(.LdU8, 0, 200), mk(.LdU8, 0, 100), mk(.Add, 0, 0), mk(.Ret, 0, 0) }, big);
+    try expectSame(gpa, &.{ mk(.LdU16, 0, 1), mk(.LdU16, 0, 2), mk(.Sub, 0, 0), mk(.Ret, 0, 0) }, big);
+    try expectSame(gpa, &.{ mk(.LdU32, 0, 0x10000), mk(.LdU32, 0, 0x10000), mk(.Mul, 0, 0), mk(.Ret, 0, 0) }, big);
+    try expectSame(gpa, &.{ mk(.LdU64, 0, 1), mk(.LdU64, 0, 0), mk(.Div, 0, 0), mk(.Ret, 0, 0) }, big);
+    // mismatched operand tags
+    try expectSame(gpa, &.{ mk(.LdU8, 0, 1), mk(.LdU64, 0, 2), mk(.Add, 0, 0), mk(.Ret, 0, 0) }, big);
+    try expectSame(gpa, &.{ mk(.LdU8, 0, 1), mk(.LdU64, 0, 2), mk(.Lt, 0, 0), mk(.Ret, 0, 0) }, big);
+    // empty stack
+    try expectSame(gpa, &.{ mk(.Pop, 0, 0), mk(.Ret, 0, 0) }, big);
+    try expectSame(gpa, &.{ mk(.LdU64, 0, 1), mk(.Add, 0, 0), mk(.Ret, 0, 0) }, big);
+    // moved-from local read
+    try expectSame(gpa, &.{ mk(.MoveLoc, 0, 0), mk(.Ret, 0, 0) }, big);
+    try expectSame(gpa, &.{ mk(.CopyLoc, 0, 0), mk(.Ret, 0, 0) }, big);
+    // operand stack overflow through Ld* and CopyLoc
+    try expectSame(gpa, &.{ mk(.LdU64, 0, 1), mk(.Branch, 0, 0) }, big);
+    try expectSame(gpa, &.{ mk(.LdU64, 0, 1), mk(.StLoc, 0, 0), mk(.CopyLoc, 0, 0), mk(.Branch, 2, 0) }, big);
+    // out of gas inside a fast path, at several budgets
+    var b: u64 = 0;
+    while (b < 40) : (b += 3) {
+        try expectSame(gpa, &.{ mk(.LdU64, 0, 1), mk(.LdU64, 0, 2), mk(.Add, 0, 0), mk(.StLoc, 0, 0), mk(.CopyLoc, 0, 0), mk(.Ret, 0, 0) }, b);
+    }
+}
+
+test "diff harness sees real results and errors" {
+    const gpa = std.testing.allocator;
+    var r: [2]DiffOut = undefined;
+    try diffRun(gpa, &.{ mk(.LdU64, 0, 9), mk(.LdU64, 0, 9), mk(.Add, 0, 0), mk(.Ret, 0, 0) }, 1_000_000_000, &r);
+    try std.testing.expect(r[1].ok and r[1].n == 1 and r[1].vals[0].a == 18);
+    try diffRun(gpa, &.{ mk(.LdU8, 0, 200), mk(.LdU8, 0, 100), mk(.Add, 0, 0), mk(.Ret, 0, 0) }, 1_000_000_000, &r);
+    try std.testing.expect(!r[1].ok and r[1].err.major == .ARITHMETIC_ERROR and r[1].err.off.?.pc == 2);
+    try diffRun(gpa, &.{ mk(.LdU64, 0, 1), mk(.Add, 0, 0), mk(.Ret, 0, 0) }, 1_000_000_000, &r);
+    try std.testing.expect(!r[1].ok and r[1].err.major == .EMPTY_VALUE_STACK);
+    try diffRun(gpa, &.{ mk(.LdU64, 0, 1), mk(.Branch, 0, 0) }, 1_000_000_000, &r);
+    try std.testing.expect(!r[1].ok);
 }

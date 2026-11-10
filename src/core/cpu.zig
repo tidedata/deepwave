@@ -162,9 +162,9 @@ pub fn info() *const Info {
     return &info_value;
 }
 
-const Regs = struct { a: u32, b: u32, c: u32, d: u32 };
+pub const Regs = struct { a: u32, b: u32, c: u32, d: u32 };
 
-fn cpuid(leaf: u32, sub: u32) Regs {
+pub fn cpuid(leaf: u32, sub: u32) Regs {
     var a: u32 = undefined;
     var b: u32 = undefined;
     var c: u32 = undefined;
@@ -180,7 +180,7 @@ fn cpuid(leaf: u32, sub: u32) Regs {
     return .{ .a = a, .b = b, .c = c, .d = d };
 }
 
-fn xcr0() u64 {
+pub fn xcr0() u64 {
     var lo: u32 = undefined;
     var hi: u32 = undefined;
     asm volatile ("xgetbv"
@@ -291,6 +291,77 @@ fn detect() Info {
     return i;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Runtime path toggles (core/hw.zig applies the user's overrides here; harness mode flips them).
+
+var sha_ni_off: std.atomic.Value(bool) = .init(false);
+
+/// False when SHA-NI is switched off (hw override or harness); hash/sha2.zig then runs the soft
+/// compression even on a CPU that has it.
+pub inline fn shaNiAllowed() bool {
+    return !sha_ni_off.load(.monotonic);
+}
+
+pub fn setShaNi(on: bool) void {
+    sha_ni_off.store(!on, .monotonic);
+}
+
+// Arm: the instruction sets that are compile-time target features still have a runtime soft
+// alternative, so the harness can compare them and the user can switch them off. Each flag only
+// matters in a build whose target has the feature (hash/sha2.zig, hash/keccak.zig, sig/dit.zig).
+var arm_sha2_off: std.atomic.Value(bool) = .init(false);
+var arm_sha512_off: std.atomic.Value(bool) = .init(false);
+var arm_sha3_on: std.atomic.Value(bool) = .init(false); // default off: Keccak runs the portable rounds today
+var dit_off: std.atomic.Value(bool) = .init(false);
+
+pub inline fn armSha2Allowed() bool {
+    return !arm_sha2_off.load(.monotonic);
+}
+pub inline fn armSha512Allowed() bool {
+    return !arm_sha512_off.load(.monotonic);
+}
+/// True when the Keccak-f[1600] EOR3/RAX1/XAR kernel is asked for (opt-in).
+pub inline fn armSha3Wanted() bool {
+    return arm_sha3_on.load(.monotonic);
+}
+pub inline fn ditAllowed() bool {
+    return !dit_off.load(.monotonic);
+}
+pub fn setArmSha2(on: bool) void {
+    arm_sha2_off.store(!on, .monotonic);
+}
+pub fn setArmSha512(on: bool) void {
+    arm_sha512_off.store(!on, .monotonic);
+}
+pub fn setArmSha3(on: bool) void {
+    arm_sha3_on.store(on, .monotonic);
+}
+pub fn setDit(on: bool) void {
+    dit_off.store(!on, .monotonic);
+}
+
+/// Whether `forceTier(t)` would succeed (the CPU runs it, this binary carries it, and it is not
+/// below the build's own tier).
+pub fn canForce(t: Tier) bool {
+    const i = info();
+    if (@intFromEnum(t) > @intFromEnum(i.supported)) return false;
+    if (@intFromEnum(t) < @intFromEnum(native_tier)) return false;
+    return t == native_tier or linkedRt(t);
+}
+
+/// Force the dispatch tier (harness and overrides). False, and nothing changed, when the CPU
+/// cannot run `t` or this binary carries no object for it.
+pub fn forceTier(t: Tier) bool {
+    if (!canForce(t)) return false;
+    tier_cache.store(@intFromEnum(t), .monotonic);
+    return true;
+}
+
+/// Back to the tier detection chose (ZUI_CPU cap applied).
+pub fn restoreTier() void {
+    tier_cache.store(@intFromEnum(info().tier), .monotonic);
+}
+
 fn linkedRt(t: Tier) bool {
     inline for (tiers.kernel_tiers) |k| if (t == k) return linked(k);
     return false;
@@ -301,15 +372,34 @@ fn linkedRt(t: Tier) bool {
 
 pub const Prim = enum { ed25519, secp256k1, secp256r1, bls12381, bn254, blake2b, blake2b_many, sha256, sha512, keccak, aes_gcm };
 
+/// Which toggled paths are in force (the live values, or a plan's).
+pub const Sel = struct {
+    sha_ni: bool,
+    arm_sha2: bool = true,
+    arm_sha512: bool = true,
+    arm_sha3: bool = false,
+};
+
+pub fn liveSel() Sel {
+    return .{ .sha_ni = info().sha_ni and shaNiAllowed(), .arm_sha2 = armSha2Allowed(), .arm_sha512 = armSha512Allowed(), .arm_sha3 = armSha3Wanted() };
+}
+
 pub fn kernelName(p: Prim, t: Tier, sha_ni: bool) []const u8 {
+    var sel = liveSel();
+    sel.sha_ni = sha_ni;
+    return kernelNameFor(p, t, sel);
+}
+
+pub fn kernelNameFor(p: Prim, t: Tier, sel: Sel) []const u8 {
+    const sha_ni = sel.sha_ni;
     if (comptime !is_x86) return switch (builtin.cpu.arch) {
         .aarch64 => switch (p) {
             .ed25519 => "radix51-neon",
             .blake2b => "scalar",
             .blake2b_many => "neon-x2",
-            .sha256 => "armv8-sha2",
-            .sha512 => "armv8-sha512",
-            .keccak => "scalar",
+            .sha256 => if (sel.arm_sha2) "armv8-sha2" else "scalar",
+            .sha512 => if (sel.arm_sha512) "armv8-sha512" else "scalar",
+            .keccak => if (sel.arm_sha3) "armv8-sha3" else "scalar",
             .aes_gcm => "armv8-aes",
             else => "portable",
         },
@@ -340,9 +430,13 @@ pub fn logChoice() void {
     const i = info();
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    for (std.enums.values(Prim)) |p| w.print(" {s}={s}", .{ @tagName(p), kernelName(p, i.tier, i.sha_ni) }) catch break;
-    std.log.info("cpu: tier {s} (supported {s}, build {s}{s}) {s}; kernels:{s}", .{
-        @tagName(i.tier),
+    const live = tier();
+    for (std.enums.values(Prim)) |p| w.print(" {s}={s}", .{ @tagName(p), kernelName(p, live, i.sha_ni and shaNiAllowed()) }) catch break;
+    var forced_buf: [32]u8 = undefined;
+    const forced = if (live != i.tier) std.fmt.bufPrint(&forced_buf, " (forced; detected {s})", .{@tagName(i.tier)}) catch "" else "";
+    std.log.info("cpu: tier {s}{s} (supported {s}, build {s}{s}) {s}; kernels:{s}", .{
+        @tagName(live),
+        forced,
         @tagName(i.supported),
         @tagName(native_tier),
         if (i.override_ignored) ", ZUI_CPU ignored" else "",
@@ -355,9 +449,10 @@ pub fn logChoice() void {
 /// plus `zui_cpu_tier{tier="avx2",supported="avx512"} 1`.
 pub fn writeMetrics(w: *std.Io.Writer) std.Io.Writer.Error!void {
     const i = info();
-    try w.print("# TYPE zui_cpu_tier gauge\nzui_cpu_tier{{tier=\"{s}\",supported=\"{s}\",build=\"{s}\"}} 1\n", .{ @tagName(i.tier), @tagName(i.supported), @tagName(native_tier) });
+    const live = tier();
+    try w.print("# TYPE zui_cpu_tier gauge\nzui_cpu_tier{{tier=\"{s}\",detected=\"{s}\",supported=\"{s}\",build=\"{s}\"}} 1\n", .{ @tagName(live), @tagName(i.tier), @tagName(i.supported), @tagName(native_tier) });
     try w.writeAll("# TYPE zui_cpu_kernel gauge\n");
-    for (std.enums.values(Prim)) |p| try w.print("zui_cpu_kernel{{prim=\"{s}\",kernel=\"{s}\"}} 1\n", .{ @tagName(p), kernelName(p, i.tier, i.sha_ni) });
+    for (std.enums.values(Prim)) |p| try w.print("zui_cpu_kernel{{prim=\"{s}\",kernel=\"{s}\"}} 1\n", .{ @tagName(p), kernelName(p, live, i.sha_ni and shaNiAllowed()) });
 }
 
 test "tier detection is stable and at least the build's own" {

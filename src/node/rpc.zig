@@ -135,8 +135,10 @@ pub const Rpc = struct {
         r.congestion.follow(r.st, &r.stop, 50);
     }
 
+    /// A simulate worker exits: its package caches go back to the allocator the engine made
+    /// them with (`gpa`, kept in each cache), its framework snapshots to theirs.
     fn releaseWorkerCaches() void {
-        exec.ptb.pkgs.releaseThreadCaches(std.heap.smp_allocator);
+        exec.ptb.pkgs.releaseThreadCaches();
         exec.system.movecall.releaseThreadCaches();
     }
 

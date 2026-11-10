@@ -24,6 +24,7 @@ pub const Out = struct {
         if (tl_scratch.len != 0 and o.buf.ptr == tl_scratch.ptr) std.heap.page_allocator.free(tl_scratch);
         tl_scratch = nb;
         o.buf = nb;
+        freeAtThreadExit();
     }
     fn lit(o: *Out, s: []const u8) Error!void {
         try o.room(s.len);
@@ -44,6 +45,36 @@ pub const Out = struct {
 };
 
 threadlocal var tl_scratch: []u8 = &.{};
+threadlocal var tl_registered: bool = false;
+
+/// The scratch buffer of a thread that exits is freed (a pthread key destructor): serving
+/// threads come and go (one per HTTP/1.1 connection), and each used to leave its buffer mapped.
+var exit_key: std.c.pthread_key_t = undefined;
+/// 0: no key yet, 1: being created, 2: ready, 3: unavailable (buffers then live until exit).
+var exit_key_state: std.atomic.Value(u8) = .init(0);
+
+fn freeScratchAtExit(p: *anyopaque) callconv(.c) void {
+    const s: *[]u8 = @ptrCast(@alignCast(p));
+    if (s.len != 0) std.heap.page_allocator.free(s.*);
+    s.* = &.{};
+    _ = freed_at_exit.fetchAdd(1, .monotonic);
+}
+
+var freed_at_exit: std.atomic.Value(u64) = .init(0);
+
+fn freeAtThreadExit() void {
+    if (tl_registered) return;
+    while (true) switch (exit_key_state.load(.acquire)) {
+        0 => if (exit_key_state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
+            const ok = std.c.pthread_key_create(&exit_key, freeScratchAtExit) == .SUCCESS;
+            exit_key_state.store(if (ok) 2 else 3, .release);
+        },
+        1 => std.atomic.spinLoopHint(),
+        2 => break,
+        else => return,
+    };
+    if (std.c.pthread_setspecific(exit_key, @ptrCast(&tl_scratch)) == 0) tl_registered = true;
+}
 
 /// An `Out` for a type string of any length (Move types nest and take up to 32 type arguments,
 /// so a fixed buffer can always be outgrown on chain): it writes into this thread's scratch
@@ -196,4 +227,20 @@ test "scratch: type strings of any length" {
     var f: Out = .{ .buf = &fixed_buf };
     try f.address(&@as([32]u8, @splat(1)));
     try std.testing.expectError(error.NoSpace, f.address(&@as([32]u8, @splat(1))));
+}
+
+test "typestr: a thread's scratch buffer is freed when the thread exits" {
+    const T = struct {
+        fn run() void {
+            var o = scratch();
+            for (0..3000) |_| o.lit("u8") catch return;
+        }
+    };
+    const before = freed_at_exit.load(.monotonic);
+    for (0..4) |_| {
+        const t = try std.Thread.spawn(.{}, T.run, .{});
+        t.join();
+    }
+    if (exit_key_state.load(.acquire) != 2) return error.SkipZigTest;
+    try std.testing.expectEqual(before + 4, freed_at_exit.load(.monotonic));
 }

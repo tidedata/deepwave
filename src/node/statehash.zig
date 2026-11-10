@@ -62,6 +62,10 @@ pub const Checker = struct {
     expect_root: ?[32]u8 = null,
     /// Tests: report a mismatch as a warning (the test runner fails on any error line).
     quiet: bool = false,
+    /// `--verify-fallback` (upgrade.zig): during an epoch whose protocol this binary has no table
+    /// for, hash with the newest path and treat a mismatch at the end of epoch as a warning (the
+    /// root is dropped; no execution stop, no halt): the accumulator rules of that protocol are unknown.
+    lenient: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, policy: Policy) !Checker {
         return .{ .gpa = gpa, .idx = try types.CheckpointIndex.init(gpa), .arena = .init(gpa), .policy = policy };
@@ -98,7 +102,8 @@ pub const Checker = struct {
         }
         _ = k.arena.reset(.retain_capacity);
         try types.indexCheckpointData(blob, &k.idx);
-        const path: exec.state_hash.Path = if (protocol.get(pv, .mainnet)) |cfg| exec.state_hash.pathFor(cfg) else |_| .v3;
+        const unknown_pv = k.lenient and (pv < protocol.min_protocol_version or pv > protocol.max_protocol_version);
+        const path: exec.state_hash.Path = if (protocol.get(if (unknown_pv) protocol.max_protocol_version else pv, .mainnet)) |cfg| exec.state_hash.pathFor(cfg) else |_| .v3;
         var out: exec.state_hash.CheckpointHash = .{};
         try exec.state_hash.accumulateCheckpoint(k.arena.allocator(), path, blob, &k.idx, &out);
         if (out.lookups.items.len != 0 or out.missing.items.len != 0) {
@@ -128,6 +133,11 @@ pub const Checker = struct {
             _ = k.stats.checks_ok.fetchAdd(1, .monotonic);
             std.log.info("state hash: epoch {d} root {x} equals the certified commitment (checkpoint {d})", .{ c.epoch, &got, seq });
             return .ok;
+        }
+        if (unknown_pv) {
+            std.log.warn("state hash: end of epoch {d} (checkpoint {d}) runs protocol {d}, unsupported by this binary: root {x} differs from the commitment {x}; check dropped until the next restore (verify-fallback)", .{ c.epoch, seq, pv, &got, &w });
+            k.drop();
+            return .none;
         }
         _ = k.stats.mismatches.fetchAdd(1, .monotonic);
         k.stats.failed.store(1, .release);

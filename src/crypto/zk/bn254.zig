@@ -15,6 +15,9 @@ pub const G1J = curve.G1J;
 pub const G2J = curve.G2J;
 pub const G2Prepared = pairing_.G2Prepared;
 pub const multiMillerLoop = pairing_.multiMillerLoop;
+pub const multiMillerLoopAny = pairing_.multiMillerLoopAny;
+pub const cyclotomicPow = pairing_.cyclotomicPow;
+pub const inTargetGroup = pairing_.inTargetGroup;
 pub const finalExponentiation = pairing_.finalExponentiation;
 pub const pairing = pairing_.pairing;
 

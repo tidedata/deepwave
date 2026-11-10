@@ -18,14 +18,7 @@ checks its sha256 and unpacks it into `~/.cache/zui/zig-0.17.1/`. Every later `.
 that copy. The build has no other dependencies: no package manager, no RocksDB, no Rust. zstd is
 vendored under `vendor/zstd` and compiled from source.
 
-**Hardware.** All published measurements were taken on a machine matching Mysten's recommended
-full-node specification:
-
-| resource | measured on | notes |
-|---|---|---|
-| CPU | 8 cores / 16 vCPU (x86_64, AVX2 or newer) | AVX2 and AVX-512 IFMA kernels are picked at runtime by CPUID |
-| RAM | 128 GiB | private memory is 1 to 6 GB in normal operation; the rest is page cache over the store |
-| Disk | local NVMe | a fresh mainnet restore at the tip uses about 183 GB |
+**Hardware.** 4 cores or more (AVX2 or newer), 16 GB RAM, local NVMe with 250 GB free.
 
 Memory figures from [performance.md](performance.md):
 - Verify mode, following mainnet: about 1 GB resident.

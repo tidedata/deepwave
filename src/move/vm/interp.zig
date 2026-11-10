@@ -12,6 +12,7 @@ const value = @import("value.zig");
 const types = @import("types.zig");
 const gas = @import("gas.zig");
 const trace = @import("trace.zig");
+const profile = @import("profile.zig");
 
 const Allocator = std.mem.Allocator;
 const ff = move_format.file_format;
@@ -94,26 +95,58 @@ pub const LinkCtx = struct {
     rt: *loader.Runtime,
     root: *loader.Package,
     ext: std.AutoHashMapUnmanaged(Key, *Function) = .empty,
+    /// Inline cache in front of `ext`: direct mapped by (module, handle), so a hot cross-package
+    /// call site costs one compare instead of a hash lookup. Entries are only ever filled from
+    /// `ext`, so they are as valid as it is.
+    ic: ?*[IC_SIZE]IcEntry = null,
 
     const Key = struct { m: *const Module, h: u16 };
+    const IC_SIZE = 64;
+    const IcEntry = struct { m: ?*const Module = null, h: u16 = 0, f: ?*Function = null };
+
+    inline fn icSlot(m: *const Module, h: u16) usize {
+        return ((@intFromPtr(m) >> 6) ^ (@as(usize, h) *% 0x9E37)) & (IC_SIZE - 1);
+    }
 
     pub fn init(rt: *loader.Runtime, root: *loader.Package) LinkCtx {
         return .{ .rt = rt, .root = root };
     }
     pub fn deinit(c: *LinkCtx) void {
         c.ext.deinit(c.rt.gpa);
+        if (c.ic) |t| c.rt.gpa.destroy(t);
+        c.ic = null;
     }
 
     pub fn resolve(c: *LinkCtx, m: *Module, fh: u16) loader.LoadError!*Function {
         if (m.local_calls[fh]) |f| return f;
-        if (c.ext.get(.{ .m = m, .h = fh })) |f| return f;
+        const si = icSlot(m, fh);
+        if (c.ic) |t| {
+            const slot = &t[si];
+            if (slot.m == m and slot.h == fh) return slot.f.?;
+        }
+        if (c.ext.get(.{ .m = m, .h = fh })) |f| {
+            c.icFill(si, m, fh, f);
+            return f;
+        }
         const h = m.cm.function_handles[fh];
         const vid = c.root.linked(m.moduleHandleAddress(h.module)) orelse return error.LinkageMissing;
         const p = c.rt.package(&vid) orelse return error.LinkageMissing;
         const tm = p.module(m.moduleHandleName(h.module)) orelse return error.ModuleMissing;
         const f = tm.functionByName(m.cm.identifiers[h.name]) orelse return error.FunctionMissing;
         try c.ext.put(c.rt.gpa, .{ .m = m, .h = fh }, f);
+        c.icFill(si, m, fh, f);
         return f;
+    }
+
+    /// Fills a cache slot; the table is created on the first miss (short-lived contexts that
+    /// never call across packages pay nothing). Failing to allocate just skips the cache.
+    fn icFill(c: *LinkCtx, si: usize, m: *const Module, fh: u16, f: *Function) void {
+        if (c.ic == null) {
+            const t = c.rt.gpa.create([IC_SIZE]IcEntry) catch return;
+            t.* = @splat(.{});
+            c.ic = t;
+        }
+        c.ic.?[si] = .{ .m = m, .h = fh, .f = f };
     }
 
     /// The function `name` of module `module_name` in the root package's linkage.
@@ -156,7 +189,7 @@ pub const LinkCache = struct {
     }
 };
 
-const Frame = struct {
+pub const Frame = struct {
     func: *const Function,
     pc: u16,
     /// Where this frame's locals, type arguments and node counts start in the LIFO region;
@@ -170,6 +203,10 @@ const Frame = struct {
 };
 
 pub const Error = error{NativeUnsupported} || loader.LoadError;
+pub const StepError = Session.Fail || Error;
+/// A compiled function (aot.zig): runs the current frame's instructions from `f.pc` until a
+/// call, a return or an error, exactly like `stepRun`, and returns what `stepRun` returns.
+pub const AotFn = *const fn (s: *Session, f: *Frame) StepError!bool;
 
 /// Depth formula of a datatype (`DepthFormula`): max(constant, depth(T_i) + c_i).
 const Formula = struct {
@@ -341,6 +378,8 @@ pub const Lifo = struct {
     }
 };
 
+const GenKey = struct { m: *const Module, i: u16 };
+
 pub const Session = struct {
     link: *LinkCtx,
     natives: ?*const NativeTable = null,
@@ -354,6 +393,9 @@ pub const Session = struct {
     sp: usize = 0,
     frames: std.ArrayList(Frame) = .empty,
     depth_cache: std.AutoHashMapUnmanaged(*const Datatype, Formula) = .empty,
+    /// Instantiated type arguments of `CallGeneric` sites that do not depend on the frame
+    /// (`Module.gen_concrete`); see `callTypeArgs`.
+    gen_cache: std.AutoHashMapUnmanaged(GenKey, []const *const Type) = .empty,
     /// The partial error of the failing operation (status and sub status).
     pending: VmError = .{ .major = .EXECUTED },
     /// Set to trace the run (move-trace-format). Null runs the untraced loop, which has no
@@ -371,7 +413,16 @@ pub const Session = struct {
         pool.* = .init(arena);
         const lifo = try arena.create(Lifo);
         lifo.* = .{ .backing = arena };
+        // Gas profiler (profile.zig): off unless the thread activated one.
+        var prof_tracer: ?*trace.Tracer = null;
+        if (profile.active) |p| {
+            const t = try arena.create(trace.Tracer);
+            t.* = trace.Tracer.init(arena, cfg);
+            t.prof = p;
+            prof_tracer = t;
+        }
         return .{
+            .tracer = prof_tracer,
             .link = link,
             .arena = arena,
             .heap = .{ .arena = arena, .pool = pool },
@@ -396,7 +447,7 @@ pub const Session = struct {
 
     // ---- operand stack -------------------------------------------------------------------
 
-    const Fail = error{Vm};
+    pub const Fail = error{Vm};
 
     fn fail(s: *Session, major: StatusCode, sub: ?u64) Fail {
         s.pending = .{ .major = major, .sub = sub };
@@ -683,7 +734,7 @@ pub const Session = struct {
     /// A native as the outermost function (`interpreter::run` → `call_native_with_args`):
     /// no call charge, errors at (function, 0) in its module.
     fn runNative(s: *Session, func: *const Function, ty_args: []const *const Type, args: []const Value) Error!Outcome {
-        if (s.tracer != null) return error.NativeUnsupported;
+        if (s.tracer) |t| if (t.prof == null) return error.NativeUnsupported;
         const table = s.natives orelse return error.NativeUnsupported;
         const m = func.module;
         const nf = table.lookup(&m.pkg.original_id, m.name, func.name) orelse return error.NativeUnsupported;
@@ -713,7 +764,7 @@ pub const Session = struct {
         }
     }
 
-    fn atFrame(s: *Session, f: *const Frame) void {
+    pub fn atFrame(s: *Session, f: *const Frame) void {
         s.pending.module = f.func.module;
         s.pending.off = .{ .fdef = f.func.def_idx, .pc = f.pc };
     }
@@ -721,24 +772,296 @@ pub const Session = struct {
     /// Untraced: runs the current frame's instructions until a call or return (handled by
     /// `step`), with the frame and its code held across instructions. Same effects as `step`
     /// per instruction.
+    ///
+    /// Threaded dispatch: a labeled switch where each hot handler ends in its own indirect jump
+    /// to the next instruction's handler (`continue :sw`), so the branch predictor sees one
+    /// jump site per opcode instead of one shared site. Hot handlers are fast paths over inline
+    /// (non-boxed) values: each one checks everything it needs BEFORE any side effect (stack
+    /// depth, operand tags, overflow) and otherwise leaves the instruction to `op`, which does
+    /// the full work, so charges, results and errors are those of `op`.
     fn stepRun(s: *Session) (Fail || Error)!bool {
         const f = &s.frames.items[s.frames.items.len - 1];
+        // aot tier: compiled code for this function runs the same instructions (see aot.zig)
+        if (f.func.aot) |a| return @as(AotFn, @ptrCast(@alignCast(a)))(s, f);
         const code = f.func.code;
+        const meter = s.meter;
         // the pc lives in a register here; the frame gets it before every instruction (stores
         // only: error locations and `step` read it there)
         var pc = f.pc;
         while (true) {
             f.pc = pc;
             if (pc >= code.len) return s.step(false);
-            const ins = code[pc];
-            switch (ins.op) {
+            sw: switch (code[pc].op) {
                 .Ret, .Call, .CallGeneric => return s.step(false),
-                else => pc = @call(.always_inline, op, .{ s, f, ins, pc }) catch |e| {
-                    if (e == error.Vm) s.atFrame(f);
-                    return e;
+                .LdU8 => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                    meter.chargeSimple(.LdU8) catch return s.atErr(f, s.chargeFail());
+                    s.stack[s.sp] = Value.u8_(@intCast(code[pc].imm));
+                    s.sp += 1;
+                    pc += 1;
+                    f.pc = pc;
+                    if (pc >= code.len) return s.step(false);
+                    continue :sw code[pc].op;
+                } else break :sw,
+                .LdU16 => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                    meter.chargeSimple(.LdU16) catch return s.atErr(f, s.chargeFail());
+                    s.stack[s.sp] = Value.u16_(@intCast(code[pc].imm));
+                    s.sp += 1;
+                    pc += 1;
+                    f.pc = pc;
+                    if (pc >= code.len) return s.step(false);
+                    continue :sw code[pc].op;
+                } else break :sw,
+                .LdU32 => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                    meter.chargeSimple(.LdU32) catch return s.atErr(f, s.chargeFail());
+                    s.stack[s.sp] = Value.u32_(@intCast(code[pc].imm));
+                    s.sp += 1;
+                    pc += 1;
+                    f.pc = pc;
+                    if (pc >= code.len) return s.step(false);
+                    continue :sw code[pc].op;
+                } else break :sw,
+                .LdU64 => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                    meter.chargeSimple(.LdU64) catch return s.atErr(f, s.chargeFail());
+                    s.stack[s.sp] = Value.u64_(code[pc].imm);
+                    s.sp += 1;
+                    pc += 1;
+                    f.pc = pc;
+                    if (pc >= code.len) return s.step(false);
+                    continue :sw code[pc].op;
+                } else break :sw,
+                .LdTrue => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                    meter.chargeSimple(.LdTrue) catch return s.atErr(f, s.chargeFail());
+                    s.stack[s.sp] = Value.bool_(true);
+                    s.sp += 1;
+                    pc += 1;
+                    f.pc = pc;
+                    if (pc >= code.len) return s.step(false);
+                    continue :sw code[pc].op;
+                } else break :sw,
+                .LdFalse => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                    meter.chargeSimple(.LdFalse) catch return s.atErr(f, s.chargeFail());
+                    s.stack[s.sp] = Value.bool_(false);
+                    s.sp += 1;
+                    pc += 1;
+                    f.pc = pc;
+                    if (pc >= code.len) return s.step(false);
+                    continue :sw code[pc].op;
+                } else break :sw,
+                .CopyLoc => {
+                    const v = f.locals[code[pc].idx];
+                    if (isInline(v.tag) and s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                        meter.chargeCopyLoc(value.size(v, meter.plain)) catch return s.atErr(f, s.chargeFail());
+                        s.stack[s.sp] = v;
+                        s.sp += 1;
+                        pc += 1;
+                        f.pc = pc;
+                        if (pc >= code.len) return s.step(false);
+                        continue :sw code[pc].op;
+                    } else break :sw;
                 },
+                .MoveLoc => {
+                    const v = f.locals[code[pc].idx];
+                    if (v.tag != .invalid and s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                        f.locals[code[pc].idx] = Value.invalid;
+                        const sz = if (meter.moveLocNeedsSize()) value.size(v, meter.plain) else 0;
+                        meter.chargeMoveLoc(sz) catch return s.atErr(f, s.chargeFail());
+                        s.stack[s.sp] = v;
+                        s.sp += 1;
+                        pc += 1;
+                        f.pc = pc;
+                        if (pc >= code.len) return s.step(false);
+                        continue :sw code[pc].op;
+                    } else break :sw;
+                },
+                .StLoc => {
+                    if (s.sp > 0 and isInlineOrInvalid(f.locals[code[pc].idx].tag)) {
+                        s.sp -= 1;
+                        const v = s.stack[s.sp];
+                        meter.chargeStoreLoc() catch return s.atErr(f, s.chargeFail());
+                        f.locals[code[pc].idx] = v;
+                        pc += 1;
+                        f.pc = pc;
+                        if (pc >= code.len) return s.step(false);
+                        continue :sw code[pc].op;
+                    } else break :sw;
+                },
+                .Pop => {
+                    if (s.sp > 0 and isInlineOrInvalid(s.stack[s.sp - 1].tag)) {
+                        s.sp -= 1;
+                        meter.chargePop() catch return s.atErr(f, s.chargeFail());
+                        pc += 1;
+                        f.pc = pc;
+                        if (pc >= code.len) return s.step(false);
+                        continue :sw code[pc].op;
+                    } else break :sw;
+                },
+                .ImmBorrowLoc => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                    meter.chargeSimple(.ImmBorrowLoc) catch return s.atErr(f, s.chargeFail());
+                    s.stack[s.sp] = Value.refSlot(&f.locals[code[pc].idx]);
+                    s.sp += 1;
+                    pc += 1;
+                    f.pc = pc;
+                    if (pc >= code.len) return s.step(false);
+                    continue :sw code[pc].op;
+                } else break :sw,
+                .MutBorrowLoc => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                    meter.chargeSimple(.MutBorrowLoc) catch return s.atErr(f, s.chargeFail());
+                    s.stack[s.sp] = Value.refSlot(&f.locals[code[pc].idx]);
+                    s.sp += 1;
+                    pc += 1;
+                    f.pc = pc;
+                    if (pc >= code.len) return s.step(false);
+                    continue :sw code[pc].op;
+                } else break :sw,
+                .BrTrue => {
+                    if (s.sp > 0 and s.stack[s.sp - 1].tag == .bool) {
+                        meter.chargeSimple(.BrTrue) catch return s.atErr(f, s.chargeFail());
+                        s.sp -= 1;
+                        pc = if (s.stack[s.sp].a != 0) code[pc].idx else pc + 1;
+                        f.pc = pc;
+                        if (pc >= code.len) return s.step(false);
+                        continue :sw code[pc].op;
+                    } else break :sw;
+                },
+                .BrFalse => {
+                    if (s.sp > 0 and s.stack[s.sp - 1].tag == .bool) {
+                        meter.chargeSimple(.BrFalse) catch return s.atErr(f, s.chargeFail());
+                        s.sp -= 1;
+                        pc = if (s.stack[s.sp].a == 0) code[pc].idx else pc + 1;
+                        f.pc = pc;
+                        if (pc >= code.len) return s.step(false);
+                        continue :sw code[pc].op;
+                    } else break :sw;
+                },
+                .Branch => {
+                    meter.chargeSimple(.Branch) catch return s.atErr(f, s.chargeFail());
+                    pc = code[pc].idx;
+                    f.pc = pc;
+                    if (pc >= code.len) return s.step(false);
+                    continue :sw code[pc].op;
+                },
+                .Not => {
+                    if (s.sp > 0 and s.stack[s.sp - 1].tag == .bool) {
+                        meter.chargeSimple(.Not) catch return s.atErr(f, s.chargeFail());
+                        const t = &s.stack[s.sp - 1];
+                        t.a = @intFromBool(t.a == 0);
+                        pc += 1;
+                        f.pc = pc;
+                        if (pc >= code.len) return s.step(false);
+                        continue :sw code[pc].op;
+                    } else break :sw;
+                },
+                inline .Add, .Sub, .Mul, .Div, .Mod, .BitOr, .BitAnd, .Xor => |o| {
+                    const k = comptime switch (o) {
+                        .Add => Arith.add,
+                        .Sub => Arith.sub,
+                        .Mul => Arith.mul,
+                        .Div => Arith.div,
+                        .Mod => Arith.mod,
+                        .BitOr => Arith.bor,
+                        .BitAnd => Arith.band,
+                        else => Arith.xor,
+                    };
+                    if (s.fastArith(k)) |r| {
+                        meter.chargeSimple(@field(gas.Meter.Simple, @tagName(o))) catch return s.atErr(f, s.chargeFail());
+                        s.sp -= 1;
+                        s.stack[s.sp - 1].a = r;
+                        pc += 1;
+                        f.pc = pc;
+                        if (pc >= code.len) return s.step(false);
+                        continue :sw code[pc].op;
+                    } else break :sw;
+                },
+                inline .Lt, .Gt, .Le, .Ge => |o| {
+                    const k = comptime switch (o) {
+                        .Lt => Cmp.lt,
+                        .Gt => Cmp.gt,
+                        .Le => Cmp.le,
+                        else => Cmp.ge,
+                    };
+                    if (s.fastCmp(k)) |r| {
+                        meter.chargeSimple(@field(gas.Meter.Simple, @tagName(o))) catch return s.atErr(f, s.chargeFail());
+                        s.sp -= 1;
+                        s.stack[s.sp - 1] = Value.bool_(r);
+                        pc += 1;
+                        f.pc = pc;
+                        if (pc >= code.len) return s.step(false);
+                        continue :sw code[pc].op;
+                    } else break :sw;
+                },
+                else => break :sw,
             }
+            // Everything the fast paths did not take.
+            pc = @call(.always_inline, op, .{ s, f, code[pc], pc }) catch |e| {
+                if (e == error.Vm) s.atFrame(f);
+                return e;
+            };
         }
+    }
+
+    inline fn atErr(s: *Session, f: *const Frame, e: Fail) Fail {
+        s.atFrame(f);
+        return e;
+    }
+
+    /// Values with no heap ownership (nothing to copy or drop).
+    inline fn isInline(t: value.Tag) bool {
+        return switch (t) {
+            .u8, .u16, .u32, .u64, .u128, .bool => true,
+            else => false,
+        };
+    }
+    inline fn isInlineOrInvalid(t: value.Tag) bool {
+        return t == .invalid or isInline(t);
+    }
+
+    const small_max = [_]u64{ 0, 0xff, 0xffff, 0xffff_ffff, std.math.maxInt(u64) };
+
+    /// u8..u64 binary op on the top two values with no error: the result, else null (the full
+    /// path decides, and reports any error). No side effects.
+    inline fn fastArith(s: *Session, comptime k: Arith) ?u64 {
+        if (s.sp < 2) return null;
+        const rhs = s.stack[s.sp - 1];
+        const lhs = s.stack[s.sp - 2];
+        const ti = @intFromEnum(lhs.tag);
+        if (lhs.tag != rhs.tag or ti < 1 or ti > 4) return null;
+        const a = lhs.a;
+        const b = rhs.a;
+        return switch (k) {
+            .add => blk: {
+                const x = @addWithOverflow(a, b);
+                break :blk if (x[1] != 0 or x[0] > small_max[ti]) null else x[0];
+            },
+            .sub => if (a < b) null else a - b,
+            .mul => blk: {
+                const x = @mulWithOverflow(a, b);
+                break :blk if (x[1] != 0 or x[0] > small_max[ti]) null else x[0];
+            },
+            .div => if (b == 0) null else a / b,
+            .mod => if (b == 0) null else a % b,
+            .bor => a | b,
+            .band => a & b,
+            .xor => a ^ b,
+        };
+    }
+
+    inline fn fastCmp(s: *Session, comptime k: Cmp) ?bool {
+        if (s.sp < 2) return null;
+        const rhs = s.stack[s.sp - 1];
+        const lhs = s.stack[s.sp - 2];
+        const ti = @intFromEnum(lhs.tag);
+        if (lhs.tag != rhs.tag or ti < 1 or ti > 4) return null;
+        return switch (k) {
+            .lt => lhs.a < rhs.a,
+            .gt => lhs.a > rhs.a,
+            .le => lhs.a <= rhs.a,
+            .ge => lhs.a >= rhs.a,
+        };
+    }
+
+    /// `step` untraced, for compiled code (aot.zig) that reaches a call, a return or a bad pc.
+    pub fn stepUntraced(s: *Session) (Fail || Error)!bool {
+        return s.step(false);
     }
 
     /// One instruction. Returns true when the outermost frame returned.
@@ -783,7 +1106,7 @@ pub const Session = struct {
                     return error.Vm;
                 };
                 const mk = s.lifo.mark();
-                const targs = try types.instantiateAll(s.typeAlloc(), f.func.module, sig, f.ty_args);
+                const targs = try s.callTypeArgs(f, ins.idx, sig);
                 const target = try s.link.resolve(f.func.module, fi.handle);
                 try s.callFunction(traced, f, target, targs, mk);
                 return false;
@@ -800,6 +1123,21 @@ pub const Session = struct {
                 return false;
             },
         }
+    }
+
+    /// The type arguments of a `CallGeneric`. When the signature mentions no type parameter the
+    /// instantiation is the same at every execution, so an untraced session builds it once
+    /// (in the arena, so it outlives the frame) and shares it: no per-call type allocation.
+    /// Everything else (and every traced run) instantiates per call in the frame's region.
+    fn callTypeArgs(s: *Session, f: *const Frame, idx: u16, sig: []const ff.Token) Error![]const *const Type {
+        const m = f.func.module;
+        if (s.tracer != null) return types.instantiateAll(s.typeAlloc(), m, sig, f.ty_args);
+        if (!m.gen_concrete[idx]) return types.instantiateAll(s.typeAlloc(), m, sig, f.ty_args);
+        const key: GenKey = .{ .m = m, .i = idx };
+        if (s.gen_cache.get(key)) |c| return c;
+        const targs = try types.instantiateAll(s.arena, m, sig, f.ty_args);
+        try s.gen_cache.put(s.arena, key, targs);
+        return targs;
     }
 
     fn callFunction(s: *Session, comptime traced: bool, caller: *Frame, target: *const Function, ty_args: []const *const Type, mk: Lifo.Mark) (Fail || Error)!void {
@@ -1110,7 +1448,7 @@ pub const Session = struct {
 
     /// One instruction other than Call, CallGeneric and Ret at `pc` (also in `f.pc`); returns
     /// the next pc.
-    fn op(s: *Session, f: *Frame, ins: ff.Instr, pc: u16) (Fail || Error)!u16 {
+    pub fn op(s: *Session, f: *Frame, ins: ff.Instr, pc: u16) (Fail || Error)!u16 {
         const m = f.func.module;
         const meter = s.meter;
         switch (ins.op) {

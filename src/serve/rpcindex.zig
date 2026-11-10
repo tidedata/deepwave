@@ -13,6 +13,13 @@
 //! - **Watermark** (`<dir>/watermark`, two checksummed slots written alternately): the last
 //!   checkpoint whose rows are durable. It is the "highest indexed checkpoint" GetPackage
 //!   `at_checkpoint` checks against; until it exists the index answers `rpc index is empty`.
+//!   The follower's per-checkpoint commit (`commitLazy`) writes the slot every checkpoint but
+//!   fsyncs it only every `wm_sync_every` checkpoints, at an end-of-epoch checkpoint and at
+//!   close: rows are always durable before the slot that names them is written, so the file
+//!   on disk can only be behind, never ahead of the rows. After a power loss the watermark is
+//!   up to `wm_sync_every` checkpoints stale and node start (`seed`) derives it again from the
+//!   store, the source of truth: it replays the stored checkpoints past it through the same
+//!   row logic (rows already there are left alone) and commits at the store tip.
 //!
 //! Feeds (CONTRACTS 6.8: a derived index with its own durable watermark):
 //! - the commit stream: `onCheckpoint(seq, blob)` for every checkpoint the follower applies, before
@@ -119,6 +126,15 @@ pub const Index = struct {
     pkg_dirty: bool = false,
     wm_file: ?Io.File = null,
     wm_gen: u64 = 0,
+    /// The watermark this process last fsynced (null: none yet, so the first commit syncs
+    /// whatever a previous process left in the page cache).
+    wm_synced: ?u64 = null,
+    /// A slot was written since the last fsync.
+    wm_dirty: bool = false,
+    /// The next `commitLazy` syncs (an end-of-epoch checkpoint was fed).
+    wm_force: bool = false,
+    /// Watermark fsyncs by this process (diagnostics, tests).
+    wm_syncs: u64 = 0,
     /// Durable watermark (writer side): the last checkpoint every row of which is on disk.
     watermark: ?u64 = null,
     /// Highest checkpoint served as indexed (GetPackage `at_checkpoint`), published to readers.
@@ -177,6 +193,8 @@ pub const Index = struct {
         x.rcu.deinit(gpa);
         if (x.cidx) |*c| c.deinit(gpa);
         if (x.io) |io| {
+            // A clean close leaves the exact watermark on disk.
+            x.flush() catch |e| std.log.warn("rpc index: watermark sync at close: {s} (the next start replays from the last synced one)", .{@errorName(e)});
             if (x.pkg_log) |f| f.close(io);
             if (x.eoe_file) |f| f.close(io);
             if (x.wm_file) |f| f.close(io);
@@ -516,6 +534,7 @@ pub const Index = struct {
         if (!hdr.end_of_epoch) return;
         try x.epochRecordsOf(seq, blob, hdr, true);
         try x.markEoePackages(hdr.epoch);
+        x.wm_force = true; // the epoch change is never left to a replay
     }
 
     /// The epoch records of a verified end-of-epoch checkpoint blob (0x01 ++ BCS CheckpointData)
@@ -731,9 +750,38 @@ pub const Index = struct {
     /// watermark where it was (the node stops; a restart replays from it).
     pub fn commit(x: *Index, seq: u64) !void {
         try x.syncRows();
-        try x.persistWatermark(seq);
+        try x.persistWatermark(seq, true);
         x.publish(seq);
         x.reclaimRetired();
+    }
+
+    /// Checkpoints between two watermark fsyncs on the follower's path (`commitLazy`). Half of
+    /// the 64-checkpoint lag at which node start replays in the background (fast start), so a
+    /// watermark made stale by a power loss is always levelled before the node serves.
+    pub const wm_sync_every: u64 = 32;
+
+    /// `commit` for the follower's per-checkpoint path: rows durable, the watermark slot
+    /// written, `seq` published, but the slot is fsynced only every `wm_sync_every` checkpoints
+    /// (and after an end-of-epoch checkpoint, at `flush` and at close). It was one fsync per
+    /// checkpoint on the ordered thread, before the store's own. What a power loss can lose is
+    /// the newest slot values, never rows: the next start finds a watermark below the store tip
+    /// and `seed` replays the stored checkpoints in between.
+    pub fn commitLazy(x: *Index, seq: u64) !void {
+        try x.syncRows();
+        const due = x.wm_force or x.wm_synced == null or seq >= x.wm_synced.? +| wm_sync_every;
+        try x.persistWatermark(seq, due);
+        x.publish(seq);
+        x.reclaimRetired();
+    }
+
+    /// Makes a lazily written watermark durable.
+    pub fn flush(x: *Index) !void {
+        const io = x.io orelse return;
+        if (!x.wm_dirty) return;
+        try x.wm_file.?.sync(io);
+        x.wm_dirty = false;
+        x.wm_synced = x.watermark;
+        x.wm_syncs += 1;
     }
 
     // ------------------------------------------------------------------ persistence
@@ -900,8 +948,9 @@ pub const Index = struct {
     }
 
     // Watermark: two 32-byte slots (magic, seq, generation, checksum), written alternately and
-    // fsynced; the valid slot with the higher generation wins, so a torn write loses at most the
-    // newest value (the replay then covers one checkpoint more).
+    // fsynced (every write for `commit`, every `wm_sync_every` checkpoints for `commitLazy`); the
+    // valid slot with the higher generation wins, so a torn write loses at most the newest value
+    // and a power loss the values since the last fsync (the replay then covers those checkpoints).
     const wm_magic: u64 = 0x314d575250455a; // "ZEPRWM1"
 
     fn wmChecksum(b: *const [24]u8) u64 {
@@ -947,7 +996,7 @@ pub const Index = struct {
         }
     }
 
-    fn persistWatermark(x: *Index, seq: u64) !void {
+    fn persistWatermark(x: *Index, seq: u64, sync: bool) !void {
         if (x.io) |io| {
             const f = x.wm_file.?;
             const gen = x.wm_gen + 1;
@@ -957,7 +1006,14 @@ pub const Index = struct {
             std.mem.writeInt(u64, b[16..24], gen, .little);
             std.mem.writeInt(u64, b[24..32], wmChecksum(b[0..24]), .little);
             try f.writePositionalAll(io, &b, (gen % 2) * 32);
-            try f.sync(io);
+            x.wm_dirty = true;
+            if (sync) {
+                try f.sync(io);
+                x.wm_dirty = false;
+                x.wm_synced = seq;
+                x.wm_force = false;
+                x.wm_syncs += 1;
+            }
             x.wm_gen = gen;
         }
         x.watermark = seq;
@@ -1322,6 +1378,197 @@ test "seed: live-set floors and stored-checkpoint replay on a store the index ne
     try testing.expectEqual(@as(u64, 0), rep.live_objects);
     try testing.expectEqual(@as(?u64, 6), x.highestIndexed());
     try testing.expectEqual(@as(usize, 2), x.lineage(&orig).len);
+}
+
+test "commitLazy: the watermark is fsynced once per wm_sync_every checkpoints, after an epoch change and at flush" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const base = pb[0..try tmp.dir.realPath(io, &pb)];
+    const path = try std.fs.path.join(gpa, &.{ base, "rpc" });
+    defer gpa.free(path);
+    const every = Index.wm_sync_every;
+    {
+        const x = try Index.open(gpa, io, path);
+        defer x.deinit();
+        // The first commit of a process always syncs (what an earlier process left is unknown).
+        try x.commitLazy(100);
+        try testing.expectEqual(@as(u64, 1), x.wm_syncs);
+        var seq: u64 = 101;
+        while (seq < 100 + every) : (seq += 1) {
+            try x.commitLazy(seq);
+            try testing.expectEqual(@as(u64, 1), x.wm_syncs); // written, not synced
+            try testing.expectEqual(@as(?u64, seq), x.watermark);
+            try testing.expectEqual(@as(?u64, seq), x.highestIndexed());
+            try testing.expect(x.wm_dirty);
+        }
+        try x.commitLazy(100 + every);
+        try testing.expectEqual(@as(u64, 2), x.wm_syncs);
+        try testing.expect(!x.wm_dirty);
+        // An end-of-epoch checkpoint was fed: its commit syncs.
+        try x.commitLazy(101 + every);
+        try testing.expectEqual(@as(u64, 2), x.wm_syncs);
+        x.wm_force = true;
+        try x.commitLazy(102 + every);
+        try testing.expectEqual(@as(u64, 3), x.wm_syncs);
+        try testing.expect(!x.wm_force);
+        // `commit` (seed, restore, fast start) syncs every time, as before.
+        try x.commit(103 + every);
+        try testing.expectEqual(@as(u64, 4), x.wm_syncs);
+        // A lazily written value is made durable by flush (deinit calls it).
+        try x.commitLazy(104 + every);
+        try testing.expect(x.wm_dirty);
+        try x.flush();
+        try testing.expectEqual(@as(u64, 5), x.wm_syncs);
+        try testing.expect(!x.wm_dirty);
+        try x.flush(); // nothing to do
+        try testing.expectEqual(@as(u64, 5), x.wm_syncs);
+        try x.commitLazy(105 + every); // left to the close
+    }
+    const x = try Index.open(gpa, io, path);
+    defer x.deinit();
+    try testing.expectEqual(@as(?u64, 105 + every), x.watermark);
+}
+
+test "power loss after lazy commits: the stale watermark is derived again from the store at the next start" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const base = pb[0..try tmp.dir.realPath(io, &pb)];
+    const sdir = try std.fs.path.join(gpa, &.{ base, "store" });
+    defer gpa.free(sdir);
+    var cfg: store.Config = .{ .dir = sdir, .max_live_objects = 1 << 10, .max_object_versions = 1 << 10, .max_transactions = 1 << 8, .max_checkpoints = 1 << 6, .max_batch_bytes = 1 << 24, .max_batch_objects = 1 << 10, .max_segments = 4, .segment_reserve = 1 << 22, .seed = 7 };
+    var h = try store.openDir(gpa, io, &cfg, .{ .sync = .none });
+    defer {
+        h.store.deinit();
+        h.io.deinit();
+    }
+    const orig: [32]u8 = @splat(0x11);
+    const up: [32]u8 = @splat(0x22);
+    const p1 = try testPackage(gpa, orig, 1, orig);
+    defer gpa.free(p1);
+    const p2 = try testPackage(gpa, up, 2, orig);
+    defer gpa.free(p2);
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Put = struct {
+        /// Commits checkpoint `seq` to the store; with `upgrade`, one transaction whose effects
+        /// write package `id` at version 2.
+        fn checkpoint(st: *store.Store, al: Allocator, seq: u64, upgrade: ?struct { id: [32]u8, bytes: []const u8 }) !void {
+            var sum = zeroOf(types.gen.CheckpointSummary);
+            sum.sequence_number = seq;
+            const sb = try bcs.encodeAlloc(types.gen.CheckpointSummary, al, &sum);
+            const b = try st.begin(seq, 0);
+            if (upgrade) |u| {
+                var tx_digest: [32]u8 = @splat(0x66);
+                std.mem.writeInt(u64, tx_digest[0..8], seq, .little);
+                var contents = zeroOf(types.gen.CheckpointContentsV1);
+                var ed = zeroOf(types.ExecutionDigests);
+                ed.transaction.@"0".@"0" = tx_digest;
+                contents.transactions = &.{ed};
+                const cb = try bcs.encodeAlloc(types.CheckpointContents, al, &types.CheckpointContents{ .V1 = contents });
+                var eff = zeroOf(types.gen.TransactionEffectsV2);
+                var ch = zeroOf(types.gen.EffectsObjectChange);
+                ch.output_state = .{ .PackageWrite = .{ .{ .@"0" = 2 }, zeroOf(types.ObjectDigest) } };
+                eff.changed_objects = &.{.{ .{ .@"0" = .{ .@"0" = u.id } }, ch }};
+                const eb = try bcs.encodeAlloc(types.TransactionEffects, al, &types.TransactionEffects{ .V2 = eff });
+                try b.putObject(&u.id, 2, &types.digest.objectDigest(u.bytes), u.bytes);
+                try b.transaction(&tx_digest, &@as([32]u8, @splat(0)), "tx", eb, null);
+                try b.checkpoint(sb, cb);
+            } else {
+                const cb = try bcs.encodeAlloc(types.CheckpointContents, al, &zeroOf(types.CheckpointContents));
+                try b.checkpoint(sb, cb);
+            }
+            try st.commit(b);
+        }
+    };
+    // Checkpoint 5 holds the package (version 1); the index is seeded and durable there.
+    {
+        var sum = zeroOf(types.gen.CheckpointSummary);
+        sum.sequence_number = 5;
+        const sb = try bcs.encodeAlloc(types.gen.CheckpointSummary, a, &sum);
+        const cb = try bcs.encodeAlloc(types.CheckpointContents, a, &zeroOf(types.CheckpointContents));
+        const b = try h.store.begin(5, 0);
+        try b.putObject(&orig, 1, &types.digest.objectDigest(p1), p1);
+        try b.checkpoint(sb, cb);
+        try h.store.commit(b);
+    }
+    const rpath = try std.fs.path.join(gpa, &.{ base, "rpc" });
+    defer gpa.free(rpath);
+    const wpath = try std.fs.path.join(gpa, &.{ rpath, "watermark" });
+    defer gpa.free(wpath);
+    var on_disk: [64]u8 = undefined; // the watermark file as of its last fsync
+    var rows_end: u64 = 0;
+    {
+        const x = try Index.open(gpa, io, rpath);
+        defer x.deinit();
+        {
+            var snap = h.store.snapshot();
+            defer snap.release();
+            _ = try x.seed(&snap);
+        }
+        try testing.expectEqual(@as(?u64, 5), x.watermark);
+        try testing.expect(!x.wm_dirty);
+        const synced = x.wm_syncs;
+        try testing.expectEqual(@as(usize, 64), (try Io.Dir.cwd().readFile(io, wpath, &on_disk)).len);
+        // The follower applies 6 (the upgrade), 7 and 8: index rows and a lazy commit, then the
+        // store's batch, per checkpoint.
+        const b6 = try testBlob(gpa, 6, &.{p2});
+        defer gpa.free(b6);
+        try x.onCheckpoint(6, b6);
+        try x.commitLazy(6);
+        try Put.checkpoint(h.store, a, 6, .{ .id = up, .bytes = p2 });
+        for ([_]u64{ 7, 8 }) |seq| {
+            const bl = try testBlob(gpa, seq, &.{});
+            defer gpa.free(bl);
+            try x.onCheckpoint(seq, bl);
+            try x.commitLazy(seq);
+            try Put.checkpoint(h.store, a, seq, null);
+        }
+        try testing.expectEqual(synced, x.wm_syncs); // no watermark fsync on that path
+        try testing.expectEqual(@as(?u64, 8), x.watermark);
+        try testing.expectEqual(@as(?u64, 8), x.highestIndexed());
+        try testing.expectEqual(@as(?u64, 6), x.lineage(&orig)[1].checkpoint);
+        rows_end = x.pkg_log_end;
+        // Power loss: nothing written since the last fsync reached the disk, and no close ran.
+        x.wm_dirty = false;
+    }
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = wpath, .data = &on_disk });
+    {
+        const x = try Index.open(gpa, io, rpath);
+        defer x.deinit();
+        try testing.expectEqual(@as(?u64, 5), x.watermark); // stale: the store is at 8
+        var snap = h.store.snapshot();
+        defer snap.release();
+        const rep = try x.seed(&snap);
+        // Levelled from the store: 6..8 replayed through the row logic, the watermark at the
+        // tip and synced. The upgrade's row was durable before its watermark was written, so
+        // the replay finds it and appends nothing.
+        try testing.expectEqual(@as(?u64, 6), rep.replay_from);
+        try testing.expectEqual(@as(u64, 3), rep.replayed);
+        try testing.expectEqual(@as(u64, 0), rep.live_objects);
+        try testing.expectEqual(@as(?u64, 8), x.watermark);
+        try testing.expectEqual(@as(?u64, 8), x.highestIndexed());
+        try testing.expect(!x.wm_dirty);
+        try testing.expectEqual(rows_end, x.pkg_log_end);
+        const l = x.lineage(&orig);
+        try testing.expectEqual(@as(usize, 2), l.len);
+        try testing.expectEqual(PkgVersion{ .version = 2, .storage_id = up, .checkpoint = 6 }, l[1]);
+        try testing.expectEqual(@as(u64, 1), atCheckpoint(l, 5).?.version);
+    }
+    // The corrected watermark is what the next start reads; nothing is replayed again.
+    const x = try Index.open(gpa, io, rpath);
+    defer x.deinit();
+    try testing.expectEqual(@as(?u64, 8), x.watermark);
+    var snap = h.store.snapshot();
+    defer snap.release();
+    const rep = try x.seed(&snap);
+    try testing.expectEqual(@as(u64, 0), rep.replayed);
 }
 
 test "seed after an in-place system package upgrade keeps the prior version (ListPackageVersions 0x1)" {

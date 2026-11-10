@@ -85,8 +85,37 @@ pub const Cache = struct {
     /// `compute_call_linkage`, a transaction's unified linkage), for this cache's packages.
     link_memo: std.StringHashMapUnmanaged(LinkMemo) = .empty,
     /// Link contexts by root linkage (the unified linkage of transactions without Publish or
-    /// Upgrade): the VM's resolved external calls stay cached across transactions.
+    /// Upgrade): the VM's resolved external calls stay cached across transactions. Each one is
+    /// the `ctx` of a `Link`.
     link_ctxs: std.StringHashMapUnmanaged(*move_vm.LinkCtx) = .empty,
+    /// What the link contexts hold outside the arena (each one's resolved-call table and inline
+    /// cache, which the VM allocates from the runtime's allocator as calls resolve), as of each
+    /// context's last `linkUsed`.
+    link_bytes: usize = 0,
+
+    /// A link context of `link_ctxs` with the bytes `link_bytes` counts for it.
+    const Link = struct { ctx: move_vm.LinkCtx, counted: usize = 0 };
+
+    /// Everything the cache holds, for `max_cache_bytes`: its arena, the VM runtime's and the
+    /// type cache's, the table of every map, and the link contexts' tables. A cache gains one
+    /// link context per distinct unified linkage it runs, so those are bounded with the rest:
+    /// past the limit `cacheFor` drops the cache whole. Not counted: the runtime's lists of a
+    /// package's versions (one pointer per loaded package).
+    pub fn held(c: *const Cache) usize {
+        return c.arena.queryCapacity() + c.rt.arena_state.queryCapacity() + c.ty_args.bytes() +
+            mapBytes(c.map) + mapBytes(c.objs) + mapBytes(c.tx_pkgs) + mapBytes(c.link_memo) + mapBytes(c.link_ctxs) +
+            mapBytes(c.rt.by_version) + mapBytes(c.rt.by_original) + c.link_bytes;
+    }
+
+    /// A transaction that ran on `lc` (a context `linkCtx` returned) ended: counts what its
+    /// calls added to the context.
+    pub fn linkUsed(c: *Cache, lc: *move_vm.LinkCtx) void {
+        const l: *Link = @fieldParentPtr("ctx", lc);
+        const ic_bytes: usize = if (lc.ic) |t| @sizeOf(@TypeOf(t.*)) else 0;
+        const now = mapBytes(lc.ext) + ic_bytes;
+        c.link_bytes = c.link_bytes - l.counted + now;
+        l.counted = now;
+    }
 
     /// The transaction ended: its published packages leave the runtime and the overlay.
     pub fn endTransaction(c: *Cache, published: []const Id) void {
@@ -103,10 +132,10 @@ pub const Cache = struct {
         if (c.link_ctxs.get(key)) |lc| return lc;
         const a = c.arena.allocator();
         const kept = try a.dupe([2]Id, linkage);
-        const lc = try a.create(move_vm.LinkCtx);
-        lc.* = move_vm.LinkCtx.init(c.rt, try rootPackage(a, c.rt, kept));
-        try c.link_ctxs.put(c.gpa, std.mem.sliceAsBytes(kept), lc);
-        return lc;
+        const l = try a.create(Link);
+        l.* = .{ .ctx = move_vm.LinkCtx.init(c.rt, try rootPackage(a, c.rt, kept)) };
+        try c.link_ctxs.put(c.gpa, std.mem.sliceAsBytes(kept), &l.ctx);
+        return &l.ctx;
     }
 
     pub fn memoLink(c: *Cache, key: []const u8, linkage: []const [2]Id, entries: usize) Allocator.Error!void {
@@ -138,7 +167,7 @@ pub const Cache = struct {
         c.* = .{ .gpa = gpa, .arena = .init(gpa), .epoch = epoch, .pv = pv, .chain = chain, .rt = try gpa.create(move_vm.Runtime), .store = store, .ty_args = .init(gpa) };
         const cfg = try protocol.get(pv, chain);
         c.rt.* = move_vm.Runtime.init(gpa, try binaryConfig(cfg));
-        c.rt.validation = try move_vm.conformance.validation(c.rt.arena_state.allocator(), pv);
+        c.rt.validation = try move_vm.conformance.validation(c.rt.arena_state.allocator(), pv, chain);
         _ = cache_count.fetchAdd(1, .monotonic);
         return c;
     }
@@ -177,6 +206,15 @@ pub const Cache = struct {
         return p.vm.?;
     }
 };
+
+/// The heap bytes of a std hash map's table: its header and every slot's metadata byte, key
+/// and value (alignment padding aside).
+fn mapBytes(m: anytype) usize {
+    const cap: usize = m.capacity();
+    if (cap == 0) return 0;
+    const KV = @TypeOf(m).KV;
+    return 3 * @sizeOf(usize) + cap * (1 + @sizeOf(@FieldType(KV, "key")) + @sizeOf(@FieldType(KV, "value")));
+}
 
 fn binaryConfig(cfg: *const protocol.ProtocolConfig) !move_format.BinaryConfig {
     const b = try protocol.derived.binaryConfig(cfg, null);
@@ -228,17 +266,17 @@ fn parse(arena: Allocator, raw: []const u8) !*Pkg {
 }
 
 threadlocal var caches: [4]?*Cache = @splat(null);
-/// Every thread's package caches: how many, and their arena and VM runtime bytes as last seen by
-/// `cacheFor` (a gauge for the node's status line).
+/// Every thread's package caches: how many, and the bytes they hold (`Cache.held`) as last seen
+/// by `cacheFor` (a gauge for the node's status line).
 pub var cache_count: std.atomic.Value(u64) = .init(0);
 pub var cache_bytes: std.atomic.Value(u64) = .init(0);
 /// Caches dropped and rebuilt because they outgrew `max_cache_bytes`.
 pub var cache_rebuilds: std.atomic.Value(u64) = .init(0);
 threadlocal var next_slot: usize = 0;
 
-/// Memory one thread's package cache may hold (its arena and its VM runtime's) before it is
-/// dropped and rebuilt: a long-running node loads every package it ever touches, and published
-/// packages' bytes go to the cache arena.
+/// Memory one thread's package cache may hold (`Cache.held`) before it is dropped and rebuilt:
+/// a long-running node loads every package it ever touches, published packages' bytes go to
+/// the cache arena, and every distinct linkage it runs leaves a link context.
 pub var max_cache_bytes: usize = 1536 << 20;
 
 /// When set, `cacheFor` for epoch E drops the thread's caches of epochs below E - epoch_window
@@ -277,7 +315,7 @@ pub fn cacheFor(gpa: Allocator, store: *const packages.Store, epoch: u64, pv: u6
         c.* = null;
     };
     for (&caches) |*c| if (c.*) |x| if (x.epoch == epoch and x.store == store and x.chain == chain) {
-        const held = x.arena.queryCapacity() + x.rt.arena_state.queryCapacity() + x.ty_args.bytes();
+        const held = x.held();
         if (held != x.reported) {
             _ = cache_bytes.fetchAdd(held, .monotonic);
             _ = cache_bytes.fetchSub(x.reported, .monotonic);
@@ -301,14 +339,39 @@ pub fn cacheFor(gpa: Allocator, store: *const packages.Store, epoch: u64, pv: u6
     return c;
 }
 
-/// Frees this thread's package caches (`gpa` is the allocator `cacheFor` was given). For worker
-/// threads that exit while the process lives on (the node's simulate pool).
-pub fn releaseThreadCaches(gpa: Allocator) void {
+/// Frees this thread's package caches, each with the allocator it was made with (the one its
+/// `cacheFor` was given, kept in the cache). For worker threads that exit while the process
+/// lives on (the node's simulate pool). The caller names no allocator: the node's exit hooks
+/// passed `smp_allocator` for caches the simulate engine had made with the node's allocator.
+pub fn releaseThreadCaches() void {
     for (&caches) |*slot| if (slot.*) |c| {
-        destroy(gpa, c);
+        destroy(c.gpa, c);
         slot.* = null;
     };
     next_slot = 0;
+}
+
+test "releaseThreadCaches frees a cache with the allocator that made it" {
+    // The testing allocator fails the test on a leak, and a free through any other allocator
+    // (as the exit hooks did with smp_allocator) does not reach it.
+    var store: packages.Store = .{ .loaded = true };
+    const pv = protocol.max_protocol_version;
+    const before = cache_count.load(.monotonic);
+    const a = try cacheFor(std.testing.allocator, &store, 3, pv, .mainnet);
+    const b = try cacheFor(std.testing.allocator, &store, 4, pv, .mainnet);
+    try std.testing.expect(a != b);
+    try std.testing.expectEqual(std.testing.allocator.ptr, a.gpa.ptr);
+    // Something in every part of a cache: its arena, a map and a link context.
+    const linkage: [1][2]Id = .{.{ @splat(1), @splat(2) }};
+    _ = try a.linkCtx(&linkage);
+    const id: Id = @splat(9);
+    try std.testing.expect((try b.get(&id)) == null);
+    try std.testing.expectEqual(before + 2, cache_count.load(.monotonic));
+    releaseThreadCaches();
+    try std.testing.expectEqual(before, cache_count.load(.monotonic));
+    for (caches) |slot| try std.testing.expect(slot == null);
+    // Nothing left to free: a second call is a no-op.
+    releaseThreadCaches();
 }
 
 test "a live package source is asked again after a miss" {
@@ -335,6 +398,53 @@ test "a live package source is asked again after a miss" {
     defer destroy(gpa, c2);
     try std.testing.expect((try c2.get(&id)) == null);
     try std.testing.expect(c2.map.contains(id));
+}
+
+test "the cache budget counts the maps and the link contexts, and they bring the rebuild" {
+    const gpa = std.testing.allocator;
+    const saved = max_cache_bytes;
+    defer max_cache_bytes = saved;
+    // This thread's caches go with the test (the testing allocator checks for leaks).
+    defer for (&caches) |*slot| if (slot.*) |x| {
+        destroy(gpa, x);
+        slot.* = null;
+    };
+    var store: packages.Store = .{ .loaded = true };
+    const pv = protocol.max_protocol_version;
+    const c = try cacheFor(gpa, &store, 7, pv, .mainnet);
+    try std.testing.expectEqual(@as(usize, 0), c.link_bytes);
+    // 64 distinct linkages, each a link context whose transaction resolved 100 calls across
+    // packages (what `LinkCtx.resolve` leaves in `ext`; the pointers are never followed).
+    var linkage: [1][2]Id = .{.{ @splat(1), @splat(2) }};
+    for (0..64) |i| {
+        linkage[0][1][0] = @intCast(i);
+        const lc = try c.linkCtx(&linkage);
+        for (0..100) |h| try lc.ext.put(c.rt.gpa, .{ .m = @ptrFromInt(0x10000 * (i + 1)), .h = @intCast(h) }, @ptrFromInt(0x10000));
+        const before = c.held();
+        c.linkUsed(lc);
+        // 100 entries: at least 100 slots of a metadata byte, a 16-byte key and a pointer.
+        try std.testing.expect(c.held() - before >= 100 * 25);
+        // The same context again adds nothing until it grows.
+        c.linkUsed(lc);
+        try std.testing.expectEqual(before + mapBytes(lc.ext), c.held());
+    }
+    try std.testing.expectEqual(@as(usize, 64), c.link_ctxs.count());
+    try std.testing.expect(c.link_bytes >= 64 * 100 * 25);
+    const maps = mapBytes(c.link_ctxs);
+    try std.testing.expect(maps >= 64 * (1 + 16 + 8));
+    // What the limit saw before: the arenas and the type cache. With the limit just there the
+    // cache stays only if the maps and the link contexts go uncounted.
+    const arenas = c.arena.queryCapacity() + c.rt.arena_state.queryCapacity() + c.ty_args.bytes();
+    try std.testing.expect(c.held() >= arenas + maps + c.link_bytes);
+    const rebuilds = cache_rebuilds.load(.monotonic);
+    max_cache_bytes = c.held();
+    try std.testing.expectEqual(c, try cacheFor(gpa, &store, 7, pv, .mainnet));
+    try std.testing.expectEqual(rebuilds, cache_rebuilds.load(.monotonic));
+    max_cache_bytes = arenas;
+    const fresh = try cacheFor(gpa, &store, 7, pv, .mainnet);
+    try std.testing.expectEqual(rebuilds + 1, cache_rebuilds.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), fresh.link_ctxs.count());
+    try std.testing.expectEqual(@as(usize, 0), fresh.link_bytes);
 }
 
 // ---------------------------------------------------------------------------------------------

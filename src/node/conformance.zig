@@ -38,6 +38,13 @@ pub const suites = [_]harness.Suite{
         .doc = "deepwave in execute mode over the longest contiguous binpb-done window from a fresh store: every executed transaction's effects, events and output objects equal the certified ones byte for byte; verify-only count at or under the recorded floor",
         .run = runExecute,
     },
+    .{
+        .name = "node-dst",
+        .lane = "node",
+        .doc = "deterministic simulation of the node's follow pipeline (virtual time, faulty sources and disk, crashes): never accepts a bad checkpoint, never loses a committed one, always converges, replays bit for bit",
+        .run = @import("dst_conformance.zig").run,
+    },
+    .{ .name = "sig-order", .lane = "node", .doc = "every corpus sponsored or multi-signer transaction: V2 contents certify required_signers order (sender, gas owner), and the sweep's reorder (and the ingest overlay rule) takes exactly a permutation of the certified signatures, keeping TransactionData and the digest", .run = @import("conformance_sigorder.zig").run },
     .{ .name = "rpc-policy", .lane = "rpc-surface", .doc = "transaction-deny-config denials (Execute, Simulate), admin GET /transaction-deny-config and POST /traffic-control, and traffic-controller answers equal sui-node 1.83.1's (src/serve/vectors/rpc-surface/{deny,traffic})", .run = @import("conformance_policy.zig").run },
 };
 

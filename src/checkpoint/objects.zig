@@ -126,6 +126,22 @@ fn outputRef(obj: []const u8) ?Ref {
 
 const Owner = types.Owner;
 
+/// id (32) ++ version (u64 LE) ++ digest (32), as `changedRefs` lists them.
+pub const OutRef = Ref;
+
+/// The changed object references of one effects value (mutated, created, unwrapped: the objects a
+/// checkpoint carries as output objects), in effects order, appended to `out`. Used by the edge
+/// feed to know which stored object versions a transaction's output set consists of.
+pub fn outputRefsOf(gpa: std.mem.Allocator, eff: []const u8, out: *std.ArrayList(Ref)) error{ OutOfMemory, Decode }!void {
+    var c: Checker = .{ .gpa = gpa, .changed = out.* };
+    defer out.* = c.changed;
+    const ok = changedRefs(&c, eff) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Decode,
+    };
+    if (!ok) return error.Decode;
+}
+
 /// Appends the changed object references of one effects value (mutated, created, unwrapped).
 fn changedRefs(c: *Checker, eff: []const u8) !bool {
     var r = bcs.Reader.init(eff);

@@ -172,7 +172,7 @@ pub fn parseTimeout(value: []const u8) ?u64 {
         'n' => 1,
         else => return null,
     };
-    return v * mul;
+    return v *| mul; // 99999999H is past u64 nanoseconds: clamp (the callers add with +|)
 }
 
 test "timestamp, date and timeout text" {
@@ -184,4 +184,5 @@ test "timestamp, date and timeout text" {
     try std.testing.expectEqual(@as(?u64, 30 * std.time.ns_per_s), parseTimeout("30000m"));
     try std.testing.expectEqual(@as(?u64, null), parseTimeout("abc"));
     try std.testing.expectEqual(@as(?u64, null), parseTimeout("123456789S"));
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), parseTimeout("99999999H")); // no overflow
 }

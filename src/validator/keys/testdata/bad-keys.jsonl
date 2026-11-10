@@ -1,0 +1,7 @@
+{"name":"bls_scalar_ff","text":"//////////////////////////////////////////8=","authority_ok":false,"suikeypair_ok":false,"network_ok":false}
+{"name":"bls_scalar_zero","text":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","authority_ok":false,"suikeypair_ok":false,"network_ok":false}
+{"name":"bls_31_bytes","text":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==","authority_ok":false,"suikeypair_ok":false,"network_ok":false}
+{"name":"bls_with_flag","text":"AAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB","authority_ok":false,"suikeypair_ok":true,"network_ok":true}
+{"name":"ed_no_flag","text":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","authority_ok":true,"suikeypair_ok":false,"network_ok":false}
+{"name":"ed_flag_9","text":"CQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB","authority_ok":false,"suikeypair_ok":false,"network_ok":false}
+{"name":"ed_trailing_newline","text":"AAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB","authority_ok":false,"suikeypair_ok":true,"network_ok":true}

@@ -18,6 +18,17 @@
 //! ends one whose PING is not acknowledged within `keepalive_timeout_ns`. A silently dead peer
 //! therefore fails its calls with UNAVAILABLE instead of holding them until the caller's deadline.
 //!
+//! Writes: `start`, `cancel`, the reader and the watchdog all write under the connection lock. The
+//! socket writer bounds them (`SockWriter`): a write that makes no progress for `send_timeout_ns`
+//! ends the connection, and so does a locked section whose writes take `send_section_timeout_ns`
+//! in all (a peer that reads a trickle). A validator that stops reading therefore costs a caller
+//! the first once, not until TCP gives up.
+//!
+//! Lock order: nothing is held while taking a connection lock. Whether a connection is dead, when
+//! it died and whether it ever was ready are atomics, so an owner (the validator pool, the
+//! upstream) asks under its own lock without touching the connection's; the watchdog ticks
+//! connections outside its registry lock and skips one whose lock is busy.
+//!
 //! Limits against a misbehaving peer (sui-node tolerates f byzantine validators; so must this):
 //! SETTINGS values are validated (RFC 9113 6.5.2), a response body is capped at
 //! `max_response_bytes` (RESOURCE_EXHAUSTED and RST for that call) and a header block at
@@ -27,6 +38,8 @@
 //! application/grpc`, `grpc-timeout` when the caller has one, trailers-only error replies,
 //! percent-decoded `grpc-message`, base64 `grpc-status-details-bin`.
 const std = @import("std");
+const builtin = @import("builtin");
+const posix = std.posix;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const serve = @import("serve");
@@ -89,9 +102,129 @@ pub var max_response_bytes: usize = 64 << 20;
 /// One HEADERS + CONTINUATION block (hyper's default max header list is 16 KiB).
 pub var max_header_block: usize = 64 << 10;
 pub var connect_timeout_ns: u64 = 10 * std.time.ns_per_s;
+/// Request bytes (paths and bodies) one connection copies for calls started before it is ready.
+/// A call past this answers UNAVAILABLE at once: a connection still connecting under a submit
+/// burst does not grow without limit (it is `connecting` for `connect_timeout_ns`, or for as
+/// long as the peer takes when no watchdog thread could start).
+pub var max_queued_bytes: usize = 64 << 20;
 pub var keepalive_busy_ns: u64 = 5 * std.time.ns_per_s;
 pub var keepalive_idle_ns: u64 = 30 * std.time.ns_per_s;
 pub var keepalive_timeout_ns: u64 = 20 * std.time.ns_per_s;
+/// How long one socket write (at most a buffer and a frame, about 33 KiB) may wait for room in
+/// the send buffer without the kernel taking a single byte. A write only waits when the peer has
+/// stopped acknowledging what is buffered already, so a healthy validator never comes near this;
+/// one that stalls fails its calls with UNAVAILABLE after it.
+pub var send_timeout_ns: u64 = 2 * std.time.ns_per_s;
+/// How long all the socket writes of one locked section may take. A slow path that keeps taking
+/// bytes (a burst on a fresh connection to a far validator, still in slow start) is not a stall
+/// and gets this long; a peer that reads a trickle to hold the lock gets no longer.
+pub var send_section_timeout_ns: u64 = 10 * std.time.ns_per_s;
+/// The kernel's own bound on data the peer does not acknowledge (Linux TCP_USER_TIMEOUT; macOS
+/// has none, TCP_RXT_CONNDROPTIME in whole seconds is the nearest): the connection is dropped
+/// after it, also where no watchdog PING is due. As `keepalive_timeout_ns`; 0 keeps the system
+/// default (minutes of retransmission).
+pub var tcp_user_timeout_ms: u32 = 20_000;
+
+/// The socket's write side. std's `Io.net.Stream.Writer` sends with a blocking sendmsg, which has
+/// no bound once the peer stops reading and the send buffer is full, and it cannot be given one
+/// (Io.Threaded treats the EAGAIN of SO_SNDTIMEO as a programmer bug). This writer makes the same
+/// sendmsg calls under SO_SNDTIMEO (macOS ignores MSG_DONTWAIT on a send) and counts the time: a
+/// write the kernel takes nothing of for `send_timeout_ns`, or one past `deadline`, fails and the
+/// caller ends the connection. The bytes and their order are those of the std writer.
+const SockWriter = struct {
+    interface: Io.Writer,
+    io: Io,
+    fd: posix.socket_t,
+    /// Monotonic ns after which a write fails. 0: set at the next write, so whoever takes the
+    /// connection lock to write clears it (`Conn.lockForWrite`) and all the writes of that section
+    /// share one `send_section_timeout_ns`.
+    deadline: u64 = 0,
+    /// Before the connection has the writer (the TLS handshake, which waits for the peer between
+    /// its writes) every write is a section of its own.
+    sectioned: bool = false,
+    /// The SO_SNDTIMEO now on the socket (0: not set yet).
+    kernel_ns: u64 = 0,
+
+    /// SO_SNDTIMEO is `send_timeout_ns`, or what is left of the section when that is less; it is
+    /// set again only when it is off by more than this (no setsockopt on the usual write).
+    const slack_ns: u64 = std.time.ns_per_ms;
+
+    fn init(stream: Io.net.Stream, io: Io, buffer: []u8) SockWriter {
+        return .{ .io = io, .fd = stream.socket.handle, .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const w: *SockWriter = @alignCast(@fieldParentPtr("interface", io_w));
+        // the buffered bytes, then `data` (its last element once when `splat` is not 0: a short
+        // write is allowed, the caller comes back for the rest)
+        var iov: [8]posix.iovec_const = undefined;
+        var n: usize = 0;
+        const head = io_w.buffered();
+        if (head.len != 0) {
+            iov[n] = .{ .base = head.ptr, .len = head.len };
+            n += 1;
+        }
+        for (data, 0..) |bytes, i| {
+            if (n == iov.len) break; // the rest goes with the next call
+            if (bytes.len == 0 or (i == data.len - 1 and splat == 0)) continue;
+            iov[n] = .{ .base = bytes.ptr, .len = bytes.len };
+            n += 1;
+        }
+        if (n == 0) return 0;
+        var msg: posix.msghdr_const = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 0, .control = null, .controllen = 0, .flags = 0 };
+        msg.iovlen = @intCast(n);
+
+        const now = monotonic(w.io);
+        if (!w.sectioned) w.deadline = 0;
+        if (w.deadline == 0) {
+            w.deadline = now +| @max(send_section_timeout_ns, slack_ns);
+        } else if (now >= w.deadline) {
+            log.debug("send: the writes of one section took over {d} ms", .{send_section_timeout_ns / std.time.ns_per_ms});
+            return error.WriteFailed;
+        }
+        const wait = @min(@max(send_timeout_ns, slack_ns), w.deadline - now);
+        if (wait > w.kernel_ns or w.kernel_ns - wait > slack_ns) w.setKernelTimeout(wait);
+        while (true) {
+            const rc = posix.system.sendmsg(w.fd, &msg, posix.MSG.NOSIGNAL);
+            switch (posix.errno(rc)) {
+                // short after SO_SNDTIMEO: some of it went, the caller comes back for the rest
+                .SUCCESS => return io_w.consume(@intCast(rc)),
+                .INTR => {},
+                .AGAIN => {
+                    log.debug("send: no progress for {d} ms", .{wait / std.time.ns_per_ms});
+                    return error.WriteFailed;
+                },
+                else => return error.WriteFailed,
+            }
+        }
+    }
+
+    /// SO_SNDTIMEO: how long one sendmsg may wait for room (at least 1 ms: zero means forever).
+    fn setKernelTimeout(w: *SockWriter, ns: u64) void {
+        const us = @max(ns / std.time.ns_per_us, std.time.us_per_ms);
+        const tv: posix.timeval = .{ .sec = @intCast(us / std.time.us_per_s), .usec = @intCast(us % std.time.us_per_s) };
+        _ = posix.system.setsockopt(w.fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(posix.timeval));
+        w.kernel_ns = ns;
+    }
+};
+
+/// Socket options of a fresh connection (best effort: a refused option changes nothing else).
+fn tuneSocket(fd: posix.socket_t) void {
+    // as mysten-network's `tcp_nodelay(true)`: every write here is a whole flush (a request, an
+    // acknowledgment), and Nagle holds the second small one of a round trip for the peer's
+    // delayed ACK, up to 40 ms
+    setOption(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, 1);
+    if (tcp_user_timeout_ms != 0) switch (builtin.os.tag) {
+        .linux => setOption(fd, posix.IPPROTO.TCP, posix.TCP.USER_TIMEOUT, tcp_user_timeout_ms),
+        .macos => setOption(fd, posix.IPPROTO.TCP, posix.TCP.RXT_CONNDROPTIME, @max(1, (tcp_user_timeout_ms +| 999) / 1000)),
+        else => {},
+    };
+}
+
+fn setOption(fd: posix.socket_t, level: i32, name: u32, value: u32) void {
+    const v: c_int = @intCast(value);
+    _ = posix.system.setsockopt(fd, level, name, std.mem.asBytes(&v), @sizeOf(c_int));
+}
 
 const Call = struct {
     sink: Sink,
@@ -115,10 +248,14 @@ pub const Conn = struct {
     authority: []u8,
     mu: Io.Mutex = .init,
     state: enum { connecting, ready, dead } = .connecting,
+    /// `state == .dead`, readable without the lock (`isDead`).
+    dead: std.atomic.Value(bool) = .init(false),
     dead_reason: []const u8 = "",
     calls: std.AutoHashMapUnmanaged(u32, *Call) = .empty,
     /// Calls started before the connection was ready, in order (stream ids not assigned yet).
     queued: std.ArrayList(Queued) = .empty,
+    /// Path and body bytes held by `queued` (`max_queued_bytes`).
+    queued_bytes: usize = 0,
     next_stream: u32 = 1,
     conn_send_window: i64 = 65_535,
     peer_initial_window: i64 = 65_535,
@@ -127,6 +264,8 @@ pub const Conn = struct {
     writer: ?*Io.Writer = null,
     /// The socket writer under TLS (the TLS writer's flush only encrypts into it).
     sock_writer: ?*Io.Writer = null,
+    /// The socket's write side, for its deadline (`lockForWrite`).
+    sock: ?*SockWriter = null,
     stream: ?Io.net.Stream = null,
     thread: ?std.Thread = null,
     /// Reference count: the owner's, the reader thread's and the keepalive registry's, plus one
@@ -140,10 +279,10 @@ pub const Conn = struct {
     /// Set (under `mu`) when the reader thread is gone; the registry then drops its reference.
     reader_done: bool = false,
     shutting_down: std.atomic.Value(bool) = .init(false),
-    /// Monotonic ns when the connection died (the pool's reconnect cooldown).
-    died_at: u64 = 0,
+    /// Monotonic ns when the connection died (the pool's reconnect cooldown); set before `dead`.
+    died_at: std.atomic.Value(u64) = .init(0),
     /// Set once the connection reached `ready` (a pool backs off reconnects to peers that never do).
-    was_ready: bool = false,
+    was_ready: std.atomic.Value(bool) = .init(false),
 
     const Queued = struct { id_slot: *u32, path: []u8, body: []u8, sink: Sink, tag: u64, timeout_ms: ?u64 };
 
@@ -176,9 +315,13 @@ pub const Conn = struct {
     /// Drops the owner's reference: the connection closes and is freed once its reader exits.
     pub fn release(c: *Conn) void {
         c.shutting_down.store(true, .release);
-        c.mu.lockUncancelable(c.io);
-        if (c.stream) |s| s.shutdown(c.io, .both) catch {};
-        c.mu.unlock(c.io);
+        // a dead connection's socket is shut down already (`dieLocked`), or its reader finds the
+        // flag after connecting: no lock, so an owner replacing it never waits for it
+        if (!c.isDead()) {
+            c.mu.lockUncancelable(c.io);
+            if (c.stream) |s| s.shutdown(c.io, .both) catch {};
+            c.mu.unlock(c.io);
+        }
         c.unref();
     }
 
@@ -199,23 +342,42 @@ pub const Conn = struct {
         gpa.destroy(c);
     }
 
-    pub fn isDead(c: *Conn) bool {
+    /// Takes the connection lock for a section that may write: its socket writes together take
+    /// at most `send_section_timeout_ns` (counted from the first one).
+    fn lockForWrite(c: *Conn) void {
         c.mu.lockUncancelable(c.io);
-        defer c.mu.unlock(c.io);
-        return c.state == .dead;
+        if (c.sock) |s| s.deadline = 0;
+    }
+
+    /// Lock-free, like `diedAt` and `wasReady`: callers ask under their own locks.
+    pub fn isDead(c: *const Conn) bool {
+        return c.dead.load(.acquire);
+    }
+
+    /// Monotonic ns when the connection died (0 while it is not dead).
+    pub fn diedAt(c: *const Conn) u64 {
+        return c.died_at.load(.acquire);
+    }
+
+    /// True once the connection reached `ready`.
+    pub fn wasReady(c: *const Conn) bool {
+        return c.was_ready.load(.acquire);
     }
 
     /// Starts a unary call. `id_slot` receives the stream id (0 while queued), which `cancel`
-    /// takes. Never blocks on the network beyond a socket write.
+    /// takes. Never blocks on the network beyond a socket write, and that within the send
+    /// timeouts (the connection is then dead and the call answered UNAVAILABLE).
     pub fn start(c: *Conn, id_slot: *u32, path: []const u8, body: []const u8, sink: Sink, tag: u64, timeout_ms: ?u64) void {
         id_slot.* = 0;
-        c.mu.lockUncancelable(c.io);
+        c.lockForWrite();
         defer c.mu.unlock(c.io);
         switch (c.state) {
             .dead => {
                 sink.done(sink.ctx, tag, .{ .status = .{ .code = 14, .message = c.dead_reason } });
             },
             .connecting => {
+                if (path.len + body.len > max_queued_bytes -| c.queued_bytes)
+                    return sink.done(sink.ctx, tag, .{ .status = .{ .code = 14, .message = "transport error: connecting, too many calls waiting" } });
                 const p = c.gpa.dupe(u8, path) catch return oom(sink, tag);
                 const b = c.gpa.dupe(u8, body) catch {
                     c.gpa.free(p);
@@ -226,6 +388,7 @@ pub const Conn = struct {
                     c.gpa.free(b);
                     return oom(sink, tag);
                 };
+                c.queued_bytes += path.len + body.len;
             },
             .ready => c.startLocked(id_slot, path, body, sink, tag, timeout_ms),
         }
@@ -233,13 +396,14 @@ pub const Conn = struct {
 
     /// Forgets a call: no delivery after this returns. Sends RST_STREAM(CANCEL) when it is open.
     pub fn cancel(c: *Conn, id_slot: *u32, tag: u64) void {
-        c.mu.lockUncancelable(c.io);
+        c.lockForWrite();
         defer c.mu.unlock(c.io);
         if (id_slot.* == 0) {
             var i: usize = 0;
             while (i < c.queued.items.len) {
                 const q = c.queued.items[i];
                 if (q.id_slot == id_slot and q.tag == tag) {
+                    c.queued_bytes -|= q.path.len + q.body.len;
                     c.gpa.free(q.path);
                     c.gpa.free(q.body);
                     _ = c.queued.orderedRemove(i);
@@ -366,9 +530,11 @@ pub const Conn = struct {
         if (c.state == .dead) return;
         c.state = .dead;
         c.dead_reason = reason;
-        c.died_at = @intCast(Io.Clock.awake.now(c.io).nanoseconds);
+        c.died_at.store(monotonic(c.io), .release);
+        c.dead.store(true, .release);
         c.writer = null;
         c.sock_writer = null;
+        c.sock = null;
         var it = c.calls.iterator();
         while (it.next()) |kv| {
             kv.value_ptr.*.sink.done(kv.value_ptr.*.sink.ctx, kv.value_ptr.*.tag, .{ .status = .{ .code = 14, .message = reason } });
@@ -381,6 +547,7 @@ pub const Conn = struct {
             c.gpa.free(q.body);
         }
         c.queued.clearRetainingCapacity();
+        c.queued_bytes = 0;
         if (c.stream) |s| s.shutdown(c.io, .both) catch {};
     }
 
@@ -412,6 +579,7 @@ pub const Conn = struct {
         defer c.mu.unlock(c.io);
         c.writer = null;
         c.sock_writer = null;
+        c.sock = null;
         c.dieLocked(reason);
     }
 
@@ -420,7 +588,7 @@ pub const Conn = struct {
     const Transport = struct {
         bufs: []u8 = &.{},
         sr: Io.net.Stream.Reader = undefined,
-        sw: Io.net.Stream.Writer = undefined,
+        sw: SockWriter = undefined,
         tls: tls_client = undefined,
         bundle: std.crypto.Certificate.Bundle = .empty,
         bundle_lock: Io.RwLock = .init,
@@ -450,6 +618,7 @@ pub const Conn = struct {
         const gpa = c.gpa;
         const host = Io.net.HostName.init(c.ep.host) catch return error.ConnectFailed;
         const stream = host.connect(io, c.ep.port, .{ .mode = .stream }) catch return error.ConnectFailed;
+        tuneSocket(stream.socket.handle);
         {
             c.mu.lockUncancelable(io);
             defer c.mu.unlock(io);
@@ -468,7 +637,7 @@ pub const Conn = struct {
         const tls_r = bufs[2 * tls_client.min_buffer_len ..][0 .. tls_client.min_buffer_len + 32 * 1024];
         const tls_w = bufs[3 * tls_client.min_buffer_len + 32 * 1024 ..][0 .. tls_client.min_buffer_len];
         t.sr = stream.reader(io, sock_r);
-        t.sw = stream.writer(io, sock_w);
+        t.sw = .init(stream, io, sock_w);
         const sr = &t.sr;
         const sw = &t.sw;
         const tls = &t.tls;
@@ -509,6 +678,9 @@ pub const Conn = struct {
             defer c.mu.unlock(io);
             c.writer = writer;
             c.sock_writer = if (c.ep.security != .plain) &sw.interface else null;
+            c.sock = sw;
+            sw.sectioned = true;
+            sw.deadline = 0;
             try writer.writeAll(serve.h2.conn.preface);
             var s: [18]u8 = undefined;
             std.mem.writeInt(u16, s[0..2], 2, .big); // ENABLE_PUSH
@@ -523,14 +695,21 @@ pub const Conn = struct {
             try c.writeFrame(frame_window, 0, 0, &wu);
             try c.flushOut();
             c.state = .ready;
-            c.was_ready = true;
-            for (c.queued.items) |q| {
-                c.startLocked(q.id_slot, q.path, q.body, q.sink, q.tag, q.timeout_ms);
+            c.was_ready.store(true, .release);
+            // The queue is taken out first: a write that fails in here ends the connection, and
+            // `dieLocked` answers and frees whatever `queued` holds. With the calls still in it,
+            // those already started were answered twice and their copies freed twice.
+            var waiting = c.queued;
+            c.queued = .empty;
+            c.queued_bytes = 0;
+            defer waiting.deinit(gpa);
+            for (waiting.items) |q| {
+                if (c.state == .dead) {
+                    q.sink.done(q.sink.ctx, q.tag, .{ .status = .{ .code = 14, .message = c.dead_reason } });
+                } else c.startLocked(q.id_slot, q.path, q.body, q.sink, q.tag, q.timeout_ms);
                 gpa.free(q.path);
                 gpa.free(q.body);
-                if (c.state == .dead) break;
             }
-            c.queued.clearRetainingCapacity();
         }
 
         var dec = hpack.Decoder.init(gpa);
@@ -553,7 +732,7 @@ pub const Conn = struct {
             const p = payload[0..len];
             reader.readSliceAll(p) catch return error.EndOfStream;
             if (trace_frames) log.debug("{s} frame kind {d} flags {x} stream {d} len {d}", .{ c.ep.host, kind, flags, id, len });
-            c.mu.lockUncancelable(io);
+            c.lockForWrite();
             defer c.mu.unlock(io);
             if (c.state == .dead) return error.EndOfStream;
             switch (kind) {
@@ -727,10 +906,12 @@ pub const Conn = struct {
     }
 
     /// One keepalive / deadline check (the watchdog, under no lock). True when the connection is
-    /// finished (dead and its reader gone): the registry then drops it.
+    /// finished (dead and its reader gone): the registry then drops it. A connection whose lock
+    /// is busy is left for the next pass: the one watchdog thread never waits behind a writer.
     fn tick(c: *Conn, now: u64) bool {
-        c.mu.lockUncancelable(c.io);
+        if (!c.mu.tryLock()) return false;
         defer c.mu.unlock(c.io);
+        if (c.sock) |s| s.deadline = 0; // as `lockForWrite`
         switch (c.state) {
             .dead => return c.reader_done,
             .connecting => if (now -| c.opened_at >= connect_timeout_ns) c.dieLocked("transport error: connect timeout"),
@@ -816,23 +997,39 @@ pub const watchdog = struct {
         }
     }
 
-    /// One pass: tick every connection, drop the finished ones.
+    /// One pass: tick every connection, drop the finished ones. The registry lock is not held
+    /// across the ticks: a tick takes a connection lock, and `register` (every `Conn.open`, which
+    /// a pool calls under its own lock) must never wait behind one.
     pub fn sweep(io: Io, now: u64) void {
-        var gone: std.ArrayListUnmanaged(*Conn) = .empty;
-        defer gone.deinit(std.heap.page_allocator);
+        var few: [512]*Conn = undefined;
+        var many: []*Conn = &.{};
+        defer std.heap.page_allocator.free(many);
+        var batch: []*Conn = &.{};
         {
             mu.lockUncancelable(io);
             defer mu.unlock(io);
-            var i: usize = 0;
-            while (i < conns.items.len) {
-                const c = conns.items[i];
-                if (c.tick(now)) {
-                    _ = conns.swapRemove(i);
-                    gone.append(std.heap.page_allocator, c) catch c.unref();
-                } else i += 1;
-            }
+            const n = conns.items.len;
+            if (n > few.len) many = std.heap.page_allocator.alloc(*Conn, n) catch return; // no memory: the next pass
+            batch = if (n > few.len) many else few[0..n];
+            @memcpy(batch, conns.items);
+            for (batch) |c| c.retain();
         }
-        for (gone.items) |c| c.unref();
+        for (batch) |c| {
+            if (c.tick(now)) drop(io, c);
+            c.unref();
+        }
+    }
+
+    /// Takes a finished connection out of the registry with the registry's reference (once: a
+    /// concurrent pass may have done it).
+    fn drop(io: Io, c: *Conn) void {
+        {
+            mu.lockUncancelable(io);
+            defer mu.unlock(io);
+            const i = std.mem.indexOfScalar(*Conn, conns.items, c) orelse return;
+            _ = conns.swapRemove(i);
+        }
+        c.unref();
     }
 
     pub fn count(io: Io) usize {

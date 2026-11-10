@@ -192,7 +192,7 @@ fn pickInputs(ctx: *harness.Ctx, arena: Allocator) ![]const []const u8 {
     if (total <= ctx.opts.bench_bytes and sel.items.len <= max_files) return sel.items;
     // Stride over the sorted list so the subset spans the whole corpus (every era, every size).
     const by_bytes = (total + ctx.opts.bench_bytes - 1) / ctx.opts.bench_bytes;
-    const by_count = (sel.items.len + max_files - 1) / max_files;
+    const by_count = (sel.items.len +| (max_files - 1)) / max_files; // saturates: no --limit means maxInt
     const stride: usize = @intCast(@max(1, @max(by_bytes, by_count)));
     var used: u64 = 0;
     var k: usize = 0;

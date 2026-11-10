@@ -10,8 +10,12 @@ pub const loader = @import("loader.zig");
 pub const types = @import("types.zig");
 pub const interp = @import("interp.zig");
 pub const trace = @import("trace.zig");
+pub const profile = @import("profile.zig");
 pub const host = @import("host.zig");
 pub const cuts = @import("cuts.zig"); // exec-history-vm
+pub const aot = @import("aot.zig"); // ahead-of-time tier, off by default
+pub const aot_rt = @import("aot_rt.zig");
+pub const aot_emit = @import("aot_emit.zig");
 
 pub const Runtime = loader.Runtime;
 pub const Package = loader.Package;

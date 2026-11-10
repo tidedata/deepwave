@@ -7,8 +7,13 @@
 //! wrong package can only make the transaction's effects differ from the certified ones (a counted
 //! mismatch, never stored). Fetched packages are written to `--packages DIR` as `<id hex>.obj`
 //! when that is set, so later runs read them locally.
+//!
+//! Every request is bounded by `timeout_ms` (netguard.timed: std.http has no read timeout). The
+//! caller is execute mode's ordered step, which every later checkpoint waits on, so a full node
+//! that accepts the connection and never answers must not hold it.
 const std = @import("std");
 const Io = std.Io;
+const netguard = @import("netguard.zig");
 
 pub const Fetcher = struct {
     gpa: std.mem.Allocator,
@@ -20,7 +25,12 @@ pub const Fetcher = struct {
     next_ms: u64 = 0,
     gets: u64 = 0,
     hits: u64 = 0,
+    /// Requests the node did not answer: not reachable, an HTTP error, or cut at `timeout_ms`
+    /// (those also count in `timeouts`). An answer without the object is not one.
     errors: u64 = 0,
+    timeouts: u64 = 0,
+    /// One request (connect, TLS, request, whole body) must finish within this, or it is cut.
+    timeout_ms: u64 = 5_000,
 
     pub const spacing_ms: u64 = 50;
 
@@ -39,8 +49,10 @@ pub const Fetcher = struct {
         f.next_ms = wallMs() + spacing_ms;
         f.gets += 1;
         const body = requestBody(arena, id) catch return null;
-        const resp = f.post(arena, body) catch {
+        var ab: netguard.Abort = .{};
+        const resp = netguard.timed(f.io, f.timeout_ms, null, &ab, post, .{ f, arena, body, &ab }) catch |e| {
             f.errors += 1;
+            if (e == error.Timeout) f.timeouts += 1;
             return null;
         };
         const got = objectBcs(resp) orelse return null;
@@ -48,7 +60,7 @@ pub const Fetcher = struct {
         return got;
     }
 
-    fn post(f: *Fetcher, arena: std.mem.Allocator, body: []u8) ![]const u8 {
+    fn post(f: *Fetcher, arena: std.mem.Allocator, body: []u8, abort: *netguard.Abort) ![]const u8 {
         var ub: [256]u8 = undefined;
         const url = try std.fmt.bufPrint(&ub, "{s}/sui.rpc.v2.LedgerService/GetObject", .{f.base});
         var req = try f.client.request(.POST, try std.Uri.parse(url), .{
@@ -60,6 +72,14 @@ pub const Fetcher = struct {
             },
         });
         defer req.deinit();
+        // A request that failed or was cut is not reused (std returns one that failed before the
+        // response head to the pool as healthy). Runs before `req.deinit`.
+        errdefer if (req.connection) |conn| {
+            conn.closing = true;
+        };
+        // The wait's expiry shuts this socket down, so a read blocked on a silent peer returns.
+        try abort.arm(netguard.socketOf(req.connection.?));
+        defer abort.disarm();
         try req.sendBodyComplete(body);
         var res = try req.receiveHead(&.{});
         if (res.head.status != .ok) return error.HttpStatus;
@@ -159,4 +179,44 @@ test "pkgfetch: request frame and response parse" {
     const frame = [_]u8{ 0, 0, 0, 0, resp.len } ++ resp ++ [_]u8{ 0x80, 0, 0, 0, 0 };
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, objectBcs(&frame).?);
     try std.testing.expect(objectBcs(&[_]u8{ 0x80, 0, 0, 0, 0 }) == null);
+}
+
+test "pkgfetch: a full node that never answers is cut at the timeout" {
+    var srv: netguard.TestServer = undefined;
+    try srv.start(std.testing.io, null);
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    var f = Fetcher.init(std.testing.allocator, std.testing.io, srv.url(&ub));
+    defer f.deinit();
+    f.timeout_ms = 300;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const id: [32]u8 = @splat(7);
+    const t0 = netguard.wallMs();
+    try std.testing.expect(f.get(arena.allocator(), &id) == null);
+    try std.testing.expect(netguard.wallMs() - t0 < 3000);
+    try std.testing.expectEqual(@as(u64, 1), f.errors);
+    try std.testing.expectEqual(@as(u64, 1), f.timeouts);
+    // The next request is on a fresh connection and is cut as well (the first is not reused).
+    try std.testing.expect(f.get(arena.allocator(), &id) == null);
+    try std.testing.expectEqual(@as(u64, 2), f.timeouts);
+    try std.testing.expectEqual(@as(u32, 2), srv.accepts.load(.acquire));
+}
+
+test "pkgfetch: an answer comes back through the bounded request" {
+    // object { bcs { value: 01 02 03 } } in one gRPC-web data frame.
+    const reply = "HTTP/1.1 200 OK\r\ncontent-type: application/grpc-web+proto\r\ncontent-length: 14\r\nconnection: close\r\n\r\n" ++
+        [_]u8{ 0, 0, 0, 0, 9, 0x0a, 7, 0x0a, 5, 0x12, 3, 1, 2, 3 };
+    var srv: netguard.TestServer = undefined;
+    try srv.start(std.testing.io, reply);
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    var f = Fetcher.init(std.testing.allocator, std.testing.io, srv.url(&ub));
+    defer f.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const id: [32]u8 = @splat(7);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, f.get(arena.allocator(), &id).?);
+    try std.testing.expectEqual(@as(u64, 0), f.errors);
+    try std.testing.expectEqual(@as(u64, 1), f.hits);
 }

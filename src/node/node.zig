@@ -15,12 +15,14 @@
 //! (trust.zig), so every committed checkpoint's epoch has a committee on disk. The spool is a
 //! per-process cache and is emptied at start.
 const std = @import("std");
+const move_vm_aot = @import("move_vm").aot;
 const core = @import("core");
 const Io = std.Io;
 const store = @import("store");
 const sync = @import("sync");
 const serve = @import("serve");
 const native = @import("native");
+const edge = @import("edge");
 const index = @import("index");
 const lhist = @import("history");
 const lhfill = @import("lhfill.zig");
@@ -54,6 +56,8 @@ pub const rpcmetrics = @import("rpcmetrics.zig");
 /// sui-node's checkpoint executor, state sync and pruner families (lane ops-metrics).
 pub const opsmetrics = @import("opsmetrics.zig");
 pub const statehash = @import("statehash.zig");
+pub const upgrade = @import("upgrade.zig");
+pub const handoff = @import("handoff.zig");
 pub const conservation = @import("conservation.zig");
 pub const admin = @import("admin.zig");
 const admin_store = @import("admin_store.zig");
@@ -96,6 +100,17 @@ pub const SourceSpec = union(enum) {
     /// older than its 30-day window; used only when its credentials load (else a warning).
     /// `base` null: the network's public bucket (network.zig).
     http: struct { base: ?[]const u8 = null, fallback: ?S3Spec = .{} },
+    /// Core (or other edge) nodes over zui/1 (`--source zui1:ADDR:PORT/KEYHEX[,...]`, docs/EDGE.md).
+    zui1: Zui1Spec,
+};
+
+pub const Zui1Spec = struct {
+    /// `ADDR:PORT/KEYHEX[,...]` (edge.client.parseSpecs).
+    cores: []const u8,
+    /// Connections kept to the cores (`--edge-conns`).
+    max_conns: u32 = 4,
+    /// Ask for zstd frames with the cores' dictionary (`--no-edge-zstd` turns it off).
+    zstd: bool = true,
 };
 
 /// `--rpc-release` value: `1.83`, `1.83.1`, `v1.84.0` or a max protocol version (serve protocfg).
@@ -140,17 +155,32 @@ pub const Config = struct {
     native_listen: ?[]const u8 = null,
     /// Write the WebTransport certificate's SHA-256 (hex) here at startup (dev: serverCertificateHashes).
     native_cert_hash_file: ?[]const u8 = null,
+    /// zui/1 Ed25519 identity seed (32 raw bytes, 0600; created on first start). Clients and
+    /// edges pin the key it derives, so it must survive restarts. Null: `<dir>/node/native-identity.seed`.
+    native_identity_file: ?[]const u8 = null,
     /// StateService indexes (lane indexes, DROP-IN G4): built in memory from the live set at start
     /// (needs RAM for every owned object), then fed per checkpoint. Off: StateService is UNIMPLEMENTED.
     indexes: bool = false,
+    /// Serve the edge feed and its dictionary on the zui/1 listener (`--edge-feed`, docs/EDGE.md):
+    /// what makes this node a feed for edges. Off by default.
+    edge_feed: bool = false,
+    /// `POST /zui1/rpc` on the native listen address over TCP (`--native-http-rpc`, certhttp.zig):
+    /// zui/1 requests over plain HTTP for Workers and fetch callers, behind a TLS terminator.
+    native_http_rpc: bool = false,
     metrics_addr: ?[]const u8 = null,
     /// sui-node `metrics.push-url`: POST the registry there (protobuf, snappy) every interval.
     metrics_push_url: ?[]const u8 = null,
     /// sui-node `metrics.push-interval-seconds` (default 60).
     metrics_push_interval_s: u64 = 60,
     workers: u32 = 0,
+    /// Certificate pairing checks decided as randomized batches of up to this many checkpoints
+    /// (sync.follower `Config.cert_batch`; same verdicts). 0: one check per worker, as before.
+    cert_batch: u32 = 0,
     fetchers: u32 = 8,
     window: u32 = 64,
+    /// `--net-max-mbps`: download cap in MiB per second for checkpoint fetches and the snapshot
+    /// restore together (http.ByteBucket); 0: none.
+    net_max_mbps: u32 = 0,
     /// Tip poll interval: one frontier request every poll_ms across all fetcher threads. Null:
     /// 25 for the public bucket (free requests), 100 for S3 (requester pays) and directories.
     poll_ms: ?u32 = null,
@@ -186,6 +216,10 @@ pub const Config = struct {
     /// The node asked (`--sig-order-from URL`); null: the first loopback `--stream` URL, else the
     /// first one (sigorder.pickBase).
     sig_order_from: ?[]const u8 = null,
+    /// Sweep the committed checkpoints for transactions stored in the contents' signature order
+    /// and serve the node's order instead (sigorder.Sweep; `--sig-order-sweep off`). Needs the
+    /// signature-order node above.
+    sig_order_sweep: bool = true,
     /// p2p state-sync peers (`host:port@peerid,...`, p2p.zig) racing the source and the streams.
     p2p: ?[]const u8 = null,
     /// Ed25519 network key seed file for p2p (random identity when null).
@@ -200,6 +234,12 @@ pub const Config = struct {
     p2p_discover: u8 = 32,
     /// p2p: threads executing a checkpoint's independent transactions (`--p2p-exec-threads`).
     p2p_exec_threads: u8 = 4,
+    /// p2p tip path as a pipeline of pinned tiles on rings (`--tiles`, p2p_tiles.zig); off: the exec thread.
+    tiles: bool = false,
+    /// Cores for the tiles in pipeline order, comma separated (`--tile-cpus 2,3,4,5,6`).
+    tile_cpus: ?[]const u8 = null,
+    /// Tiles never sleep when idle (`--tile-spin`).
+    tile_spin: bool = false,
     /// p2p only (`--p2p-only`, p2p_only.zig): no bucket, S3 or stream; needs a store to resume.
     p2p_only: bool = false,
     /// p2p `pinned-checkpoints` (`--p2p-pinned SEQ:DIGEST,...`).
@@ -247,6 +287,11 @@ pub const Config = struct {
     admin_port: ?u16 = null,
     /// Per-epoch state-hash check (statehash.zig): what a mismatch does.
     state_hash: statehash.Policy = .verify_only,
+    /// `--verify-fallback`: on a protocol this binary cannot execute, keep following and serving,
+    /// pause execution and the state-hash halt (upgrade.zig). Alert lines are always on; the zui_protocol_* metrics only with this flag.
+    verify_fallback: bool = false,
+    /// `--handoff-sock PATH`: zero-downtime binary upgrade (handoff.zig); null: off.
+    handoff_sock: ?[]const u8 = null,
     /// SUI conservation check at every end of epoch (conservation.zig): what a failure does.
     /// Off by default, as sui-node 1.83.1: `ExpensiveSafetyCheckConfig::default()` has
     /// `enable_epoch_sui_conservation_check` false, on only in debug builds (cfg!(debug_assertions))
@@ -390,6 +435,20 @@ var stop_deadline_s: c_uint = 8;
 /// comes before the stop, and `gracefulStop` re-arms `stop_deadline_s` once it ends, so a stop
 /// with no connections open still exits within the deadline.
 var stop_drain_s: c_uint = 0;
+/// While a successor takes the store (handoff.zig) the stop deadline is this long instead
+/// (`ZUI_HANDOFF_RELEASE_DEADLINE_S`): an _exit of the old process mid-close would be the unit's
+/// main process ending, and the store close of a big store takes longer than 8 s.
+var release_deadline_s: c_uint = 120;
+
+fn deadlineS() c_uint {
+    return if (handoff.isReleasing()) @max(stop_deadline_s, release_deadline_s) else stop_deadline_s;
+}
+
+/// The first-signal part of onSignal, callable from a thread (handoff: a successor asked for the store).
+pub fn requestStop() void {
+    if (signals.fetchAdd(1, .acq_rel) == 0) _ = std.c.alarm(deadlineS() + @atomicLoad(c_uint, &stop_drain_s, .acquire));
+    stop_signal.store(true, .release);
+}
 
 fn onSignal(_: std.posix.SIG) callconv(.c) void {
     // The first signal arms the deadline: a kernel timer armed from the handler (alarm is
@@ -458,6 +517,7 @@ pub fn installSignalHandlers() void {
         stop_deadline_s = std.fmt.parseInt(c_uint, std.mem.span(v), 10) catch 8;
         if (stop_deadline_s == 0) stop_deadline_s = 8;
     }
+    if (std.c.getenv("ZUI_HANDOFF_RELEASE_DEADLINE_S")) |v| release_deadline_s = std.fmt.parseInt(c_uint, std.mem.span(v), 10) catch 120;
     const act: std.posix.Sigaction = .{
         .handler = .{ .handler = onSignal },
         .mask = std.posix.sigemptyset(),
@@ -487,6 +547,10 @@ pub const Node = struct {
     rio: *store.RealIo,
     bucket: ?*s3.Bucket = null,
     public: ?*http.Public = null,
+    /// `--source zui1:`: the cores this node follows.
+    edge_pool: ?*edge.client.Pool = null,
+    /// `--edge-feed`: the zui/1 feed and dictionary state.
+    edge_feeder: ?*native.edgefeed.Feeder = null,
     /// The committed checkpoint whose timestamp the metrics last read, and that timestamp.
     compat_seq: Atomic(u64) = .init(std.math.maxInt(u64)),
     compat_ts: Atomic(u64) = .init(0),
@@ -497,6 +561,8 @@ pub const Node = struct {
     streams: std.ArrayList(*stream_mod.Stream) = .empty,
     /// Signature-order overlay for bucket checkpoints (sigorder.zig), from the first stream URL.
     sig_order: ?*sigorder.Overlay = null,
+    /// Its sweep over committed checkpoints (`node/sig-order.log`).
+    sig_sweep: ?*sigorder.Sweep = null,
     /// p2p state-sync follower (`--p2p`).
     p2p: ?*p2p_mod.P2p = null,
     /// State-sync/discovery server (p2p_serve.zig): inbound listener and outbound connections.
@@ -570,6 +636,8 @@ pub const Node = struct {
     native_cert: native.cert.Cert = undefined,
     native_certhttp: ?*native.certhttp.Server = null,
     native_hooks: native_hooks.Hooks = undefined,
+    edge_warm: ?std.Thread = null,
+    edge_stop: Atomic(bool) = .init(false),
     serve_stop: Atomic(bool) = .init(false),
     ix: ?*index.Index = null,
     ix_feed: ?*index.feed.Feed = null,
@@ -582,6 +650,8 @@ pub const Node = struct {
     /// Per-epoch state-hash check (writer thread), and the executor switch it turns off.
     state_hash: statehash.Checker = undefined,
     exec_off: bool = false,
+    /// Unsupported-protocol alerting and the verify-only fallback (upgrade.zig).
+    guard: upgrade.Guard = .{},
     /// Duration of the last epoch change seen (ms, `epoch_total_duration`).
     epoch_duration_ms: Atomic(u64) = .init(0),
     /// sui-node's checkpoint executor and state sync families (opsmetrics.zig).
@@ -670,6 +740,9 @@ pub const Node = struct {
             .started_ns = source_mod.nowNs(),
             .lock_fd = lock_fd,
         };
+        // Before anything downloads (the snapshot restore below, the trust walk, the fetchers).
+        http.net_cap.configure(cfg.net_max_mbps);
+        if (cfg.net_max_mbps != 0) std.log.info("download cap: {d} MiB/s for checkpoint fetches and the snapshot restore together (--net-max-mbps)", .{cfg.net_max_mbps});
 
         // An interrupted snapshot restore leaves a partial live set: start it again from scratch.
         const marker = try snapshot.readMarker(io, node_dir);
@@ -720,6 +793,16 @@ pub const Node = struct {
             n.source = .{ .gpa = gpa, .io = io, .kind = .none };
             std.log.info("source: none (p2p only: summaries and contents from peers, every checkpoint executed here)", .{});
         } else switch (cfg.source) {
+            .zui1 => |spec| {
+                const specs = try edge.client.parseSpecs(gpa, spec.cores);
+                defer gpa.free(specs);
+                const pool = try edge.client.Pool.init(gpa, io, specs, spec.max_conns);
+                pool.chain_id = cfg.chain_id orelse cfg.network.params().chain_id;
+                pool.use_zstd = spec.zstd;
+                n.edge_pool = pool;
+                n.source = .{ .gpa = gpa, .io = io, .kind = .{ .zui1 = pool } };
+                std.log.info("source: zui/1 from {d} core(s), {d} connection(s), zstd {s}", .{ specs.len, spec.max_conns, if (spec.zstd) "on" else "off" });
+            },
             .dir => |p| n.source = .{ .gpa = gpa, .io = io, .kind = .{ .dir = try cwd.openDir(io, p, .{}) } },
             .s3 => |spec| {
                 const b = try loadBucket(n, spec);
@@ -729,6 +812,8 @@ pub const Node = struct {
             .http => |spec| {
                 const h = try gpa.create(http.Public);
                 h.* = http.Public.init(gpa, io, spec.base orelse cfg.network.params().bucket_url);
+                // The request pool follows --fetchers (it was a fixed 16).
+                _ = h.setConcurrency(cfg.fetchers);
                 n.public = h;
                 if (spec.fallback) |fb| {
                     if (loadBucket(n, fb)) |b| {
@@ -748,6 +833,8 @@ pub const Node = struct {
         // State-hash running root at the last committed checkpoint (written by a restore or by
         // the previous run's commits).
         n.state_hash = try statehash.Checker.init(gpa, cfg.state_hash);
+        n.state_hash.lenient = cfg.verify_fallback;
+        n.guard.enabled = cfg.verify_fallback;
         if (n.st.committed()) |last| {
             var snap = n.st.snapshot();
             defer snap.release();
@@ -774,7 +861,7 @@ pub const Node = struct {
                 _ = d.statFile(io, name, .{}) catch break :blk false;
                 break :blk true;
             },
-            .s3, .http => false,
+            .s3, .http, .zui1 => false,
         };
         if (direct) {
             n.archive = try sync.archive.Archive.open(io, cfg.source.dir);
@@ -790,15 +877,17 @@ pub const Node = struct {
         n.follower = try sync.Follower.init(gpa, io, n.st, .{ .archive = &n.archive }, .{
             .mode = .apply,
             .workers = cfg.workers,
-            // Spool mode: the next file usually lands within milliseconds of the previous commit at
-            // the tip, and a miss is one stat(); 2 ms keeps the wait off the tip latency.
-            .poll_ms = if (direct) n.pollMs() else 2,
+            // Spool mode: every spool writer wakes the workers (Fetcher.on_spooled below), so they
+            // block until their file is there; the timeout is a safety net only. Until lane
+            // tip-cheap this was a 2 ms poll: one failed open per worker every 2 ms at the tip.
+            .poll_ms = if (direct) n.pollMs() else spool_fallback_ms,
             // Store read-ahead (lane fast-start): inside a memory cap the live table and the
             // segments do not fit the page cache, and the apply would wait on one fault at a time.
             .prefetch_qd = envU32("ZUI_PREFETCH_QD", 64),
             .prefetch_ahead = @max(1, envU32("ZUI_PREFETCH_AHEAD", 32)),
+            .cert_batch = cfg.cert_batch,
         }, anchor);
-        n.follower.observer = .{ .ctx = n, .on_checkpoint = onCheckpoint, .on_batch = onBatch, .on_committed = onCommitted };
+        n.follower.observer = .{ .ctx = n, .on_checkpoint = onCheckpoint, .on_batch = onBatch, .on_committed = onCommitted, .on_idle = onIdle };
         if (cfg.read_sets) {
             const h = try gpa.create(history.History);
             h.* = try history.History.init(gpa, io, if (direct) try cwd.openDir(io, cfg.source.dir, .{}) else n.spool_dir.?);
@@ -861,6 +950,7 @@ pub const Node = struct {
                 .lookahead = cfg.lookahead,
                 .to = cfg.to orelse std.math.maxInt(u64),
                 .keep = cfg.keep_spool,
+                .on_spooled = .{ .ctx = n.follower, .call = spooled },
             };
             n.fetcher = f;
             if (cfg.stream) |urls| if (!cfg.p2p_only) {
@@ -941,6 +1031,18 @@ pub const Node = struct {
                     pp.pool_cfg.silent_ms = ms;
                     pp.pool_cfg.wrong_peer_ms = ms;
                 }
+            }
+            pp.tiles = cfg.tiles;
+            pp.tile_spin = cfg.tile_spin;
+            if (cfg.tile_cpus) |txt| {
+                var cpus: std.ArrayList(u16) = .empty;
+                var it = std.mem.splitScalar(u8, txt, ',');
+                while (it.next()) |part| {
+                    const t = std.mem.trim(u8, part, " ");
+                    if (t.len == 0) continue;
+                    try cpus.append(n.anchor_arena.allocator(), try std.fmt.parseInt(u16, t, 10));
+                }
+                pp.tile_cpus = cpus.items;
             }
             if (cfg.p2p_pinned) |pins| pp.pinned = .init(try @import("p2p_only.zig").parsePinned(n.anchor_arena.allocator(), pins));
             n.p2p = pp;
@@ -1080,11 +1182,41 @@ pub const Node = struct {
         return spec.origin orelse .{ .https = n.cfg.network.params().formal_snapshot_url };
     }
 
+    /// How long a follower worker waits for its spool file when no writer woke it: about one
+    /// checkpoint interval, so a wake that was somehow lost costs one checkpoint of delay, not a
+    /// stall, and a waiting worker looks 4 times a second, not 500.
+    pub const spool_fallback_ms: u32 = 250;
+
+    /// `Fetcher.on_spooled`: checkpoint `seq` is in the spool.
+    fn spooled(ctx: *anyopaque, seq: u64) void {
+        const f: *sync.Follower = @ptrCast(@alignCast(ctx));
+        f.notify(seq);
+    }
+
     pub fn pollMs(n: *const Node) u32 {
         return n.cfg.poll_ms orelse switch (n.cfg.source) {
             .http => 25,
+            .zui1 => 50,
             .s3, .dir => 100,
         };
+    }
+
+    /// One line at start: how many checkpoint downloads can really be in flight. The public
+    /// bucket's request pool follows `--fetchers` up to http.Public.max_clients; before, it
+    /// was 16 whatever the flag said, and nothing told the operator.
+    fn logFetchConcurrency(n: *Node, threads: u32) void {
+        if (threads == 0) return;
+        switch (n.source.kind) {
+            .http => |h| {
+                const pool = h.limit.load(.acquire);
+                const eff = @min(threads, pool);
+                std.log.info("fetch: {d} fetcher threads, at most {d} checkpoint requests in flight at the public bucket (pool of {d} with the tip search and stream-check, hard maximum {d}){s}", .{ threads, eff, pool, http.Public.max_clients, if (eff < threads) "; the fetchers above that wait for a slot" else "" });
+            },
+            .s3 => std.log.info("fetch: {d} fetcher threads, at most {d} checkpoint requests in flight at S3", .{ threads, threads }),
+            .zui1 => std.log.info("fetch: {d} fetcher threads, at most {d} checkpoint requests in flight at the zui/1 cores", .{ threads, threads }),
+            .dir => std.log.info("fetch: {d} fetcher threads reading the source directory", .{threads}),
+            .none => {},
+        }
     }
 
     /// The follower's starting point.
@@ -1359,6 +1491,23 @@ pub const Node = struct {
             s.* = .{ .gpa = n.gpa, .io = n.io, .kind = .{ .dir = try Io.Dir.cwd().openDir(n.io, p, .{}) } };
             try srcs.append(a, s);
         }
+        // An edge (`--source zui1:`) follows cores that hold only their last couple of epochs, so
+        // the committee chain from genesis comes from the network's public checkpoint bucket
+        // (free, the same trust root a core walks; every certificate is still verified here).
+        var trust_http: ?*http.Public = null;
+        defer if (trust_http) |h| {
+            h.deinit();
+            n.gpa.destroy(h);
+        };
+        if (n.source.kind == .zui1) {
+            const h = try n.gpa.create(http.Public);
+            h.* = http.Public.init(n.gpa, n.io, n.cfg.network.params().bucket_url);
+            trust_http = h;
+            const s = try a.create(source_mod.Source);
+            s.* = .{ .gpa = n.gpa, .io = n.io, .kind = .{ .http = h } };
+            try srcs.append(a, s);
+            std.log.info("trust walk: end-of-epoch checkpoints from {s}, then the zui/1 cores", .{h.base});
+        }
         try srcs.append(a, &n.source);
         var w: trust.Walker = .{ .gpa = n.gpa, .io = n.io, .sources = srcs.items, .save_dir = n.epochs_dir, .keep_last_eoe = keep, .parallel = @max(16, n.cfg.fetchers) };
         if (n.cfg.epochs_index) |p| w.index = try trust.EpochIndex.load(a, n.io, p);
@@ -1389,8 +1538,8 @@ pub const Node = struct {
         const lowest = n.lowest.load(.acquire);
         if (tip < lowest) return;
         if (h.indexedLo()) |lo| if (lo <= lowest) return;
-        const cpus = std.Thread.getCpuCount() catch 4;
-        const workers = std.math.clamp(cpus / 2, 1, 12);
+        // Usable CPUs (the cgroup quota included), not the host's.
+        const workers = std.math.clamp(usableCpus() / 2, 1, 12);
         n.lh_fill_tries += 1;
         const b = lhfill.Backfill.startOpts(n.gpa, n.io, n.st, lowest, tip, .{ .workers = workers, .staging = n.lh_staging, .save_every_ns = @as(u64, envU32("ZUI_LH_SAVE_S", 300)) * std.time.ns_per_s }) catch |e| {
             std.log.err("history: backfill: {s}", .{@errorName(e)});
@@ -1470,8 +1619,8 @@ pub const Node = struct {
     }
 
     /// Retention (CONTRACTS 6.8, node/retention.zig): sui-node's two pruning watermarks, one
-    /// tick per 10 s of wall clock, on the writer thread between checkpoints (the follower calls
-    /// on_checkpoint before it opens the next batch). The store applies them as floors and ages
+    /// tick per 10 s of wall clock, on the writer thread between checkpoints (the follower's
+    /// on_idle, after a commit and before the next batch opens). The store applies them as floors and ages
     /// a segment out once both have passed it: nothing is copied, a meta write and some unlinks.
     fn retentionTick(n: *Node) void {
         const cfg: retention.Config = .{
@@ -1635,10 +1784,7 @@ pub const Node = struct {
         defer if (ix) |x| x.deinit();
         var feed: index.feed.Feed = undefined;
         if (n.cfg.indexes) {
-            var opts: index.lsm.Options = .{};
-            if (std.c.getenv("ZUI_INDEX_BUILD_GROUPS")) |g| opts.build_groups = std.fmt.parseInt(u32, std.mem.span(g), 10) catch opts.build_groups;
-            if (std.c.getenv("ZUI_INDEX_BUILD_THREADS")) |g| opts.build_threads = std.fmt.parseInt(usize, std.mem.span(g), 10) catch 0;
-            ix = try index.Index.open(n.gpa, n.io, try std.fs.path.join(arena, &.{ n.cfg.dir, "state-index" }), opts);
+            ix = try index.Index.open(n.gpa, n.io, try std.fs.path.join(arena, &.{ n.cfg.dir, "state-index" }), indexBuildOptions());
             feed = index.feed.Feed.init(n.gpa, ix.?, n.st);
             j.feed = &feed;
             j.build = true;
@@ -1665,11 +1811,27 @@ pub const Node = struct {
     }
 
     /// Bulk-build options of the StateService index (ZUI_INDEX_BUILD_GROUPS, ZUI_INDEX_BUILD_THREADS).
+    /// Build passes over the live set: 1 needs temp space for every row (~1.5x the index), 4
+    /// (default) a quarter of it but reads the live set four times (slow on IOPS-bound disks).
+    /// Threads: the env value, else one per usable CPU up to 32. The index's own default (0) is
+    /// the host's CPU count: 32 build threads with 96 MiB each inside a 4-core cgroup.
     fn indexBuildOptions() index.lsm.Options {
         var opts: index.lsm.Options = .{};
         if (std.c.getenv("ZUI_INDEX_BUILD_GROUPS")) |g| opts.build_groups = std.fmt.parseInt(u32, std.mem.span(g), 10) catch opts.build_groups;
         if (std.c.getenv("ZUI_INDEX_BUILD_THREADS")) |g| opts.build_threads = std.fmt.parseInt(usize, std.mem.span(g), 10) catch 0;
+        if (opts.build_threads == 0) opts.build_threads = indexBuildThreads(usableCpus());
         return opts;
+    }
+
+    /// Index build threads for `usable` CPUs (index/lsm.zig caps its own default at 32 too).
+    pub fn indexBuildThreads(usable: u32) usize {
+        return std.math.clamp(usable, 1, 32);
+    }
+
+    /// CPUs this process can use: the affinity mask capped by the cgroup CPU quota of its own
+    /// cgroup and its parents (sync.follower.usableCpus, core/hw.zig).
+    pub fn usableCpus() u32 {
+        return sync.follower.usableCpus();
     }
 
     /// Live objects from which a store without a restore image builds its indexes from a
@@ -1708,12 +1870,7 @@ pub const Node = struct {
     /// live set when there is no usable index, else replayed from its watermark; then served.
     fn startIndexes(n: *Node) !void {
         const dir = try std.fs.path.join(n.anchor_arena.allocator(), &.{ n.cfg.dir, "state-index" });
-        var opts: index.lsm.Options = .{};
-        // Bulk-build passes over the live set: 1 needs temp space for every row (~1.5x the index),
-        // 4 (default) a quarter of it but reads the live set four times (slow on IOPS-bound disks).
-        if (std.c.getenv("ZUI_INDEX_BUILD_GROUPS")) |g| opts.build_groups = std.fmt.parseInt(u32, std.mem.span(g), 10) catch opts.build_groups;
-        if (std.c.getenv("ZUI_INDEX_BUILD_THREADS")) |g| opts.build_threads = std.fmt.parseInt(usize, std.mem.span(g), 10) catch 0;
-        const x = try index.Index.open(n.gpa, n.io, dir, opts);
+        const x = try index.Index.open(n.gpa, n.io, dir, indexBuildOptions());
         n.ix = x;
         const f = try n.gpa.create(index.feed.Feed);
         f.* = index.feed.Feed.init(n.gpa, x, n.st);
@@ -1747,14 +1904,7 @@ pub const Node = struct {
         n.prof.mark(.wait);
         defer n.prof.mark(.misc);
         if (!n.lowest_known) n.refreshLowest();
-        // fast start: the background job reads the restore image segment; cleaning and
-        // retention wait until the indexes are live
-        if (n.fast == null or !n.fast.?.active()) {
-            n.retentionTick();
-            n.prof.mark(.retention);
-            n.clean();
-            n.prof.mark(.clean);
-        }
+        // (The retention tick and the cleaning step run in onIdle, after the commit.)
         // The index changes are computed before the commit (old versions still live) and applied
         // in onCommitted, so the index trails the store as sui-node's rpc-store does.
         if (n.ix_feed) |f| if (f.ix.ready.load(.acquire)) f.prepare(seq, blob) catch |e| std.log.err("indexes: checkpoint {d}: {s}", .{ seq, @errorName(e) });
@@ -1787,6 +1937,7 @@ pub const Node = struct {
             n.cur_epoch = c.epoch;
             if (n.next_pv) |p| n.cur_pv = p;
             n.next_pv = null;
+            n.guard.noteEpoch(n.cur_pv, c.epoch, seq);
             if (n.next_params) |p| {
                 if (p.start_ms) |b| if (n.cur_params.start_ms) |a| if (b > a) n.epoch_duration_ms.store(b - a, .monotonic);
                 n.cur_params = p;
@@ -1806,7 +1957,8 @@ pub const Node = struct {
             if (seq > 0) h.publish(seq - 1);
             n.prof.mark(.ledger);
         }
-        if (n.executor) |x| if (!n.exec_off) {
+        n.guard.noteCheckpoint();
+        if (n.executor) |x| if (!n.exec_off and !n.guard.skipExec(n.cur_pv)) {
             x.submit(seq, c.epoch, n.cur_pv, n.cur_params, blob);
             if (n.cfg.halt_on_mismatch and x.mismatchSeen() and n.failure == null) {
                 n.failure = "execute mismatch";
@@ -1821,7 +1973,9 @@ pub const Node = struct {
                 std.log.err("rpc index: checkpoint {d}: {s}", .{ seq, @errorName(e) });
                 return n.fatal("rpc index write failed");
             };
-            x.commit(seq) catch |e| {
+            // The watermark file is fsynced every rpcindex.wm_sync_every checkpoints, not here
+            // per checkpoint; a stale one is levelled with the store at the next start (seed).
+            x.commitLazy(seq) catch |e| {
                 std.log.err("rpc index: commit {d}: {s}", .{ seq, @errorName(e) });
                 return n.fatal("rpc index write failed");
             };
@@ -1850,6 +2004,7 @@ pub const Node = struct {
             };
             n.next_pv = info.protocol_version;
             n.next_params = params;
+            n.guard.noteEpochEnd(info.protocol_version, c.epoch, seq);
             if (n.cfg.sui_conservation != .off) n.cons_pending = .{ .seq = seq, .epoch = c.epoch };
             if (n.cfg.snapshot_write != null) {
                 for (eoe.epochCommitments) |cm| switch (cm) {
@@ -1902,6 +2057,25 @@ pub const Node = struct {
         }
         if (n.fast) |j| j.onCommitted(seq);
         if (n.ix_feed) |f| if (f.ix.ready.load(.acquire)) f.publish(seq) catch |e| std.log.err("indexes: publish checkpoint {d}: {s}", .{ seq, @errorName(e) });
+    }
+
+    /// Follower `on_idle`: the writer thread's background work, once checkpoint `seq` is committed,
+    /// published and the follower has moved past it. Until lane tip-cheap both calls sat at the
+    /// top of onCheckpoint, so an arriving checkpoint first paid the retention tick and a cleaning
+    /// step (about 48 ms at the tip while a clean is in progress, retention.Pace) before its own
+    /// commit. No batch is open here either, which is all setFloors and cleanStepUntil ask for,
+    /// and the order between checkpoints is unchanged (commit, publish, tick, clean, next
+    /// checkpoint): only the wait for the next checkpoint now comes after the step, not before.
+    fn onIdle(ctx: *anyopaque, seq: u64) void {
+        _ = seq;
+        const n: *Node = @ptrCast(@alignCast(ctx));
+        // fast start: the background job reads the restore image segment; cleaning and
+        // retention wait until the indexes are live
+        if (n.fast != null and n.fast.?.active()) return;
+        n.retentionTick();
+        n.prof.mark(.retention);
+        n.clean();
+        n.prof.mark(.clean);
     }
 
     /// `rpcindex.CommitteeSource`: the committee the node persisted for `epoch` (trust.save).
@@ -2017,7 +2191,11 @@ pub const Node = struct {
         // Off by default: `--age-out` or ZUI_AGE_OUT=1 turns it on, ZUI_AGE_OUT=0 forces it off.
         if (envU32("ZUI_AGE_OUT", @intFromBool(n.cfg.age_out)) != 0) n.st.startAger() catch |e| std.log.err("store: age-out thread: {s}", .{@errorName(e)});
         // p2p-only: the fetcher is only the spool and its claims (no fetch threads).
-        if (n.fetcher) |f| try f.start(if (n.cfg.p2p_only) 0 else @max(1, n.cfg.fetchers));
+        if (n.fetcher) |f| {
+            const threads: u32 = if (n.cfg.p2p_only) 0 else @max(1, n.cfg.fetchers);
+            try f.start(threads);
+            n.logFetchConcurrency(threads);
+        }
         for (n.streams.items) |st| {
             try st.start();
             std.log.info("live stream from {s} (SubscribeCheckpoints over gRPC-web); the source fills gaps", .{st.base});
@@ -2050,6 +2228,13 @@ pub const Node = struct {
             }
         }
         if (n.cfg.indexes) try n.startIndexes();
+        // Before serving: the fixes the sweep already found are installed by `open`.
+        if (n.sig_order) |ov| if (n.cfg.sig_order_sweep) {
+            const sw = try sigorder.Sweep.open(n.gpa, n.io, n.st, ov, n.node_dir);
+            n.sig_sweep = sw;
+            try sw.start();
+            std.log.info("signature order sweep from {s}: {d} fixes reinstalled, resuming at {s}", .{ ov.base, sw.stats.loaded.load(.monotonic), if (sw.next != null) "the last mark" else "the lowest checkpoint" });
+        };
         if (n.fast) |j| try j.start();
         n.resumeSnapshotWrite();
         if (n.cfg.serve_addr) |addr| try n.startServe(addr);
@@ -2063,6 +2248,8 @@ pub const Node = struct {
             try p.start();
         }
         if (n.cfg.admin_port) |port| n.startAdmin(port);
+        n.guard.noteEpoch(n.cur_pv, n.cur_epoch, n.first_seq);
+        if (n.cfg.handoff_sock) |path| n.startHandoff(path);
         try n.threads.append(n.gpa, try std.Thread.spawn(.{}, statusLoop, .{n}));
         n.started_ns = source_mod.nowNs();
         std.log.info("following from checkpoint {d} ({s} mode, {s})", .{ n.first_seq, @tagName(n.cfg.mode), if (n.fetcher != null) "fetch-ahead" else "direct" });
@@ -2070,7 +2257,24 @@ pub const Node = struct {
         // The follower treats a missing blob as a source error when it has an end (`to`): right
         // for a complete directory, wrong for the spool, which fills as the fetcher goes. With the
         // spool the follower runs open-ended and the status loop stops it once `to` is applied.
-        const res = n.follower.run(if (n.fetcher != null) null else n.cfg.to);
+        var res = n.follower.run(if (n.fetcher != null) null else n.cfg.to);
+        // An edge with several cores: a feed that fails verification is that core's lie, not the
+        // chain's. The checkpoint is fetched again from another core before the node gives up.
+        if (n.edge_pool) |pool| {
+            var tries: u32 = 0;
+            while (tries < 8) : (tries += 1) {
+                _ = res catch |e| {
+                    if (e != error.BadCheckpoint) break;
+                    const fl = n.follower.failure orelse break;
+                    if (!n.refetchFromOtherCore(pool, fl.seq)) break;
+                    std.log.warn("edge: checkpoint {d} failed verification ({s}); fetched again from another core", .{ fl.seq, fl.verdict.name() });
+                    n.follower.rewind();
+                    res = n.follower.run(if (n.fetcher != null) null else n.cfg.to);
+                    continue;
+                };
+                break;
+            }
+        }
         // Every committed checkpoint's transactions finish before the final status.
         if (n.executor) |x| {
             x.drain();
@@ -2093,7 +2297,23 @@ pub const Node = struct {
         if (n.failure) |f| return if (std.mem.eql(u8, f, "rejected checkpoint") or std.mem.eql(u8, f, "execute mismatch")) error.Mismatch else error.NodeFailed;
     }
 
+    /// Marks the core that served `seq` as bad for it and spools the checkpoint again from another.
+    fn refetchFromOtherCore(n: *Node, pool: *edge.client.Pool, seq: u64) bool {
+        const f = n.fetcher orelse return false;
+        if (!pool.blame(seq)) return false;
+        var sc = source_mod.Scratch.init(n.gpa);
+        defer sc.deinit(n.gpa);
+        var blob: std.ArrayList(u8) = .empty;
+        defer blob.deinit(n.gpa);
+        const raw = n.source.fetchRaw(&sc, seq, &blob) catch return false;
+        if (raw != .blob) return false;
+        f.writeSpool(seq, blob.items, sc.aux.items) catch return false;
+        return true;
+    }
+
     fn shutdownThreads(n: *Node) void {
+        // The listeners are closed below: no HELLO may be answered with them (handoff.zig).
+        handoff.closeOffers();
         // The ledger-history backfill's loaders read the store and what the follower and
         // indexes own: cancel and join them before anything is torn down (follower.run has
         // returned, so the commit path no longer adopts it). Joined later (deinit) they read
@@ -2127,7 +2347,10 @@ pub const Node = struct {
         // Bucket requests in flight end within ~100 ms (netguard.timed), so the joins below never
         // wait on a socket.
         if (n.public) |p| p.stopping.store(true, .release);
+        http.net_cap.stopping.store(true, .release); // fetchers asleep on the download cap
+        n.edge_stop.store(true, .release);
         if (n.sig_order) |o| o.stopping.store(true, .release);
+        if (n.sig_sweep) |sw| sw.join();
         if (n.fetcher) |f| f.stop();
         // Subscription streams end (service_shutdown); the hub itself lives until exit, as
         // detached connection threads may still hold it.
@@ -2139,6 +2362,10 @@ pub const Node = struct {
         if (n.native_certhttp) |h| {
             h.stop(n.gpa);
             n.native_certhttp = null;
+        }
+        if (n.edge_warm) |t| {
+            t.join();
+            n.edge_warm = null;
         }
         n.serve_stop.store(true, .release);
         // Wake the accept loops before joining them, and close the sockets only after: on Linux
@@ -2166,6 +2393,11 @@ pub const Node = struct {
     /// listening socket does not (macOS). The accept loops check their stop flag after each accept.
     fn wakeListener(io: Io, srv: *const Io.net.Server) void {
         const st: Io.net.Stream = .{ .socket = srv.socket };
+        // A socket handed to a successor (handoff.zig) is shared: shutdown() would end it for the
+        // new process too, so only the connect below wakes the accept loop.
+        // Nor does it connect: the wake connection would sit in the shared backlog and a real client
+        // accepted ahead of it would be reset. The handed-over accept loops poll their stop flag.
+        if (handoff.isReleasing()) return;
         st.shutdown(io, .both) catch {};
         var addr = srv.socket.address;
         switch (addr) {
@@ -2185,6 +2417,9 @@ pub const Node = struct {
 
     /// Clean shutdown of the store (seals the memtable, flushes the live index).
     pub fn deinit(n: *Node) void {
+        // The handoff thread outlives this node until finishActive: it must not read the node
+        // (freed at the end of deinit) from here on.
+        handoff.closeOffers();
         if (n.metrics_pusher) |p| {
             p.deinit();
             n.gpa.destroy(p);
@@ -2244,6 +2479,14 @@ pub const Node = struct {
             n.gpa.destroy(st);
         }
         n.streams.deinit(n.gpa);
+        if (n.sig_sweep) |sw| {
+            if (n.sig_order) |o| o.stopping.store(true, .release);
+            sw.join();
+            const x = &sw.stats;
+            std.log.info("signature order sweep: next {d}, {d} checkpoints, {d} candidates, {d} requests, {d} fixed, {d} same, {d} unavailable, {d} rejected, {d} retries", .{ sw.pos.load(.monotonic), x.checkpoints.load(.monotonic), x.candidates.load(.monotonic), x.requests.load(.monotonic), x.fixed.load(.monotonic), x.same.load(.monotonic), x.unavailable.load(.monotonic), x.rejected.load(.monotonic), x.retries.load(.monotonic) });
+            sw.deinit();
+            n.sig_sweep = null;
+        }
         if (n.sig_order) |o| {
             const x = &o.stats;
             std.log.info("signature order from {s}: {d} wanted, {d} requests, {d} served, {d} not found, {d} over budget, {d} timeouts, {d} errors", .{ o.base, x.wanted.load(.monotonic), x.requests.load(.monotonic), x.served.load(.monotonic), x.not_found.load(.monotonic), x.throttled.load(.monotonic), x.timeouts.load(.monotonic), x.errors.load(.monotonic) });
@@ -2255,6 +2498,17 @@ pub const Node = struct {
         if (n.history) |h| {
             h.deinit();
             n.gpa.destroy(h);
+        }
+        if (n.edge_pool) |p| {
+            const st = &p.stats;
+            std.log.info("edge source: {d} requests, {d} failovers, {d} errors, {d} KiB on the wire, {d} KiB feeds, {d} KiB blobs", .{ st.requests.load(.monotonic), st.failovers.load(.monotonic), st.errors.load(.monotonic), st.wire_bytes.load(.monotonic) >> 10, st.raw_bytes.load(.monotonic) >> 10, st.blob_bytes.load(.monotonic) >> 10 });
+            p.deinit();
+            n.edge_pool = null;
+        }
+        if (n.edge_feeder) |f| {
+            f.deinit();
+            n.gpa.destroy(f);
+            n.edge_feeder = null;
         }
         if (n.public) |h| {
             const st = &h.stats;
@@ -2302,6 +2556,8 @@ pub const Node = struct {
     /// a small stack is refused (EINVAL), and std treats that as unreachable. The alarm already
     /// bounded the stop well under `shutdown_timeout_s`.
     fn gracefulStop(n: *Node) void {
+        // No takeover is served from this node from here on (a successor that connects now gets BUSY).
+        handoff.closeOffers();
         const t0 = source_mod.nowNs();
         const st = &serve.h2.server.stats;
         std.log.info("signal: stopping; draining {d} RPC connections ({d} calls, {d} streams in flight)", .{ st.conns.load(.monotonic), st.jobs.load(.monotonic), st.pumps.load(.monotonic) });
@@ -2323,7 +2579,7 @@ pub const Node = struct {
                 std.log.warn("shutdown: {d} connections still open after {d} ms", .{ left, (source_mod.nowNs() - t0) / std.time.ns_per_ms });
             } else std.log.info("shutdown: RPC drained in {d} ms", .{(source_mod.nowNs() - t0) / std.time.ns_per_ms});
             // The drain is over: the rest of the stop gets the plain deadline (lane fast-start).
-            _ = std.c.alarm(stop_deadline_s);
+            _ = std.c.alarm(deadlineS());
         }
         n.follower.stop();
     }
@@ -2551,6 +2807,10 @@ pub const Node = struct {
             w.print(" | kept exec jobs {d} MiB threads {d} MiB fetch {d} MiB", .{ memstat.keptBytes(.exec_jobs) >> 20, memstat.keptBytes(.exec_threads) >> 20, memstat.keptBytes(.fetch_scratch) >> 20 }) catch {};
             if (n.executor) |x| x.memLine(&w);
         }
+        if (move_vm_aot.enabled()) {
+            const st = &move_vm_aot.stats;
+            w.print(" | vm-aot modules {d} matched {d} digest-miss, functions {d} attached {d} not-hot", .{ st.modules_matched.load(.monotonic), st.modules_digest_miss.load(.monotonic), st.functions_attached.load(.monotonic), st.functions_not_hot.load(.monotonic) }) catch {};
+        }
         if (final) {
             const h = &n.follower.commit_hist;
             w.print(" | commit path p50 {d} us p99 {d} us", .{ h.quantile(0.5) / std.time.ns_per_us, h.quantile(0.99) / std.time.ns_per_us }) catch {};
@@ -2621,6 +2881,59 @@ pub const Node = struct {
 
     // ---------------------------------------------------------------- serve and metrics
 
+    /// `addr.listen`, or the socket a predecessor handed over under `name` (handoff.zig).
+    fn listenOrInherit(n: *Node, name: []const u8, text: []const u8, addr: Io.net.IpAddress, opts: Io.net.IpAddress.ListenOptions) !Io.net.Server {
+        if (handoff.inherited(name)) |h| {
+            if (std.mem.eql(u8, h.addr, text)) {
+                std.log.info("handoff: serving {s} on the inherited socket ({s})", .{ name, h.addr });
+                return .{ .socket = .{ .handle = h.fd, .address = addr }, .options = {} };
+            }
+            // the successor is configured for another address: the old socket serves the old one
+            std.log.warn("handoff: {s} is configured on {s} but the inherited socket is {s}; closing it and listening on {s}", .{ name, text, h.addr, text });
+            handoff.closeFd(h.fd);
+        }
+        return addr.listen(n.io, opts);
+    }
+
+    fn handoffOffers(ctx: *anyopaque, out: *[handoff.max_fds]handoff.Entry) usize {
+        const n: *Node = @ptrCast(@alignCast(ctx));
+        var k: usize = 0;
+        if (n.serve_server) |*s| if (n.cfg.serve_addr) |a| {
+            out[k] = .{ .name = "serve", .addr = a, .fd = s.socket.handle };
+            k += 1;
+        };
+        if (n.serve_tls_server) |*s| if (n.cfg.serve_tls_addr) |a| {
+            out[k] = .{ .name = "serve_tls", .addr = a, .fd = s.socket.handle };
+            k += 1;
+        };
+        if (n.metrics_server) |*s| if (n.cfg.metrics_addr) |a| {
+            out[k] = .{ .name = "metrics", .addr = a, .fd = s.socket.handle };
+            k += 1;
+        };
+        return k;
+    }
+
+    /// A successor asked for the store: the SIGTERM path (drain, finish the checkpoint in hand, flush).
+    fn handoffRelease(ctx: *anyopaque) void {
+        const n: *Node = @ptrCast(@alignCast(ctx));
+        // Clients that connect while the store closes and the successor opens it wait in the
+        // listen queue: make it long (the kernel caps it at net.core.somaxconn).
+        if (n.serve_server) |*s| handoff.raiseBacklog(s.socket.handle);
+        if (n.serve_tls_server) |*s| handoff.raiseBacklog(s.socket.handle);
+        std.log.info("handoff: a successor took the listening sockets; stopping to release the store", .{});
+        requestStop();
+    }
+
+    /// Starts the handoff server (this process can be taken over from) and, when this start was
+    /// itself a takeover, tells systemd and the old process that it is serving.
+    fn startHandoff(n: *Node, path: []const u8) void {
+        handoff.active = handoff.Server.start(n.gpa, path, .{ .ctx = n, .offers = handoffOffers, .release = handoffRelease, .stopping = &stop_signal }) catch |e| blk: {
+            std.log.err("handoff: cannot listen on {s}: {s} (this process cannot be upgraded without downtime)", .{ path, @errorName(e) });
+            break :blk null;
+        };
+        handoff.ready("following");
+    }
+
     fn parseAddr(text: []const u8) !Io.net.IpAddress {
         const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.BadAddress;
         const port = try std.fmt.parseInt(u16, text[colon + 1 ..], 10);
@@ -2629,6 +2942,33 @@ pub const Node = struct {
 
     /// zui/1 on `text` (UDP): raw QUIC ALPN zui/1 with the Ed25519 identity below, WebTransport
     /// (h3) with a fresh 13-day P-256 certificate whose hash goes to `native_cert_hash_file`.
+    /// The 32-byte seed in `path`, or a fresh one written there (0600, exclusive create) when the
+    /// file does not exist. Returns whether it was created. A file of another size is an error,
+    /// never silently replaced: every edge and client pinned the key it derives.
+    fn loadOrCreateSeed(io: Io, path: []const u8, seed: *[32]u8) !bool {
+        var zb: [std.fs.max_path_bytes]u8 = undefined;
+        const z = try std.fmt.bufPrintSentinel(&zb, "{s}", .{path}, 0);
+        const fd = std.c.open(z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        if (fd >= 0) {
+            defer _ = std.c.close(fd);
+            var buf: [33]u8 = undefined;
+            const got = std.c.read(fd, &buf, buf.len);
+            if (got != 32) {
+                std.log.err("zui/1 identity {s}: {d} bytes, want 32 (not replaced)", .{ path, got });
+                return error.BadIdentityFile;
+            }
+            @memcpy(seed, buf[0..32]);
+            return false;
+        }
+        io.random(seed);
+        const w = std.c.open(z, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
+        if (w < 0) return error.IdentityFileCreate;
+        defer _ = std.c.close(w);
+        if (std.c.write(w, seed, 32) != 32) return error.IdentityFileWrite;
+        if (std.c.fsync(w) != 0) return error.IdentityFileWrite;
+        return true;
+    }
+
     fn startNative(n: *Node, text: []const u8) !void {
         const addr = try parseAddr(text);
         var seed: [32]u8 = undefined;
@@ -2639,19 +2979,27 @@ pub const Node = struct {
         const now_unix: i64 = @intCast(@divTrunc(Io.Clock.real.now(n.io).toNanoseconds(), std.time.ns_per_s));
         n.native_cert = native.cert.generate(kp, serial, now_unix, 13, "localhost");
         n.native_hooks = .{ .io = n.io, .st = n.st, .rpc = &n.exec_rpc, .epochs_dir = n.epochs_dir };
-        n.native_disp = .{ .svc = &n.service, .ix = n.ix, .hooks = .{
+        if (n.cfg.edge_feed) {
+            const fd = try n.gpa.create(native.edgefeed.Feeder);
+            fd.* = native.edgefeed.Feeder.init(n.gpa);
+            n.edge_feeder = fd;
+            n.edge_warm = std.Thread.spawn(.{}, edgeWarm, .{n}) catch null;
+        }
+        n.native_disp = .{ .svc = &n.service, .ix = n.ix, .edge = n.edge_feeder, .hooks = .{
             .epoch_fallback = n.native_hooks.epochFallback(),
             .simulator = n.native_hooks.simulator(),
             .submitter = n.native_hooks.submitter(),
         } };
         var id_seed: [32]u8 = undefined;
-        n.io.random(&id_seed);
+        var pb: [std.fs.max_path_bytes]u8 = undefined;
+        const id_path = n.cfg.native_identity_file orelse try std.fmt.bufPrint(&pb, "{s}/node/native-identity.seed", .{n.cfg.dir});
+        const created = try loadOrCreateSeed(n.io, id_path, &id_seed);
         n.native_listener = try native.listener.Listener.start(n.gpa, n.io, .{ .listen = addr, .identity_seed = id_seed, .cert = &n.native_cert, .slow_worker_exit = simulate.api.releaseThreadCaches }, &n.native_disp);
         const hash = n.native_cert.sha256();
         const ed = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(id_seed);
         // GET http://ADDR/native/cert-hash on TCP at the same address (CORS, for dapps in dev)
         switch (addr) {
-            .ip4 => |a4| n.native_certhttp = native.certhttp.Server.start(n.gpa, a4.bytes, a4.port, hash) catch |e| blk: {
+            .ip4 => |a4| n.native_certhttp = native.certhttp.Server.startRpc(n.gpa, a4.bytes, a4.port, hash, if (n.cfg.native_http_rpc) &n.native_disp else null) catch |e| blk: {
                 std.log.warn("zui/1: /native/cert-hash not served on tcp {s}: {s}", .{ text, @errorName(e) });
                 break :blk null;
             },
@@ -2662,12 +3010,31 @@ pub const Node = struct {
             const line = try std.fmt.bufPrint(&buf, "{x}\n{x}\n", .{ &hash, &ed.public_key.toBytes() });
             try Io.Dir.cwd().writeFile(n.io, .{ .sub_path = f, .data = line });
         }
-        std.log.info("serving zui/1 (QUIC zui/1 + WebTransport h3) on {s}; cert sha256 {x}; zui/1 key {x}", .{ text, &hash, &ed.public_key.toBytes() });
+        std.log.info("serving zui/1 (QUIC zui/1 + WebTransport h3) on {s}; cert sha256 {x}; zui/1 key {x} ({s} {s})", .{ text, &hash, &ed.public_key.toBytes(), if (created) "new identity in" else "identity from", id_path });
+    }
+
+    /// Builds the edge feed dictionary once the store holds enough checkpoints, then returns.
+    /// The only place that builds it (requests never do); waits in short slices so stop() is quick.
+    fn edgeWarm(n: *Node) void {
+        const fd = n.edge_feeder orelse return;
+        while (!n.edge_stop.load(.acquire)) {
+            var snap = n.st.snapshot();
+            if (fd.warm(&snap)) |d| {
+                snap.release();
+                std.log.info("edge feed: dictionary {x} ({d} bytes) ready", .{ d.id, d.content.len });
+                return;
+            } else |_| snap.release();
+            // not enough checkpoints yet (a fresh store): try again in a while
+            var waited: u32 = 0;
+            while (waited < 30_000 and !n.edge_stop.load(.acquire)) : (waited += 250) {
+                n.io.sleep(.fromMilliseconds(250), .awake) catch return;
+            }
+        }
     }
 
     fn startServe(n: *Node, text: []const u8) !void {
         const addr = try parseAddr(text);
-        n.serve_server = try addr.listen(n.io, .{ .reuse_address = true, .kernel_backlog = listen_backlog });
+        n.serve_server = try n.listenOrInherit("serve", text, addr, .{ .reuse_address = true, .kernel_backlog = listen_backlog });
         @atomicStore(c_uint, &stop_drain_s, @intCast(n.cfg.drain_ms / 1000 + 2), .release);
         n.rpc_metrics = rpcmetrics.RpcMetrics.init(n.gpa);
         n.rpc_metrics.install();
@@ -2728,13 +3095,14 @@ pub const Node = struct {
         n.io.random(&serial);
         const now_unix: i64 = @intCast(@divTrunc(Io.Clock.real.now(n.io).toNanoseconds(), std.time.ns_per_s));
         n.serve_tls = native.tcptls.Server.init(n.gpa, n.io, native.cert.generate(kp, serial, now_unix, 13, "localhost"));
-        n.serve_tls_server = try addr.listen(n.io, .{ .reuse_address = true, .kernel_backlog = listen_backlog });
+        n.serve_tls_server = try n.listenOrInherit("serve_tls", text, addr, .{ .reuse_address = true, .kernel_backlog = listen_backlog });
         try n.threads.append(n.gpa, try std.Thread.spawn(.{}, serveTlsMain, .{n}));
         std.log.info("serving sui.rpc.v2 (h2 over TLS 1.3) on {s}; cert sha256 {x}", .{ text, &n.serve_tls.cert.sha256() });
     }
 
     fn serveTlsMain(n: *Node) void {
         var sopts = n.cfg.serve_opts;
+        sopts.poll_accept = n.cfg.handoff_sock != null;
         sopts.stop_grace_ns = @as(u64, n.cfg.drain_ms) * std.time.ns_per_ms;
         sopts.tls = n.serve_tls.acceptor();
         serve.stream_conn.serveBlocking(n.gpa, n.io, &n.serve_tls_server.?, sopts, n.service.handler(), &n.serve_stop) catch |e| {
@@ -2744,6 +3112,7 @@ pub const Node = struct {
 
     fn serveMain(n: *Node) void {
         var sopts = n.cfg.serve_opts;
+        sopts.poll_accept = n.cfg.handoff_sock != null;
         sopts.stop_grace_ns = @as(u64, n.cfg.drain_ms) * std.time.ns_per_ms;
         serve.stream_conn.serveBlocking(n.gpa, n.io, &n.serve_server.?, sopts, n.service.handler(), &n.serve_stop) catch |e| {
             if (!n.stopping.load(.acquire)) std.log.err("serve: {s}", .{@errorName(e)});
@@ -2784,7 +3153,7 @@ pub const Node = struct {
 
     fn startMetrics(n: *Node, text: []const u8) !void {
         const addr = try parseAddr(text);
-        n.metrics_server = try addr.listen(n.io, .{ .reuse_address = true });
+        n.metrics_server = try n.listenOrInherit("metrics", text, addr, .{ .reuse_address = true });
         try n.threads.append(n.gpa, try std.Thread.spawn(.{}, metricsMain, .{n}));
         std.log.info("metrics on http://{s}/metrics", .{text});
     }
@@ -2792,6 +3161,12 @@ pub const Node = struct {
     fn metricsMain(n: *Node) void {
         while (!n.stopping.load(.acquire)) {
             const srv = &(n.metrics_server orelse return);
+            if (n.cfg.handoff_sock != null) {
+                // handed-over listener: never block in accept, so the stop needs no wake connection
+                const ready = serve.h2.sock.waitReadableRaw(srv.socket.handle, 100) catch return;
+                if (!ready) continue;
+                if (n.stopping.load(.acquire)) return;
+            }
             const stream = srv.accept(n.io) catch return;
             n.answerMetrics(stream);
         }
@@ -2906,6 +3281,8 @@ pub const Node = struct {
         n.disk_usage.maybeRefresh(n.gpa, n.io, n.cfg.dir);
         try n.disk_usage.render(w);
         try n.state_hash.render(w);
+        // zui_protocol_* families only with --verify-fallback: default /metrics stays as main (train/12).
+        if (n.cfg.verify_fallback) try n.guard.render(w);
         try n.cons_stats.render(w);
         try n.follower.metrics.render(w);
         try core.cpu.writeMetrics(w);
@@ -2926,6 +3303,17 @@ pub const Node = struct {
         }
         if (n.p2p_server) |srv| try srv.render(w);
         if (n.p2p != null or n.p2p_server != null) try n.renderSuiP2p(w);
+        if (n.native_listener) |nl| {
+            inline for (comptime std.meta.fieldNames(native.listener.Stats)) |name| {
+                try w.print("# TYPE zui_native_{s} counter\nzui_native_{s} {d}\n", .{ name, name, @field(nl.stats, name).load(.monotonic) });
+            }
+        }
+        // Edge source (`--source zui1:`): requests, failovers, and wire / feed / blob bytes.
+        if (n.edge_pool) |ep| {
+            inline for (comptime std.meta.fieldNames(edge.client.Stats)) |name| {
+                try w.print("# TYPE zui_edge_{s} counter\nzui_edge_{s} {d}\n", .{ name, name, @field(ep.stats, name).load(.monotonic) });
+            }
+        }
         if (n.p2p_listener) |l| {
             inline for (comptime std.meta.fieldNames(@import("net").server.Stats)) |name| {
                 try w.print("# TYPE zui_p2p_listener_{s} counter\nzui_p2p_listener_{s} {d}\n", .{ name, name, @field(l.stats, name).load(.monotonic) });
@@ -3006,6 +3394,12 @@ pub const Node = struct {
             inline for (comptime std.meta.fieldNames(sigorder.Stats)) |name| {
                 try w.print("# TYPE zui_sig_order_{s} counter\nzui_sig_order_{s} {d}\n", .{ name, name, @field(o.stats, name).load(.monotonic) });
             }
+        }
+        if (n.sig_sweep) |sw| {
+            inline for (comptime std.meta.fieldNames(sigorder.SweepStats)) |name| {
+                try w.print("# TYPE zui_sig_order_sweep_{s} counter\nzui_sig_order_sweep_{s} {d}\n", .{ name, name, @field(sw.stats, name).load(.monotonic) });
+            }
+            try w.print("# TYPE zui_sig_order_sweep_next gauge\nzui_sig_order_sweep_next {d}\n# TYPE zui_sig_order_fixes gauge\nzui_sig_order_fixes {d}\n# TYPE zui_sig_order_fix_bytes gauge\nzui_sig_order_fix_bytes {d}\n", .{ sw.pos.load(.monotonic), n.st.tx_fix.count(), n.st.tx_fix.heldBytes() });
         }
         if (n.history) |h| {
             inline for (comptime std.meta.fieldNames(history.Stats)) |name| {

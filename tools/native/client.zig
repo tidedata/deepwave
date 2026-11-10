@@ -5,6 +5,10 @@
 //!   deepwave-native get        HOST:PORT KEYHEX OBJECTHEX [VERSION]
 //!   deepwave-native checkpoint HOST:PORT KEYHEX SEQ
 //!   deepwave-native sub        HOST:PORT KEYHEX checkpoints|address:HEX FROM COUNT
+//!   deepwave-native digest     HOST:PORT KEYHEX FROM COUNT [OBJECTHEX...]
+//!                         one line per checkpoint FROM..FROM+COUNT-1 (all parts) and per object
+//!                         (latest, no proof): status, body bytes and the body's sha256, over one
+//!                         connection: diff two nodes' outputs to compare what they serve
 //!   deepwave-native bench      HOST:PORT KEYHEX GRPC_HOST:PORT OBJECTHEX N CP_FROM CP_COUNT [GRPC_TLS_HOST:PORT|-] [CLIENTS=1,8,64]
 //!
 //! KEYHEX is the server's zui/1 Ed25519 key (line 2 of --native-cert-hash-file).
@@ -174,6 +178,16 @@ fn describe(w: *Io.Writer, resp: []const u8) !void {
         return w.print("error code {d}: {s}\n", .{ code, msg });
     }
     try w.print("ok flags {d} body {d} bytes\n", .{ r.flags, r.body.len });
+}
+
+fn digestLine(w: *Io.Writer, kind: []const u8, name: []const u8, seq: u64, resp: []const u8) !void {
+    const r = proto.parseResponse(resp) orelse return w.print("{s} {s} {d} bad response\n", .{ kind, name, seq });
+    var h: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(r.body, &h, .{});
+    if (std.mem.eql(u8, kind, "checkpoint"))
+        try w.print("checkpoint {d} status {d} bytes {d} sha256 {x}\n", .{ seq, r.status, r.body.len, &h })
+    else
+        try w.print("object {s} status {d} bytes {d} sha256 {x}\n", .{ name, r.status, r.body.len, &h });
 }
 
 // ---------------------------------------------------------------- subscriptions
@@ -482,7 +496,7 @@ pub fn main(init: std.process.Init) !u8 {
     const w = &ow.interface;
     defer w.flush() catch {};
     if (args.len < 4) {
-        try w.print("usage: deepwave-native hello|get|checkpoint|sub|bench HOST:PORT KEYHEX ...\n", .{});
+        try w.print("usage: deepwave-native hello|get|checkpoint|digest|sub|bench HOST:PORT KEYHEX ...\n", .{});
         return 2;
     }
     const cmd = args[1];
@@ -521,6 +535,25 @@ pub fn main(init: std.process.Init) !u8 {
     } else if (std.mem.eql(u8, cmd, "checkpoint")) {
         const resp = try cl.request(a, .get_checkpoint, 0, try checkpointReq(a, try std.fmt.parseInt(u64, args[4], 10), 0x0f));
         try describe(w, resp);
+    } else if (std.mem.eql(u8, cmd, "digest")) {
+        if (args.len < 6) return 2;
+        const from = try std.fmt.parseInt(u64, args[4], 10);
+        const count = try std.fmt.parseInt(u64, args[5], 10);
+        var it_arena: std.heap.ArenaAllocator = .init(gpa);
+        defer it_arena.deinit();
+        for (0..count) |k| {
+            defer _ = it_arena.reset(.retain_capacity);
+            const ia = it_arena.allocator();
+            const seq = from + k;
+            const resp = try cl.request(ia, .get_checkpoint, 0, try checkpointReq(ia, seq, 0x0f));
+            try digestLine(w, "checkpoint", args[4], seq, resp);
+        }
+        for (args[6..]) |oid| {
+            defer _ = it_arena.reset(.retain_capacity);
+            const ia = it_arena.allocator();
+            const resp = try cl.request(ia, .get_object, 0, try objectKey(ia, try hex32(oid), null));
+            try digestLine(w, "object", oid, 0, resp);
+        }
     } else if (std.mem.eql(u8, cmd, "sub")) {
         const r = try subscribe(cl, a, args[4], try std.fmt.parseInt(u64, args[5], 10), try std.fmt.parseInt(u64, args[6], 10), 0, w);
         try w.print("frames {d} checkpoints {d} bytes {d} first {d:.2} ms total {d:.2} ms\n", .{ r.frames, r.checkpoints, r.bytes, @as(f64, @floatFromInt(r.first_ns)) / 1e6, @as(f64, @floatFromInt(r.total_ns)) / 1e6 });

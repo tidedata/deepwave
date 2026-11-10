@@ -16,6 +16,7 @@ const Io = std.Io;
 const bcs = @import("bcs");
 const types = @import("types");
 const checkpoint = @import("checkpoint");
+const core_pool = @import("core").pool;
 const sync = @import("sync");
 const source_mod = @import("source.zig");
 const Source = source_mod.Source;
@@ -223,7 +224,37 @@ pub const EpochIndex = struct {
         const a = @field(x, f);
         return if (e < a.len) a[@intCast(e)] else null;
     }
+
+    /// A checkpoint at or before the first one of epoch `e`: the newest the index knows (the first
+    /// of `e` or of an earlier epoch, or one past an earlier epoch's last). 0 when it knows none.
+    /// The bisection for an epoch past a stale index starts here, not at 0: a bisection from 0
+    /// probes old checkpoints the public bucket does not hold (only end-of-epoch ones).
+    fn floor(x: *const EpochIndex, e: u64) u64 {
+        var k = e + 1;
+        while (k > 0) {
+            k -= 1;
+            if (k < e) if (x.get("last", k)) |l| return l + 1;
+            if (x.get("first", k)) |f| return f;
+        }
+        return 0;
+    }
 };
+
+test "EpochIndex.floor: newest known checkpoint at or before an epoch's start" {
+    var first = [_]?u64{ 0, 10, 20, null };
+    var last = [_]?u64{ 9, 19, null, null };
+    var pv = [_]?u64{ 1, 1, 1, null };
+    const x: EpochIndex = .{ .first = &first, .last = &last, .pv = &pv };
+    try std.testing.expectEqual(@as(u64, 20), x.floor(2));
+    try std.testing.expectEqual(@as(u64, 20), x.floor(3)); // past the index: its newest first
+    try std.testing.expectEqual(@as(u64, 20), x.floor(9));
+    try std.testing.expectEqual(@as(u64, 10), x.floor(1));
+    first[2] = null; // epoch 2's start unknown: one past epoch 1's last
+    last[1] = 25;
+    try std.testing.expectEqual(@as(u64, 26), x.floor(2));
+    const empty: EpochIndex = .{};
+    try std.testing.expectEqual(@as(u64, 0), empty.floor(5));
+}
 
 pub const Walker = struct {
     gpa: std.mem.Allocator,
@@ -369,9 +400,13 @@ pub const Walker = struct {
             for (p.certs) |c| got += @intFromBool(c != null);
             std.log.info("trust walk: prefetched {d} of {d} end-of-epoch certificates with {d} threads in {d} ms", .{ got, p.certs.len, w.parallel, (source_mod.nowNs() - t0) / std.time.ns_per_ms });
         };
+        var win: PreWindow = .{ .gpa = w.gpa };
+        defer win.deinit();
         while (e < target) : (e += 1) {
+            // pool lanes: the next window of prefetched certificates is checked in parallel first
+            if (pre) |*p| if (e >= win.hi) win.fill(p, e, target, &committee);
             const last = w.index.get("last", e) orelse blk: {
-                const lo = if (prev_last) |p| p + 1 else (w.index.get("first", e) orelse 0);
+                const lo = if (prev_last) |p| p + 1 else w.index.floor(e);
                 break :blk try w.findEpochEnd(&sc, e, lo, tip, &probe);
             };
             const pre_cert: ?checkpoint.CertifiedSummaryView = if (e + 1 == target) null else if (pre) |*p| p.get(e) else null;
@@ -379,7 +414,8 @@ pub const Walker = struct {
                 if (!try w.fetch(&sc, last, &buf)) return error.SourceMissing;
             }
             const cert = pre_cert orelse try blobCert(buf.items);
-            const v = checkpoint.verifyCertifiedSummary(&committee, cert);
+            // a window verdict was computed on these very bytes with this very committee
+            const v = (if (pre_cert != null) win.verdict(e) else null) orelse checkpoint.verifyCertifiedSummary(&committee, cert);
             if (v != .ok) {
                 if (w.log) std.log.err("trust walk: end-of-epoch checkpoint {d} of epoch {d} does not verify: {s}", .{ last, e, @tagName(v) });
                 return error.UntrustedCheckpoint;
@@ -409,7 +445,8 @@ pub const Walker = struct {
             }
             var next_arena: std.heap.ArenaAllocator = .init(w.gpa);
             errdefer next_arena.deinit();
-            const next = checkpoint.nextCommittee(next_arena.allocator(), s) catch return error.UntrustedCheckpoint;
+            const next = (if (pre_cert != null) win.takeCommittee(e, &next_arena) else null) orelse
+                (checkpoint.nextCommittee(next_arena.allocator(), s) catch return error.UntrustedCheckpoint);
             pv = s.next_protocol_version;
             cur_arena.deinit();
             cur_arena = next_arena;
@@ -428,6 +465,106 @@ pub const Walker = struct {
         out.rgp = params.rgp;
         out.start_ms = params.start_ms;
         return out;
+    }
+};
+
+/// Parallel step of the trust walk over a window of prefetched end-of-epoch certificates
+/// [lo, hi): the committee of epoch e + 1 depends only on certificate e's summary, so every
+/// committee of the window is derived at once, then every certificate is verified with the
+/// committee its predecessor hands over, on the lanes of core.pool.shared(). The walk still goes
+/// epoch by epoch over the results, so the first failure, its message and error are the serial
+/// walk's; where a step could not be precomputed (a summary that does not parse, a committee
+/// that cannot form) the walk does that step itself.
+const PreWindow = struct {
+    gpa: std.mem.Allocator,
+    lo: u64 = 0,
+    hi: u64 = 0,
+    /// Index i: certificate lo + i (null: not computed).
+    verdicts: []?checkpoint.Verdict = &.{},
+    /// Index i: the committee of epoch lo + i + 1, from certificate lo + i, in `arenas[i]`.
+    comms: []?checkpoint.Committee = &.{},
+    arenas: []std.heap.ArenaAllocator = &.{},
+    taken: []bool = &.{},
+    certs: []checkpoint.CertifiedSummaryView = &.{},
+    cur: *const checkpoint.Committee = undefined,
+
+    fn deinit(wn: *PreWindow) void {
+        for (wn.arenas, wn.taken) |*a, t| if (!t) a.deinit();
+        wn.gpa.free(wn.verdicts);
+        wn.gpa.free(wn.comms);
+        wn.gpa.free(wn.arenas);
+        wn.gpa.free(wn.taken);
+        wn.gpa.free(wn.certs);
+        wn.* = .{ .gpa = wn.gpa, .lo = wn.lo, .hi = wn.hi };
+    }
+
+    /// Precomputes [e, hi) where hi < target and every certificate is prefetched; `cur` is the
+    /// committee of epoch e. Does nothing without a pool of 2+ lanes (or on allocation failure).
+    fn fill(wn: *PreWindow, p: *const Walker.Prefetch, e: u64, target: u64, cur: *const checkpoint.Committee) void {
+        wn.deinit();
+        wn.lo = e;
+        wn.hi = e;
+        const pool = core_pool.shared() orelse return;
+        const lanes = pool.lanes();
+        if (lanes < 2 or e + 1 >= target) return;
+        const cap: u64 = @min(256, 16 * lanes);
+        var hi = e;
+        while (hi < target - 1 and hi - e < cap and p.get(hi) != null) hi += 1;
+        const n: usize = @intCast(hi - e);
+        if (n < 2) return;
+        const g = wn.gpa;
+        wn.verdicts = g.alloc(?checkpoint.Verdict, n) catch return;
+        wn.comms = g.alloc(?checkpoint.Committee, n) catch return wn.deinit();
+        wn.arenas = g.alloc(std.heap.ArenaAllocator, n) catch return wn.deinit();
+        wn.taken = g.alloc(bool, n) catch return wn.deinit();
+        wn.certs = g.alloc(checkpoint.CertifiedSummaryView, n) catch return wn.deinit();
+        for (0..n) |i| {
+            wn.arenas[i] = .init(g);
+            wn.taken[i] = false;
+            wn.verdicts[i] = null;
+            wn.comms[i] = null;
+            wn.certs[i] = p.get(e + i).?;
+        }
+        wn.cur = cur;
+        wn.hi = hi;
+        core_pool.forRange(pool, n, 1, 0, wn, derive);
+        core_pool.forRange(pool, n, 1, 0, wn, check);
+    }
+
+    fn derive(wn: *PreWindow, lo: usize, hi: usize) void {
+        for (lo..hi) |i| {
+            const s = checkpoint.Summary.parse(wn.certs[i].summary) catch continue;
+            if (s.epoch != wn.lo + i) continue;
+            wn.comms[i] = checkpoint.nextCommittee(wn.arenas[i].allocator(), s) catch null;
+        }
+    }
+
+    fn check(wn: *PreWindow, lo: usize, hi: usize) void {
+        for (lo..hi) |i| {
+            const c: *const checkpoint.Committee = if (i == 0) wn.cur else if (wn.comms[i - 1]) |*x| x else continue;
+            wn.verdicts[i] = checkpoint.verifyCertifiedSummary(c, wn.certs[i]);
+        }
+    }
+
+    /// The verdict of certificate `e` against the committee the walk holds at `e` (the window's
+    /// own derivation of it), null when not precomputed.
+    fn verdict(wn: *const PreWindow, e: u64) ?checkpoint.Verdict {
+        if (e < wn.lo or e >= wn.hi) return null;
+        const i: usize = @intCast(e - wn.lo);
+        // epoch e's committee came from the window only if it was taken from it (or is `cur`)
+        if (i > 0 and !wn.taken[i - 1]) return null;
+        return wn.verdicts[i];
+    }
+
+    /// The committee of epoch e + 1, moving its arena into `into` (whose own arena is freed).
+    fn takeCommittee(wn: *PreWindow, e: u64, into: *std.heap.ArenaAllocator) ?checkpoint.Committee {
+        if (e < wn.lo or e >= wn.hi) return null;
+        const i: usize = @intCast(e - wn.lo);
+        const c = wn.comms[i] orelse return null;
+        into.deinit();
+        into.* = wn.arenas[i];
+        wn.taken[i] = true;
+        return c;
     }
 };
 

@@ -9,6 +9,9 @@ and serves the same `sui.rpc.v2` gRPC API, with answers byte for byte the ones s
 gives. It reads sui-node's `fullnode.yaml` and command line, supports protocol versions 1 to 142,
 and has no RocksDB and no Rust: everything is Zig, apart from the vendored zstd library.
 
+Deepwave is in beta.
+The validator part is under development and should not be used.
+
 ## Why
 
 Measured against sui-node 1.83.1 on the same machine (Mysten's recommended full-node spec) with the
@@ -27,8 +30,7 @@ same mainnet inputs. Details in [docs/performance.md](docs/performance.md).
 
 - **OS**: x86_64 Linux with glibc 2.35 or newer (Ubuntu 22.04, 24.04) for production. macOS on
   Apple silicon works for development.
-- **Hardware**: Mysten's full-node spec class: 8 cores / 16 vCPU (AVX2 or newer), 128 GB RAM,
-  local NVMe with at least 300 GB free for default retention.
+- **Hardware**: 4 cores or more (AVX2 or newer), 16 GB RAM, local NVMe with 250 GB free.
 - **Zig 0.17.1**, pinned: the `./zig` wrapper downloads and verifies it on first use. Nothing else.
 
 ## Build

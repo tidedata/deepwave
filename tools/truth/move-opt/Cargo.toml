@@ -1,0 +1,25 @@
+[package]
+name = "zui-truth-move-opt"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Ground truth for deepwave-move optimize: Mysten's move-binary-format, move-bytecode-verifier and sui-verifier (1.83.1) over .mv files, to confirm that what deepwave-move emits verifies in Rust too"
+
+# Standalone workspace. ../../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
+[workspace]
+
+[[bin]]
+name = "zui-truth-move-opt"
+path = "src/main.rs"
+
+[dependencies]
+sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
+sui-verifier-latest = { path = "../../sui/sui-execution/latest/sui-verifier" }
+move-binary-format = { path = "../../sui/external-crates/move/crates/move-binary-format" }
+move-bytecode-verifier = { path = "../../sui/external-crates/move/crates/move-bytecode-verifier" }
+move-bytecode-verifier-meter = { path = "../../sui/external-crates/move/crates/move-bytecode-verifier-meter" }
+serde_json = "1"
+anyhow = "1"
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }

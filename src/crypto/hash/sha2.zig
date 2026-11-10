@@ -33,7 +33,18 @@ fn Wrap(comptime T: type) type {
 // (the Rust `sha2` crate does the same via `cpufeatures`; a build for generic x86-64 must not
 // fall to 5x slower code just because the build flags omit `+sha`), and a portable fallback.
 
-pub const Sha256 = if (builtin.cpu.arch == .x86_64) Sha256X86 else Wrap(S.Sha256);
+pub const Sha256 = if (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64) Sha256X86 else Wrap(S.Sha256);
+
+/// aarch64 target has the SHA2 instructions (std's block function then uses them).
+const arm_sha2_hw = builtin.cpu.arch == .aarch64 and builtin.zig_backend != .stage2_c and std.Target.aarch64.featureSetHas(builtin.cpu.features, .sha2);
+
+/// Whole 64-byte blocks through std's compression (the ARMv8 SHA2 path in a build that has it).
+fn compress256Std(st: *[8]u32, data: []const u8) void {
+    var d = S.Sha256.init(.{});
+    d.s = st.*;
+    d.update(data); // whole blocks only: compressed straight from `data`, nothing buffered
+    st.* = d.s;
+}
 
 const k256 = [64]u32{
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -214,7 +225,11 @@ fn cpuHasShaNi() bool {
 }
 
 fn compress256Blocks(st: *[8]u32, data: []const u8) void {
-    if (sha_ni_compiles and cpuHasShaNi()) compress256Ni(st, data) else compress256Soft(st, data);
+    if (comptime builtin.cpu.arch == .aarch64) {
+        if (arm_sha2_hw and cpu.armSha2Allowed()) compress256Std(st, data) else compress256Soft(st, data);
+        return;
+    }
+    if (sha_ni_compiles and cpu.shaNiAllowed() and cpuHasShaNi()) compress256Ni(st, data) else compress256Soft(st, data);
 }
 
 const Sha256X86 = struct {
@@ -306,7 +321,10 @@ pub const has_sha512_hw = builtin.cpu.arch == .aarch64 and builtin.zig_backend !
 /// One SHA-512 block: the ARMv8.2 instructions where the target has them, else the portable
 /// rounds, which dispatch at runtime on x86-64 (core/cpu.zig: BMI2 `rorx` in the AVX2 object).
 pub fn compress512(st: *[8]u64, block: *const [128]u8) void {
-    if (comptime has_sha512_hw) return compress512Hw(st, block);
+    if (comptime has_sha512_hw) {
+        if (cpu.armSha512Allowed()) return compress512Hw(st, block);
+        return compress512Soft(st, block);
+    }
     cpu.call("sha512_block", compress512Soft, .{ st, block });
 }
 

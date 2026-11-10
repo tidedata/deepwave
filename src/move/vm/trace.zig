@@ -52,6 +52,8 @@ const TYPE_DEPTH_MAX: u64 = 256;
 const MAX_TYPE_INSTANTIATION_NODES: u64 = 128;
 
 pub const Tracer = struct {
+    /// Gas-only profile mode (profile.zig): the hooks feed the profiler and skip all rendering.
+    prof: ?*@import("profile.zig").Profiler = null,
     arena: Allocator,
     /// Event lines, each ending in '\n'.
     out: std.ArrayList(u8) = .empty,
@@ -661,6 +663,7 @@ pub const Tracer = struct {
     // ---- entry points -------------------------------------------------------------------------
 
     pub fn enterInitialFrame(t: *Tracer, s: *Session, func: *const Function, ty_args: []const *const Type, args: []const Value) E!void {
+        if (t.prof) |p| return p.enter(s.meter, func);
         if (!try t.enterInitialFrameImpl(s, func, ty_args, args)) try t.reportError("Unknown");
     }
 
@@ -699,6 +702,7 @@ pub const Tracer = struct {
     }
 
     pub fn enterFrame(t: *Tracer, s: *Session, func: *const Function, ty_args: []const *const Type) E!void {
+        if (t.prof) |p| return p.enter(s.meter, func);
         if (!try t.enterFrameImpl(s, func, ty_args)) try t.reportError("Unknown");
     }
 
@@ -742,6 +746,7 @@ pub const Tracer = struct {
     /// `exit_frame`: a returning frame (Ret, or a native call that finished). `err` is the
     /// failing status of a native call.
     pub fn exitFrame(t: *Tracer, s: *Session, func: *const Function, err: ?StatusCode) E!void {
+        if (t.prof) |p| return p.exit(s.meter);
         if (err) |e| {
             try t.effectNow(try t.execError(@tagName(e)));
             return;
@@ -800,6 +805,7 @@ pub const Tracer = struct {
     }
 
     pub fn startInstruction(t: *Tracer, s: *Session, ins: ff.Instr, pc: u16) E!void {
+        if (t.prof) |p| return p.start(s.meter, s.frames.items[s.frames.items.len - 1].func, @intFromEnum(ins.op), pc);
         t.pc = pc;
         t.ins = ins;
         if ((try t.startImpl(s, ins)) == null) try t.reportError("Unknown");
@@ -859,6 +865,7 @@ pub const Tracer = struct {
 
     /// `end_instruction`: `err` is the status of a failed operation.
     pub fn endInstruction(t: *Tracer, s: *Session, err: ?StatusCode) E!void {
+        if (t.prof) |p| return p.end(s.meter);
         const gas = s.meter.remainingGas();
         const pc = t.pc orelse {
             try t.reportError("PC always set by this point by `open_instruction`");
