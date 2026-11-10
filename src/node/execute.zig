@@ -580,6 +580,12 @@ pub const Executor = struct {
             exec.ptb.pkgs.cache_bytes.load(.monotonic) >> 20, exec.ptb.pkgs.cache_rebuilds.load(.monotonic),
             exec.ptb.pkgs.max_cache_bytes >> 20,    memstat.exec_gpa.bytes() >> 20,
         }) catch {};
+        // The process-wide parsed-package table (bytes counted once; a cache's MiB above
+        // includes the entries it pins there).
+        if (exec.ptb.pkgs.shared_enabled) w.print(" pkg table {d} ({d} MiB, cap {d} MiB, {d} evictions)", .{
+            exec.ptb.pkgs.shared.entries.load(.monotonic), exec.ptb.pkgs.shared.bytes_held.load(.monotonic) >> 20,
+            exec.ptb.pkgs.shared.max_bytes >> 20,          exec.ptb.pkgs.shared.evictions.load(.monotonic),
+        }) catch {};
     }
 
     /// `pkgs_view`'s fallback: `pkgs` under a shared lock (the bytes are never freed or moved).
@@ -644,8 +650,9 @@ pub const Executor = struct {
         exec.ptb.pkgs.epoch_window = 1;
         // Each thread keeps up to two epochs' package caches (VM runtimes holding every package
         // the thread loaded that epoch); the epoch's working set grows with the chain's package
-        // count, so the caches share one budget instead of 1.5 GiB each.
-        exec.ptb.pkgs.max_cache_bytes = @max(32 << 20, x.cache_budget / (@as(usize, @max(threads, 1)) * 2));
+        // count, so the caches share one budget instead of 1.5 GiB each. The process-wide
+        // parsed-package table, when on, is counted in that budget once (`pkgs.setBudget`).
+        exec.ptb.pkgs.setBudget(x.cache_budget, @as(usize, @max(threads, 1)) * 2);
         x.bindView();
         if (threads == 0) return;
         const p = &x.pool;

@@ -70,7 +70,7 @@ impl ObjectStore for MapStore<'_> {
     }
 }
 
-fn fw(module: &str, name: &str, params: Vec<TypeTag>) -> StructTag {
+pub(crate) fn fw(module: &str, name: &str, params: Vec<TypeTag>) -> StructTag {
     StructTag {
         address: move_core_types::account_address::AccountAddress::TWO,
         module: move_core_types::identifier::Identifier::new(module).unwrap(),
@@ -80,7 +80,7 @@ fn fw(module: &str, name: &str, params: Vec<TypeTag>) -> StructTag {
 }
 
 /// `Field<K, Setting<bool>>` under `config` with the given key, as the store holds it.
-fn setting_object(config: ObjectID, key_name: &str, key: &[u8], newer_epoch: u64, newer: Option<bool>, older: Option<bool>) -> Result<Object> {
+pub(crate) fn setting_object(config: ObjectID, key_name: &str, key: &[u8], newer_epoch: u64, newer: Option<bool>, older: Option<bool>) -> Result<Object> {
     let key_tag = TypeTag::Struct(Box::new(fw("deny_list", key_name, vec![])));
     let id = sui_types::dynamic_field::derive_dynamic_field_id(config, &key_tag, key)?;
     let mut contents = id.to_vec();
@@ -126,7 +126,7 @@ impl Ctx<'_> {
     /// `clock::borrow`, protocol 142).
     fn run_sys(&self, data: &TransactionData, inputs: &HashMap<ObjectID, Object>, latest: &HashMap<ObjectID, Object>, digest: Option<TransactionDigest>, sysv: sui_types::base_types::SystemObjectVersions) -> Result<Run> {
         let ep = self.env.epochs[self.epoch as usize];
-        let store = ExecStore { inputs, packages: &self.env.packages, system: &self.env.system, epoch: self.epoch, latest: Some(latest) };
+        let store = ExecStore { inputs, packages: &self.env.packages, system: &self.env.system, epoch: self.epoch, latest: Some(latest), reads: None };
         let mut reads = Vec::new();
         for k in data.input_objects()? {
             if matches!(k, InputObjectKind::MovePackage(_)) {

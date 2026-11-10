@@ -29,6 +29,7 @@ pub const dflayout = @import("dflayout.zig");
 pub const conformance = @import("conformance.zig");
 pub const feed = @import("feed.zig");
 pub const lsm = @import("lsm.zig");
+pub const bulk = @import("bulk.zig");
 
 pub const Kind = enum(u8) { address = 0, object = 1 };
 pub const CoinWrapper = enum(u8) { metadata = 0, treasury = 1, regulated = 2 };
@@ -578,5 +579,7 @@ test {
     std.testing.refAllDecls(Index);
     _ = @import("live_test.zig");
     _ = @import("lsm_test.zig");
+    _ = @import("bulk_test.zig");
     _ = lsm;
+    _ = bulk;
 }

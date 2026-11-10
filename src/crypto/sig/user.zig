@@ -758,9 +758,13 @@ fn addressOf(flag: u8, pk: []const u8) Address {
 }
 
 /// fastcrypto public key parsing for a plain signature's key (PublicKey::try_from_bytes).
+/// Every arm goes through the decoded-key cache (sig/fast.zig, off by default: then this is the
+/// plain decoder). With the cache on, the key decoded here is the one `verifySingle` reuses, so
+/// intake decodes each Ed25519 key once instead of twice; a key that does not decode is cached
+/// as such and is the same InvalidSignature from `address`.
 fn pkValid(scheme: Scheme, pk: []const u8) bool {
     return switch (scheme) {
-        .ed25519 => pk.len == 32 and ed25519.decompress(pk[0..32]) != null,
+        .ed25519 => pk.len == 32 and fast.edDecodeKey(pk[0..32]) != null,
         .secp256k1 => fast.ecdsaDecodeKey(.k1, pk) != null,
         .secp256r1 => fast.ecdsaDecodeKey(.r1, pk) != null,
         .mldsa65 => pk.len == mldsa65_pk_bytes, // TODO(crypto-sig): fastcrypto-pq key checks
@@ -1357,4 +1361,112 @@ test "ed25519 verified cache: verdicts unchanged, a hit only for the exact tripl
     fast.configure(.{});
     try std.testing.expectEqual(want[0], try verifyUserSignatureDigest(&env, &digest, &a.addr, &a.sig, &sc));
     try std.testing.expectEqual(st.hits, fast.edVerifiedStats().hits);
+}
+
+// Intake exactness (old against new on the same inputs): for every item of the Ed25519 edge set
+// (ed25519_exact.zig: ZIP-215 small-order and non-canonical keys, keys that do not decode,
+// mixed-order keys, honest signatures and their corruptions), the address step and the verify
+// step must give the decision and the error kind the plain decoder and the reference verifier
+// give, with the key cache off, on and cold, and on and warm.
+test "intake exactness: Ed25519 key decisions and error kinds on the edge set, key cache off, cold and warm" {
+    const exact = @import("ed25519_exact.zig");
+    const gpa = std.testing.allocator;
+    const set = try exact.Set.initOpts(gpa, true);
+    defer set.deinit();
+    const env: UserSigEnv = .{ .epoch = 0 };
+    fast.configure(.{});
+    fast.clearCaches();
+    defer fast.configure(.{});
+    defer fast.clearCaches();
+    var sc: [64]u8 = undefined;
+    const stranger: Address = @splat(0x5a);
+    var n_bad_key: usize = 0;
+    var n_valid: usize = 0;
+    for ([_]bool{ false, true, true }) |cache_on| {
+        fast.configure(.{ .pk_cache = cache_on });
+        for (set.items, set.want) |*it, w| {
+            var bytes: [ed_sig_len]u8 = undefined;
+            bytes[0] = 0;
+            bytes[1..65].* = it.sig;
+            bytes[65..97].* = it.pk;
+            const digest = it.msg()[0..32];
+            var p: Parsed = undefined;
+            try std.testing.expect(parse(&bytes, &p, &sc) == null);
+            const ar = try address(&p);
+            // the old rule of the address step: the plain decoder on the key bytes
+            if (ed25519.decompress(&it.pk) == null) {
+                try std.testing.expect(std.meta.eql(w, Verdict{ .invalid = .pk_invalid_input }));
+                try std.testing.expect(std.meta.eql(ar, AddressResult{ .err = .InvalidSignature }));
+                // verify_claims on such a key: the key conversion fails before anything else
+                const v = try verifyParsed(&env, &p, digest, &stranger, &sc);
+                try std.testing.expect(std.meta.eql(v, Verdict{ .invalid = .KeyConversionError }));
+                n_bad_key += 1;
+                continue;
+            }
+            const addr = addressOf(0, &it.pk);
+            try std.testing.expect(std.meta.eql(ar, AddressResult{ .ok = addr }));
+            const want: Verdict = if (w == .valid) .valid else .{ .invalid = .InvalidSignature };
+            const got = try verifyParsed(&env, &p, digest, &addr, &sc);
+            if (!std.meta.eql(got, want)) {
+                std.debug.print("intake ({s}, cache {}): want {s}, got {s}\n", .{ it.tag, cache_on, want.truthName(), got.truthName() });
+                return error.VerdictMismatch;
+            }
+            // the author check comes before the signature check
+            const v2 = try verifyParsed(&env, &p, digest, &stranger, &sc);
+            try std.testing.expect(std.meta.eql(v2, Verdict{ .invalid = .IncorrectSigner }));
+            // the same through the one-call entry
+            const v3 = try verifyUserSignatureDigest(&env, digest, &addr, &bytes, &sc);
+            try std.testing.expect(std.meta.eql(v3, want));
+            n_valid += @intFromBool(w == .valid);
+        }
+    }
+    try std.testing.expect(n_bad_key >= 3 * 24);
+    try std.testing.expect(n_valid >= 3 * 300);
+}
+
+test "intake decodes an Ed25519 key once when the key cache is on: the address step fills it, the verify step reuses it" {
+    const env: UserSigEnv = .{ .epoch = 0 };
+    fast.configure(.{ .pk_cache = true });
+    fast.clearCaches();
+    defer fast.configure(.{});
+    defer fast.clearCaches();
+    var sc: [64]u8 = undefined;
+    const digest: [32]u8 = @splat(0x21);
+    const a = testEdSig(0x31, &digest);
+    const before = fast.pkCacheStats().ed25519;
+    // cold key: one decode (the miss of the address step), then a hit in the verify step
+    var p: Parsed = undefined;
+    try std.testing.expect(parse(&a.sig, &p, &sc) == null);
+    const ar = try address(&p);
+    try std.testing.expect(std.meta.eql(ar, AddressResult{ .ok = a.addr }));
+    try std.testing.expectEqual(Verdict.valid, try verifyParsed(&env, &p, &digest, &a.addr, &sc));
+    const cold = fast.pkCacheStats().ed25519;
+    try std.testing.expectEqual(@as(u64, 1), cold.misses - before.misses);
+    try std.testing.expectEqual(@as(u64, 1), cold.inserts - before.inserts);
+    try std.testing.expectEqual(@as(u64, 1), cold.hits - before.hits);
+    // warm key: no decode at all, both steps hit
+    _ = try address(&p);
+    try std.testing.expectEqual(Verdict.valid, try verifyParsed(&env, &p, &digest, &a.addr, &sc));
+    const warm = fast.pkCacheStats().ed25519;
+    try std.testing.expectEqual(cold.misses, warm.misses);
+    try std.testing.expectEqual(cold.inserts, warm.inserts);
+    try std.testing.expectEqual(@as(u64, 2), warm.hits - cold.hits);
+    // a key that does not decode: the same error from the address step cold and from the cache
+    var bad = a.sig;
+    var y: [32]u8 = @splat(0);
+    var c: u8 = 2;
+    while (ed25519.decompress(&y) != null) : (c += 1) y[0] = c;
+    bad[65..97].* = y;
+    try std.testing.expect(parse(&bad, &p, &sc) == null);
+    for (0..2) |_| {
+        try std.testing.expect(std.meta.eql(try address(&p), AddressResult{ .err = .InvalidSignature }));
+        try std.testing.expect(std.meta.eql(try verifyParsed(&env, &p, &digest, &a.addr, &sc), Verdict{ .invalid = .KeyConversionError }));
+    }
+    const undec = fast.pkCacheStats().ed25519;
+    try std.testing.expectEqual(@as(u64, 1), undec.misses - warm.misses);
+    try std.testing.expectEqual(@as(u64, 1), undec.inserts - warm.inserts);
+    // switch off: the cache is not read at all
+    fast.configure(.{});
+    _ = try address(&p);
+    try std.testing.expectEqual(undec.hits + undec.misses, fast.pkCacheStats().ed25519.hits + fast.pkCacheStats().ed25519.misses);
 }

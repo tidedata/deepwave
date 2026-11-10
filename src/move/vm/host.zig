@@ -49,6 +49,25 @@ pub const Host = struct {
     /// Native type arguments (tags and layouts) by type, kept by the caller for the runtime's
     /// life; null computes them per call.
     ty_cache: ?*TyArgCache = null,
+    /// DevInspect<true> (`Mode::allow_arbitrary_function_calls`): natives can be called with
+    /// type arguments their Move callers never pass, so a native's result may not have the shape
+    /// of its declared type (a native written for `Balance<T>` asked for a `u256`). Rust's VM
+    /// values are dynamically typed: the native boundary checks only the number of return
+    /// values (`call_native_with_args`), the value travels on, and it fails where it is first
+    /// read against its type. The values here are built from the declared type, so each result
+    /// is checked first. Off: no check.
+    ///
+    /// A native that says what layout its value has (`Outcome.ok.actual`) gets Rust's behaviour:
+    /// when the value would not serialize as the declared type (`serializesAs`) it is built with
+    /// its own layout, pushed, and the session is marked `tainted`: from there only instructions
+    /// that move values run (`Session.taintedLoop`), and the executor fails the command where
+    /// sui-node's `tracked_results` cannot serialize the result. Any other mismatch stops the
+    /// call (`ill_typed`).
+    arbitrary_calls: bool = false,
+    /// A native under `arbitrary_calls` returned a value that is not of its declared type and
+    /// did not say what it is; the call failed with an invariant error the executor must not
+    /// report as sui-node's answer.
+    ill_typed: bool = false,
 
     pub fn table(h: *const Host) interp.NativeTable {
         // `lookup` reads only the execution version off the host: one memo key per version.
@@ -235,6 +254,19 @@ fn call(ctx: *interp.NativeContext, data: ?*const anyopaque, ty_args: []const *c
         .err => |e| return ctx.fail(e.status, e.sub),
         .ok, .abort => {},
     }
+    // The layout of return value 0 when it is not a value of its declared type (see `arbitrary_calls`).
+    var as_is: ?*const Layout = null;
+    if (host.arbitrary_calls) switch (try resultTyping(scratch, m, func, tys, ty_args, params, largs, writes_back, out)) {
+        .typed => {},
+        .as_is => |l| {
+            as_is = l;
+            ctx.session.tainted = true;
+        },
+        .unknown => {
+            host.ill_typed = true;
+            return ctx.fail(.UNKNOWN_INVARIANT_VIOLATION_ERROR, null);
+        },
+    };
     // `&mut` arguments: the native updated `largs[i]` in place.
     if (writes_back) for (args, params, largs, func.params) |a, p, lv, tok| switch (p.*) {
         .mut_ref => |inner| writeThrough(heap, a, if (tokLayout(tok, tys)) |l| try fromLayoutL(heap, l, lv) else try fromLayout(heap, inner, lv)),
@@ -273,7 +305,11 @@ fn call(ctx: *interp.NativeContext, data: ?*const anyopaque, ty_args: []const *c
             }
             if (o.rets.len != func.returns.len) return ctx.fail(.UNKNOWN_INVARIANT_VIOLATION_ERROR, null);
             const rets = try scratch.alloc(Value, o.rets.len);
-            for (func.returns, o.rets, rets) |tok, lv, *r| {
+            for (func.returns, o.rets, rets, 0..) |tok, lv, *r, i| {
+                if (i == 0) if (as_is) |l| {
+                    r.* = try fromLayoutL(heap, l, lv);
+                    continue;
+                };
                 if (tokLayout(tok, tys)) |l| {
                     r.* = try fromLayoutL(heap, l, lv);
                     continue;
@@ -285,6 +321,193 @@ fn call(ctx: *interp.NativeContext, data: ?*const anyopaque, ty_args: []const *c
         },
         .abort => |a| return .{ .cost = a.cost, .outcome = .{ .abort = a.code } },
         .err => unreachable,
+    }
+}
+
+/// `v` has the shape of a value of layout `l` (what `fromLayoutL` and `fromLayout` assume).
+pub fn conforms(l: *const Layout, v: LV) bool {
+    return switch (l.*) {
+        .bool => v == .bool,
+        .u8 => v == .u8,
+        .u16 => v == .u16,
+        .u32 => v == .u32,
+        .u64 => v == .u64,
+        .u128 => v == .u128,
+        .u256 => v == .u256,
+        .address => v == .address,
+        .signer => v == .signer,
+        .vector => |e| switch (v) {
+            .bytes => e.* == .u8,
+            .vector => |items| for (items) |it| {
+                if (!conforms(e, it)) break false;
+            } else true,
+            else => false,
+        },
+        .@"struct" => |sl| blk: {
+            if (v != .@"struct" or v.@"struct".len != sl.@"0".len) break :blk false;
+            for (sl.@"0", v.@"struct") |*fl, it| if (!conforms(fl, it)) break :blk false;
+            break :blk true;
+        },
+        .@"enum" => |el| blk: {
+            if (v != .variant or v.variant.tag >= el.@"0".len) break :blk false;
+            const fields = el.@"0"[v.variant.tag];
+            if (fields.len != v.variant.fields.len) break :blk false;
+            for (fields, v.variant.fields) |*fl, it| if (!conforms(fl, it)) break :blk false;
+            break :blk true;
+        },
+    };
+}
+
+fn isPrimLayout(l: *const Layout) bool {
+    return switch (l.*) {
+        .bool, .u8, .u16, .u32, .u64, .u128, .u256, .address => true,
+        .signer, .vector, .@"struct", .@"enum" => false,
+    };
+}
+
+/// A value `v` built with layout `src` serializes under layout `dst`: the move-vm serializer's
+/// rules for a (layout, value) pair (values_impl.rs `AnnotatedValue<MoveTypeLayout, Value>`),
+/// where the value's container kinds are the ones `src` gives it. Scalars need the same kind.
+/// A vector of bool, u8, u16, u32, u64, u128, u256 or address is its own container kind and
+/// needs exactly that element layout, also when it is empty; any other vector is checked element
+/// by element, so an empty one serializes under every element layout. Structs and variants
+/// need the same field count and each field in turn. (A struct of one address also serializes
+/// as a signer in Rust; no native returns one, and it counts as a mismatch here.)
+pub fn serializesAs(src: *const Layout, v: LV, dst: *const Layout) bool {
+    switch (src.*) {
+        .bool, .u8, .u16, .u32, .u64, .u128, .u256, .address, .signer => return std.meta.activeTag(src.*) == std.meta.activeTag(dst.*),
+        .vector => |se| {
+            const de = switch (dst.*) {
+                .vector => |d| d,
+                else => return false,
+            };
+            if (isPrimLayout(se)) return std.meta.activeTag(se.*) == std.meta.activeTag(de.*);
+            const items = switch (v) {
+                .vector => |x| x,
+                else => return false,
+            };
+            for (items) |it| if (!serializesAs(se, it, de)) return false;
+            return true;
+        },
+        .@"struct" => |ss| {
+            const ds = switch (dst.*) {
+                .@"struct" => |d| d,
+                else => return false,
+            };
+            if (v != .@"struct" or ss.@"0".len != ds.@"0".len or v.@"struct".len != ss.@"0".len) return false;
+            for (ss.@"0", v.@"struct", ds.@"0") |*sf, it, *df| if (!serializesAs(sf, it, df)) return false;
+            return true;
+        },
+        .@"enum" => |se| {
+            const de = switch (dst.*) {
+                .@"enum" => |d| d,
+                else => return false,
+            };
+            if (v != .variant or v.variant.tag >= se.@"0".len or v.variant.tag >= de.@"0".len) return false;
+            const sfs = se.@"0"[v.variant.tag];
+            const dfs = de.@"0"[v.variant.tag];
+            if (sfs.len != dfs.len or v.variant.fields.len != sfs.len) return false;
+            for (sfs, v.variant.fields, dfs) |*sf, it, *df| if (!serializesAs(sf, it, df)) return false;
+            return true;
+        },
+    }
+}
+
+const ResultTyping = union(enum) {
+    /// Every value the native hands back has the shape of its declared type.
+    typed,
+    /// Return value 0 is a value of this layout that does not serialize as its declared type.
+    as_is: *const Layout,
+    /// A value that is not of its declared type, of a layout the native did not give.
+    unknown,
+};
+
+/// `Host.arbitrary_calls`: the values the native hands back (its `&mut` arguments, its return
+/// values, the slot behind a returned reference) against their declared types.
+fn resultTyping(scratch: Allocator, m: *loader.Module, func: *const loader.Function, tys: []const abi.TyArg, ty_args: []const *const Type, params: []const *const Type, largs: []const LV, writes_back: bool, out: abi.Outcome) loader.LoadError!ResultTyping {
+    const of = struct {
+        fn layout(a: Allocator, tok: anytype, tys_: []const abi.TyArg, t: *const Type) Allocator.Error!*const Layout {
+            if (tokLayout(tok, tys_)) |l| return l;
+            const inner: *const Type = switch (t.*) {
+                .ref, .mut_ref => |i| i,
+                else => t,
+            };
+            return (try layoutLimited(a, inner, Limits.none)).?;
+        }
+    };
+    if (writes_back) for (params, largs, func.params) |p, lv, tok| {
+        if (p.* == .mut_ref and !conforms(try of.layout(scratch, tok, tys, p), lv)) return .unknown;
+    };
+    const o = switch (out) {
+        .ok => |o| o,
+        else => return .typed,
+    };
+    if (o.ref) |slot| {
+        if (func.returns.len != 1) return .typed;
+        const rty = try vm_types.instantiate(scratch, m, func.returns[0], ty_args);
+        return if (conforms(try of.layout(scratch, func.returns[0], tys, rty), slot.*)) .typed else .unknown;
+    }
+    if (o.rets.len != func.returns.len) return .typed;
+    var as_is: ?*const Layout = null;
+    for (func.returns, o.rets, 0..) |tok, lv, i| {
+        const rt = try vm_types.instantiate(scratch, m, tok, ty_args);
+        const declared = try of.layout(scratch, tok, tys, rt);
+        if (i == 0) if (o.actual) |actual| {
+            // the native built the value with `actual`: Rust's serializer decides
+            if (!conforms(actual, lv)) return .unknown;
+            if (!serializesAs(actual, lv, declared)) as_is = actual;
+            continue;
+        };
+        if (!conforms(declared, lv)) return .unknown;
+    }
+    return if (as_is) |l| .{ .as_is = l } else .typed;
+}
+
+/// A VM value against a type as move-vm's typed serializer accepts it (`typed_serialize` with
+/// the type's layout): what sui-node's `tracked_results` does with every command result. Only
+/// a session that was `tainted` holds values that can fail it.
+pub fn valueSerializesAs(arena: Allocator, t: *const Type, v: Value) loader.LoadError!bool {
+    switch (t.*) {
+        .bool => return v.tag == .bool,
+        .u8 => return v.tag == .u8,
+        .u16 => return v.tag == .u16,
+        .u32 => return v.tag == .u32,
+        .u64 => return v.tag == .u64,
+        .u128 => return v.tag == .u128,
+        .u256 => return v.tag == .u256,
+        .address => return v.tag == .address,
+        .signer => {
+            if (v.tag != .container) return false;
+            const c = v.cont();
+            return c.kind == .struct_ and c.len == 1 and c.values()[0].tag == .address;
+        },
+        .vector => |e| {
+            if (v.tag != .container) return false;
+            const c = v.cont();
+            if (c.kind.isPrimVec()) return c.kind == e.vecKind();
+            if (c.kind != .vec) return false;
+            for (c.values()) |x| if (!try valueSerializesAs(arena, e, x)) return false;
+            return true;
+        },
+        .datatype => |d| {
+            if (v.tag != .container) return false;
+            const c = v.cont();
+            const fields = if (d.dt.is_enum) blk: {
+                if (c.kind != .variant or c.tag >= d.dt.variants.len) return false;
+                break :blk d.dt.variants[c.tag].fields;
+            } else blk: {
+                if (c.kind != .struct_) return false;
+                break :blk d.dt.fields;
+            };
+            if (c.len != fields.len) return false;
+            for (fields, c.values()) |f, x| {
+                if (!try valueSerializesAs(arena, try vm_types.instantiate(arena, d.dt.module, f.signature, d.args), x)) return false;
+            }
+            return true;
+        },
+        // a reference result is read through before it is serialized; not a tainted value
+        .ref, .mut_ref => return true,
+        .param => return false,
     }
 }
 

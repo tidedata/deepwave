@@ -23,6 +23,19 @@ pub const Entry = struct {
     /// The store's transaction-fix generation the response was rendered at (store txfix.zig):
     /// a later fix for this checkpoint (a submitted signature order) makes it stale.
     gen: u64 = 0,
+    /// Epoch of the checkpoint (its record's segment in the store), for the lookup that runs
+    /// before any store read: the record is readable only while that segment is in the store's
+    /// window. Null when the caller did not say (`put`, `putGen`): such an entry is never served
+    /// without the record being read first.
+    epoch: ?u64 = null,
+    /// Monotonic time (ns) the checkpoint's record was last read from the store for this entry:
+    /// when it was rendered, or by a later call that read the record and then served the entry.
+    /// The lookup that runs before any store read serves an entry only while this is recent, so
+    /// a record that went bad on disk is read again, and reported, within that time.
+    checked_ns: std.atomic.Value(u64) = .init(0),
+    /// The same for the store's loaded-list fixes (`Store.list_fix`): a transaction of this
+    /// checkpoint whose loaded runtime object list was replaced since makes it stale.
+    gen_lists: u64 = 0,
     mask: []u8,
     bytes: []u8,
     /// Compressed frames of `bytes` (codec.compress), filled by the first call that asks.
@@ -51,6 +64,8 @@ pub const Stats = struct {
     misses: std.atomic.Value(u64) = .init(0),
     inserts: std.atomic.Value(u64) = .init(0),
     evictions: std.atomic.Value(u64) = .init(0),
+    /// Responses not cached because one alone is over the per-entry limit (`fits`).
+    too_big: std.atomic.Value(u64) = .init(0),
 };
 
 pub const Cache = struct {
@@ -82,22 +97,26 @@ pub const Cache = struct {
 
     /// The cached response, with a reference the caller drops with `release`.
     pub fn get(c: *Cache, seq: u64, mask: []const u8) ?*Entry {
+        const e = c.peek(seq, mask) orelse {
+            if (c.enabled()) _ = c.stats.misses.fetchAdd(1, .monotonic);
+            return null;
+        };
+        _ = c.stats.hits.fetchAdd(1, .monotonic);
+        return e;
+    }
+
+    /// `get` that counts neither a hit nor a miss: for a lookup that is followed by `get` when
+    /// it does not serve the entry (the caller counts the hit when it does, `stats.hits`).
+    pub fn peek(c: *Cache, seq: u64, mask: []const u8) ?*Entry {
         if (!c.enabled()) return null;
         const k = keyOf(seq, mask);
         const sh = c.shardOf(k);
         sh.lock.lock();
         defer sh.lock.unlock();
-        const e = sh.map.get(k) orelse {
-            _ = c.stats.misses.fetchAdd(1, .monotonic);
-            return null;
-        };
-        if (e.seq != seq or !std.mem.eql(u8, e.mask, mask)) {
-            _ = c.stats.misses.fetchAdd(1, .monotonic);
-            return null;
-        }
+        const e = sh.map.get(k) orelse return null;
+        if (e.seq != seq or !std.mem.eql(u8, e.mask, mask)) return null;
         _ = e.refs.fetchAdd(1, .monotonic);
         e.ref.store(true, .monotonic);
-        _ = c.stats.hits.fetchAdd(1, .monotonic);
         return e;
     }
 
@@ -130,12 +149,27 @@ pub const Cache = struct {
 
     /// `put`, recording the transaction-fix generation the response was rendered at.
     pub fn putGen(c: *Cache, gpa: Allocator, seq: u64, mask: []const u8, bytes: []const u8, gen: u64) void {
+        c.putAt(gpa, seq, null, 0, mask, bytes, gen, 0);
+    }
+
+    /// `putGen`, with the loaded-list fix generation as well.
+    pub fn putGens(c: *Cache, gpa: Allocator, seq: u64, mask: []const u8, bytes: []const u8, gen: u64, gen_lists: u64) void {
+        c.putAt(gpa, seq, null, 0, mask, bytes, gen, gen_lists);
+    }
+
+    /// `putGens` for a checkpoint of `epoch` (`Entry.epoch`) whose record was read at `now_ns`
+    /// (`Entry.checked_ns`).
+    pub fn putAt(c: *Cache, gpa: Allocator, seq: u64, epoch: ?u64, now_ns: u64, mask: []const u8, bytes: []const u8, gen: u64, gen_lists: u64) void {
         if (!c.enabled()) return;
         const shard_budget = c.budget / nshards;
-        if (bytes.len + mask.len + @sizeOf(Entry) > shard_budget / 4) return; // one response may not flush a shard
+        if (bytes.len + mask.len + @sizeOf(Entry) > shard_budget / 4) {
+            // one response may not flush a shard
+            _ = c.stats.too_big.fetchAdd(1, .monotonic);
+            return;
+        }
         const k = keyOf(seq, mask);
         const e = gpa.create(Entry) catch return;
-        e.* = .{ .seq = seq, .hash = k, .gen = gen, .mask = gpa.dupe(u8, mask) catch {
+        e.* = .{ .seq = seq, .hash = k, .gen = gen, .gen_lists = gen_lists, .epoch = epoch, .checked_ns = .init(now_ns), .mask = gpa.dupe(u8, mask) catch {
             gpa.destroy(e);
             return;
         }, .bytes = gpa.dupe(u8, bytes) catch {
@@ -188,6 +222,28 @@ pub const Cache = struct {
         var b: u64 = 0;
         for (&c.shards) |*sh| b += @atomicLoad(u64, &sh.bytes, .monotonic);
         return b;
+    }
+
+    /// Responses held now.
+    pub fn entries(c: *Cache) u64 {
+        var n: u64 = 0;
+        for (&c.shards) |*sh| {
+            sh.lock.lock();
+            defer sh.lock.unlock();
+            n += sh.clock.items.len;
+        }
+        return n;
+    }
+
+    /// Prometheus text for the node's /metrics. The `zui_cpcache_*` families are deepwave's own
+    /// (sui-node has no such cache): lookups that hit and missed, responses inserted, evicted and
+    /// refused as too big for one entry, and the bytes and entries held now.
+    pub fn render(c: *Cache, w: *std.Io.Writer) !void {
+        const st = &c.stats;
+        inline for (.{ .{ "hits", &st.hits }, .{ "misses", &st.misses }, .{ "inserts", &st.inserts }, .{ "evictions", &st.evictions }, .{ "oversize_rejects", &st.too_big } }) |m| {
+            try w.print("# TYPE zui_cpcache_" ++ m[0] ++ " counter\nzui_cpcache_" ++ m[0] ++ " {d}\n", .{m[1].load(.monotonic)});
+        }
+        try w.print("# TYPE zui_cpcache_bytes gauge\nzui_cpcache_bytes {d}\n# TYPE zui_cpcache_entries gauge\nzui_cpcache_entries {d}\n# TYPE zui_cpcache_budget_bytes gauge\nzui_cpcache_budget_bytes {d}\n", .{ c.bytesHeld(), c.entries(), c.budget });
     }
 };
 
@@ -271,6 +327,52 @@ test "cpcache: hit, miss, eviction keeps held entries alive" {
     const k2 = try maskKey(gpa, &.{""});
     defer gpa.free(k2);
     try std.testing.expect(!std.mem.eql(u8, k1, k2));
+}
+
+test "cpcache: stats are rendered as zui_cpcache_* metrics" {
+    const gpa = std.testing.allocator;
+    var c: Cache = .{ .budget = nshards * 64 * 1024 };
+    defer c.deinit(gpa);
+    const k = try maskKey(gpa, &.{"a"});
+    defer gpa.free(k);
+    try std.testing.expect(c.get(1, k) == null); // miss
+    c.put(gpa, 1, k, "hello"); // insert
+    release(gpa, c.get(1, k).?); // hit
+    release(gpa, c.get(1, k).?); // hit
+    // one response over the per-entry limit (a quarter of a shard) is refused and counted
+    const big = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(big);
+    @memset(big, 1);
+    c.put(gpa, 2, k, big);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try c.render(&out.writer);
+    const held = "hello".len + k.len + @sizeOf(Entry);
+    var want_buf: [1024]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf,
+        \\# TYPE zui_cpcache_hits counter
+        \\zui_cpcache_hits 2
+        \\# TYPE zui_cpcache_misses counter
+        \\zui_cpcache_misses 1
+        \\# TYPE zui_cpcache_inserts counter
+        \\zui_cpcache_inserts 1
+        \\# TYPE zui_cpcache_evictions counter
+        \\zui_cpcache_evictions 0
+        \\# TYPE zui_cpcache_oversize_rejects counter
+        \\zui_cpcache_oversize_rejects 1
+        \\# TYPE zui_cpcache_bytes gauge
+        \\zui_cpcache_bytes {d}
+        \\# TYPE zui_cpcache_entries gauge
+        \\zui_cpcache_entries 1
+        \\# TYPE zui_cpcache_budget_bytes gauge
+        \\zui_cpcache_budget_bytes {d}
+        \\
+    , .{ held, c.budget });
+    try std.testing.expectEqualStrings(want, out.writer.buffered());
+    // a cache that is off counts nothing as too big
+    var off: Cache = .{ .budget = 0 };
+    off.put(gpa, 1, k, "x");
+    try std.testing.expectEqual(@as(u64, 0), off.stats.too_big.load(.monotonic));
 }
 
 test "cpcache: a stale entry is dropped and replaced, readers keep the old bytes" {

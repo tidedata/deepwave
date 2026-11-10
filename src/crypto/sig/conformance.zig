@@ -11,6 +11,32 @@
 //!   derivation and verify_authenticator; and every transaction through
 //!   verify_sender_signed_data_message_signatures with the address aliases the checkpoint pins
 //!   and the JWKs the validators held (verdict and signature indices).
+//!
+//! What a run exercised. sig-vectors, sig-corpus and sig-fast print one line before their first
+//! item (the Ed25519 kernel and tier, ZUI_ED25519_VEC4, ZUI_ED25519_BATCH_KEYS, the decoded-key
+//! cache, the batch path) and one after their last (how many batch equations
+//! `ed25519.verifyBatch` ran, and how many on a switched path). The run fails with
+//! SigSwitchNotLive or SigSwitchUnused when a switch that was asked for is not what ran:
+//!   - ZUI_ED25519_VEC4=on on a tier other than avx2 (it changes nothing there; `force` runs the
+//!     four-way kernel everywhere), or a value that is not a mode;
+//!   - ZUI_ED25519_BATCH_KEYS with a token that is not `cache` or `merge`, or `cache` without
+//!     ZUI_SIG_FAST=1 (the batch reads sig.fast's decoded-key cache, off by default);
+//!   - ZUI_ED25519_BATCH_KEYS set and no batch equation ran (sig-corpus without ZUI_SIG_PATH);
+//!   - ZUI_ED25519_EXPECT_KERNEL=<name> and another Ed25519 kernel (a gate on an AVX2 box sets
+//!     radix25.5x4-avx2 next to ZUI_ED25519_VEC4=on).
+//!
+//! Where `ed25519.verifyBatch` runs. By default sig-vectors and sig-corpus check item by item:
+//! the batch equation runs only for the `ed25519_batch` vectors of sig-vectors. To put every
+//! Ed25519 leaf of either suite through the batch equation (chunks of 64 by `sig.batch`), set
+//! ZUI_SIG_PATH=cpu1 (the calling thread) or ZUI_SIG_PATH=pool (the CPU pool). sig-fast always
+//! runs it (one batch per checkpoint, whole and split). The invocations:
+//!   ./zig build test-conformance -Dsuite=sig-vectors -Doptimize=ReleaseFast
+//!   ZUI_SIG_PATH=cpu1 ./zig build test-conformance -Dsuite=sig-vectors -Doptimize=ReleaseFast
+//!   ZUI_SIG_PATH=pool ./zig build test-conformance -Dsuite=sig-corpus -Doptimize=ReleaseFast
+//!   ./zig build test-conformance -Dsuite=sig-fast -Doptimize=ReleaseFast
+//! with any of ZUI_ED25519_VEC4=on|force, ZUI_ED25519_BATCH_KEYS=merge and
+//! ZUI_SIG_FAST=1 ZUI_ED25519_BATCH_KEYS=cache,merge in front ( has
+//! the whole gate list).
 const std = @import("std");
 const harness = @import("harness");
 const ed25519 = @import("ed25519.zig");
@@ -23,6 +49,7 @@ const zkl = @import("zk").zklogin;
 const sig_fast = @import("fast.zig");
 const batch = @import("batch.zig");
 const core = @import("core");
+const cpu = core.cpu;
 const Verdict = verdict_mod.Verdict;
 
 pub const suites = [_]harness.Suite{
@@ -319,9 +346,11 @@ pub fn runVectors(ctx: *harness.Ctx) !void {
     sigFastFromEnv();
     try batchSetup(ctx);
     defer batchTeardown(ctx);
+    const sw = try switchesEnter(ctx);
     try runVectorFile(ctx, vectors_path);
     try runVectorFile(ctx, user_vectors_path);
     try ctx.forEachFile(zk_vectors_dir, ".jsonl.zst", {}, zkVectorFile);
+    try switchesLeave(ctx, &sw);
 }
 
 /// One `zk/NNN.jsonl.zst` shard (`zui-truth-sig zkvec`): mainnet zkLogin signatures as MultiSig
@@ -755,7 +784,9 @@ pub fn runCorpus(ctx: *harness.Ctx) !void {
     sigFastFromEnv();
     try batchSetup(ctx);
     defer batchTeardown(ctx);
+    const sw = try switchesEnter(ctx);
     try ctx.forEachFile(corpus_dir, ".jsonl.zst", {}, corpusFile);
+    try switchesLeave(ctx, &sw);
 }
 
 fn corpusFile(_: void, ctx: *harness.Ctx, name: []const u8) !void {
@@ -891,6 +922,214 @@ fn prepUserSig(c: *harness.Check, a: std.mem.Allocator, env: *const user.UserSig
     const au = try a.create(user.Address);
     au.* = author.*;
     return .{ .env = env, .parsed = p, .digest = digest, .author = au, .scratch = sc };
+}
+
+// ---------------------------------------------------------------------------------------------
+// What ran. Each suite prints the Ed25519 kernel and the switches in force before its first item
+// and what `ed25519.verifyBatch` did after its last, and the run FAILS when a switch that was
+// asked for is not live, so a green run with a switch set is a run that had it.
+
+/// The switch variables as given and what is live in this process.
+const Switches = struct {
+    tier: cpu.Tier,
+    /// `cpu.kernelName(.ed25519, ...)` for the live tier and vec4 mode.
+    kernel: []const u8,
+    /// ZUI_ED25519_VEC4 as given (null: unset), the mode in force, and whether that mode runs
+    /// the four-way kernel on this tier.
+    vec4_env: ?[]const u8,
+    vec4: cpu.EdVec4,
+    vec4_live: bool,
+    /// ZUI_ED25519_BATCH_KEYS as given, and the switches in force.
+    keys_env: ?[]const u8,
+    keys: ed25519.BatchKeys,
+    /// sig.fast's decoded-key cache (the batch key cache reads and fills it), and ZUI_SIG_FAST.
+    pk_cache: bool,
+    fast_env: ?[]const u8,
+    /// ZUI_ED25519_EXPECT_KERNEL: the kernel name the run must have (a gate sets it).
+    expect_kernel: ?[]const u8,
+    /// `ed25519.batchCalls()` when the suite started.
+    calls0: ed25519.BatchCalls,
+
+    fn live() Switches {
+        const tier = cpu.tier();
+        return .{
+            .tier = tier,
+            .kernel = cpu.kernelName(.ed25519, tier, false),
+            .vec4_env = cpu.envGet("ZUI_ED25519_VEC4"),
+            .vec4 = cpu.edVec4(),
+            .vec4_live = cpu.edVec4Live(),
+            .keys_env = cpu.envGet("ZUI_ED25519_BATCH_KEYS"),
+            .keys = ed25519.batchKeys(),
+            .pk_cache = sig_fast.pkCacheOn(),
+            .fast_env = cpu.envGet("ZUI_SIG_FAST"),
+            .expect_kernel = cpu.envGet("ZUI_ED25519_EXPECT_KERNEL"),
+            .calls0 = ed25519.batchCalls(),
+        };
+    }
+
+    /// Null, or why this process is not running what the variables ask for.
+    fn problem(s: *const Switches) ?[]const u8 {
+        if (s.fast_env) |v| {
+            if (v.len != 0 and !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "1")) return "ZUI_SIG_FAST takes 0 or 1";
+        }
+        if (s.vec4_env) |v| {
+            const want = cpu.parseEdVec4(v) orelse return "ZUI_ED25519_VEC4 takes 0, off, 1, on or force";
+            if (want != s.vec4) return "ZUI_ED25519_VEC4 is not the mode in force";
+        }
+        if (s.vec4 != .off and !s.vec4_live)
+            return "ZUI_ED25519_VEC4=on runs the four-way kernel on the avx2 tier of x86-64 only and changes nothing on this tier: use force for an equality run, or run on the avx2 tier (an AVX2 CPU, or ZUI_CPU=avx2 on a larger one)";
+        if (s.keys_env) |v| {
+            const p = cpu.parseEdBatchKeys(v);
+            if (p.bad != null) return "ZUI_ED25519_BATCH_KEYS takes a comma-separated list of cache and merge, or all, or off";
+            if (!std.meta.eql(p.keys, s.keys)) return "ZUI_ED25519_BATCH_KEYS is not what is in force";
+        }
+        if (s.keys.cache and !s.pk_cache)
+            return "ZUI_ED25519_BATCH_KEYS=cache reads the decoded-key cache of sig.fast, which is off, so it changes nothing: set ZUI_SIG_FAST=1";
+        if (s.expect_kernel) |k| {
+            if (!std.mem.eql(u8, k, s.kernel)) return "the Ed25519 kernel is not the one ZUI_ED25519_EXPECT_KERNEL names";
+        }
+        return null;
+    }
+
+    /// After the suite, with `ed25519.batchCalls()` then: null, or the switch that was live but
+    /// never reached the code it selects.
+    fn unused(s: *const Switches, calls: ed25519.BatchCalls) ?[]const u8 {
+        const switched = calls.switched - s.calls0.switched;
+        if ((s.keys.cache or s.keys.merge) and switched == 0)
+            return "ZUI_ED25519_BATCH_KEYS is set but no batch equation ran in this suite (its default mode checks item by item): run it with ZUI_SIG_PATH=cpu1 or pool";
+        // the avx512 tier's IFMA kernel keeps the single verify; vec4 moves the batch chain only
+        if (s.vec4_live and s.tier == .avx512 and switched == 0)
+            return "on the avx512 tier the four-way kernel runs in the batch chain only and no batch equation ran in this suite: run it with ZUI_SIG_PATH=cpu1 or pool";
+        return null;
+    }
+};
+
+/// Prints the suite's banner; fails the run when a requested switch is not live.
+fn switchesEnter(ctx: *harness.Ctx) !Switches {
+    const s = Switches.live();
+    ctx.stderr.print("{s}: ed25519 kernel {s} (tier {s}); ZUI_ED25519_VEC4={s} ({s}); ZUI_ED25519_BATCH_KEYS={s}; decoded-key cache {s} (ZUI_SIG_FAST={s}); batch path {s}\n", .{
+        ctx.suite.name,
+        s.kernel,
+        @tagName(s.tier),
+        @tagName(s.vec4),
+        if (s.vec4_live) "four-way kernel running" else "scalar chains",
+        cpu.edBatchKeysName(s.keys),
+        if (s.pk_cache) "on" else "off",
+        s.fast_env orelse "unset",
+        if (batch_active) @tagName(batch_path) else "per-item (ZUI_SIG_PATH unset)",
+    }) catch {};
+    if (s.problem()) |why| {
+        ctx.stderr.print("{s}: FAIL, a requested switch is not live: {s}\n", .{ ctx.suite.name, why }) catch {};
+        return error.SigSwitchNotLive;
+    }
+    return s;
+}
+
+/// Prints what the batch verifier did in the suite; fails the run when a live switch never
+/// reached a batch.
+fn switchesLeave(ctx: *harness.Ctx, s: *const Switches) !void {
+    const c = ed25519.batchCalls();
+    ctx.stderr.print("{s}: ed25519.verifyBatch ran {d} batch equations over {d} signatures, {d} of them on a switched path\n", .{
+        ctx.suite.name, c.equations - s.calls0.equations, c.items - s.calls0.items, c.switched - s.calls0.switched,
+    }) catch {};
+    if (s.unused(c)) |why| {
+        ctx.stderr.print("{s}: FAIL, a requested switch was never used: {s}\n", .{ ctx.suite.name, why }) catch {};
+        return error.SigSwitchUnused;
+    }
+}
+
+test "conformance switches: a switch that is asked for and not live fails the run" {
+    const none: ed25519.BatchCalls = .{ .equations = 0, .items = 0, .switched = 0 };
+    const base: Switches = .{ .tier = .baseline, .kernel = "radix51", .vec4_env = null, .vec4 = .off, .vec4_live = false, .keys_env = null, .keys = .{}, .pk_cache = false, .fast_env = null, .expect_kernel = null, .calls0 = none };
+    try std.testing.expect(base.problem() == null and base.unused(none) == null);
+    const has = struct {
+        fn f(why: ?[]const u8, word: []const u8) bool {
+            return std.mem.indexOf(u8, why orelse return false, word) != null;
+        }
+    }.f;
+    // ZUI_ED25519_VEC4=on where it is a no-op (any tier but avx2)
+    var s = base;
+    s.vec4_env = "on";
+    s.vec4 = .on;
+    try std.testing.expect(has(s.problem(), "ZUI_ED25519_VEC4=on"));
+    s.tier = .avx512;
+    s.kernel = "ifma";
+    try std.testing.expect(has(s.problem(), "ZUI_ED25519_VEC4=on"));
+    // on the avx2 tier it is live
+    s.tier = .avx2;
+    s.kernel = "radix25.5x4-avx2";
+    s.vec4_live = true;
+    try std.testing.expect(s.problem() == null);
+    // force is live everywhere
+    s = base;
+    s.vec4_env = "force";
+    s.vec4 = .force;
+    s.vec4_live = true;
+    s.kernel = "radix25.5x4-sse2";
+    try std.testing.expect(s.problem() == null);
+    // a value that is not a mode, and a mode that is not the one in force
+    s = base;
+    s.vec4_env = "yes";
+    try std.testing.expect(has(s.problem(), "ZUI_ED25519_VEC4 takes"));
+    s.vec4_env = "force";
+    try std.testing.expect(has(s.problem(), "not the mode in force"));
+    // ZUI_ED25519_BATCH_KEYS=cache without sig.fast's cache
+    s = base;
+    s.keys_env = "cache,merge";
+    s.keys = .{ .cache = true, .merge = true };
+    try std.testing.expect(has(s.problem(), "ZUI_SIG_FAST=1"));
+    s.pk_cache = true;
+    s.fast_env = "1";
+    try std.testing.expect(s.problem() == null);
+    // merge alone needs no cache
+    s = base;
+    s.keys_env = "merge";
+    s.keys = .{ .merge = true };
+    try std.testing.expect(s.problem() == null);
+    // a token that is not a name (the parser leaves both off: the run would be a default run)
+    s = base;
+    s.keys_env = "cache,nomerge";
+    try std.testing.expect(has(s.problem(), "ZUI_ED25519_BATCH_KEYS takes"));
+    s.keys_env = "merge";
+    try std.testing.expect(has(s.problem(), "not what is in force"));
+    // ZUI_SIG_FAST
+    s = base;
+    s.fast_env = "on";
+    try std.testing.expect(has(s.problem(), "ZUI_SIG_FAST takes"));
+    s.fast_env = "0";
+    try std.testing.expect(s.problem() == null);
+    // the kernel a gate expects
+    s = base;
+    s.expect_kernel = "radix25.5x4-avx2";
+    try std.testing.expect(has(s.problem(), "ZUI_ED25519_EXPECT_KERNEL"));
+    s.kernel = "radix25.5x4-avx2";
+    try std.testing.expect(s.problem() == null);
+    // after the suite: a batch switch with no batch equation on a switched path
+    s = base;
+    s.keys = .{ .merge = true };
+    s.calls0 = .{ .equations = 5, .items = 50, .switched = 2 };
+    try std.testing.expect(has(s.unused(.{ .equations = 9, .items = 90, .switched = 2 }), "ZUI_SIG_PATH=cpu1"));
+    try std.testing.expect(s.unused(.{ .equations = 9, .items = 90, .switched = 3 }) == null);
+    // vec4 on the avx512 tier moves the batch chain only
+    s = base;
+    s.tier = .avx512;
+    s.vec4 = .force;
+    s.vec4_live = true;
+    try std.testing.expect(has(s.unused(none), "avx512"));
+    try std.testing.expect(s.unused(.{ .equations = 1, .items = 4, .switched = 1 }) == null);
+    s.tier = .avx2;
+    try std.testing.expect(s.unused(none) == null);
+    // what is live in this process, read back
+    const vec_before = cpu.edVec4();
+    defer cpu.setEdVec4(vec_before);
+    const keys_before = ed25519.batchKeys();
+    defer ed25519.setBatchKeys(keys_before);
+    cpu.setEdVec4(.force);
+    ed25519.setBatchKeys(.{ .merge = true });
+    const l = Switches.live();
+    try std.testing.expect(l.vec4 == .force and l.vec4_live and l.keys.merge and !l.keys.cache);
+    try std.testing.expectEqualStrings(cpu.kernelName(.ed25519, cpu.tier(), false), l.kernel);
+    try std.testing.expect(std.mem.indexOf(u8, l.kernel, "x4") != null);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1166,7 +1405,12 @@ fn edVerdicts(gpa: std.mem.Allocator, items: []const ed25519.BatchItem, scratch:
 }
 
 fn runFast(ctx: *harness.Ctx) !void {
+    // ZUI_SIG_FAST=1 here too: the batch key cache (ZUI_ED25519_BATCH_KEYS=cache) reads the
+    // decoded-key cache it turns on
+    sigFastFromEnv();
+    const sw = try switchesEnter(ctx);
     try ctx.forEachFile(corpus_dir, ".jsonl.zst", {}, fastFile);
+    try switchesLeave(ctx, &sw);
 }
 
 fn fastFile(_: void, ctx: *harness.Ctx, name: []const u8) !void {

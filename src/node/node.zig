@@ -34,6 +34,7 @@ const http = @import("http.zig");
 const stream_mod = @import("stream.zig");
 const sigorder = @import("sigorder.zig");
 const p2p_mod = @import("p2p.zig");
+const reconcile_mod = @import("reconcile.zig");
 const p2p_serve = @import("p2p_serve.zig");
 const p2p_config = @import("p2p_config.zig");
 pub const ops = @import("ops.zig");
@@ -45,6 +46,7 @@ const convert = @import("convert.zig");
 const exec = @import("exec");
 const rpc = @import("rpc.zig");
 const native_hooks = @import("native_hooks.zig");
+const native_pass = @import("native_pass.zig");
 const simulate = @import("simulate");
 const history = @import("history.zig");
 const snapshot = @import("snapshot.zig");
@@ -158,6 +160,11 @@ pub const Config = struct {
     /// zui/1 Ed25519 identity seed (32 raw bytes, 0600; created on first start). Clients and
     /// edges pin the key it derives, so it must survive restarts. Null: `<dir>/node/native-identity.seed`.
     native_identity_file: ?[]const u8 = null,
+    /// zui/1 API keys and the Agent Passes bound to them (`<key> <tier> [<pass hex>]` per line,
+    /// docs/NATIVE-PROTOCOL.md 6.1). Null: everyone is anonymous, no pass.
+    native_keys: ?[]const u8 = null,
+    /// Where the passes keep their ledgers. Null: `<dir>/node/agent-pass`.
+    native_pass_dir: ?[]const u8 = null,
     /// StateService indexes (lane indexes, DROP-IN G4): built in memory from the live set at start
     /// (needs RAM for every owned object), then fed per checkpoint. Off: StateService is UNIMPLEMENTED.
     indexes: bool = false,
@@ -240,6 +247,10 @@ pub const Config = struct {
     tile_cpus: ?[]const u8 = null,
     /// Tiles never sleep when idle (`--tile-spin`).
     tile_spin: bool = false,
+    /// p2p: seconds a checkpoint built here waits for the stream's copy before the bucket's is
+    /// fetched to compare its read sets with sui-node's (`--p2p-reconcile-wait S`, reconcile.zig;
+    /// 0: no reconcile).
+    p2p_reconcile_wait_s: u32 = 10,
     /// p2p only (`--p2p-only`, p2p_only.zig): no bucket, S3 or stream; needs a store to resume.
     p2p_only: bool = false,
     /// p2p `pinned-checkpoints` (`--p2p-pinned SEQ:DIGEST,...`).
@@ -278,6 +289,10 @@ pub const Config = struct {
     /// Execute mode: exec's deny-list state file (`deny/objects.bin.zst`) for a store that does
     /// not hold the full live set (`--deny-state`); see execute.zig `Lookup.latest`.
     deny_state: ?[]const u8 = null,
+    /// `--dev-inspect-disabled true|false` (fullnode.yaml `dev-inspect-disabled`): true refuses
+    /// SimulateTransaction with checks disabled as sui-node does, false runs it as DevInspect<true>;
+    /// null (not given) is `rpc_exec.simulate.Engine.default_dev_inspect`.
+    dev_inspect_disabled: ?bool = null,
     /// Execute mode: per-transaction verdicts (the `node-execute` suite).
     report: ?execute.Report = null,
     store_cfg: store.Config = .{},
@@ -549,8 +564,11 @@ pub const Node = struct {
     public: ?*http.Public = null,
     /// `--source zui1:`: the cores this node follows.
     edge_pool: ?*edge.client.Pool = null,
-    /// `--edge-feed`: the zui/1 feed and dictionary state.
+    /// `--edge-feed`: the zui/1 feed state.
     edge_feeder: ?*native.edgefeed.Feeder = null,
+    /// zui/1 response dictionaries (`--native-listen`): hello, get_dictionary, ZSTD responses,
+    /// and the edge feed's frames. Built once by `edge_warm`.
+    native_dicts: ?*native.dicts.Dicts = null,
     /// The committed checkpoint whose timestamp the metrics last read, and that timestamp.
     compat_seq: Atomic(u64) = .init(std.math.maxInt(u64)),
     compat_ts: Atomic(u64) = .init(0),
@@ -563,6 +581,8 @@ pub const Node = struct {
     sig_order: ?*sigorder.Overlay = null,
     /// Its sweep over committed checkpoints (`node/sig-order.log`).
     sig_sweep: ?*sigorder.Sweep = null,
+    /// Compares the read sets of p2p-built checkpoints with sui-node's and repairs them.
+    reconcile: ?*reconcile_mod.Reconciler = null,
     /// p2p state-sync follower (`--p2p`).
     p2p: ?*p2p_mod.P2p = null,
     /// State-sync/discovery server (p2p_serve.zig): inbound listener and outbound connections.
@@ -636,6 +656,8 @@ pub const Node = struct {
     native_cert: native.cert.Cert = undefined,
     native_certhttp: ?*native.certhttp.Server = null,
     native_hooks: native_hooks.Hooks = undefined,
+    /// `--native-keys`: API keys and Agent Passes (lives until exit, after the listener).
+    native_policy: ?*native.agentpass.Policy = null,
     edge_warm: ?std.Thread = null,
     edge_stop: Atomic(bool) = .init(false),
     serve_stop: Atomic(bool) = .init(false),
@@ -1047,6 +1069,14 @@ pub const Node = struct {
             if (cfg.p2p_pinned) |pins| pp.pinned = .init(try @import("p2p_only.zig").parsePinned(n.anchor_arena.allocator(), pins));
             n.p2p = pp;
         };
+        // The read sets of a checkpoint p2p built are deepwave's own word: they are compared with
+        // sui-node's copy (the stream's duplicate, else the bucket's). p2p-only has no such copy.
+        if (n.p2p != null and !cfg.p2p_only and cfg.p2p_reconcile_wait_s > 0) if (n.history) |h| {
+            const r = try reconcile_mod.Reconciler.open(gpa, io, n.st, n.node_dir, if (n.source.kind == .none) null else &n.source, .{ .wait_ms = @as(u64, cfg.p2p_reconcile_wait_s) * 1000 });
+            n.reconcile = r;
+            h.mark_built = true;
+            for (n.streams.items) |st| st.reconcile = r;
+        };
         const np = cfg.network.params();
         n.service = .{ .gpa = gpa, .store = n.st, .chain_id = cfg.chain_id orelse np.chain_id, .chain = np.chain, .chain_name = np.name, .protocol_release_max = cfg.rpc_release_max, .loaded = .{ .ctx = n, .get = loadedOf }, .cp_cache = .{ .budget = cfg.cp_cache_bytes } };
         n.service.lowest = &n.lowest;
@@ -1140,6 +1170,7 @@ pub const Node = struct {
             if (n.lh_fill == null and n.lowest_known) n.dropStaging();
         }
         try n.exec_rpc.init(gpa, n.io, n.st, n.service.chain_id);
+        if (cfg.dev_inspect_disabled) |off| n.exec_rpc.svc.engine.dev_inspect = if (off) .refused else .enabled;
         // One `--exec-cache-mb` budget for every thread holding Move package caches: the
         // executor's threads (execute mode) and the simulate workers.
         {
@@ -1326,6 +1357,7 @@ pub const Node = struct {
                 .rpc_dir = if (n.cfg.serve_addr != null) (n.cfg.rpc_dir orelse try std.fs.path.join(arena, &.{ n.cfg.dir, "rpc" })) else null,
                 .committees = .{ .ctx = n, .get = committeeOf },
                 .lsm = indexBuildOptions(),
+                .threads = spec.threads,
                 .signal = &stop_signal,
             }) catch |e| blk: {
                 std.log.warn("snapshot: indexes during the download: {s}; they are built after the restore instead", .{@errorName(e)});
@@ -1344,29 +1376,21 @@ pub const Node = struct {
             .on_partition = if (rib) |b| b.partitionHook() else null,
             .after_objects = if (rib) |b| b.doneHook() else null,
         }, &stats);
-        // The table durable in its file before `done` (shadow-install finding 2: an exit before
-        // the first follow flush replayed the whole restored segment, ~23 min, on every start).
-        const t_p = source_mod.nowNs();
-        try n.st.persistLive();
-        std.log.info("snapshot: live table persisted in {d} ms", .{(source_mod.nowNs() - t_p) / std.time.ns_per_ms});
-        // The derived indexes level with the store before `done`, so the first start serves
+        // The store is restored once its table is durable: `done` is written then, before the
+        // derived indexes are waited for, so a stop or a kill while their tables are written
+        // costs no download (restore_index.finishRestore; the next start finds the index build
+        // pending and resumes it, StateService UNAVAILABLE until it is level).
+        // The indexes level with the store before this returns, so the first start serves
         // everything at once: from the stream, else from the restore image now (lane
         // fast-start); skipped with ZUI_FAST_START=0 (node start builds).
-        var indexed = false;
+        const indexed = try restore_index.finishRestore(n.io, n.node_dir, n.st, epoch, rib);
+        n.snapshot_epoch = epoch;
+        n.restored_epoch = epoch;
         if (rib) |b| {
-            if (b.finish()) |_| {
-                indexed = true;
-            } else |e| {
-                if (e == error.Stopped or stop_signal.load(.acquire)) return error.Stopped;
-                std.log.warn("snapshot: indexes from the download: {s}; walking the restore image instead", .{@errorName(e)});
-            }
             b.destroy();
             rib = null;
         }
         if (fastOn() and !indexed) try n.restoreIndexes(epoch);
-        try snapshot.writeMarker(n.io, n.node_dir, .done, epoch);
-        n.snapshot_epoch = epoch;
-        n.restored_epoch = epoch;
         _ = a;
         std.log.info("snapshot: epoch {d} restored in {d} s ({d} objects, {d} MiB fetched); following from its end-of-epoch checkpoint", .{ epoch, (source_mod.nowNs() - t0) / std.time.ns_per_s, stats.objects.load(.monotonic), stats.bytes_fetched.load(.monotonic) >> 20 });
     }
@@ -1766,9 +1790,10 @@ pub const Node = struct {
 
     /// The restore image (lane fast-start) of a store restored from a formal snapshot. Off with
     /// ZUI_FAST_START=0.
-    /// After a restore of `epoch`, before its `done` marker: the StateService index (with
-    /// `--indexes`) and the rpc index's package floors (with `--serve`) from one walk of the
-    /// restore image, made durable at the restored checkpoint.
+    /// After a restore of `epoch` (its `done` marker is written: a stop here resumes at the next
+    /// start, which builds beside the follower): the StateService index (with `--indexes`) and
+    /// the rpc index's package floors (with `--serve`) from one walk of the restore image, made
+    /// durable at the restored checkpoint.
     fn restoreIndexes(n: *Node, epoch: u64) !void {
         if (!n.cfg.indexes and n.cfg.serve_addr == null) return;
         var snap = n.st.snapshot();
@@ -1810,17 +1835,35 @@ pub const Node = struct {
         std.log.info("snapshot: indexes built from the restore image at checkpoint {d} in {d} s ({d} objects)", .{ at, (source_mod.nowNs() - t0) / std.time.ns_per_s, j.image_objects.load(.monotonic) });
     }
 
-    /// Bulk-build options of the StateService index (ZUI_INDEX_BUILD_GROUPS, ZUI_INDEX_BUILD_THREADS).
-    /// Build passes over the live set: 1 needs temp space for every row (~1.5x the index), 4
-    /// (default) a quarter of it but reads the live set four times (slow on IOPS-bound disks).
-    /// Threads: the env value, else one per usable CPU up to 32. The index's own default (0) is
-    /// the host's CPU count: 32 build threads with 96 MiB each inside a 4-core cgroup.
+    /// Bulk-build options of the StateService index.
+    /// Threads (ZUI_INDEX_BUILD_THREADS): the env value, else one per usable CPU up to 32. The
+    /// index's own default (0) is the host's CPU count: 32 build threads inside a 4-core cgroup.
+    /// Memory (ZUI_INDEX_BUILD_MEM_MB): what the partitioned build (index/bulk.zig) may
+    /// allocate, by default an eighth of the memory this process can use (`indexBuildMemory`).
+    /// ZUI_INDEX_BULK=0 selects the sort-and-merge build instead; only that one reads
+    /// ZUI_INDEX_BUILD_GROUPS (passes over the live set: 1 needs temp space for every row, 4,
+    /// its default, a quarter of it but reads the live set four times) and it holds one 96 MiB
+    /// sort buffer a thread whatever the memory limit.
     fn indexBuildOptions() index.lsm.Options {
         var opts: index.lsm.Options = .{};
         if (std.c.getenv("ZUI_INDEX_BUILD_GROUPS")) |g| opts.build_groups = std.fmt.parseInt(u32, std.mem.span(g), 10) catch opts.build_groups;
         if (std.c.getenv("ZUI_INDEX_BUILD_THREADS")) |g| opts.build_threads = std.fmt.parseInt(usize, std.mem.span(g), 10) catch 0;
         if (opts.build_threads == 0) opts.build_threads = indexBuildThreads(usableCpus());
+        if (std.c.getenv("ZUI_INDEX_BULK")) |v| opts.bulk = !std.mem.eql(u8, std.mem.span(v), "0");
+        opts.build_mem_bytes = indexBuildMemory(core.hw.detect(null).ram_bytes);
+        if (std.c.getenv("ZUI_INDEX_BUILD_MEM_MB")) |v| {
+            const mb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+            if (mb != 0) opts.build_mem_bytes = mb << 20;
+        }
         return opts;
+    }
+
+    /// Memory the state index build may allocate when this process can use `ram` bytes (the
+    /// cgroup's memory.max or memory.high when there is one, core/hw.zig; 0: unknown): an
+    /// eighth of it, between 512 MiB and 4 GiB. 2 GiB in a 16 GiB unit.
+    pub fn indexBuildMemory(ram: u64) usize {
+        if (ram == 0) return 1 << 30;
+        return @intCast(std.math.clamp(ram / 8, 512 << 20, 4 << 30));
     }
 
     /// Index build threads for `usable` CPUs (index/lsm.zig caps its own default at 32 too).
@@ -2108,6 +2151,7 @@ pub const Node = struct {
             }
         }
         if (n.history) |h| try h.onBatch(n.st, seq, c, blob, b);
+        if (n.reconcile) |r| try r.applied(seq, n.history.?.last_built, b);
         n.prof.mark(.history);
         const pv = if (c.epoch != n.cur_epoch) (n.next_pv orelse n.cur_pv) else n.cur_pv;
         switch (try n.state_hash.onBatch(seq, c, blob, b, pv)) {
@@ -2199,6 +2243,10 @@ pub const Node = struct {
         for (n.streams.items) |st| {
             try st.start();
             std.log.info("live stream from {s} (SubscribeCheckpoints over gRPC-web); the source fills gaps", .{st.base});
+        }
+        if (n.reconcile) |r| {
+            try r.start();
+            std.log.info("p2p read-set reconcile: {d} lists reinstalled, {d} checkpoints waiting", .{ r.stats.loaded.load(.monotonic), r.stats.pending.load(.monotonic) });
         }
         if (n.p2p) |pp| {
             try pp.start();
@@ -2343,6 +2391,7 @@ pub const Node = struct {
             t3 = source_mod.nowNs();
             n.printP2p();
         };
+        if (n.reconcile) |r| r.quit();
         std.log.info("stop: p2p listener {d} ms, streams {d} ms, p2p {d} ms", .{ (t1 - t0) / std.time.ns_per_ms, (t2 - t1) / std.time.ns_per_ms, (t3 - t2) / std.time.ns_per_ms });
         // Bucket requests in flight end within ~100 ms (netguard.timed), so the joins below never
         // wait on a socket.
@@ -2351,6 +2400,7 @@ pub const Node = struct {
         n.edge_stop.store(true, .release);
         if (n.sig_order) |o| o.stopping.store(true, .release);
         if (n.sig_sweep) |sw| sw.join();
+        if (n.reconcile) |r| r.stop();
         if (n.fetcher) |f| f.stop();
         // Subscription streams end (service_shutdown); the hub itself lives until exit, as
         // detached connection threads may still hold it.
@@ -2495,6 +2545,12 @@ pub const Node = struct {
             n.sig_order = null;
         }
         if (n.fetcher) |f| n.gpa.destroy(f);
+        if (n.reconcile) |r| {
+            const x = &r.stats;
+            std.log.info("p2p read-set reconcile: {d} checkpoints compared ({d} stream copies, {d} bucket copies), {d} repaired ({d} lists, {d} objects), {d} waiting", .{ x.reconciled.load(.monotonic), x.from_stream.load(.monotonic), x.from_bucket.load(.monotonic), x.repaired_checkpoints.load(.monotonic), x.repairs.load(.monotonic), x.objects_added.load(.monotonic), x.pending.load(.monotonic) });
+            r.deinit();
+            n.reconcile = null;
+        }
         if (n.history) |h| {
             h.deinit();
             n.gpa.destroy(h);
@@ -2506,9 +2562,17 @@ pub const Node = struct {
             n.edge_pool = null;
         }
         if (n.edge_feeder) |f| {
-            f.deinit();
             n.gpa.destroy(f);
             n.edge_feeder = null;
+        }
+        if (n.native_dicts) |x| {
+            x.deinit();
+            n.gpa.destroy(x);
+            n.native_dicts = null;
+        }
+        if (n.native_policy) |p| {
+            p.deinit();
+            n.native_policy = null;
         }
         if (n.public) |h| {
             const st = &h.stats;
@@ -2979,16 +3043,26 @@ pub const Node = struct {
         const now_unix: i64 = @intCast(@divTrunc(Io.Clock.real.now(n.io).toNanoseconds(), std.time.ns_per_s));
         n.native_cert = native.cert.generate(kp, serial, now_unix, 13, "localhost");
         n.native_hooks = .{ .io = n.io, .st = n.st, .rpc = &n.exec_rpc, .epochs_dir = n.epochs_dir };
+        const ds = try n.gpa.create(native.dicts.Dicts);
+        ds.* = native.dicts.Dicts.init(n.gpa);
+        n.native_dicts = ds;
         if (n.cfg.edge_feed) {
             const fd = try n.gpa.create(native.edgefeed.Feeder);
-            fd.* = native.edgefeed.Feeder.init(n.gpa);
+            fd.* = native.edgefeed.Feeder.init(ds);
             n.edge_feeder = fd;
-            n.edge_warm = std.Thread.spawn(.{}, edgeWarm, .{n}) catch null;
         }
-        n.native_disp = .{ .svc = &n.service, .ix = n.ix, .edge = n.edge_feeder, .hooks = .{
+        n.edge_warm = std.Thread.spawn(.{}, edgeWarm, .{n}) catch null;
+        if (n.cfg.native_keys) |keys_path| {
+            var lb: [std.fs.max_path_bytes]u8 = undefined;
+            const ld = n.cfg.native_pass_dir orelse try std.fmt.bufPrint(&lb, "{s}/node/agent-pass", .{n.cfg.dir});
+            n.native_policy = try native_pass.load(n.gpa, n.io, keys_path, ld, &n.native_hooks);
+        }
+        n.native_disp = .{ .svc = &n.service, .ix = n.ix, .edge = n.edge_feeder, .dicts = ds, .hooks = .{
             .epoch_fallback = n.native_hooks.epochFallback(),
             .simulator = n.native_hooks.simulator(),
             .submitter = n.native_hooks.submitter(),
+            .auth = if (n.native_policy) |p| p.auth() else null,
+            .agent_pass = if (n.native_policy) |p| p.agentPass() else null,
         } };
         var id_seed: [32]u8 = undefined;
         var pb: [std.fs.max_path_bytes]u8 = undefined;
@@ -3013,17 +3087,20 @@ pub const Node = struct {
         std.log.info("serving zui/1 (QUIC zui/1 + WebTransport h3) on {s}; cert sha256 {x}; zui/1 key {x} ({s} {s})", .{ text, &hash, &ed.public_key.toBytes(), if (created) "new identity in" else "identity from", id_path });
     }
 
-    /// Builds the edge feed dictionary once the store holds enough checkpoints, then returns.
-    /// The only place that builds it (requests never do); waits in short slices so stop() is quick.
+    /// Builds the zui/1 response dictionaries (object, checkpoint and edge feed, effects) once the
+    /// store holds enough checkpoints, then returns. The only place that builds them (requests
+    /// never do); waits in short slices so stop() is quick.
     fn edgeWarm(n: *Node) void {
-        const fd = n.edge_feeder orelse return;
+        const ds = n.native_dicts orelse return;
         while (!n.edge_stop.load(.acquire)) {
             var snap = n.st.snapshot();
-            if (fd.warm(&snap)) |d| {
-                snap.release();
-                std.log.info("edge feed: dictionary {x} ({d} bytes) ready", .{ d.id, d.content.len });
+            const res = ds.warm(&snap);
+            snap.release();
+            if (res) |_| {
+                for ([_]native.dicts.Kind{ .object, .checkpoint, .effects }) |k| if (ds.get(k)) |d|
+                    std.log.info("zui/1: {s} dictionary {x} ({d} bytes) ready", .{ @tagName(k), d.id, d.content.len });
                 return;
-            } else |_| snap.release();
+            } else |_| {}
             // not enough checkpoints yet (a fresh store): try again in a while
             var waited: u32 = 0;
             while (waited < 30_000 and !n.edge_stop.load(.acquire)) : (waited += 250) {
@@ -3301,6 +3378,12 @@ pub const Node = struct {
                 try w.print("# TYPE zui_p2p_{s} counter\nzui_p2p_{s} {d}\n", .{ name, name, @field(pp.stats, name).load(.monotonic) });
             }
         }
+        if (n.reconcile) |r| {
+            inline for (comptime std.meta.fieldNames(reconcile_mod.Stats)) |name| {
+                const kind = if (comptime std.mem.eql(u8, name, "pending")) "gauge" else "counter";
+                try w.print("# TYPE zui_p2p_readset_{s} {s}\nzui_p2p_readset_{s} {d}\n", .{ name, kind, name, @field(r.stats, name).load(.monotonic) });
+            }
+        }
         if (n.p2p_server) |srv| try srv.render(w);
         if (n.p2p != null or n.p2p_server != null) try n.renderSuiP2p(w);
         if (n.native_listener) |nl| {
@@ -3368,6 +3451,7 @@ pub const Node = struct {
             }
             try w.print("# TYPE zui_store_commits counter\nzui_store_commits {d}\n# TYPE zui_store_commit_max_ms gauge\nzui_store_commit_max_ms {d:.3}\n# TYPE zui_store_commits_over_100ms counter\nzui_store_commits_over_100ms {d}\n", .{ cl.n, @as(f64, @floatFromInt(cl.max_ever)) / 1e6, cl.slow });
             const fs = &n.st.stats;
+            try w.print("# TYPE zui_store_corrupt_reads_total counter\nzui_store_corrupt_reads_total {d}\n", .{fs.corrupt_reads.load(.monotonic)});
             try w.print("# TYPE zui_store_index_flushes counter\nzui_store_index_flushes {d}\n# TYPE zui_store_flush_cow_pages counter\nzui_store_flush_cow_pages {d}\n# TYPE zui_store_flush_wait_ms counter\nzui_store_flush_wait_ms {d}\n# TYPE zui_store_flush_last_ms gauge\nzui_store_flush_last_ms {d}\n# TYPE zui_store_flush_runs counter\nzui_store_flush_runs {d}\n# TYPE zui_store_flush_run_pages counter\nzui_store_flush_run_pages {d}\n# TYPE zui_store_live_dirty_pages gauge\nzui_store_live_dirty_pages {d}\n", .{
                 fs.index_flushes, fs.flush_cow_pages, fs.flush_wait_ns / std.time.ns_per_ms, fs.flush_last_ns / std.time.ns_per_ms, fs.flush_runs, fs.flush_run_pages, n.st.indexMemory().live_dirty / 4096,
             });
@@ -3385,6 +3469,7 @@ pub const Node = struct {
                 try w.print("zui_subscription_terminations{{reason=\"" ++ name ++ "\"}} {d}\n", .{st.terminations[i].load(.monotonic)});
             }
         }
+        try n.service.cp_cache.render(w); // zui_cpcache_*: the GetCheckpoint response cache (serve/cpcache.zig)
         if (n.fetcher) |f| {
             inline for (comptime std.meta.fieldNames(source_mod.FetcherStats)) |name| {
                 try w.print("# TYPE zui_fetch_{s} counter\nzui_fetch_{s} {d}\n", .{ name, name, @field(f.stats, name).load(.monotonic) });

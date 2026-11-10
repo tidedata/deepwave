@@ -10,6 +10,7 @@ const index = @import("index");
 const proto = @import("proto.zig");
 const indexq = @import("indexq.zig");
 const edgefeed = @import("edgefeed.zig");
+const dicts_mod = @import("dicts.zig");
 const W = proto.W;
 const R = proto.R;
 const Code = proto.Code;
@@ -67,10 +68,14 @@ pub const Auth = struct {
 };
 pub const Principal = struct { id: u64, tier: u8 };
 
-/// Agent Pass policy hook (interface only, section 6): runs before dry_run and submit.
+/// Agent Pass policy hook (section 6.1, agentpass.zig): runs before dry_run and submit, on the
+/// worker thread, with the request arena `a` (a deny reason may live there).
 pub const AgentPass = struct {
     ctx: *anyopaque,
-    check: *const fn (ctx: *anyopaque, principal: ?Principal, method: proto.Method, tx_data: []const u8) Verdict,
+    check: *const fn (ctx: *anyopaque, a: Allocator, principal: ?Principal, method: proto.Method, tx_data: []const u8) Verdict,
+    /// After an allowed submit: `executed` false when the transaction provably never reached the
+    /// network (TX_REJECTED from the submit path), so the pass frees what it reserved.
+    settle: ?*const fn (ctx: *anyopaque, principal: ?Principal, tx_data: []const u8, executed: bool) void = null,
     pub const Verdict = union(enum) { allow, deny: []const u8 };
 };
 
@@ -96,11 +101,15 @@ pub const Dispatcher = struct {
     server: []const u8 = "zui/0.1",
     /// The node's owner/balance index (`--indexes`); null: index methods answer UNAVAILABLE.
     ix: ?*index.Index = null,
-    /// Edge feed and dictionary (`--edge-feed`, docs/EDGE.md); null: those methods are UNIMPLEMENTED.
+    /// Edge feed (`--edge-feed`, docs/EDGE.md); null: get_checkpoint_feed is UNIMPLEMENTED.
     edge: ?*edgefeed.Feeder = null,
+    /// Response dictionaries (hello, get_dictionary, ZSTD frames); null: plain zstd only and
+    /// get_dictionary answers NOT_FOUND.
+    dicts: ?*const dicts_mod.Dicts = null,
 
     /// Answers one request into `out` (a whole response: header, body, proof).
     pub fn handle(d: *Dispatcher, a: Allocator, req: proto.Request, principal: ?Principal, out: *std.ArrayList(u8)) void {
+        defer dicts_mod.Dicts.compressResponse(d.dicts, a, req.method, req.flags, out) catch {};
         d.handleInner(a, req, principal, out) catch |e| {
             const code: Code = switch (e) {
                 error.Malformed, error.EndOfStream, error.InvalidValue => .bad_request,
@@ -146,10 +155,8 @@ pub const Dispatcher = struct {
                 if (d.ix != null) feat |= 1 << 2;
                 if (d.hooks.simulator != null) feat |= 1 << 3;
                 if (d.hooks.submitter != null) feat |= 1 << 4;
-                if (d.edge) |fd| {
-                    feat |= @as(u64, 1) << feature_edge_feed_bit;
-                    if (fd.peek() != null) feat |= 1 << 1; // zstd frames
-                }
+                feat |= 1 << 1; // ZSTD responses (spec 2.2), with or without dictionaries
+                if (d.edge != null) feat |= @as(u64, 1) << feature_edge_feed_bit;
                 try w.int(u64, feat);
                 // Limits
                 try w.int(u32, 128);
@@ -157,14 +164,7 @@ pub const Dispatcher = struct {
                 try w.int(u32, proto.max_request_bytes);
                 try w.int(u32, proto.max_batch_objects);
                 try w.int(u64, 0);
-                const dc: ?*const @import("edgewire").dict.Dictionary = if (d.edge) |fd| fd.peek() else null;
-                if (dc) |x| {
-                    try w.uleb(1);
-                    try w.int(u32, x.id);
-                    try w.u8_(1); // kind: checkpoint (the whole feed frame)
-                    try w.fixed(&x.sha256);
-                    try w.int(u32, @intCast(x.content.len));
-                } else try w.uleb(0);
+                if (d.dicts) |ds| try ds.writeInfos(w) else try w.uleb(0);
                 try w.int(u64, if (ei) |e| e.reference_gas_price else 0);
                 try w.u8_(if (authed or principal != null) 1 else 0);
                 return;
@@ -231,7 +231,6 @@ pub const Dispatcher = struct {
                 return;
             },
             .submit_transaction => {
-                const sub = d.hooks.submitter orelse return error.Unimplemented;
                 const tx = try r.bytes();
                 const n = try r.uleb();
                 if (n > 16) return error.Malformed;
@@ -240,10 +239,19 @@ pub const Dispatcher = struct {
                 const wait = try r.u8_();
                 try r.done();
                 if (wait > 2) return error.Malformed;
+                // the pass first: its reason is the answer even where submit is not served
                 if (try d.denied(a, principal, req.method, tx, out)) return;
+                const sub = d.hooks.submitter orelse {
+                    if (d.hooks.agent_pass) |ap| if (ap.settle) |f| f(ap.ctx, principal, tx, false);
+                    return error.Unimplemented;
+                };
                 sub.submit(sub.ctx, a, tx, sigs, wait, out) catch |e| {
+                    // unknown whether it was sent: the pass keeps the reservation
+                    if (d.hooks.agent_pass) |ap| if (ap.settle) |f| f(ap.ctx, principal, tx, true);
                     return proto.errorResponse(out, a, .tx_rejected, @errorName(e), "");
                 };
+                if (d.hooks.agent_pass) |ap| if (ap.settle) |f|
+                    f(ap.ctx, principal, tx, !(out.items.len > 0 and out.items[0] == @intFromEnum(Code.tx_rejected)));
                 return;
             },
             .get_epoch_info => {
@@ -279,10 +287,13 @@ pub const Dispatcher = struct {
                 return;
             },
             .get_dictionary => {
-                const fd = d.edge orelse return error.Unimplemented;
                 const id = try r.int(u32);
                 try r.done();
-                return fd.handleDict(a, &snap, id, out);
+                const x = (if (d.dicts) |ds| ds.byId(id) else null) orelse
+                    return proto.errorResponse(out, a, .not_found, "unknown dictionary", "");
+                try proto.okHeader(out, a, 0);
+                try w.bytes(x.content);
+                return;
             },
             .get_checkpoint_feed => {
                 const fd = d.edge orelse return error.Unimplemented;
@@ -319,7 +330,7 @@ pub const Dispatcher = struct {
 
     fn denied(d: *Dispatcher, a: Allocator, principal: ?Principal, m: proto.Method, tx: []const u8, out: *std.ArrayList(u8)) !bool {
         const ap = d.hooks.agent_pass orelse return false;
-        switch (ap.check(ap.ctx, principal, m, tx)) {
+        switch (ap.check(ap.ctx, a, principal, m, tx)) {
             .allow => return false,
             .deny => |why| {
                 try proto.errorResponse(out, a, .permission_denied, why, "");
@@ -390,6 +401,16 @@ fn pruned(out: *std.ArrayList(u8), a: Allocator, lo: u64) !void {
     var b: [8]u8 = undefined;
     std.mem.writeInt(u64, &b, lo, .little);
     try proto.errorResponse(out, a, .pruned, "below the lowest available checkpoint", &b);
+}
+
+/// The token of a `HelloReq` body, if it carries one (the listener sets the connection's
+/// principal from it, spec 6).
+pub fn helloToken(body: []const u8) ?[]const u8 {
+    var r: R = .{ .b = body };
+    _ = r.str() catch return null;
+    _ = r.int(u16) catch return null;
+    if (!(r.option() catch return null)) return null;
+    return r.bytes() catch null;
 }
 
 pub const Key = struct { id: [32]u8, version: ?u64 };

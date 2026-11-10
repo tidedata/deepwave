@@ -304,6 +304,85 @@ fn prepare(arena: std.mem.Allocator, line: []const u8) !sig.PreparedCommittee {
 
 fn runCerts(ctx: *harness.Ctx) !void {
     try ctx.forEachFile("vectors/bls-cert", ".jsonl", {}, certFile);
+    const n = certBatchSize();
+    if (n > 1) {
+        const t = &cert_batch_totals;
+        std.debug.print("bls-cert through verifyCertBatch, lists of {d}: early={d} off_g2={d} equations={d} failed={d} batch_ok={d} singles={d} no_memory={d}\n", .{
+            n,                         t[0].load(.monotonic), t[1].load(.monotonic), t[2].load(.monotonic),
+            t[3].load(.monotonic), t[4].load(.monotonic), t[5].load(.monotonic), t[6].load(.monotonic),
+        });
+    }
+}
+
+/// ZUI_BLS_CERT_BATCH=N (N > 1) sends the suite's certificates through `sig.verifyCertBatch`
+/// in lists of N per epoch file: the real certificates in lists of their own (the catch-up
+/// shape: every batch equation must hold) and the mutated ones in lists of their own (decided
+/// before the equation, or by the single check after it fails). Every verdict must still be
+/// the one Mysten's path gave. Unset: one `verifyAggregateVerdict` per certificate.
+fn certBatchSize() usize {
+    const v = std.c.getenv("ZUI_BLS_CERT_BATCH") orelse return 0;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+}
+
+/// CertBatchStats summed over the suite's workers: early, off_g2, equations, failed, batch_ok,
+/// singles, no_memory.
+var cert_batch_totals: [7]std.atomic.Value(usize) = @splat(.init(0));
+
+const CertList = struct {
+    certs: std.ArrayList(sig.CertItem) = .empty,
+    ids: std.ArrayList([]const u8) = .empty,
+    want: std.ArrayList([]const u8) = .empty,
+
+    fn flush(l: *CertList, ctx: *harness.Ctx, a: std.mem.Allocator, rng: std.Random, st: *sig.CertBatchStats) !void {
+        const n = l.certs.items.len;
+        if (n == 0) return;
+        const out = try a.alloc(sig.CertVerdict, n);
+        sig.verifyCertBatch(ctx.gpa, l.certs.items, rng, .{ .max_batch = n, .stats = st }, out);
+        for (l.ids.items, l.want.items, out) |id, want, got| _ = ctx.expectText(id, "verdict", want, verdictText(got));
+        l.certs.clearRetainingCapacity();
+        l.ids.clearRetainingCapacity();
+        l.want.clearRetainingCapacity();
+    }
+};
+
+/// One epoch file through `verifyCertBatch` in lists of `n`. The file's lines stay in one arena
+/// until its last list is checked.
+fn certFileBatched(ctx: *harness.Ctx, committee: *const sig.PreparedCommittee, it: *std.mem.SplitIterator(u8, .scalar), n: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var seed: [32]u8 = undefined;
+    ctx.io.random(&seed);
+    var chacha = std.Random.ChaCha.init(seed);
+    const rng = chacha.random();
+    var st: sig.CertBatchStats = .{};
+    var real: CertList = .{};
+    var mutated: CertList = .{};
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (ctx.done()) break;
+        const cl = try std.json.parseFromSliceLeaky(CertLine, a, line, .{ .ignore_unknown_fields = true });
+        const id = try std.fmt.allocPrint(a, "{d}/{s}", .{ cl.seq, cl.case });
+        if (!ctx.selected(id)) continue;
+        const msg = try hexAlloc(a, cl.msg);
+        const sigb = try hexAlloc(a, cl.sig);
+        if (sigb.len != 48) {
+            // the certificate field is a fixed 48-byte BCS array
+            _ = ctx.expectText(id, "verdict", cl.verdict, verdictText(.sig_decode));
+            continue;
+        }
+        const l = if (std.mem.eql(u8, cl.case, "real")) &real else &mutated;
+        try l.certs.append(a, .{ .committee = committee, .signers = cl.signers, .msg = msg, .agg_sig = sigb[0..48] });
+        try l.ids.append(a, id);
+        try l.want.append(a, cl.verdict);
+        if (l.certs.items.len >= n) try l.flush(ctx, a, rng, &st);
+    }
+    try real.flush(ctx, a, rng, &st);
+    try mutated.flush(ctx, a, rng, &st);
+    const t = &cert_batch_totals;
+    for ([_]usize{ st.early, st.off_g2, st.batch.equations, st.batch.failed, st.batch.batch_ok, st.batch.singles, st.no_memory }, 0..) |v, i| {
+        _ = t[i].fetchAdd(v, .monotonic);
+    }
 }
 
 fn certFile(_: void, ctx: *harness.Ctx, name: []const u8) !void {
@@ -312,6 +391,8 @@ fn certFile(_: void, ctx: *harness.Ctx, name: []const u8) !void {
     var it = std.mem.splitScalar(u8, text, '\n');
     const first = it.next() orelse return error.EmptyCertFile;
     const committee = try prepare(ctx.scratch(), first);
+    const batch = certBatchSize();
+    if (batch > 1) return certFileBatched(ctx, &committee, &it, batch);
     var arena = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena.deinit();
     while (it.next()) |line| {

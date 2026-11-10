@@ -59,7 +59,10 @@ pub const VmError = objrt.VmError;
 pub const Outcome = union(enum) {
     /// `ref` is set when the native returns one reference (`&T`/`&mut T`) instead of values:
     /// the caller reads and writes the value through it.
-    ok: struct { cost: u64, rets: []const Value, ref: ?*Value = null },
+    /// `actual` is set by a native whose (single) return value is built without looking at its
+    /// declared return type: the layout the value has. Its Move callers always ask for a type
+    /// of that layout; a direct call under DevInspect<true> may not (`Host.arbitrary_calls`).
+    ok: struct { cost: u64, rets: []const Value, ref: ?*Value = null, actual: ?*const Layout = null },
     abort: struct { cost: u64, code: u64 },
     err: VmError,
 };
@@ -188,6 +191,13 @@ pub const Ctx = struct {
 
     pub fn ok0(c: *const Ctx) Outcome {
         return c.ok(&.{});
+    }
+
+    /// `ok1` for a value of layout `actual`, whatever the declared return type is.
+    pub fn ok1As(c: *const Ctx, v: Value, actual: *const Layout) Error!Outcome {
+        const r = try c.arena.alloc(Value, 1);
+        r[0] = v;
+        return .{ .ok = .{ .cost = c.used(), .rets = r, .actual = actual } };
     }
 
     pub fn abort(c: *const Ctx, code: u64) Outcome {

@@ -15,6 +15,9 @@
 //!    the signatures exactly reversed, and reordering back gives the stored envelope. The
 //!    ingest overlay (convert.txSignatures) accepts the same list; a list with one signature
 //!    byte changed is refused by both.
+//! 3. What a restart takes a logged fix by (sigorder.selfProven, no stored transaction read):
+//!    the fix proves itself under the transaction digest the checkpoint contents certify, and
+//!    under no other digest.
 const std = @import("std");
 const harness = @import("harness");
 const types = @import("types");
@@ -40,9 +43,9 @@ pub fn run(ctx: *harness.Ctx) !void {
     ctx.stdout.flush() catch {};
 }
 
-/// Per transaction of the contents: certified signature count and whether any carries an
-/// alias version (V2 only).
-const Entry = struct { k: u64, aliased: bool };
+/// Per transaction of the contents: its digest, the certified signature count and whether any
+/// carries an alias version (V2 only).
+const Entry = struct { digest: [32]u8, k: u64, aliased: bool };
 
 fn contentsEntries(a: std.mem.Allocator, contents: []const u8) !struct { v2: bool, e: []Entry } {
     var r = bcs.Reader.init(contents);
@@ -50,8 +53,8 @@ fn contentsEntries(a: std.mem.Allocator, contents: []const u8) !struct { v2: boo
     const n = try r.length();
     const out = try a.alloc(Entry, n);
     for (out) |*e| {
-        _ = try r.bytes(66);
-        e.* = .{ .k = 0, .aliased = false };
+        const d = try r.bytes(66);
+        e.* = .{ .digest = d[1..33].*, .k = 0, .aliased = false };
         if (tag == 1) {
             e.k = try r.length();
             for (0..e.k) |_| {
@@ -153,6 +156,13 @@ fn one(c: *Counts, ctx: *harness.Ctx, name: []const u8) !void {
                     continue;
                 };
                 chk.bytes("back", env, back);
+                // 3. The log reload's check, against the certified digest.
+                if (i < ce.e.len) {
+                    if (!sigorder.selfProven(&ce.e[i].digest, fixed)) chk.failf("the fix does not prove itself under the contents' transaction digest", .{});
+                    var other = ce.e[i].digest;
+                    other[31] ^= 1;
+                    if (sigorder.selfProven(&other, fixed)) chk.failf("the fix proves itself under another digest", .{});
+                }
             } else chk.failf("reorder refused a permutation of the stored signatures", .{});
             // The ingest overlay's rule agrees.
             const raw_start = e.head;

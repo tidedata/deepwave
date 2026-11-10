@@ -271,6 +271,29 @@ pub const Options = struct {
     /// a path outside every service answers tonic's fallback (UNIMPLEMENTED, empty message)
     /// instead of 404. Off: the full node's stack.
     grpc_only: bool = false,
+    /// Send bound: bytes framed and waiting for the socket (`pending()`). At the bound `flush`
+    /// leaves response DATA in its stream, which stays open and counted against `max_streams`,
+    /// and the runtime reads no more requests until the socket takes some (`outFull`). Without
+    /// it a peer with a huge h2 window that reads slowly had every response copied whole into
+    /// `out`, with no limit. The h2 crate bounds the same thing per stream
+    /// (`max_send_buffer_size`); DATA frame sizes are unchanged for a peer with the default
+    /// SETTINGS_MAX_FRAME_SIZE. HEADERS, trailers and control frames are small and not held back.
+    max_out_bytes: usize = 1 << 20,
+    /// Rapid reset (CVE-2023-44487). The h2 crate's default, which sui-node runs with
+    /// (`max_pending_accept_reset_streams`, 20): streams the peer opens and resets before the
+    /// server has taken them up. Here that is within one `feed` pass; one more answers
+    /// GOAWAY(ENHANCE_YOUR_CALM) with h2's debug data `too_many_resets`.
+    max_pending_resets: u32 = 20,
+    /// deepwave's own bound, for what tonic gets for free: there a reset drops the call's future,
+    /// here the handler keeps its worker until it returns. Calls still on a worker whose stream
+    /// is gone (reset by the peer, or by this side for a stream error the peer caused) are
+    /// counted, and one more than this many closes the connection the same way, so a peer
+    /// never has more than `max_streams` + this many calls on the workers (`--h2-max-cancelled`).
+    /// A client that cancels calls, at any rate, stays below it unless that many cancelled calls
+    /// are still running at once. The default leaves room for that case too: a node that stalls
+    /// while its clients time out and retry several times over (sui-node never closes such a
+    /// client; a cancelled call costs it nothing).
+    max_reset_running: u32 = 4096,
 };
 
 const FrameType = enum(u8) { data = 0, headers = 1, priority = 2, rst_stream = 3, settings = 4, push_promise = 5, ping = 6, goaway = 7, window_update = 8, continuation = 9, _ };
@@ -297,6 +320,21 @@ pub const Job = struct {
     encoding: Encoding,
     deadline_ns: ?u64,
     client_protocol_version: ?u64 = null,
+    /// Set by the connection (under its lock) when nobody waits for the answer any more: the
+    /// stream was reset or dropped, or `expireJobs` answered it at its deadline.
+    cancelled: std.atomic.Value(bool) = .init(false),
+
+    /// Why a worker taking the job at `now_ns` must not run its handler, or null to run it.
+    /// `.cancelled`: the stream is gone, any answer would be dropped. `.deadline_exceeded`: the
+    /// deadline passed while the job waited for a worker; the worker answers what `expireJobs`
+    /// answers ("Timeout expired", trailers-only), whichever of the two gets there first.
+    /// sui-http's GrpcTimeout drops the call's future at the deadline, so sui-node does not run
+    /// it either.
+    pub fn dropped(j: *const Job, now_ns: u64) ?Status {
+        if (j.cancelled.load(.acquire)) return .cancelled;
+        if (j.deadline_ns) |d| if (now_ns >= d) return .deadline_exceeded;
+        return null;
+    }
 
     pub fn request(j: *const Job) Request {
         return .{ .path = j.path, .authority = j.authority, .body = j.body, .stream_id = j.stream_id, .accept = j.encoding, .deadline_ns = j.deadline_ns, .client_protocol_version = j.client_protocol_version };
@@ -310,7 +348,9 @@ pub const Job = struct {
 };
 
 /// Runs unary handlers off the connection (server.zig: the worker pool). `submit` takes the job
-/// (true) or declines it (false: the handler runs inline, as without an offload).
+/// (true) or declines it (false: the handler runs inline, as without an offload). The stream
+/// keeps a pointer to a job it handed out until `complete` or `jobEnded` is called for it, so the
+/// worker calls one of them (under the connection lock) before it frees the job.
 pub const Offload = struct {
     ctx: *anyopaque,
     submit: *const fn (ctx: *anyopaque, job: *Job) bool,
@@ -350,6 +390,8 @@ pub const Stream = struct {
     running: bool = false,
     /// Deadline of the call running on a worker (`expireJobs`).
     job_deadline: ?u64 = null,
+    /// The job of that call, to tell its worker when the stream goes (`Job.cancelled`).
+    job: ?*Job = null,
     /// A plain HTTP reply (GET /health, gRPC-web): the stream ends after `out` with an empty
     /// DATA frame instead of trailers.
     plain_end: bool = false,
@@ -409,6 +451,23 @@ pub const Conn = struct {
     /// Earliest deadline of a call running on a worker (connection thread only): the server
     /// loop waits no longer than this, so `expireJobs` answers at the deadline.
     next_job_deadline: ?u64 = null,
+    /// A `flush` stopped at the send bound (`Options.max_out_bytes`): `consumed` moves more
+    /// stream bytes into `out` once there is room.
+    out_blocked: bool = false,
+    /// `consumed` moved held-back stream bytes into `out` (the runtime wakes its pumps: their
+    /// `unsent` may have reached zero) and clears it.
+    out_refilled: bool = false,
+    /// RST_STREAM frames received on this connection.
+    rst_frames: u64 = 0,
+    /// `last_stream` when the current `feed` pass began: streams above it were opened in this
+    /// pass (`Options.max_pending_resets`), and how many of those the peer reset in it.
+    pass_base: u32 = 0,
+    pass_resets: u32 = 0,
+    /// Streams dropped while their call was still on a worker (`Options.max_reset_running`);
+    /// the worker's `complete` takes its stream out.
+    reset_running: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// The connection was closed for resets (GOAWAY ENHANCE_YOUR_CALM).
+    calmed: bool = false,
 
     pub fn init(gpa: Allocator, opts: Options, handler: Handler) !Conn {
         var c: Conn = .{ .gpa = gpa, .opts = opts, .handler = handler, .dec = hpack.Decoder.init(gpa) };
@@ -423,6 +482,7 @@ pub const Conn = struct {
             c.gpa.destroy(s.*);
         }
         c.streams.deinit(c.gpa);
+        c.reset_running.deinit(c.gpa);
         c.in.deinit(c.gpa);
         c.out.deinit(c.gpa);
         c.hb.deinit(c.gpa);
@@ -437,9 +497,33 @@ pub const Conn = struct {
     pub fn consumed(c: *Conn, n: usize) void {
         c.out_off += n;
         if (c.out_off == c.out.items.len) {
-            c.out.clearRetainingCapacity();
+            // Control frames are not held back, so `out` can pass the bound: do not keep that.
+            if (c.out.capacity > 2 *| c.opts.max_out_bytes) c.out.clearAndFree(c.gpa) else c.out.clearRetainingCapacity();
+            c.out_off = 0;
+        } else if (c.out_off >= out_compact_min and c.out_off >= c.out.items.len / 2) {
+            // A backlog that is refilled as it drains never empties: drop the sent prefix here,
+            // or `out` would grow by everything ever sent.
+            const rest = c.out.items.len - c.out_off;
+            std.mem.copyForwards(u8, c.out.items[0..rest], c.out.items[c.out_off..]);
+            c.out.shrinkRetainingCapacity(rest);
             c.out_off = 0;
         }
+        if (c.out_blocked and !c.outFull()) {
+            c.out_blocked = false;
+            c.out_refilled = true;
+            // Out of memory here leaves streams that nothing would flush again: close.
+            c.flushAll() catch {
+                c.closing = true;
+            };
+        }
+    }
+
+    const out_compact_min = 64 << 10;
+
+    /// The queued output is at the send bound (`Options.max_out_bytes`): the runtime writes
+    /// `pending()` and reads nothing more from the peer until this is false again.
+    pub fn outFull(c: *const Conn) bool {
+        return c.pending().len >= c.opts.max_out_bytes;
     }
 
     /// Does nothing (lets a runtime drain `pending()` through its usual control path).
@@ -508,6 +592,30 @@ pub const Conn = struct {
         return error.ConnectionError;
     }
 
+    /// GOAWAY(ENHANCE_YOUR_CALM) with the h2 crate's debug data, for a peer that resets streams
+    /// faster than the limits allow.
+    fn tooManyResets(c: *Conn) ConnError {
+        const debug = "too_many_resets";
+        c.closing = true;
+        c.calmed = true;
+        c.frameHeader(8 + debug.len, .goaway, 0, 0) catch return error.OutOfMemory;
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u32, b[0..4], c.last_stream, .big);
+        std.mem.writeInt(u32, b[4..8], @intFromEnum(ErrCode.enhance_your_calm), .big);
+        c.out.appendSlice(c.gpa, &b) catch return error.OutOfMemory;
+        c.out.appendSlice(c.gpa, debug) catch return error.OutOfMemory;
+        return error.ConnectionError;
+    }
+
+    /// Calls still on a worker whose stream is gone.
+    pub fn resetRunning(c: *const Conn) usize {
+        return c.reset_running.count();
+    }
+
+    fn maxResetRunning(c: *const Conn) usize {
+        return c.opts.max_reset_running;
+    }
+
     /// Graceful shutdown (max connection age, server stop): GOAWAY(NO_ERROR) with the last
     /// stream id; open streams finish, new ones are refused.
     pub fn drain(c: *Conn) !void {
@@ -535,6 +643,8 @@ pub const Conn = struct {
     pub fn feed(c: *Conn, bytes: []const u8) ConnError!void {
         if (c.closing) return;
         try c.in.appendSlice(c.gpa, bytes);
+        c.pass_base = c.last_stream;
+        c.pass_resets = 0;
         var pos: usize = 0;
         defer {
             if (pos > 0) {
@@ -627,14 +737,24 @@ pub const Conn = struct {
                     if (s.send_window > 0x7fffffff) {
                         c.rst(sid, .flow_control) catch return error.OutOfMemory;
                         c.dropStream(sid);
+                        // a reset the peer provoked frees the stream like its own would
+                        if (c.reset_running.count() > c.maxResetRunning()) return c.tooManyResets();
                     }
                 }
             },
             .priority => {},
             .rst_stream => {
                 if (sid == 0 or payload.len != 4) return c.goaway(.protocol);
-                if (c.streams.get(sid)) |s| s.reset = true;
+                c.rst_frames += 1;
+                if (c.streams.get(sid)) |s| {
+                    s.reset = true;
+                    if (sid > c.pass_base) {
+                        c.pass_resets += 1;
+                        if (c.pass_resets > c.opts.max_pending_resets) return c.tooManyResets();
+                    }
+                }
                 c.dropStream(sid);
+                if (c.reset_running.count() > c.maxResetRunning()) return c.tooManyResets();
             },
             .goaway => {
                 c.closing = true;
@@ -807,6 +927,11 @@ pub const Conn = struct {
 
     fn dropStream(c: *Conn, sid: u32) void {
         if (c.streams.fetchRemove(sid)) |kv| {
+            // Its call is still on a worker: the stream no longer counts against
+            // `max_streams`, the call does against `max_reset_running`.
+            if (kv.value.running) c.reset_running.put(c.gpa, sid, {}) catch {};
+            // a worker that has not started the call yet drops it
+            if (kv.value.job) |j| j.cancelled.store(true, .release);
             kv.value.deinit(c.gpa);
             c.gpa.destroy(kv.value);
         }
@@ -873,12 +998,14 @@ pub const Conn = struct {
         if (c.offload) |o| {
             if (c.makeJob(s, payload)) |job| {
                 const dl = job.deadline_ns;
+                s.job = job; // before `submit`: the worker may have the job at once
                 if (o.submit(o.ctx, job)) {
                     s.running = true;
                     s.job_deadline = dl;
                     if (dl) |d| c.next_job_deadline = if (c.next_job_deadline) |x| @min(x, d) else d;
                     return;
                 }
+                s.job = null;
                 job.destroy(c.gpa);
             } else |_| {}
         }
@@ -910,8 +1037,10 @@ pub const Conn = struct {
     /// (prefix and payload, compressed with the stream's encoding) and the status. False when
     /// the stream is gone (reset by the peer, or the connection failed).
     pub fn complete(c: *Conn, stream_id: u32, framed: []const u8, messages: u32, status: Status, text: []const u8, details_bin: []const u8) ConnError!bool {
+        _ = c.reset_running.remove(stream_id);
         const s = c.streams.get(stream_id) orelse return false;
         s.running = false;
+        s.job = null;
         if (s.reset or s.ended() or c.closing) return false;
         var off: usize = 0;
         while (off + 5 <= framed.len) {
@@ -925,6 +1054,15 @@ pub const Conn = struct {
             else => try c.setTrailersEx(s, status, text, details_bin, false),
         }
         return true;
+    }
+
+    /// The worker of `stream_id`'s job is done with it and has no answer to give (the connection
+    /// failed): what `complete` does for the bookkeeping, nothing queued.
+    pub fn jobEnded(c: *Conn, stream_id: u32) void {
+        _ = c.reset_running.remove(stream_id);
+        const s = c.streams.get(stream_id) orelse return;
+        s.running = false;
+        s.job = null;
     }
 
     /// sui-http's `GrpcTimeout` (the 60 s server default, or a shorter `grpc-timeout`): a unary
@@ -950,6 +1088,9 @@ pub const Conn = struct {
         for (ids[0..n]) |id| if (c.streams.get(id)) |s| {
             s.running = false;
             s.job_deadline = null;
+            // answered here: a worker that has not started the call drops it
+            if (s.job) |j| j.cancelled.store(true, .release);
+            s.job = null;
             try c.setTrailersEx(s, .deadline_exceeded, "Timeout expired", "", false);
         };
     }
@@ -1254,7 +1395,16 @@ pub const Conn = struct {
             const avail = s.out.items.len - s.out_off;
             const win = @min(c.conn_send_window, s.send_window);
             if (win <= 0) break;
-            const n: usize = @intCast(@min(@min(@as(i64, @intCast(avail)), win), @as(i64, c.peer_max_frame)));
+            // The send bound: the rest stays in the stream until the socket takes some
+            // (`consumed`). A frame is cut to the room left only above the 16,384 bytes every
+            // peer accepts, so default-sized frames keep their size.
+            const room = c.opts.max_out_bytes -| c.pending().len;
+            if (room == 0) {
+                c.out_blocked = true;
+                break;
+            }
+            const cap: i64 = @intCast(@min(@max(room, 16384), @as(usize, c.peer_max_frame)));
+            const n: usize = @intCast(@min(@min(@as(i64, @intCast(avail)), win), cap));
             s.obs.firstChunk(meta.monoNs());
             c.frameHeader(n, .data, 0, s.id) catch return error.OutOfMemory;
             c.out.appendSlice(c.gpa, s.out.items[s.out_off..][0..n]) catch return error.OutOfMemory;

@@ -67,12 +67,33 @@ fn setup(ctx: *harness.Ctx, arena: Allocator) !*Shared {
     for (epochs, last) |e, *l| l.* = e.last;
     const pkgs = try arena.create(exec.packages.Store);
     pkgs.* = try exec.packages.load(ctx, arena, last);
+    try loadFetchedPackages(ctx, arena, pkgs);
     const sh = try arena.create(Shared);
     sh.* = .{
-        .engine = .{ .gpa = std.heap.smp_allocator, .pkgs = pkgs },
+        // the records' checks-disabled cases (4, 20) are sui-node with its default config
+        // (`dev-inspect-disabled: false`): DevInspect<true>
+        .engine = .{ .gpa = std.heap.smp_allocator, .pkgs = pkgs, .dev_inspect = .enabled },
         .chain_id = serve.b58.decode32(mainnet_chain_id_b58) orelse return error.InvalidChainId,
     };
     return sh;
+}
+
+/// The rest of the truth tool's package set (`load_env`): `vectors/rpc-simulate-pkgs/*.obj`, the
+/// packages `zui-truth-rpc-exec fetch-packages` added to the corpus `packages/` (original
+/// packages of upgraded ones, where their types were first defined). sui-node's answers were made
+/// with them in the store, and the `json` of a command output whose type one of them defines
+/// (cases 19 and 20) needs its layout from there. A corpus without the directory has none.
+fn loadFetchedPackages(ctx: *harness.Ctx, arena: Allocator, pkgs: *exec.packages.Store) !void {
+    var dir = ctx.corpus.openDir(ctx.io, "vectors/rpc-simulate-pkgs", .{ .iterate = true }) catch return;
+    defer dir.close(ctx.io);
+    var it = dir.iterate();
+    while (try it.next(ctx.io)) |e| {
+        if (!std.mem.endsWith(u8, e.name, ".obj") or e.name.len != 64 + 4) continue;
+        var id: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&id, e.name[0..64]) catch continue;
+        if (pkgs.user.contains(id)) continue;
+        try pkgs.user.put(arena, id, try dir.readFileAlloc(ctx.io, e.name, arena, .limited(1 << 28)));
+    }
 }
 
 fn run(ctx: *harness.Ctx) !void {

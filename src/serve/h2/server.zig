@@ -50,7 +50,7 @@ pub const Options = struct {
     /// Pump threads running at once, process-wide; a server stream past it ends with
     /// RESOURCE_EXHAUSTED (each pump is an OS thread).
     max_pumps: u32 = 2048,
-    /// h2c unary calls run on a fixed worker pool (0: 4 per CPU, 16 to 256), not on the
+    /// h2c unary calls run on a fixed worker pool (0: 4 per usable CPU, 16 to 256), not on the
     /// connection thread, so the streams of one connection are served concurrently as tonic
     /// serves them. `inline_unary` keeps them on the connection thread (tests, tools).
     workers: u32 = 0,
@@ -72,6 +72,13 @@ pub const Stats = struct {
     accept_errors: Atomic(u64) = .init(0),
     /// h2c unary calls in flight on the worker pool.
     jobs: Atomic(u32) = .init(0),
+    /// RST_STREAM frames received, and connections closed with GOAWAY(ENHANCE_YOUR_CALM) for
+    /// resetting streams past the limits (conn.zig `max_pending_resets`, `max_reset_running`).
+    rst_frames: Atomic(u64) = .init(0),
+    reset_closes: Atomic(u64) = .init(0),
+    /// Calls a worker took and did not run: the deadline had passed while they waited in the
+    /// queue, or nobody was left to answer (stream reset, connection closed).
+    jobs_dropped: Atomic(u64) = .init(0),
 };
 
 pub var stats: Stats = .{};
@@ -246,17 +253,10 @@ const H2 = struct {
     /// Running or finished pump threads; touched under `mu`.
     pumps: std.ArrayList(*Attached) = .empty,
 
-    /// Writes everything the connection has queued. Caller holds `mu`.
-    fn drain(h: *H2) !void {
-        while (h.conn.pending().len > 0) {
-            const p = h.conn.pending();
-            try sock.writeAll(h.fd, p);
-            h.conn.consumed(p.len);
-        }
-    }
-
-    /// Writes what the socket takes now; the rest stays queued for the connection thread
-    /// (workers must not wait on a slow reader). Returns the bytes written. Caller holds `mu`.
+    /// Writes what the socket takes now; the rest stays queued for the connection thread.
+    /// Returns the bytes written. Caller holds `mu`, and nothing ever waits for the peer under
+    /// `mu`: workers finishing calls of this connection queue behind it, and the pools are
+    /// process-wide, so a few slow readers could otherwise park a whole worker class.
     fn drainSome(h: *H2) usize {
         var total: usize = 0;
         while (h.conn.pending().len > 0) {
@@ -269,7 +269,43 @@ const H2 = struct {
             h.conn.consumed(n);
             total += n;
         }
+        // records a TLS session sealed and the socket did not take yet
+        if (sock.unsent(h.fd) > 0) _ = sock.writeSome(h.fd, "") catch h.closed.store(true, .release);
         return total;
+    }
+
+    /// Bytes are still owed to the peer: queued on the connection or held by a TLS session.
+    /// Caller holds `mu`.
+    fn owes(h: *H2) bool {
+        return h.conn.pending().len > 0 or sock.unsent(h.fd) > 0;
+    }
+
+    /// `drainSome` from a thread other than the connection's (a worker, a pump): what the
+    /// socket does not take is left to the connection thread, woken to wait for POLLOUT. A
+    /// refill at the send bound may have unblocked a pump, which that thread wakes too.
+    /// Caller holds `mu`.
+    fn kick(h: *H2) void {
+        _ = h.drainSome();
+        if (h.owes() or h.conn.out_refilled) if (h.wake) |k| k.signal();
+    }
+
+    /// The last bytes of a connection that closes in an orderly way (a GOAWAY, the final
+    /// trailers): written as the socket takes them, waiting for it outside `mu`, until nothing
+    /// is left, the peer takes nothing for `write_stall_ns`, or the socket fails. Connection
+    /// thread only; `mu` not held.
+    fn lingerOut(h: *H2) void {
+        var since = meta.monoNs();
+        while (!h.closed.load(.acquire)) {
+            h.lock();
+            const wrote = h.drainSome();
+            const left = h.owes();
+            h.unlock();
+            if (!left) return;
+            const now = meta.monoNs();
+            if (wrote > 0) since = now else if (now -| since >= write_stall_ns) return;
+            const rdy = sock.waitConn(h.fd, false, true, null, 1000) catch return;
+            if (rdy.readable and !rdy.writable) return; // hung up
+        }
     }
 
     fn lock(h: *H2) void {
@@ -303,10 +339,10 @@ const H2 = struct {
         h.lock();
         defer h.unlock();
         h.conn.push(sid, payload) catch return error.Closed;
-        h.drain() catch {
-            h.closed.store(true, .release);
-            return error.Closed;
-        };
+        // The pump does not wait for the peer here (it holds `mu`); it waits on `blocked`, which
+        // stays true while the stream's bytes are held back by a window or by the send bound.
+        h.kick();
+        if (h.closed.load(.acquire)) return error.Closed;
     }
     fn linkFinish(impl: *anyopaque, sid: u32, status: conn_mod.Status, text: []const u8, details: []const u8) void {
         const h: *H2 = @ptrCast(@alignCast(impl));
@@ -314,7 +350,7 @@ const H2 = struct {
         h.lock();
         defer h.unlock();
         h.conn.finishDetails(sid, status, text, details) catch return;
-        h.drain() catch h.closed.store(true, .release);
+        h.kick();
     }
     fn linkBlocked(impl: *anyopaque, sid: u32) ?bool {
         const h: *H2 = @ptrCast(@alignCast(impl));
@@ -407,30 +443,32 @@ const H2 = struct {
         defer h.unlock();
         const prev = pump.current;
         pump.current = .{ .ctx = h, .attach = attachFn };
+        const rst0 = h.conn.rst_frames;
+        const calmed0 = h.conn.calmed;
         const r = h.conn.feed(bytes);
         pump.current = prev;
+        if (h.conn.rst_frames != rst0) _ = stats.rst_frames.fetchAdd(h.conn.rst_frames - rst0, .monotonic);
+        if (h.conn.calmed and !calmed0) _ = stats.reset_closes.fetchAdd(1, .monotonic);
         // Never block under the lock: what the socket does not take now goes out on POLLOUT.
         _ = h.drainSome();
+        // the connection thread wakes its pumps after every read
+        h.conn.out_refilled = false;
         h.startFresh();
         if (h.closed.load(.acquire)) return false;
-        if (r) |_| {} else |_| {
-            h.drain() catch {}; // the GOAWAY goes out before the close
-            return false;
-        }
-        if (h.conn.wantsClose()) {
-            h.drain() catch {};
-            return false;
-        }
-        return true;
+        // (the GOAWAY of a connection error goes out before the close: `lingerOut`)
+        if (r) |_| {} else |_| return false;
+        return !h.conn.wantsClose();
     }
 
-    /// Queues something on the connection (GOAWAY, PING) and writes it. False when the
-    /// connection must close.
+    /// Queues something on the connection (GOAWAY, PING, expired calls) and writes what the
+    /// socket takes now; the loop sends the rest on POLLOUT. False when the connection must
+    /// close (the caller lingers on what is left).
     fn control(h: *H2, comptime f: anytype, args: anytype) bool {
         h.lock();
         defer h.unlock();
         @call(.auto, f, .{&h.conn} ++ args) catch return false;
-        h.drain() catch return false;
+        _ = h.drainSome();
+        if (h.closed.load(.acquire)) return false;
         return !h.conn.wantsClose();
     }
 
@@ -500,24 +538,45 @@ const H2 = struct {
         defer rs.release();
         var wa: WorkAttach = .{};
         const req = job.request();
-        const prev = pump.current;
-        pump.current = .{ .ctx = &wa, .attach = WorkAttach.attach };
-        var status = h.handler.call(h.handler.ctx, &req, &rs);
-        pump.current = prev;
+        // A call nobody waits for is not run: its deadline passed while it sat in the queue (it
+        // is answered "Timeout expired", by this worker or by `expireJobs`, whichever is first),
+        // its stream was reset, or the connection is gone. Under overload the queue used to hold
+        // calls until the 60 s deadline answered them and then ran every one of them anyway.
+        const drop: ?conn_mod.Status = if (h.closed.load(.acquire)) .cancelled else job.dropped(meta.monoNs());
+        var status: conn_mod.Status = undefined;
+        if (drop) |why| {
+            _ = stats.jobs_dropped.fetchAdd(1, .monotonic);
+            status = if (why == .deadline_exceeded) rs.deadlineExceeded() else why;
+        } else {
+            const prev = pump.current;
+            pump.current = .{ .ctx = &wa, .attach = WorkAttach.attach };
+            status = h.handler.call(h.handler.ctx, &req, &rs);
+            pump.current = prev;
+        }
         if (status == .deferred and wa.pump == null) status = .unimplemented;
         {
             h.lock();
             defer h.unlock();
-            const alive = !h.closed.load(.acquire) and (h.conn.complete(job.stream_id, buf.out.items, buf.messages, status, rs.msg, rs.details_bin) catch false);
+            // (`jobEnded`: the stream forgets the job before it is freed below)
+            const alive = if (h.closed.load(.acquire)) blk: {
+                h.conn.jobEnded(job.stream_id);
+                break :blk false;
+            } else (h.conn.complete(job.stream_id, buf.out.items, buf.messages, status, rs.msg, rs.details_bin) catch false);
             if (wa.pump) |p| {
                 if (alive and status == .deferred and h.attachLocked(job.stream_id, p)) {
                     h.startFresh();
                 } else if (p.done) |d| d(p.ctx); // never started
             }
-            _ = h.drainSome();
-            if (h.conn.pending().len > 0) if (h.wake) |k| k.signal();
+            h.kick();
         }
         job.destroy(gpa);
+        // What the response still holds goes back now: the reference on a cached frame (`hold`),
+        // its owned strings, the buffer. Once the counts below drop, the connection is freed and
+        // whoever waited for the server to drain (`waitDrained`, a test, a runner) may take the
+        // service, its cache and the allocator down; left to the `defer`s above, the hold was
+        // dropped after that.
+        rs.release();
+        buf.out.clearAndFree(gpa);
         _ = stats.jobs.fetchSub(1, .monotonic);
         // last touch of `h`: the connection may be freed right after
         _ = h.inflight.fetchSub(1, .acq_rel);
@@ -534,7 +593,8 @@ fn serveH2(gpa: std.mem.Allocator, io: Io, fd: std.c.fd_t, first: []const u8, op
     h.wake = sock.Wake.open();
     defer {
         h.closed.store(true, .release);
-        // A pump or worker blocked in a socket write returns once the socket is shut down.
+        // No pump or worker waits in a socket write (they write with `kick`); the shutdown ends
+        // the connection for the peer, and `wakeAll` ends the pumps' waits.
         sock.shutdown(fd);
         h.wakeAll();
         // workers finish their call (handlers are finite) and touch `h` one last time
@@ -558,7 +618,7 @@ fn serveH2(gpa: std.mem.Allocator, io: Io, fd: std.c.fd_t, first: []const u8, op
         if (h.wake) |k| k.close();
         gpa.destroy(h);
     }
-    if (!h.feed(first)) return;
+    if (!h.feed(first)) return h.lingerOut();
     var stall_since: ?u64 = null;
     var rbuf: [16384]u8 = undefined;
     var drain_deadline: ?u64 = null;
@@ -570,22 +630,31 @@ fn serveH2(gpa: std.mem.Allocator, io: Io, fd: std.c.fd_t, first: []const u8, op
         // as it is writable; a peer that takes nothing for `write_stall_ns` is dropped.
         h.lock();
         const wrote = h.drainSome();
-        const backlog = h.conn.pending().len > 0;
+        const backlog = h.owes();
+        const pumps_live = h.pumps.items.len > 0;
+        // At the send bound (conn.zig `max_out_bytes`) nothing more is read from the peer: its
+        // requests wait in the socket (TCP pushes back) until it takes some of what it is owed.
+        const over = h.conn.outFull();
+        const refilled = h.conn.out_refilled;
+        h.conn.out_refilled = false;
         h.unlock();
         if (h.closed.load(.acquire)) return;
+        // stream bytes held back at the bound moved on: a pump waiting on `blocked` may go on
+        if (refilled) h.wakeAll();
         if (!backlog or wrote > 0) {
             stall_since = null;
         } else if (stall_since) |s0| {
             if (meta.monoNs() -| s0 >= write_stall_ns) return;
         } else stall_since = meta.monoNs();
-        // With a wake fd, workers signal their backlog; without one, poll often while they run.
-        var timeout: i32 = if (h.wake != null or h.inflight.load(.acquire) == 0) 1000 else 20;
+        // With a wake fd, workers and pumps signal their backlog; without one, poll often while
+        // they run.
+        var timeout: i32 = if (h.wake != null or (h.inflight.load(.acquire) == 0 and !pumps_live)) 1000 else 20;
         // A call on a worker is answered DEADLINE_EXCEEDED at its deadline, not at the next wake.
         if (h.inflight.load(.acquire) > 0) if (h.conn.next_job_deadline) |d| {
             const left_ms = (d -| meta.monoNs()) / std.time.ns_per_ms + 1;
             timeout = @intCast(@min(@as(u64, @intCast(timeout)), left_ms));
         };
-        const rdy = sock.waitConn(fd, backlog, h.wake, timeout) catch return;
+        const rdy = sock.waitConn(fd, !over, backlog, h.wake, timeout) catch return;
         if (rdy.woken) h.wake.?.clear();
         const now = meta.monoNs();
         if (rdy.readable) {
@@ -594,25 +663,25 @@ fn serveH2(gpa: std.mem.Allocator, io: Io, fd: std.c.fd_t, first: []const u8, op
             const keep = h.feed(rbuf[0..n]);
             h.reap();
             h.wakeAll();
-            if (!keep) return;
+            if (!keep) return h.lingerOut();
         } else {
             h.reap();
             h.lock();
             const done = h.conn.wantsClose();
             h.unlock();
-            if (done) return;
+            if (done) return h.lingerOut();
         }
         // server timeout (sui-http GrpcTimeout) for unary calls running on workers
         if (h.inflight.load(.acquire) > 0) {
-            if (!h.control(Conn.expireJobs, .{now})) return;
+            if (!h.control(Conn.expireJobs, .{now})) return h.lingerOut();
         }
         // graceful close: server stop, then max connection age
         if (drain_deadline == null) {
             if (stop.load(.acquire)) {
-                if (!h.control(Conn.drain, .{})) return;
+                if (!h.control(Conn.drain, .{})) return h.lingerOut();
                 drain_deadline = now +| opts.stop_grace_ns;
             } else if (opts.max_age_ns) |age| if (now -| t0 >= age) {
-                if (!h.control(Conn.drain, .{})) return;
+                if (!h.control(Conn.drain, .{})) return h.lingerOut();
                 drain_deadline = now +| opts.age_grace_ns;
             };
         } else if (now >= drain_deadline.?) return;
@@ -627,7 +696,7 @@ fn serveH2(gpa: std.mem.Allocator, io: Io, fd: std.c.fd_t, first: []const u8, op
         }
         if (next_ping) |np| if (now >= np) {
             ping_seq += 1;
-            if (!h.control(Conn.ping, .{ping_seq})) return;
+            if (!h.control(Conn.ping, .{ping_seq})) return h.lingerOut();
             ping_deadline = now +| opts.keepalive_timeout_ns;
             next_ping = now +| opts.keepalive_ns.?;
         };

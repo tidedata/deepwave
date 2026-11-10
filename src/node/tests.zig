@@ -18,11 +18,17 @@ const lhfill = @import("lhfill.zig");
 const removal_log = @import("removal_log.zig");
 const lhist = @import("history");
 const p2p_exec = @import("p2p_exec.zig");
+const reconcile = @import("reconcile.zig");
+const stream_mod = @import("stream.zig");
 const sigorder = @import("sigorder.zig");
 const netguard = @import("netguard.zig");
 const bcs = @import("bcs");
 const statehash = @import("statehash.zig");
 const sig = @import("sig");
+const hash = @import("hash");
+const index = @import("index");
+const restore_index = @import("restore_index.zig");
+const fast_start = @import("fast_start.zig");
 
 fn corpus() ?[]const u8 {
     const p = std.c.getenv("ZUI_CORPUS") orelse return null;
@@ -224,6 +230,343 @@ test "node: pools sized by the node use the usable CPU count (cgroup quota), not
     const usable = Node.usableCpus();
     try testing.expect(usable >= 1 and usable <= (std.Thread.getCpuCount() catch 1));
     try testing.expectEqual(@import("core").hw.detect(null).logical_cores, usable);
+}
+
+test "node: the state index build's memory follows the memory the process can use" {
+    const Node = @import("node.zig").Node;
+    try testing.expectEqual(@as(usize, 2 << 30), Node.indexBuildMemory(16 << 30)); // MemoryMax=16G: 2 GiB
+    try testing.expectEqual(@as(usize, 1 << 30), Node.indexBuildMemory(8 << 30));
+    try testing.expectEqual(@as(usize, 512 << 20), Node.indexBuildMemory(2 << 30));
+    try testing.expectEqual(@as(usize, 4 << 30), Node.indexBuildMemory(256 << 30));
+    try testing.expectEqual(@as(usize, 1 << 30), Node.indexBuildMemory(0)); // unknown
+    // a restore's row buffers: 64 MiB asked for stays (the build caps it for up to 16 threads);
+    // 32 and 64 fetch threads share a fifth of the 2 GiB budget
+    try testing.expectEqual(@as(usize, 64 << 20), restore_index.laneBytes(64 << 20, 16, 2 << 30));
+    try testing.expectEqual(@as(usize, (2 << 30) / 160), restore_index.laneBytes(64 << 20, 32, 2 << 30));
+    try testing.expectEqual(@as(usize, (2 << 30) / 320), restore_index.laneBytes(64 << 20, 64, 2 << 30));
+    try testing.expectEqual(@as(usize, 1 << 20), restore_index.laneBytes(64 << 20, 64, 64 << 20));
+}
+
+// ------------------------------------------------------------------ state index of a restore
+
+/// Real mainnet objects with distinct ids (the newest version seen of each), from the inputs
+/// and outputs of a few corpus checkpoints: a live set to restore.
+fn sampleLiveSet(gpa: std.mem.Allocator, a: std.mem.Allocator) ![]const []const u8 {
+    const Newest = struct { ver: u64, raw: []const u8 };
+    var by_id: std.AutoArrayHashMapUnmanaged([32]u8, Newest) = .empty;
+    var idx = try types.CheckpointIndex.init(gpa);
+    defer idx.deinit(gpa);
+    var seq: u64 = 342451160;
+    while (seq < 342451184) : (seq += 1) {
+        var nb: [64]u8 = undefined;
+        const blob = readCorpus(gpa, try std.fmt.bufPrint(&nb, "chk/{d}.chk", .{seq})) catch |e| switch (e) {
+            error.SkipZigTest => continue,
+            else => return e,
+        };
+        defer gpa.free(blob);
+        try types.indexCheckpointData(blob, &idx);
+        for (0..idx.tx_count) |i| {
+            const t = idx.txAt(i);
+            for (idx.objs[t.in_first..][0 .. t.in_count + t.out_count]) |r| {
+                const raw = r.slice(blob);
+                const k = try exec.objects.keyOf(raw);
+                const gop = try by_id.getOrPut(a, k.id);
+                if (gop.found_existing and gop.value_ptr.ver >= k.version) continue;
+                gop.value_ptr.* = .{ .ver = k.version, .raw = try a.dupe(u8, raw) };
+            }
+        }
+    }
+    if (by_id.count() == 0) return error.SkipZigTest;
+    const out = try a.alloc([]const u8, by_id.count());
+    for (by_id.values(), out) |v, *o| o.* = v.raw;
+    return out;
+}
+
+/// The table files of a finished state index's base run, in key order.
+fn indexTablePaths(gpa: std.mem.Allocator, a: std.mem.Allocator, dir: []const u8, watermark: ?u64) ![]const []const u8 {
+    const ix = try index.Index.open(gpa, testing.io, dir, .{ .sync = .none });
+    defer {
+        ix.deinit();
+        gpa.destroy(ix);
+    }
+    try testing.expect(ix.db.buildPending() == null);
+    try testing.expectEqual(watermark, ix.db.watermark());
+    try testing.expectEqual(@as(usize, 1), ix.db.runs.items.len);
+    const tabs = ix.db.runs.items[0].tables;
+    const out = try a.alloc([]const u8, tabs.len);
+    for (tabs, out) |t, *o| o.* = try std.fmt.allocPrint(a, "{s}/index/{d}.tbl", .{ dir, t.gen });
+    return out;
+}
+
+fn expectSameIndexTables(gpa: std.mem.Allocator, a: std.mem.Allocator, want_dir: []const u8, got_dir: []const u8, watermark: ?u64) !void {
+    const want = try indexTablePaths(gpa, a, want_dir, watermark);
+    const got = try indexTablePaths(gpa, a, got_dir, watermark);
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |wp, gp| {
+        const w = try Io.Dir.cwd().readFileAlloc(testing.io, wp, gpa, .limited(1 << 30));
+        defer gpa.free(w);
+        const g = try Io.Dir.cwd().readFileAlloc(testing.io, gp, gpa, .limited(1 << 30));
+        defer gpa.free(g);
+        try testing.expect(std.mem.eql(u8, w, g));
+    }
+}
+
+test "restore: the state index built from the download equals inserts, the image walk and the old build; a killed build resumes without reading the image again" {
+    const gpa = testing.allocator;
+    const c = corpus() orelse return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pb: [512]u8 = undefined;
+    const objs = try sampleLiveSet(gpa, a);
+    // The end-of-epoch checkpoint the restore ends with (the test root stands in for its
+    // commitment, as the snapshot holds a sample, not the epoch's live set).
+    const eidx = trust.EpochIndex.load(a, testing.io, try std.fmt.bufPrint(&pb, "{s}/epochs.jsonl", .{c})) catch return error.SkipZigTest;
+    const epoch: u64 = 1303;
+    if (epoch >= eidx.last.len) return error.SkipZigTest;
+    const seq = eidx.last[@intCast(epoch)] orelse return error.SkipZigTest;
+    const blob = try readCorpus(a, try std.fmt.bufPrint(&pb, "chk/{d}.chk", .{seq}));
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "snap");
+    const snap_dir = try tmp.dir.openDir(testing.io, "snap", .{});
+    defer snap_dir.close(testing.io);
+    const root = try snapshot.writeSnapshot(gpa, testing.io, snap_dir, epoch, objs, 97);
+    const base = try a.dupe(u8, try tmpPath(&tmp, &pb));
+    // the node's record codec: restored objects are compact records, which the image walk reads
+    var cfg: store.Config = .{ .dir = try std.fs.path.join(a, &.{ base, "store" }), .max_live_objects = 1 << 16, .segment_reserve = 1 << 28, .codec = exec.objects.store_codec };
+    const h = try store.openDir(gpa, testing.io, &cfg, .{ .sync = .none });
+    defer h.io.deinit();
+    defer h.store.deinit();
+    var stop: std.atomic.Value(bool) = .init(false);
+    const opts: index.lsm.Options = .{ .build_threads = 3, .build_mem_bytes = 16 << 20, .sync = .none };
+
+    // 1. The restore, with the index fed by its fetch threads and built beside the live table.
+    const dl_dir = try std.fs.path.join(a, &.{ base, "ix-download" });
+    {
+        const rib = (try restore_index.Build.begin(gpa, testing.io, h.store, .{ .state_dir = dl_dir, .rpc_dir = null, .lsm = opts, .chunk = 64 << 10, .threads = 3, .signal = &stop })).?;
+        defer rib.destroy();
+        var stats: snapshot.Stats = .{};
+        try snapshot.restore(gpa, testing.io, h.store, .{
+            .epoch = epoch,
+            .origin = .{ .dir = .{ .root = snap_dir } },
+            .threads = 3,
+            .eoe_blob = blob,
+            .expect_root = root,
+            .bulk_live = true,
+            .log_every_s = 0,
+            .on_partition = rib.partitionHook(),
+            .after_objects = rib.doneHook(),
+        }, &stats);
+        try testing.expectEqual(@as(u64, objs.len), stats.objects.load(.monotonic));
+        try h.store.persistLive();
+        try rib.finish();
+        // level with the store, and the rows inserting the live set gives
+        const ix = rib.ix.?;
+        try testing.expectEqual(@as(?u64, seq), ix.checkpoint);
+        try testing.expectEqual(@as(?u64, seq), ix.db.watermark());
+        var mem = try index.Index.init(gpa);
+        defer mem.deinit();
+        for (objs) |raw| try mem.insert(raw);
+        var x = try mem.all(a);
+        var y = try ix.all(a);
+        var n: usize = 0;
+        while (try x.next()) |e| {
+            const g = (try y.next()) orelse return error.TestMissingRow;
+            try testing.expectEqualSlices(u8, e.key, g.key);
+            try testing.expectEqualSlices(u8, e.val.bytes(), g.val.bytes());
+            n += 1;
+        }
+        try testing.expect((try y.next()) == null);
+        try testing.expect(n > objs.len / 2);
+    }
+
+    // 2. The image walk (a store restored without the stream, or one whose index is gone): one
+    //    pass over the restored segment, the same tables.
+    const Walk = struct {
+        fn run(g: std.mem.Allocator, st: *store.Store, dir: []const u8, o: index.lsm.Options, img: fast_start.Image, flag: *const std.atomic.Value(bool)) !u64 {
+            const ix = try index.Index.open(g, testing.io, dir, o);
+            defer {
+                ix.deinit();
+                g.destroy(ix);
+            }
+            var feed = index.feed.Feed.init(g, ix, st);
+            defer feed.deinit();
+            var j: fast_start.Job = .{ .gpa = g, .st = st, .image = img, .feed = &feed, .build = true, .signal = flag };
+            try j.buildNow();
+            return j.image_objects.load(.monotonic);
+        }
+    };
+    const img: fast_start.Image = .{ .epoch = epoch, .at = seq };
+    const img_dir = try std.fs.path.join(a, &.{ base, "ix-image" });
+    try testing.expect(try Walk.run(gpa, h.store, img_dir, opts, img, &stop) >= objs.len);
+    try expectSameIndexTables(gpa, a, dl_dir, img_dir, seq);
+
+    // 3. The old build (four passes over the image): the same tables.
+    const old_dir = try std.fs.path.join(a, &.{ base, "ix-old" });
+    var old_opts = opts;
+    old_opts.bulk = false;
+    old_opts.build_chunk_bytes = 64 << 10;
+    try testing.expect(try Walk.run(gpa, h.store, old_dir, old_opts, img, &stop) >= 4 * objs.len);
+    try expectSameIndexTables(gpa, a, dl_dir, old_dir, seq);
+
+    // 4. Killed while it writes its tables: the next build reads no object again.
+    const kill_dir = try std.fs.path.join(a, &.{ base, "ix-killed" });
+    index.bulk.test_crash = .{ .ranges = 5 };
+    defer index.bulk.test_crash = null;
+    try testing.expectError(error.TestCrash, Walk.run(gpa, h.store, kill_dir, opts, img, &stop));
+    index.bulk.test_crash = null;
+    try testing.expectEqual(@as(u64, 0), try Walk.run(gpa, h.store, kill_dir, opts, img, &stop));
+    try expectSameIndexTables(gpa, a, dl_dir, kill_dir, seq);
+}
+
+test "restore: a stop while the index tables are written leaves a restored store; the next start resumes the build, reads no object again and is not live before the index is" {
+    const gpa = testing.allocator;
+    const c = corpus() orelse return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pb: [512]u8 = undefined;
+    const objs = try sampleLiveSet(gpa, a);
+    const eidx = trust.EpochIndex.load(a, testing.io, try std.fmt.bufPrint(&pb, "{s}/epochs.jsonl", .{c})) catch return error.SkipZigTest;
+    const epoch: u64 = 1303;
+    if (epoch >= eidx.last.len) return error.SkipZigTest;
+    const seq = eidx.last[@intCast(epoch)] orelse return error.SkipZigTest;
+    const blob = try readCorpus(a, try std.fmt.bufPrint(&pb, "chk/{d}.chk", .{seq}));
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "snap");
+    const snap_dir = try tmp.dir.openDir(testing.io, "snap", .{});
+    defer snap_dir.close(testing.io);
+    const root = try snapshot.writeSnapshot(gpa, testing.io, snap_dir, epoch, objs, 97);
+    const base = try a.dupe(u8, try tmpPath(&tmp, &pb));
+    const opts: index.lsm.Options = .{ .build_threads = 3, .build_mem_bytes = 16 << 20, .sync = .none };
+    defer index.bulk.test_crash = null;
+
+    // Run 0 is not interrupted (the reference tables). Then: stopped after the rows are sealed,
+    // before any table; and stopped with five ranges written.
+    const kills = [_]?index.bulk.TestCrash{ null, .sealed, .{ .ranges = 5 } };
+    var ref_dir: []const u8 = "";
+    for (kills, 0..) |kill, ki| {
+        const run = try std.fmt.allocPrint(a, "run{d}", .{ki});
+        try tmp.dir.createDirPath(testing.io, try std.fmt.allocPrint(a, "{s}/node", .{run}));
+        const node_dir = try tmp.dir.openDir(testing.io, try std.fmt.allocPrint(a, "{s}/node", .{run}), .{});
+        defer node_dir.close(testing.io);
+        var cfg: store.Config = .{ .dir = try std.fs.path.join(a, &.{ base, run, "store" }), .max_live_objects = 1 << 16, .segment_reserve = 1 << 28, .codec = exec.objects.store_codec };
+        const h = try store.openDir(gpa, testing.io, &cfg, .{ .sync = .none });
+        defer h.io.deinit();
+        defer h.store.deinit();
+        const ix_dir = try std.fs.path.join(a, &.{ base, run, "state-index" });
+        var stop: std.atomic.Value(bool) = .init(false);
+
+        // The restore, as Node.restoreSnapshot runs it.
+        try snapshot.writeMarker(testing.io, node_dir, .loading, epoch);
+        index.bulk.test_crash = kill;
+        {
+            const rib = (try restore_index.Build.begin(gpa, testing.io, h.store, .{ .state_dir = ix_dir, .rpc_dir = null, .lsm = opts, .chunk = 64 << 10, .threads = 3, .signal = &stop })).?;
+            defer rib.destroy();
+            var stats: snapshot.Stats = .{};
+            try snapshot.restore(gpa, testing.io, h.store, .{
+                .epoch = epoch,
+                .origin = .{ .dir = .{ .root = snap_dir } },
+                .threads = 3,
+                .eoe_blob = blob,
+                .expect_root = root,
+                .bulk_live = true,
+                .log_every_s = 0,
+                .on_partition = rib.partitionHook(),
+                .after_objects = rib.doneHook(),
+            }, &stats);
+            try testing.expectEqual(snapshot.Marker.loading, (try snapshot.readMarker(testing.io, node_dir)).state);
+            if (kill == null) {
+                try testing.expect(try restore_index.finishRestore(testing.io, node_dir, h.store, epoch, rib));
+            } else {
+                // The index build has stopped at the kill point; then the signal, as a SIGTERM
+                // (or a kill: nothing more is written to the index either way).
+                while (!rib.merged.load(.acquire)) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                try testing.expectEqual(@as(?anyerror, error.TestCrash), rib.merge_err);
+                stop.store(true, .release);
+                try testing.expectError(error.Stopped, restore_index.finishRestore(testing.io, node_dir, h.store, epoch, rib));
+            }
+        }
+        index.bulk.test_crash = null;
+        stop.store(false, .release);
+
+        // What the next start reads. The marker: the store is restored, so Node.init neither
+        // wipes it nor restores again (it does both only for `loading`, and restores only into
+        // an empty store).
+        const m = try snapshot.readMarker(testing.io, node_dir);
+        try testing.expectEqual(snapshot.Marker.done, m.state);
+        try testing.expectEqual(epoch, m.epoch);
+        try testing.expectEqual(@as(?u64, seq), h.store.committed());
+        try testing.expectEqual(@as(u64, objs.len), h.store.liveCount());
+        if (kill == null) {
+            ref_dir = ix_dir;
+            _ = try indexTablePaths(gpa, a, ix_dir, seq);
+            continue;
+        }
+        // The index: its own state says it is not built, whatever the marker says.
+        const ix = try index.Index.open(gpa, testing.io, ix_dir, opts);
+        var ix_open = true;
+        defer if (ix_open) {
+            ix.deinit();
+            gpa.destroy(ix);
+        };
+        try testing.expect(ix.db.watermark() == null);
+        try testing.expect(ix.db.buildPending() != null);
+        var feed = index.feed.Feed.init(gpa, ix, h.store);
+        defer feed.deinit();
+        var img: fast_start.Image = undefined;
+        {
+            var snap = h.store.snapshot();
+            defer snap.release();
+            // Node.startIndexes: a reason to build and a restore image mean the background job
+            try testing.expectEqualStrings("resume build", feed.buildReason(&snap).?);
+            img = fast_start.findImage(&snap, m.epoch) orelse return error.TestNoImage;
+            try testing.expectEqual(seq, img.at);
+        }
+        {
+            const st = index.bulk.State.read(gpa, ix.db.files.?) orelse return error.TestNoState;
+            defer gpa.destroy(st);
+            try testing.expectEqual(index.bulk.State.Phase.sort, st.phase);
+            try testing.expectEqual(seq, st.tip);
+            switch (kill.?) {
+                .sealed => try testing.expectEqual(@as(u64, 0), st.ranges_done),
+                .ranges => |n| try testing.expect(@popCount(st.ranges_done) >= n),
+                else => unreachable,
+            }
+        }
+        // Node.run: the job starts before the servers do. Until it hands over, StateService is
+        // UNAVAILABLE (`ready`) and /health is 503 (`indexCaughtUp`).
+        var svc: serve.service.Service = .{ .gpa = gpa, .store = h.store, .chain_id = @splat(0) };
+        defer svc.deinit();
+        svc.state = index.state.hook(ix);
+        var j: fast_start.Job = .{ .gpa = gpa, .st = h.store, .image = img, .feed = &feed, .build = true };
+        try j.start();
+        try testing.expect(!ix.ready.load(.acquire));
+        try testing.expect(!serve.service.indexCaughtUp(&svc, seq));
+        while (!j.handoff.load(.acquire) and !j.done.load(.acquire)) {
+            try testing.expect(!ix.ready.load(.acquire));
+            testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        try testing.expect(j.failed == null);
+        // built and replayed, but not live until the follower's thread hands over
+        try testing.expect(!ix.ready.load(.acquire));
+        try testing.expect(!serve.service.indexCaughtUp(&svc, seq));
+        j.onCommitted(seq);
+        try testing.expect(j.failed == null);
+        try testing.expect(ix.ready.load(.acquire));
+        try testing.expect(serve.service.indexCaughtUp(&svc, seq));
+        try testing.expectEqual(@as(?u64, seq), ix.checkpoint);
+        // resumed from load.state: no object of the image was read, let alone fetched
+        try testing.expectEqual(@as(u64, 0), j.image_objects.load(.monotonic));
+        try testing.expect(ix.db.buildPending() == null);
+        ix.deinit();
+        gpa.destroy(ix);
+        ix_open = false;
+        try expectSameIndexTables(gpa, a, ref_dir, ix_dir, seq);
+    }
 }
 
 // ------------------------------------------------------------------ source
@@ -2401,6 +2744,704 @@ test "sigorder: a sweep answer that is not the stored signatures changes nothing
     try testing.expectEqual(@as(usize, 0), h.store.tx_fix.count());
 }
 
+// ------------------------------------------------------------------ sigorder: the log reload
+
+const sig_seq: u64 = 343111673;
+const StoreHandle = @typeInfo(@typeInfo(@TypeOf(store.openDir)).@"fn".return_type.?).error_union.payload;
+
+/// The sweep tests' store: checkpoint 343111673 stored as a bucket catch-up stores it (every
+/// transaction's signatures in the contents' order), sui-node's envelope of each transaction,
+/// and an empty node directory.
+const SigStore = struct {
+    arena: std.heap.ArenaAllocator,
+    tmp: testing.TmpDir,
+    cfg: store.Config,
+    h: StoreHandle,
+    node_dir: Io.Dir,
+    ds: []CDigest,
+    node_envs: [][]const u8,
+
+    /// `gpa`: the store's allocator (and so its fix table's).
+    fn init(s: *SigStore, gpa: std.mem.Allocator) !void {
+        const io = testing.io;
+        s.arena = .init(testing.allocator);
+        errdefer s.arena.deinit();
+        const a = s.arena.allocator();
+        var idx = try types.CheckpointIndex.init(testing.allocator);
+        defer idx.deinit(testing.allocator);
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(testing.allocator);
+        _ = try convert.protoToChk(testing.allocator, a, sigorder_proto, &want);
+        var plain: std.ArrayList(u8) = .empty;
+        defer plain.deinit(testing.allocator);
+        _ = try convert.protoToChkOpts(testing.allocator, a, sigorder_proto, &plain, null, .{ .tx_signature_order = false });
+        try types.indexCheckpointData(want.items, &idx);
+        s.node_envs = try a.alloc([]const u8, idx.tx_count);
+        for (s.node_envs, idx.txs[0..idx.tx_count]) |*e, t| e.* = try a.dupe(u8, t.transaction.slice(want.items));
+
+        s.tmp = testing.tmpDir(.{ .iterate = true });
+        errdefer s.tmp.cleanup();
+        var pb: [std.fs.max_path_bytes]u8 = undefined;
+        const base = pb[0..try s.tmp.dir.realPath(io, &pb)];
+        s.cfg = .{ .dir = try std.fs.path.join(a, &.{ base, "store" }), .max_live_objects = 1 << 10, .max_object_versions = 1 << 10, .max_transactions = 1 << 10, .max_checkpoints = 1 << 6, .max_batch_bytes = 1 << 26, .max_batch_objects = 1 << 10, .max_segments = 4, .segment_reserve = 1 << 22, .seed = 7 };
+        s.h = try store.openDir(gpa, io, &s.cfg, .{ .sync = .none });
+        errdefer {
+            s.h.store.deinit();
+            s.h.io.deinit();
+        }
+        try types.indexCheckpointData(plain.items, &idx);
+        const blob = plain.items;
+        const contents = idx.contents.slice(blob);
+        s.ds = try contentsDigests(a, contents);
+        try testing.expectEqual(@as(usize, idx.tx_count), s.ds.len);
+        var sr = bcs.Reader.init(idx.summary.slice(blob));
+        const b = try s.h.store.begin(sig_seq, try sr.int(u64));
+        try b.checkpoint(blob[idx.summary.o .. idx.sig.o + idx.sig.n], contents);
+        for (idx.txs[0..idx.tx_count], s.ds) |t, d| try b.transaction(&d.tx, &d.fx, t.transaction.slice(blob), t.effects.slice(blob), if (t.events) |e| e.slice(blob) else null);
+        try s.h.store.commit(b);
+        try s.tmp.dir.createDir(io, "node", .default_dir);
+        s.node_dir = try s.tmp.dir.openDir(io, "node", .{ .iterate = true });
+    }
+
+    fn deinit(s: *SigStore) void {
+        s.node_dir.close(testing.io);
+        s.h.store.deinit();
+        s.h.io.deinit();
+        s.tmp.cleanup();
+        s.arena.deinit();
+    }
+
+    /// The full node's BatchGetTransactions answer (an HTTP reply) for the checkpoint's
+    /// multi-signer transactions: sui-node's signature order of each.
+    fn batchReply(s: *SigStore) ![]const u8 {
+        const a = s.arena.allocator();
+        var msg: std.ArrayList(u8) = .empty;
+        for (s.ds, 0..) |d, i| {
+            if (d.k < 2) continue;
+            var tb: [44]u8 = undefined;
+            var t: std.ArrayList(u8) = .empty;
+            try pbPutLen(a, &t, 1, serve.b58.encode32(&tb, &d.tx));
+            for ((try sigorder.envelopeSigs(a, s.node_envs[i])).sigs) |g| {
+                var bb: std.ArrayList(u8) = .empty;
+                try pbPutLen(a, &bb, 2, g);
+                var us: std.ArrayList(u8) = .empty;
+                try pbPutLen(a, &us, 1, bb.items);
+                try pbPutLen(a, &t, 3, us.items);
+            }
+            var res: std.ArrayList(u8) = .empty;
+            try pbPutLen(a, &res, 1, t.items);
+            try pbPutLen(a, &msg, 1, res.items);
+        }
+        return grpcWebReply(a, msg.items);
+    }
+
+    fn writeLog(s: *SigStore, bytes: []const u8) !void {
+        const f = try s.node_dir.createFile(testing.io, sigorder.log_name, .{ .truncate = true });
+        defer f.close(testing.io);
+        try f.writePositionalAll(testing.io, bytes, 0);
+    }
+
+    fn readLog(s: *SigStore, gpa: std.mem.Allocator) ![]u8 {
+        return s.node_dir.readFileAlloc(testing.io, sigorder.log_name, gpa, .unlimited);
+    }
+
+    /// The fix table's entry of each of `digests` (null: none).
+    fn table(s: *SigStore, a: std.mem.Allocator, digests: []const [32]u8) ![]?store.txfix.Entry {
+        var snap = s.h.store.snapshot();
+        defer snap.release();
+        const out = try a.alloc(?store.txfix.Entry, digests.len);
+        for (out, digests) |*o, *d| o.* = if (s.h.store.tx_fix.find(d)) |f| .{ .seq = f.seq, .digest = f.digest, .tx = try a.dupe(u8, f.tx) } else null;
+        return out;
+    }
+
+    /// GetTransaction of every transaction (the response messages one after another), one
+    /// BatchGetTransactions of all of them, and GetCheckpoint: digests, signatures and
+    /// transaction bytes.
+    fn served(s: *SigStore, a: std.mem.Allocator) ![3][]const u8 {
+        var svc: serve.service.Service = .{ .gpa = testing.allocator, .store = s.h.store, .chain_id = @splat(0), .json = false, .display = false, .lowest_checkpoint = sig_seq };
+        defer svc.deinit();
+        const tx_mask = try rsMask(a, &.{ "digest", "signatures", "transaction.bcs" });
+        var one: std.ArrayList(u8) = .empty;
+        var breq: std.ArrayList(u8) = .empty;
+        for (s.ds) |*d| {
+            var tb: [44]u8 = undefined;
+            const text = serve.b58.encode32(&tb, &d.tx);
+            try pbPutLen(a, &breq, 1, text);
+            var req: std.ArrayList(u8) = .empty;
+            try pbPutLen(a, &req, 1, text);
+            try pbPutLen(a, &req, 2, tx_mask);
+            const r = try serve.loopback.unary(a, svc.handler(), "/sui.rpc.v2.LedgerService/GetTransaction", req.items);
+            try testing.expectEqual(@as(u32, 0), r.status);
+            try one.appendSlice(a, r.message);
+        }
+        try pbPutLen(a, &breq, 2, tx_mask);
+        const bt = try serve.loopback.unary(a, svc.handler(), "/sui.rpc.v2.LedgerService/BatchGetTransactions", breq.items);
+        try testing.expectEqual(@as(u32, 0), bt.status);
+        var creq: std.ArrayList(u8) = .empty;
+        try pbPutVarint(a, &creq, 1 << 3);
+        try pbPutVarint(a, &creq, sig_seq);
+        try pbPutLen(a, &creq, 3, try rsMask(a, &.{ "sequence_number", "transactions.digest", "transactions.signatures", "transactions.transaction.bcs" }));
+        const cp = try serve.loopback.unary(a, svc.handler(), "/sui.rpc.v2.LedgerService/GetCheckpoint", creq.items);
+        try testing.expectEqual(@as(u32, 0), cp.status);
+        return .{ one.items, bt.message, cp.message };
+    }
+};
+
+fn expectSameTable(want: []const ?store.txfix.Entry, got: []const ?store.txfix.Entry) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| {
+        try testing.expectEqual(w == null, g == null);
+        if (w == null) continue;
+        try testing.expectEqual(w.?.seq, g.?.seq);
+        try testing.expectEqualSlices(u8, &w.?.digest, &g.?.digest);
+        try testing.expectEqualSlices(u8, w.?.tx, g.?.tx);
+    }
+}
+
+/// Fixes for transactions that never were: sui-node's envelope of the fixture's smallest
+/// multi-signer transaction with the gas budget set to `i`, so each has its own digest and
+/// proves itself (`sigorder.selfProven`), and no store holds it.
+const SynthFix = struct {
+    env: []u8,
+    from: usize,
+    to: usize,
+
+    fn init(a: std.mem.Allocator, fx: *const SigStore) !SynthFix {
+        var best: ?[]const u8 = null;
+        for (fx.ds, fx.node_envs) |d, e| {
+            if (d.k >= 2 and (best == null or e.len < best.?.len)) best = e;
+        }
+        const env = try a.dupe(u8, best.?);
+        const head = (try sigorder.envelopeSigs(a, env)).head;
+        // TransactionData V1 ends `gas price u64, gas budget u64, expiration`; None is one 0.
+        try testing.expectEqual(@as(u8, 0), env[head - 1]);
+        return .{ .env = env, .from = 4, .to = head };
+    }
+
+    /// The `i`th envelope (valid until the next call) and its transaction digest.
+    fn get(s: *SynthFix, i: u64) struct { digest: [32]u8, env: []const u8 } {
+        std.mem.writeInt(u64, s.env[s.to - 9 ..][0..8], i, .little);
+        return .{ .digest = hash.blake2b256(&.{ "TransactionData::", s.env[s.from..s.to] }), .env = s.env };
+    }
+};
+
+fn txReads() u64 {
+    return store.readstats.hist[@intFromEnum(store.readstats.Table.transactions)].count();
+}
+
+test "sigorder: a restart installs the logged fixes of held checkpoints from the log alone, with no stored transaction read" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx: SigStore = undefined;
+    try fx.init(gpa);
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    var syn = try SynthFix.init(a, &fx);
+    var o = sigorder.Overlay.init(gpa, io, "http://127.0.0.1:1", 20);
+    defer o.deinit();
+
+    // 6000 fixes around the store's only checkpoint: three in eight below it (pruned).
+    const n: u64 = 6000;
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(gpa);
+    try log.appendSlice(gpa, sigorder.log_magic);
+    var held: u64 = 0;
+    for (0..n) |i| {
+        const t = syn.get(i);
+        try testing.expect(sigorder.selfProven(&t.digest, t.env));
+        const seq = sig_seq - 3 + i % 8;
+        held += @intFromBool(seq >= sig_seq);
+        try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, seq, &t.digest, t.env);
+    }
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_mark, sig_seq, &@as([32]u8, @splat(0)), "");
+    try fx.writeLog(log.items);
+    const st = fx.h.store;
+
+    // The reload before this one asked the store for every fix's transaction (the counters see
+    // it: the sampled read histogram and the reload's own count), and these it never held.
+    {
+        const before = txReads();
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{ .proof = .store });
+        defer sw.deinit();
+        try testing.expectEqual(n, sw.reload.store_lookups);
+        try testing.expect(txReads() - before >= n / store.readstats.sample_every - 64);
+        try testing.expectEqual(@as(u64, 0), sw.reload.installed);
+        try testing.expectEqual(n, sw.reload.unproven);
+        try testing.expectEqual(@as(usize, 0), st.tx_fix.count());
+    }
+    // From the log alone: no transaction read, exactly the fixes at or above the floor. (No
+    // rewrite here: the next tests cover it.)
+    {
+        const before = txReads();
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{ .compact_min = std.math.maxInt(u64) });
+        defer sw.deinit();
+        try testing.expectEqual(@as(u64, 0), sw.reload.store_lookups);
+        try testing.expectEqual(before, txReads());
+        try testing.expectEqual(sig_seq, sw.reload.floor);
+        try testing.expectEqual(n, sw.reload.fixes);
+        try testing.expectEqual(n - held, sw.reload.pruned);
+        try testing.expectEqual(held, sw.reload.installed);
+        try testing.expectEqual(held, sw.stats.loaded.load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), sw.reload.rejected);
+        try testing.expectEqual(@as(u64, 0), sw.reload.cut);
+        try testing.expect(!sw.reload.compacted);
+        try testing.expect(sw.reload.dead_bytes * 4 > log.items.len);
+        try testing.expectEqual(@as(?u64, sig_seq + 1), sw.next);
+        try testing.expectEqual(@as(usize, @intCast(held)), st.tx_fix.count());
+        try testing.expectEqual(@as(u64, 1), st.tx_fix.generation());
+        // No snapshot outlives the reload.
+        try testing.expect(st.creaders.oldest() == null);
+    }
+    var snap = st.snapshot();
+    defer snap.release();
+    for (0..n) |i| {
+        const t = syn.get(i);
+        const seq = sig_seq - 3 + i % 8;
+        const f = st.tx_fix.find(&t.digest);
+        if (seq < sig_seq) {
+            try testing.expect(f == null);
+            continue;
+        }
+        try testing.expectEqual(seq, f.?.seq);
+        try testing.expectEqualSlices(u8, t.env, f.?.tx);
+    }
+    // The log is as it was.
+    const now = try fx.readLog(gpa);
+    defer gpa.free(now);
+    try testing.expectEqualSlices(u8, log.items, now);
+}
+
+test "sigorder: the table reloaded from the log is the live sweep's; GetTransaction, BatchGetTransactions and GetCheckpoint answer the same bytes" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx: SigStore = undefined;
+    try fx.init(gpa);
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    const st = fx.h.store;
+    const digests = try a.alloc([32]u8, fx.ds.len);
+    for (digests, fx.ds) |*d, c| d.* = c.tx;
+    var srv: netguard.TestServer = undefined;
+    try srv.start(io, try fx.batchReply());
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    var o = sigorder.Overlay.init(gpa, io, srv.url(&ub), 20);
+    defer o.deinit();
+
+    // As stored: the contents' order.
+    const plain = try fx.served(a);
+    // The live sweep.
+    {
+        const sw = try sigorder.Sweep.open(gpa, io, st, &o, fx.node_dir);
+        defer sw.deinit();
+        sw.behind = 0;
+        try testing.expectEqual(sigorder.Sweep.Step.progress, try sw.step());
+        try testing.expect(sw.stats.fixed.load(.monotonic) >= 1);
+    }
+    const live = try fx.table(a, digests);
+    const live_n = st.tx_fix.count();
+    try testing.expect(live_n >= 1);
+    const live_served = try fx.served(a);
+    for (plain, live_served) |p, l| try testing.expect(!std.mem.eql(u8, p, l));
+    {
+        var snap = st.snapshot();
+        defer snap.release();
+        for (fx.ds, fx.node_envs) |d, env| try testing.expectEqualSlices(u8, env, snap.transaction(&d.tx).?.tx);
+    }
+
+    // A restart, from the log alone.
+    st.tx_fix.reset();
+    {
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{});
+        defer sw.deinit();
+        try testing.expectEqual(@as(u64, live_n), sw.reload.installed);
+        try testing.expectEqual(@as(u64, live_n), sw.reload.fixes);
+        try testing.expectEqual(@as(u64, 0), sw.reload.store_lookups);
+        try testing.expectEqual(@as(u64, 0), sw.reload.rejected);
+        try testing.expectEqual(@as(?u64, sig_seq + 1), sw.next);
+        // Nothing left to sweep, nothing asked.
+        sw.behind = 0;
+        try testing.expectEqual(sigorder.Sweep.Step.idle, try sw.step());
+    }
+    try testing.expectEqual(live_n, st.tx_fix.count());
+    try expectSameTable(live, try fx.table(a, digests));
+    const again = try fx.served(a);
+    for (live_served, again) |l, g| try testing.expectEqualSlices(u8, l, g);
+
+    // And the same table as the reload that proves every fix against its stored transaction.
+    st.tx_fix.reset();
+    {
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{ .proof = .store });
+        defer sw.deinit();
+        try testing.expectEqual(@as(u64, live_n), sw.reload.installed);
+        try testing.expectEqual(@as(u64, live_n), sw.reload.store_lookups);
+    }
+    try expectSameTable(live, try fx.table(a, digests));
+    try testing.expectEqual(@as(u64, 1), srv.accepts.load(.monotonic));
+}
+
+test "sigorder: a corrupt log record is rejected and the rest still loads; no mark after it counts; the log is rewritten without it; a torn tail is cut" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx: SigStore = undefined;
+    try fx.init(gpa);
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    const st = fx.h.store;
+    var syn = try SynthFix.init(a, &fx);
+    var o = sigorder.Overlay.init(gpa, io, "http://127.0.0.1:1", 20);
+    defer o.deinit();
+    const zero: [32]u8 = @splat(0);
+
+    var ds: [8][32]u8 = undefined;
+    var envs: [8][]const u8 = undefined;
+    for (&ds, &envs, 0..) |*d, *e, i| {
+        const t = syn.get(i);
+        d.* = t.digest;
+        e.* = try a.dupe(u8, t.env);
+    }
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(gpa);
+    try log.appendSlice(gpa, sigorder.log_magic);
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &ds[0], envs[0]);
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_mark, sig_seq - 10, &zero, "");
+    // A flipped byte in the envelope: the checksum fails.
+    const bad_at = log.items.len;
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &ds[1], envs[1]);
+    log.items[bad_at + sigorder.rec_head + 40] ^= 0x10;
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &ds[2], envs[2]);
+    // Good checksums, but not the transaction's envelope: a digest no transaction has, and a
+    // stored transaction's digest over another transaction's envelope.
+    var wrong = ds[3];
+    wrong[7] ^= 1;
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &wrong, envs[3]);
+    var e7: [32]u8 = undefined;
+    for (fx.ds) |d| if (d.k >= 2) {
+        e7 = d.tx;
+    };
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &e7, envs[4]);
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_mark, sig_seq, &zero, "");
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &ds[5], envs[5]);
+    const whole = log.items.len;
+    // A record half written.
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &ds[6], envs[6]);
+    log.shrinkRetainingCapacity(whole + 30);
+    try fx.writeLog(log.items);
+
+    {
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{});
+        defer sw.deinit();
+        try testing.expectEqual(@as(u64, 3), sw.reload.installed);
+        try testing.expectEqual(@as(u64, 3), sw.reload.rejected);
+        // Only the two records that do not prove themselves were looked up.
+        try testing.expectEqual(@as(u64, 2), sw.reload.store_lookups);
+        try testing.expectEqual(@as(u64, 30), sw.reload.cut);
+        // The mark after the first rejected record does not count: its fix is to be found again.
+        try testing.expectEqual(@as(?u64, sig_seq - 9), sw.next);
+        var snap = st.snapshot();
+        defer snap.release();
+        for ([_]usize{ 0, 2, 5 }) |i| try testing.expectEqualSlices(u8, envs[i], st.tx_fix.find(&ds[i]).?.tx);
+        for ([_]usize{ 1, 3, 4, 6 }) |i| try testing.expect(st.tx_fix.find(&ds[i]) == null);
+        try testing.expect(st.tx_fix.find(&wrong) == null);
+        try testing.expect(st.tx_fix.find(&e7) == null);
+        try testing.expectEqual(@as(usize, 3), st.tx_fix.count());
+        // The stored transaction still reads as stored.
+        try testing.expect(snap.transaction(&e7) != null);
+        try testing.expect(sw.reload.compacted);
+    }
+    // The log now holds the three intact fixes and the mark that counts, so the next start
+    // rejects nothing, reads no transaction and resumes at the same place.
+    {
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(gpa);
+        try want.appendSlice(gpa, sigorder.log_magic);
+        for ([_]usize{ 0, 2, 5 }) |i| try sigorder.encodeRec(gpa, &want, sigorder.kind_fix, sig_seq, &ds[i], envs[i]);
+        try sigorder.encodeRec(gpa, &want, sigorder.kind_mark, sig_seq - 10, &zero, "");
+        const now = try fx.readLog(gpa);
+        defer gpa.free(now);
+        try testing.expectEqualSlices(u8, want.items, now);
+        st.tx_fix.reset();
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{});
+        defer sw.deinit();
+        try testing.expectEqual(@as(u64, 3), sw.reload.installed);
+        try testing.expectEqual(@as(u64, 0), sw.reload.rejected);
+        try testing.expectEqual(@as(u64, 0), sw.reload.store_lookups);
+        try testing.expectEqual(@as(u64, 0), sw.reload.dead_bytes);
+        try testing.expect(!sw.reload.compacted);
+        try testing.expectEqual(@as(u64, want.items.len), sw.end);
+        try testing.expectEqual(@as(?u64, sig_seq - 9), sw.next);
+    }
+
+    // A bad checksum in the last record is a torn tail: cut, as a half-written record is.
+    st.tx_fix.reset();
+    log.shrinkRetainingCapacity(sigorder.log_magic.len);
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &ds[0], envs[0]);
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_mark, sig_seq, &zero, "");
+    const keep = log.items.len;
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &ds[1], envs[1]);
+    log.items[log.items.len - 1] ^= 1;
+    try fx.writeLog(log.items);
+    {
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{});
+        defer sw.deinit();
+        try testing.expectEqual(@as(u64, 1), sw.reload.installed);
+        try testing.expectEqual(@as(u64, 0), sw.reload.rejected);
+        try testing.expectEqual(@as(u64, log.items.len - keep), sw.reload.cut);
+        try testing.expect(!sw.reload.compacted);
+        try testing.expectEqual(@as(?u64, sig_seq + 1), sw.next);
+    }
+    const now = try fx.readLog(gpa);
+    defer gpa.free(now);
+    try testing.expectEqualSlices(u8, log.items[0..keep], now);
+}
+
+test "sigorder: 100,000 logged fixes reload in memory proportional to the log, with no snapshot held" {
+    const io = testing.io;
+    const n: u64 = 100_000;
+    var counting: store.txfix.Counting = .{ .child = testing.allocator };
+    const gpa = counting.allocator();
+    var fx: SigStore = undefined;
+    try fx.init(gpa);
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    const st = fx.h.store;
+    var syn = try SynthFix.init(a, &fx);
+    var o = sigorder.Overlay.init(testing.allocator, io, "http://127.0.0.1:1", 20);
+    defer o.deinit();
+
+    // One fix in ten below the store's lowest checkpoint; the log written in pieces.
+    var held: u64 = 0;
+    var log_bytes: u64 = sigorder.log_magic.len;
+    {
+        const f = try fx.node_dir.createFile(io, sigorder.log_name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, sigorder.log_magic, 0);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        for (0..n) |i| {
+            const t = syn.get(i);
+            const seq = if (i % 10 == 0) sig_seq - 1 else sig_seq + i / 100;
+            held += @intFromBool(seq >= sig_seq);
+            try sigorder.encodeRec(testing.allocator, &buf, sigorder.kind_fix, seq, &t.digest, t.env);
+            if (buf.items.len >= 1 << 20 or i + 1 == n) {
+                try f.writePositionalAll(io, buf.items, log_bytes);
+                log_bytes += buf.items.len;
+                buf.clearRetainingCapacity();
+            }
+        }
+    }
+    const before_reads = txReads();
+    const live0 = counting.live.load(.monotonic);
+    counting.peak.store(live0, .monotonic);
+    const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{});
+    defer sw.deinit();
+    // One dead record in ten (6 MB): not worth a rewrite.
+    try testing.expect(!sw.reload.compacted);
+    try testing.expectEqual(log_bytes, sw.end);
+    const peak = counting.peak.load(.monotonic) - live0;
+    const kept = counting.live.load(.monotonic) - live0;
+    try testing.expectEqual(held, sw.reload.installed);
+    try testing.expectEqual(n - held, sw.reload.pruned);
+    try testing.expectEqual(@as(u64, 0), sw.reload.store_lookups);
+    try testing.expectEqual(before_reads, txReads());
+    try testing.expect(st.creaders.oldest() == null);
+    try testing.expectEqual(@as(usize, @intCast(held)), st.tx_fix.count());
+    // The peak: the log read once and the table's copy of the installed envelopes, plus the
+    // table's and the reload's per-fix bookkeeping. No store chunk: the reload that looked
+    // every fix up held a snapshot's decoded chunks (12 GB at 65k fixes, 3 GB renewed).
+    try testing.expect(peak <= 2 * log_bytes + n * 1024);
+    try testing.expect(kept <= log_bytes + n * 256);
+    {
+        var snap = st.snapshot();
+        defer snap.release();
+        var i: u64 = 1;
+        while (i < n) : (i += 997) {
+            const t = syn.get(i);
+            if (i % 10 == 0) try testing.expect(st.tx_fix.find(&t.digest) == null) else try testing.expectEqualSlices(u8, t.env, st.tx_fix.find(&t.digest).?.tx);
+        }
+    }
+    std.debug.print("sig-order reload 100k: {d} fixes ({d} B log) in {d} ms; {d} installed, {d} below the floor; peak {d} B ({d} B/fix), kept {d} B; stored transactions read 0\n", .{ n, log_bytes, sw.reload.ns / std.time.ns_per_ms, sw.reload.installed, sw.reload.pruned, peak, peak / n, kept });
+
+    // The same start with the rewrite forced (a lower byte threshold): the table is the same,
+    // the log loses the pruned tenth, and the rewrite's buffer adds nothing that grows with it.
+    st.tx_fix.reset();
+    const live1 = counting.live.load(.monotonic);
+    counting.peak.store(live1, .monotonic);
+    const sw2 = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{ .compact_bytes = 1 << 20 });
+    defer sw2.deinit();
+    const peak2 = counting.peak.load(.monotonic) - live1;
+    try testing.expect(sw2.reload.compacted);
+    try testing.expectEqual(held, sw2.reload.installed);
+    try testing.expectEqual(log_bytes - sw2.reload.dead_bytes, sw2.reload.size);
+    try testing.expectEqual((try fx.node_dir.statFile(io, sigorder.log_name, .{})).size, sw2.reload.size);
+    try testing.expect(peak2 <= 2 * log_bytes + n * 1024);
+    std.debug.print("sig-order reload 100k with a rewrite: {d} ms, log {d} -> {d} B, peak {d} B\n", .{ sw2.reload.ns / std.time.ns_per_ms, log_bytes, sw2.reload.size, peak2 });
+}
+
+test "sigorder: a restart rewrites the log without pruned and superseded fixes and old marks; a crash before or after the rename leaves a whole log" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx: SigStore = undefined;
+    try fx.init(gpa);
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    const st = fx.h.store;
+    var syn = try SynthFix.init(a, &fx);
+    var o = sigorder.Overlay.init(gpa, io, "http://127.0.0.1:1", 20);
+    defer o.deinit();
+    const zero: [32]u8 = @splat(0);
+    var ds: [6][32]u8 = undefined;
+    var envs: [6][]const u8 = undefined;
+    for (&ds, &envs, 0..) |*d, *e, i| {
+        const t = syn.get(i);
+        d.* = t.digest;
+        e.* = try a.dupe(u8, t.env);
+    }
+    // Transaction 1 logged twice: first with its signatures the other way round.
+    const sigs = (try sigorder.envelopeSigs(a, envs[1])).sigs;
+    const rev = try a.alloc([]const u8, sigs.len);
+    for (rev, 0..) |*r, j| r.* = sigs[sigs.len - 1 - j];
+    const first = (try sigorder.reorder(a, envs[1], rev)).?;
+    try testing.expect(sigorder.selfProven(&ds[1], first));
+
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(gpa);
+    try log.appendSlice(gpa, sigorder.log_magic);
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq - 1, &ds[0], envs[0]); // pruned
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_mark, sig_seq - 20, &zero, "");
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &ds[1], first); // superseded
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &ds[2], envs[2]);
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_mark, sig_seq - 10, &zero, "");
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &ds[1], envs[1]);
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq - 2, &ds[3], envs[3]); // pruned
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq + 1, &ds[4], envs[4]);
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_mark, sig_seq, &zero, "");
+    // A fix after the last mark (a pass that logged its fixes and then failed).
+    try sigorder.encodeRec(gpa, &log, sigorder.kind_fix, sig_seq, &ds[5], envs[5]);
+    try fx.writeLog(log.items);
+    // The live records in their order, then the last mark.
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(gpa);
+    try want.appendSlice(gpa, sigorder.log_magic);
+    try sigorder.encodeRec(gpa, &want, sigorder.kind_fix, sig_seq, &ds[2], envs[2]);
+    try sigorder.encodeRec(gpa, &want, sigorder.kind_fix, sig_seq, &ds[1], envs[1]);
+    try sigorder.encodeRec(gpa, &want, sigorder.kind_fix, sig_seq + 1, &ds[4], envs[4]);
+    try sigorder.encodeRec(gpa, &want, sigorder.kind_fix, sig_seq, &ds[5], envs[5]);
+    try sigorder.encodeRec(gpa, &want, sigorder.kind_mark, sig_seq, &zero, "");
+
+    const Check = struct {
+        fn table(s: *store.Store, d: *const [6][32]u8, e: *const [6][]const u8) !void {
+            var snap = s.snapshot();
+            defer snap.release();
+            try testing.expectEqual(@as(usize, 4), s.tx_fix.count());
+            for ([_]usize{ 1, 2, 4, 5 }) |i| try testing.expectEqualSlices(u8, e[i], s.tx_fix.find(&d[i]).?.tx);
+            for ([_]usize{ 0, 3 }) |i| try testing.expect(s.tx_fix.find(&d[i]) == null);
+        }
+        fn logIs(f: *SigStore, bytes: []const u8) !void {
+            const now = try f.readLog(testing.allocator);
+            defer testing.allocator.free(now);
+            try testing.expectEqualSlices(u8, bytes, now);
+        }
+    };
+
+    // Too little to be worth a rewrite (the default: 64 KiB of dead records at least).
+    {
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{});
+        defer sw.deinit();
+        try testing.expectEqual(@as(u64, 4), sw.reload.installed);
+        try testing.expectEqual(@as(u64, 2), sw.reload.pruned);
+        try testing.expectEqual(@as(u64, 1), sw.reload.superseded);
+        try testing.expectEqual(@as(u64, log.items.len - want.items.len), sw.reload.dead_bytes);
+        try testing.expect(!sw.reload.compacted);
+        try testing.expectEqual(@as(?u64, sig_seq + 1), sw.next);
+        try Check.table(st, &ds, &envs);
+    }
+    try Check.logIs(&fx, log.items);
+
+    // A crash after the new log is written and synced, before the rename: the old log stands.
+    st.tx_fix.reset();
+    try testing.expectError(error.CrashInjected, sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{ .compact_min = 0, .crash_at = .before_rename }));
+    try Check.logIs(&fx, log.items);
+    _ = try fx.node_dir.statFile(io, sigorder.log_tmp, .{});
+    st.tx_fix.reset();
+    {
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{});
+        defer sw.deinit();
+        try testing.expectEqual(@as(?u64, sig_seq + 1), sw.next);
+        try Check.table(st, &ds, &envs);
+    }
+    try Check.logIs(&fx, log.items);
+    try testing.expectError(error.FileNotFound, fx.node_dir.statFile(io, sigorder.log_tmp, .{}));
+    // A crash while the new log was being written: the same, whatever the leftover holds.
+    {
+        const f = try fx.node_dir.createFile(io, sigorder.log_tmp, .{ .truncate = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, want.items[0 .. want.items.len / 2], 0);
+    }
+    st.tx_fix.reset();
+    {
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{});
+        defer sw.deinit();
+        try Check.table(st, &ds, &envs);
+    }
+    try Check.logIs(&fx, log.items);
+    try testing.expectError(error.FileNotFound, fx.node_dir.statFile(io, sigorder.log_tmp, .{}));
+
+    // A crash after the rename (before the directory sync): the new log stands.
+    st.tx_fix.reset();
+    try testing.expectError(error.CrashInjected, sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{ .compact_min = 0, .crash_at = .after_rename }));
+    try Check.logIs(&fx, want.items);
+    try testing.expectError(error.FileNotFound, fx.node_dir.statFile(io, sigorder.log_tmp, .{}));
+    st.tx_fix.reset();
+    {
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{ .compact_min = 0 });
+        defer sw.deinit();
+        try testing.expectEqual(@as(u64, 4), sw.reload.installed);
+        try testing.expectEqual(@as(u64, 4), sw.reload.fixes);
+        try testing.expectEqual(@as(u64, 1), sw.reload.marks);
+        try testing.expectEqual(@as(u64, 0), sw.reload.dead_bytes);
+        try testing.expect(!sw.reload.compacted);
+        try testing.expectEqual(@as(u64, want.items.len), sw.end);
+        try testing.expectEqual(@as(?u64, sig_seq + 1), sw.next);
+        try Check.table(st, &ds, &envs);
+    }
+    try Check.logIs(&fx, want.items);
+
+    // The whole rewrite, and its thresholds: under a quarter dead it waits for `compact_bytes`.
+    try sigorder.encodeRec(gpa, &want, sigorder.kind_fix, sig_seq - 1, &ds[0], envs[0]);
+    try fx.writeLog(want.items);
+    st.tx_fix.reset();
+    {
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{ .compact_min = 0 });
+        defer sw.deinit();
+        try testing.expect(sw.reload.dead_bytes > 0 and sw.reload.dead_bytes * 4 < want.items.len);
+        try testing.expect(!sw.reload.compacted);
+        try testing.expectEqual(@as(u64, want.items.len), sw.end);
+    }
+    try Check.logIs(&fx, want.items);
+    st.tx_fix.reset();
+    {
+        const sw = try sigorder.Sweep.openWith(gpa, io, st, &o, fx.node_dir, .{ .compact_min = 0, .compact_bytes = 1 });
+        defer sw.deinit();
+        try testing.expect(sw.reload.compacted);
+        try testing.expectEqual(@as(u64, 1), sw.reload.pruned);
+        try testing.expectEqual(sw.reload.size, sw.end);
+        try Check.table(st, &ds, &envs);
+    }
+    want.shrinkRetainingCapacity(want.items.len - sigorder.rec_head - envs[0].len);
+    // The mark moved behind the fix that followed it; nothing else changed.
+    var last: std.ArrayList(u8) = .empty;
+    defer last.deinit(gpa);
+    try last.appendSlice(gpa, sigorder.log_magic);
+    try sigorder.encodeRec(gpa, &last, sigorder.kind_fix, sig_seq, &ds[2], envs[2]);
+    try sigorder.encodeRec(gpa, &last, sigorder.kind_fix, sig_seq, &ds[1], envs[1]);
+    try sigorder.encodeRec(gpa, &last, sigorder.kind_fix, sig_seq + 1, &ds[4], envs[4]);
+    try sigorder.encodeRec(gpa, &last, sigorder.kind_fix, sig_seq, &ds[5], envs[5]);
+    try sigorder.encodeRec(gpa, &last, sigorder.kind_mark, sig_seq, &zero, "");
+    try testing.expectEqualSlices(u8, want.items, last.items);
+    try Check.logIs(&fx, last.items);
+}
+
 // ------------------------------------------------------------------ p2p: read sets
 
 const serve = @import("serve");
@@ -2495,6 +3536,11 @@ fn rsStore(env: *RsEnv, a: std.mem.Allocator, name: []const u8) !RsStore {
 /// object that a node's full store would answer is not seen here (`deepwave check` against the
 /// bucket on a store followed with --p2p covers that).
 fn rsSeed(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, epoch: u64, blob: []const u8, bucket: convert.Aux) !void {
+    return rsSeedWithout(env, a, st, seq, epoch, blob, bucket, null);
+}
+
+/// `rsSeed` leaving out one object version (a store that never held it).
+fn rsSeedWithout(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, epoch: u64, blob: []const u8, bucket: convert.Aux, skip: ?RsKey) !void {
     const idx = &env.idx;
     var outs: std.AutoHashMapUnmanaged(RsKey, void) = .empty;
     for (0..idx.tx_count) |i| {
@@ -2511,6 +3557,7 @@ fn rsSeed(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, epoch: 
     }
     for (bucket.objects) |raw| {
         const k = try exec.objects.keyOf(raw);
+        if (skip) |x| if (x.version == k.version and std.mem.eql(u8, &x.id, &k.id)) continue;
         if (!outs.contains(k)) try pre.put(a, k, raw);
     }
     const keys = try a.dupe(RsKey, pre.keys());
@@ -2569,6 +3616,12 @@ fn rsTypeIds(a: std.mem.Allocator, out: *std.ArrayList([32]u8), t: *const types.
 /// The follower's apply of one checkpoint (sync/follower.zig `applyOne`, certificate aside) with
 /// the node's read-set hook reading `<seq>.aux` from `aux_dir`.
 fn rsApply(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, blob: []const u8, aux_dir: Io.Dir) !void {
+    return rsApplyOpts(env, a, st, seq, blob, aux_dir, null);
+}
+
+/// `rsApply` as the node does it when it reconciles p2p-built checkpoints: history marks a
+/// checkpoint whose spool holds `<seq>.p2p`, and the reconciler's batch hook follows.
+fn rsApplyOpts(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, blob: []const u8, aux_dir: Io.Dir, rec: ?*reconcile.Reconciler) !void {
     const idx = &env.idx;
     try types.indexCheckpointData(blob, idx);
     const c = switch (try sync.verify.check(a, blob, idx)) {
@@ -2577,6 +3630,7 @@ fn rsApply(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, blob: 
     };
     var h = try history.History.init(env.gpa, testing.io, aux_dir);
     defer h.deinit();
+    h.mark_built = rec != null;
     const b = try st.begin(seq, c.epoch);
     try b.checkpoint(blob[idx.summary.o .. idx.sig.o + idx.sig.n], idx.contents.slice(blob));
     try b.checkpointDigest(&c.digest);
@@ -2587,6 +3641,7 @@ fn rsApply(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, blob: 
         for (plan.removes) |r| try b.removeObject(&r.id, r.version, if (r.kind == 1) .wrapped else .deleted);
     }
     try h.onBatch(st, seq, &c, blob, b);
+    if (rec) |r| try r.applied(seq, h.last_built, b);
     try st.commit(b);
 }
 
@@ -2600,21 +3655,33 @@ fn rsMask(a: std.mem.Allocator, paths: []const []const u8) ![]const u8 {
     return m.items;
 }
 
-/// GetCheckpoint (objects and every transaction's unchanged loaded runtime objects) and
-/// BatchGetTransactions (the same per transaction) from the store, as response message bytes.
-fn rsRender(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, digests: []const [32]u8) ![2][]const u8 {
-    var svc: serve.service.Service = .{ .gpa = env.gpa, .store = st, .chain_id = @splat(0), .json = false, .display = false, .lowest_checkpoint = seq, .loaded = .{ .ctx = st, .get = rsLoadedOf } };
-    defer svc.deinit();
+const rs_cp_mask = [_][]const u8{ "sequence_number", "digest", "transactions.digest", "transactions.effects.unchanged_loaded_runtime_objects", "transactions.objects", "objects" };
+/// The same without the per-transaction objects, whose `display` keeps a GetCheckpoint response
+/// out of the response cache: this one is cached.
+const rs_cp_mask_cached = [_][]const u8{ "sequence_number", "digest", "transactions.digest", "transactions.effects.unchanged_loaded_runtime_objects", "objects" };
+const rs_tx_mask = [_][]const u8{ "digest", "effects.unchanged_loaded_runtime_objects", "objects" };
+
+fn rsService(env: *RsEnv, st: *store.Store, seq: u64) serve.service.Service {
+    return .{ .gpa = env.gpa, .store = st, .chain_id = @splat(0), .json = false, .display = false, .lowest_checkpoint = seq, .loaded = .{ .ctx = st, .get = rsLoadedOf } };
+}
+
+/// GetCheckpoint (objects and every transaction's unchanged loaded runtime objects) as response
+/// message bytes.
+fn rsGetCheckpoint(a: std.mem.Allocator, svc: *serve.service.Service, seq: u64, mask: []const []const u8) ![]const u8 {
     var req: std.ArrayList(u8) = .empty;
     try pbPutVarint(a, &req, 1 << 3);
     try pbPutVarint(a, &req, seq);
-    try pbPutLen(a, &req, 3, try rsMask(a, &.{ "sequence_number", "digest", "transactions.digest", "transactions.effects.unchanged_loaded_runtime_objects", "transactions.objects", "objects" }));
+    try pbPutLen(a, &req, 3, try rsMask(a, mask));
     const cp = try serve.loopback.unary(a, svc.handler(), "/sui.rpc.v2.LedgerService/GetCheckpoint", req.items);
     if (cp.status != 0) {
         std.debug.print("GetCheckpoint {d}: grpc-status {d} {s}\n", .{ seq, cp.status, cp.grpc_message });
         return error.RenderFailed;
     }
-    var out: [2][]const u8 = .{ cp.message, "" };
+    return cp.message;
+}
+
+/// BatchGetTransactions (the same per transaction) as response message bytes.
+fn rsBatchGet(a: std.mem.Allocator, svc: *serve.service.Service, seq: u64, digests: []const [32]u8) ![]const u8 {
     var all: std.ArrayList(u8) = .empty;
     // BatchGetTransactions takes at most 200 digests a request.
     var i: usize = 0;
@@ -2624,7 +3691,7 @@ fn rsRender(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, diges
             var tb: [44]u8 = undefined;
             try pbPutLen(a, &breq, 1, serve.b58.encode32(&tb, d));
         }
-        try pbPutLen(a, &breq, 2, try rsMask(a, &.{ "digest", "effects.unchanged_loaded_runtime_objects", "objects" }));
+        try pbPutLen(a, &breq, 2, try rsMask(a, &rs_tx_mask));
         const bt = try serve.loopback.unary(a, svc.handler(), "/sui.rpc.v2.LedgerService/BatchGetTransactions", breq.items);
         if (bt.status != 0) {
             std.debug.print("BatchGetTransactions {d}: grpc-status {d} {s}\n", .{ seq, bt.status, bt.grpc_message });
@@ -2632,16 +3699,37 @@ fn rsRender(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, diges
         }
         try all.appendSlice(a, bt.message);
     }
-    out[1] = all.items;
-    return out;
+    return all.items;
 }
 
-/// One corpus checkpoint through both paths. False: the p2p build fell back (nothing compared).
-fn rsOne(env: *RsEnv, seq: u64) !bool {
+/// Both answers from the store, each from a service of its own (nothing cached).
+fn rsRender(env: *RsEnv, a: std.mem.Allocator, st: *store.Store, seq: u64, digests: []const [32]u8) ![2][]const u8 {
+    var svc = rsService(env, st, seq);
+    defer svc.deinit();
+    return .{ try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask), try rsBatchGet(a, &svc, seq, digests) };
+}
+
+/// One corpus checkpoint as both paths take it (everything in the caller's arena). `env.idx`
+/// is left indexing `blob`.
+const RsCp = struct {
+    seq: u64,
+    epoch: u64,
+    meta: RsMeta,
+    /// The bucket's blob and aux record (`convert.protoToChkAux` of the archive proto).
+    blob: []const u8,
+    aux: []const u8,
+    bucket: convert.Aux,
+    digests: []const [32]u8,
+    /// The archive proto (what the stream sends for the checkpoint).
+    proto: []const u8,
+    /// What a peer sends: the certificate, the contents, each transaction and its effects.
+    cert: []const u8,
+    contents: []const u8,
+    txs: []const p2p_exec.ExecData,
+};
+
+fn rsLoad(env: *RsEnv, a: std.mem.Allocator, seq: u64) !RsCp {
     const gpa = env.gpa;
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
     var pb: [96]u8 = undefined;
     // The archive proto: the dense window, or (exploration) the corpus's older protos.
     const z = for ([_][]const u8{ "binpb-done", "binpb-hist", "binpb-r4", "binpb-exec" }) |dir| {
@@ -2655,8 +3743,8 @@ fn rsOne(env: *RsEnv, seq: u64) !bool {
     var aux_b: std.ArrayList(u8) = .empty;
     defer aux_b.deinit(gpa);
     try testing.expectEqual(seq, try convert.protoToChkAux(gpa, a, proto, &blob_b, &aux_b));
-    const blob = blob_b.items;
-    const bucket = try convert.Aux.parse(a, aux_b.items);
+    const blob = try a.dupe(u8, blob_b.items);
+    const aux = try a.dupe(u8, aux_b.items);
     const idx = &env.idx;
     try types.indexCheckpointData(blob, idx);
     var sr = bcs.Reader.init(idx.summary.slice(blob));
@@ -2665,8 +3753,6 @@ fn rsOne(env: *RsEnv, seq: u64) !bool {
         if (x.epoch == epoch) break x;
     } else return error.SkipZigTest;
     const n = idx.tx_count;
-
-    // ---- the p2p build: local execution on the store as of the previous checkpoint
     const txs = try a.alloc(p2p_exec.ExecData, n);
     const digests = try a.alloc([32]u8, n);
     for (txs, digests, 0..) |*t, *d, i| {
@@ -2674,42 +3760,78 @@ fn rsOne(env: *RsEnv, seq: u64) !bool {
         t.* = .{ .tx = x.transaction.slice(blob), .effects = x.effects.slice(blob) };
         d.* = types.digest.transactionDataDigest(x.data.slice(blob));
     }
-    const cert = try a.dupe(u8, blob[idx.summary.o .. idx.sig.o + idx.sig.n]);
-    const contents = try a.dupe(u8, idx.contents.slice(blob));
-    const names = [3][]const u8{ try std.fmt.allocPrint(a, "{d}-pre", .{seq}), try std.fmt.allocPrint(a, "{d}-bucket", .{seq}), try std.fmt.allocPrint(a, "{d}-p2p", .{seq}) };
-    defer for (names) |nm| env.tmp.dir.deleteTree(testing.io, nm) catch {};
-    const res = blk: {
-        const h = try rsStore(env, a, names[0]);
-        defer h.io.deinit();
-        defer h.store.deinit();
-        try rsSeed(env, a, h.store, seq, epoch, blob, bucket);
-        var snap = h.store.snapshot();
-        defer snap.release();
-        const params: p2p_exec.Params = .{ .pv = m.pv.?, .rgp = m.rgp.?, .start_ms = m.start_ms.? };
-        const serial = try p2p_exec.run(rs_exec_gpa, a, &snap, env.ps, params, epoch, cert, contents, txs, &env.stats, null, null);
-        if (env.pool) |pl| if (serial == .ok) switch (try p2p_exec.run(rs_exec_gpa, a, &snap, env.ps, params, epoch, cert, contents, txs, &env.stats, null, pl)) {
-            .ok => |o| {
-                try testing.expectEqualSlices(u8, serial.ok.blob, o.blob);
-                try testing.expectEqualSlices(u8, serial.ok.aux, o.aux);
-            },
-            .fallback => |why| {
-                std.debug.print("p2p read sets: checkpoint {d}: the level-parallel build fell back: {s}\n", .{ seq, why });
-                return error.ParallelFellBack;
-            },
-        };
-        break :blk serial;
+    return .{
+        .seq = seq,
+        .epoch = epoch,
+        .meta = m,
+        .blob = blob,
+        .aux = aux,
+        .bucket = try convert.Aux.parse(a, aux),
+        .proto = try a.dupe(u8, proto),
+        .digests = digests,
+        .cert = blob[idx.summary.o .. idx.sig.o + idx.sig.n],
+        .contents = idx.contents.slice(blob),
+        .txs = txs,
     };
-    const built = switch (res) {
+}
+
+/// The p2p build of `cp` on a store as of the checkpoint before it (in `dir`, removed after), in
+/// order and, with `env.pool`, on the exec threads (the same bytes). Returns its aux record;
+/// null: it fell back.
+fn rsBuild(env: *RsEnv, a: std.mem.Allocator, cp: *const RsCp, dir: []const u8) !?[]const u8 {
+    defer env.tmp.dir.deleteTree(testing.io, dir) catch {};
+    const h = try rsStore(env, a, dir);
+    defer h.io.deinit();
+    defer h.store.deinit();
+    try types.indexCheckpointData(cp.blob, &env.idx);
+    try rsSeed(env, a, h.store, cp.seq, cp.epoch, cp.blob, cp.bucket);
+    var snap = h.store.snapshot();
+    defer snap.release();
+    const params: p2p_exec.Params = .{ .pv = cp.meta.pv.?, .rgp = cp.meta.rgp.?, .start_ms = cp.meta.start_ms.? };
+    const serial = switch (try p2p_exec.run(rs_exec_gpa, a, &snap, env.ps, params, cp.epoch, cp.cert, cp.contents, cp.txs, &env.stats, null, null)) {
         .ok => |o| o,
         .fallback => |why| {
-            env.fallbacks += 1;
-            if (env.diag) std.debug.print("p2p read sets: checkpoint {d} fell back: {s}\n", .{ seq, why });
-            return false;
+            if (env.diag) std.debug.print("p2p read sets: checkpoint {d} fell back: {s}\n", .{ cp.seq, why });
+            return null;
         },
     };
+    try testing.expectEqualSlices(u8, cp.blob, serial.blob);
+    if (env.pool) |pl| switch (try p2p_exec.run(rs_exec_gpa, a, &snap, env.ps, params, cp.epoch, cp.cert, cp.contents, cp.txs, &env.stats, null, pl)) {
+        .ok => |o| {
+            try testing.expectEqualSlices(u8, serial.blob, o.blob);
+            try testing.expectEqualSlices(u8, serial.aux, o.aux);
+        },
+        .fallback => |why| {
+            std.debug.print("p2p read sets: checkpoint {d}: the level-parallel build fell back: {s}\n", .{ cp.seq, why });
+            return error.ParallelFellBack;
+        },
+    };
+    return serial.aux;
+}
+
+/// One corpus checkpoint through both paths. False: the p2p build fell back (nothing compared).
+fn rsOne(env: *RsEnv, seq: u64) !bool {
+    const gpa = env.gpa;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pb: [96]u8 = undefined;
+    const cp = try rsLoad(env, a, seq);
+    const blob = cp.blob;
+    const bucket = cp.bucket;
+    const idx = &env.idx;
+    const epoch = cp.epoch;
+    const digests = cp.digests;
+    const n = digests.len;
+    const names = [3][]const u8{ try std.fmt.allocPrint(a, "{d}-pre", .{seq}), try std.fmt.allocPrint(a, "{d}-bucket", .{seq}), try std.fmt.allocPrint(a, "{d}-p2p", .{seq}) };
+    defer for (names) |nm| env.tmp.dir.deleteTree(testing.io, nm) catch {};
+    // ---- the p2p build: local execution on the store as of the previous checkpoint
+    const built_aux = (try rsBuild(env, a, &cp, names[0])) orelse {
+        env.fallbacks += 1;
+        return false;
+    };
     env.built += 1;
-    try testing.expectEqualSlices(u8, blob, built.blob);
-    const p2p = try convert.Aux.parse(a, built.aux);
+    const p2p = try convert.Aux.parse(a, built_aux);
     try testing.expectEqual(n, p2p.loaded.len);
 
     // The rule for implicit system object reads against the archive: a read-only root entry of
@@ -2798,7 +3920,7 @@ fn rsOne(env: *RsEnv, seq: u64) !bool {
     var rendered: [2][2][]const u8 = undefined;
     var lists: [2][]const []const u8 = undefined;
     var objs: [2][]const ?[]const u8 = undefined;
-    for ([2][]const u8{ aux_b.items, built.aux }, 0..) |aux_bytes, side| {
+    for ([2][]const u8{ cp.aux, built_aux }, 0..) |aux_bytes, side| {
         const h = try rsStore(env, a, names[1 + side]);
         defer h.io.deinit();
         defer h.store.deinit();
@@ -2973,77 +4095,177 @@ test "p2p: an undeclared read-only root entry of the accumulator root or the Clo
 
 const RsOut = struct { built: u64 = 0, fallbacks: u64 = 0, list_diffs: u64 = 0, extra_diffs: u64 = 0, store_diffs: u64 = 0, render_diffs: u64 = 0, loaded_txs: u64 = 0, loaded_refs: u64 = 0, implicit_reads: u64 = 0, seen_count_field: u64 = 0, seen_usdc_config: u64 = 0 };
 
-fn rsRun(seqs: []const u64, diag: bool, out: *RsOut) !void {
-    const gpa = testing.allocator;
-    const c = corpus() orelse return error.SkipZigTest;
-    var arena: std.heap.ArenaAllocator = .init(gpa);
+/// Runs `body(ctx, env)` with the corpus environment (system packages of every epoch, the
+/// corpus packages behind a p2p package source, the exec threads) on a thread of its own: exec's
+/// per-thread package caches are keyed by the packages store's address, and the Move VM wants
+/// the stack the p2p exec threads have.
+fn rsWith(ctx: anytype, comptime body: fn (@TypeOf(ctx), *RsEnv) anyerror!void) !void {
+    const Ctx = @TypeOf(ctx);
+    const T = struct {
+        fn run(c: Ctx, r: *?anyerror) void {
+            setup(c) catch |e| {
+                r.* = e;
+            };
+        }
+        fn setup(cx: Ctx) !void {
+            const gpa = testing.allocator;
+            const c = corpus() orelse return error.SkipZigTest;
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var pb: [std.fs.max_path_bytes]u8 = undefined;
+            const base = try a.dupe(u8, pb[0..try tmp.dir.realPath(testing.io, &pb)]);
+            const text = try readCorpus(gpa, "epochs.jsonl");
+            defer gpa.free(text);
+            var metas: std.ArrayList(RsMeta) = .empty;
+            var it = std.mem.splitScalar(u8, text, '\n');
+            while (it.next()) |line| if (line.len > 0) {
+                try metas.append(a, try std.json.parseFromSliceLeaky(RsMeta, a, line, .{ .ignore_unknown_fields = true }));
+            };
+            const pkg_dir = Io.Dir.cwd().openDir(testing.io, try std.fmt.bufPrint(&pb, "{s}/packages", .{c}), .{}) catch return error.SkipZigTest;
+            defer pkg_dir.close(testing.io);
+            const chk_dir = Io.Dir.cwd().openDir(testing.io, try std.fmt.bufPrint(&pb, "{s}/chk", .{c}), .{}) catch return error.SkipZigTest;
+            defer chk_dir.close(testing.io);
+            const eidx = try trust.EpochIndex.load(a, testing.io, try std.fmt.bufPrint(&pb, "{s}/epochs.jsonl", .{c}));
+
+            var env: RsEnv = .{ .gpa = gpa, .base = base, .tmp = &tmp, .metas = metas.items, .ps = undefined, .pkgs = undefined, .sys = undefined, .idx = try types.CheckpointIndex.init(gpa) };
+            defer env.idx.deinit(gpa);
+            // System packages of every epoch (the executor's loader; its store is not used).
+            const sh = try rsStore(&env, a, "sys");
+            defer sh.io.deinit();
+            defer sh.store.deinit();
+            var sys = try execute.Executor.init(gpa, testing.io, sh.store, null);
+            defer sys.deinit();
+            try testing.expect(sys.seedSystemPackages(chk_dir, eidx.last, eidx.last.len) > 0);
+            env.sys = &sys;
+            var ps: p2p_exec.PackageSource = .{ .keep = .init(gpa) };
+            defer ps.deinit();
+            ps.bind();
+            var corpus_pkgs: RsPkgs = .{ .inner = ps.pkgs.lookup.?, .dir = pkg_dir, .keep = a };
+            ps.pkgs.lookup = .{ .ctx = &corpus_pkgs, .get = RsPkgs.get };
+            env.ps = &ps;
+            env.pkgs = &corpus_pkgs;
+            defer exec.ptb.pkgs.releaseThreadCaches();
+            defer exec.system.movecall.releaseThreadCaches();
+            var pool: p2p_exec.Pool = .{ .gpa = gpa, .io = testing.io };
+            try pool.start(4);
+            defer pool.stop();
+            env.pool = &pool;
+            try body(cx, &env);
+        }
+    };
+    var res: ?anyerror = null;
+    const t = try std.Thread.spawn(.{ .stack_size = 64 << 20 }, T.run, .{ ctx, &res });
+    t.join();
+    if (res) |e| return e;
+}
+
+/// The stored-layout bytes of a loaded list (`history.entry_len` per entry).
+fn rsListBytes(a: std.mem.Allocator, list: []const convert.LoadedRef) ![]u8 {
+    const out = try a.alloc(u8, list.len * history.entry_len);
+    for (list, 0..) |r, j| {
+        std.mem.writeInt(u64, out[j * history.entry_len ..][0..8], r.version, .little);
+        out[j * history.entry_len + 8 ..][0..32].* = r.id;
+    }
+    return out;
+}
+
+/// The bucket path's store of `cp` in `dir`: seeded, then applied with the bucket's aux record.
+fn rsBucketStore(env: *RsEnv, a: std.mem.Allocator, cp: *const RsCp, dir: []const u8) !RsStore {
+    const h = try rsStore(env, a, dir);
+    errdefer {
+        h.store.deinit();
+        h.io.deinit();
+    }
+    try types.indexCheckpointData(cp.blob, &env.idx);
+    try rsSeed(env, a, h.store, cp.seq, cp.epoch, cp.blob, cp.bucket);
+    var nb: [48]u8 = undefined;
+    try env.tmp.dir.writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&nb, "{d}.aux", .{cp.seq}), .data = cp.aux });
+    try rsApply(env, a, h.store, cp.seq, cp.blob, env.tmp.dir);
+    return h;
+}
+
+fn rsListFixBody(_: void, env: *RsEnv) anyerror!void {
+    var arena: std.heap.ArenaAllocator = .init(env.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var pb: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try a.dupe(u8, pb[0..try tmp.dir.realPath(testing.io, &pb)]);
-    const text = try readCorpus(gpa, "epochs.jsonl");
-    defer gpa.free(text);
-    var metas: std.ArrayList(RsMeta) = .empty;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |line| if (line.len > 0) {
-        try metas.append(a, try std.json.parseFromSliceLeaky(RsMeta, a, line, .{ .ignore_unknown_fields = true }));
-    };
-    const pkg_dir = Io.Dir.cwd().openDir(testing.io, try std.fmt.bufPrint(&pb, "{s}/packages", .{c}), .{}) catch return error.SkipZigTest;
-    defer pkg_dir.close(testing.io);
-    const chk_dir = Io.Dir.cwd().openDir(testing.io, try std.fmt.bufPrint(&pb, "{s}/chk", .{c}), .{}) catch return error.SkipZigTest;
-    defer chk_dir.close(testing.io);
-    const eidx = try trust.EpochIndex.load(a, testing.io, try std.fmt.bufPrint(&pb, "{s}/epochs.jsonl", .{c}));
+    const seq: u64 = 342451165;
+    const cp = try rsLoad(env, a, seq);
+    const h = try rsBucketStore(env, a, &cp, "listfix");
+    defer h.io.deinit();
+    defer h.store.deinit();
+    const st = h.store;
+    var svc = rsService(env, st, seq);
+    defer svc.deinit();
+    const r1 = try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached);
+    const b1 = try rsBatchGet(a, &svc, seq, cp.digests);
+    // The second call is the cached response.
+    try testing.expect(svc.cp_cache.bytesHeld() > 0);
+    try testing.expectEqualSlices(u8, r1, try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached));
 
-    var env: RsEnv = .{ .gpa = gpa, .base = base, .tmp = &tmp, .metas = metas.items, .ps = undefined, .pkgs = undefined, .sys = undefined, .idx = try types.CheckpointIndex.init(gpa), .diag = diag };
-    defer env.idx.deinit(gpa);
-    // System packages of every epoch (the executor's loader; its store is not used).
-    const sh = try rsStore(&env, a, "sys");
-    defer sh.io.deinit();
-    defer sh.store.deinit();
-    var sys = try execute.Executor.init(gpa, testing.io, sh.store, null);
-    defer sys.deinit();
-    try testing.expect(sys.seedSystemPackages(chk_dir, eidx.last, eidx.last.len) > 0);
-    env.sys = &sys;
-    var ps: p2p_exec.PackageSource = .{ .keep = .init(gpa) };
-    defer ps.deinit();
-    ps.bind();
-    var corpus_pkgs: RsPkgs = .{ .inner = ps.pkgs.lookup.?, .dir = pkg_dir, .keep = a };
-    ps.pkgs.lookup = .{ .ctx = &corpus_pkgs, .get = RsPkgs.get };
-    env.ps = &ps;
-    env.pkgs = &corpus_pkgs;
-    defer exec.ptb.pkgs.releaseThreadCaches();
-    defer exec.system.movecall.releaseThreadCaches();
-    var pool: p2p_exec.Pool = .{ .gpa = gpa, .io = testing.io };
-    try pool.start(4);
-    defer pool.stop();
-    env.pool = &pool;
+    // A transaction with two or more loaded objects: its list in another order is the fix.
+    const i = for (cp.bucket.loaded, 0..) |l, k| {
+        if (l.len >= 2) break k;
+    } else return error.SkipZigTest;
+    const good = try rsListBytes(a, cp.bucket.loaded[i]);
+    const reversed = try a.alloc(convert.LoadedRef, cp.bucket.loaded[i].len);
+    for (reversed, 0..) |*r, k| r.* = cp.bucket.loaded[i][reversed.len - 1 - k];
+    const wrong = try rsListBytes(a, reversed);
+    const d = &cp.digests[i];
+    try testing.expect(try st.list_fix.put(seq, d, wrong));
+    {
+        var snap = st.snapshot();
+        defer snap.release();
+        try testing.expectEqualSlices(u8, wrong, std.mem.sliceAsBytes(history.loadedList(serve.objset.Ref, &snap, d)));
+        const rec = snap.transaction(d).?;
+        try testing.expectEqualSlices(u8, wrong, std.mem.sliceAsBytes(history.loadedListNear(serve.objset.Ref, &snap, d, rec.loc)));
+        // Other transactions read their stored records.
+        for (cp.bucket.loaded, cp.digests, 0..) |l, *od, k| {
+            if (k != i) try testing.expectEqualSlices(u8, try rsListBytes(a, l), std.mem.sliceAsBytes(history.loadedList(serve.objset.Ref, &snap, od)));
+        }
+    }
+    // The cached response is stale: both answers are rendered again, with the installed list.
+    const r2 = try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached);
+    try testing.expect(!std.mem.eql(u8, r1, r2));
+    try testing.expect(!std.mem.eql(u8, b1, try rsBatchGet(a, &svc, seq, cp.digests)));
+    {
+        var uncached = rsService(env, st, seq);
+        defer uncached.deinit();
+        try testing.expectEqualSlices(u8, try rsGetCheckpoint(a, &uncached, seq, &rs_cp_mask_cached), r2);
+    }
+    // A later fix replaces the earlier one (here: back to sui-node's list), again for every read.
+    try testing.expect(try st.list_fix.put(seq, d, good));
+    try testing.expectEqualSlices(u8, r1, try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached));
+    try testing.expectEqualSlices(u8, b1, try rsBatchGet(a, &svc, seq, cp.digests));
+    // An empty list is a fix as well.
+    try testing.expect(try st.list_fix.put(seq, d, &.{}));
+    var snap = st.snapshot();
+    defer snap.release();
+    try testing.expectEqual(@as(usize, 0), history.loadedList(serve.objset.Ref, &snap, d).len);
+}
 
-    for (seqs) |seq| _ = rsOne(&env, seq) catch |e| switch (e) {
+test "history: a loaded list installed in the store's list table replaces the stored record for every read and stales the cached GetCheckpoint response" {
+    try rsWith({}, rsListFixBody);
+}
+
+const RsRun = struct { seqs: []const u64, diag: bool, out: *RsOut };
+
+fn rsRunBody(r: RsRun, env: *RsEnv) anyerror!void {
+    env.diag = r.diag;
+    for (r.seqs) |seq| _ = rsOne(env, seq) catch |e| switch (e) {
         error.SkipZigTest => return e,
         else => {
             std.debug.print("p2p read sets: checkpoint {d}: {s}\n", .{ seq, @errorName(e) });
             return e;
         },
     };
-    out.* = .{ .built = env.built, .fallbacks = env.fallbacks, .list_diffs = env.list_diffs, .extra_diffs = env.extra_diffs, .store_diffs = env.store_diffs, .render_diffs = env.render_diffs, .loaded_txs = env.loaded_txs, .loaded_refs = env.loaded_refs, .implicit_reads = env.implicit_reads, .seen_count_field = env.seen_count_field, .seen_usdc_config = env.seen_usdc_config };
+    r.out.* = .{ .built = env.built, .fallbacks = env.fallbacks, .list_diffs = env.list_diffs, .extra_diffs = env.extra_diffs, .store_diffs = env.store_diffs, .render_diffs = env.render_diffs, .loaded_txs = env.loaded_txs, .loaded_refs = env.loaded_refs, .implicit_reads = env.implicit_reads, .seen_count_field = env.seen_count_field, .seen_usdc_config = env.seen_usdc_config };
 }
 
 fn rsOnThread(seqs: []const u64, diag: bool, out: *RsOut) !void {
-    const T = struct {
-        fn run(s: []const u64, d: bool, o: *RsOut, r: *?anyerror) void {
-            rsRun(s, d, o) catch |e| {
-                r.* = e;
-            };
-        }
-    };
-    var res: ?anyerror = null;
-    // Its own thread: exec's per-thread package caches are keyed by the packages store's address,
-    // and the Move VM wants the stack the p2p exec threads have.
-    const t = try std.Thread.spawn(.{ .stack_size = 64 << 20 }, T.run, .{ seqs, diag, out, &res });
-    t.join();
-    if (res) |e| return e;
+    return rsWith(RsRun{ .seqs = seqs, .diag = diag, .out = out }, rsRunBody);
 }
 
 test "p2p: a checkpoint built by local execution stores and serves the same read sets as the bucket's" {
@@ -3086,4 +4308,626 @@ test "p2p: a checkpoint built by local execution stores and serves the same read
     try testing.expectEqual(@as(u64, 0), out.extra_diffs);
     try testing.expectEqual(@as(u64, 0), out.store_diffs);
     try testing.expectEqual(@as(u64, 0), out.render_diffs);
+}
+
+// ------------------------------------------------------------------ p2p: read-set reconcile
+
+test "source: a checkpoint built here is spooled with its .p2p mark, removed with the blob" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src: source_mod.Source = .{ .gpa = testing.allocator, .io = testing.io, .kind = .none };
+    var applied: std.atomic.Value(u64) = .init(100);
+    var f: source_mod.Fetcher = .{ .gpa = testing.allocator, .io = testing.io, .source = &src, .spool = tmp.dir, .next = .init(100), .applied_next = &applied, .window = 64, .poll_ms = 25, .to = std.math.maxInt(u64) };
+    try f.writeSpoolBuilt(100, "blob", "aux");
+    try f.writeSpool(101, "blob", "aux");
+    _ = try tmp.dir.statFile(testing.io, "100.p2p", .{});
+    _ = try tmp.dir.statFile(testing.io, "100.chk", .{});
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "101.p2p", .{}));
+    f.clean(100, 102);
+    inline for (.{ "100.p2p", "100.chk", "100.aux", "101.chk" }) |name| try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, name, .{}));
+}
+
+/// An aux record (`convert.Aux` layout) of the given lists and extra objects.
+fn rsAuxBytes(a: std.mem.Allocator, loaded: []const []const convert.LoadedRef, objects: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, convert.aux_magic);
+    try pbPutVarint(a, &out, loaded.len);
+    for (loaded) |l| {
+        try pbPutVarint(a, &out, l.len);
+        for (l) |r| {
+            try out.appendSlice(a, &r.id);
+            var vb: [8]u8 = undefined;
+            std.mem.writeInt(u64, &vb, r.version, .little);
+            try out.appendSlice(a, &vb);
+            if (r.digest) |d| {
+                try out.append(a, 1);
+                try out.appendSlice(a, &d);
+            } else try out.append(a, 0);
+        }
+    }
+    try pbPutVarint(a, &out, objects.len);
+    for (objects) |raw| {
+        try pbPutVarint(a, &out, raw.len);
+        try out.appendSlice(a, raw);
+    }
+    return out.items;
+}
+
+/// A store as a node following with --p2p leaves it: the reconciler opened on the store as of
+/// the checkpoint before `cp`, then `cp` applied from a spool that holds a p2p build's aux
+/// record and its `.p2p` mark.
+const RsNode = struct {
+    env: *RsEnv,
+    dir: []const u8,
+    h: RsStore,
+    rec: *reconcile.Reconciler,
+    node_dir: Io.Dir,
+    spool: Io.Dir,
+    bucket: ?*const source_mod.Source,
+
+    fn init(env: *RsEnv, a: std.mem.Allocator, cp: *const RsCp, dir: []const u8, aux: []const u8, skip: ?RsKey, bucket: ?*const source_mod.Source, cfg: reconcile.Config) !RsNode {
+        const h = try rsStore(env, a, dir);
+        errdefer {
+            h.store.deinit();
+            h.io.deinit();
+        }
+        try types.indexCheckpointData(cp.blob, &env.idx);
+        try rsSeedWithout(env, a, h.store, cp.seq, cp.epoch, cp.blob, cp.bucket, skip);
+        const node_name = try std.fmt.allocPrint(a, "{s}-node", .{dir});
+        const spool_name = try std.fmt.allocPrint(a, "{s}-spool", .{dir});
+        try env.tmp.dir.createDir(testing.io, node_name, .default_dir);
+        try env.tmp.dir.createDir(testing.io, spool_name, .default_dir);
+        const node_dir = try env.tmp.dir.openDir(testing.io, node_name, .{});
+        const spool = try env.tmp.dir.openDir(testing.io, spool_name, .{});
+        const rec = try reconcile.Reconciler.open(env.gpa, testing.io, h.store, node_dir, bucket, cfg);
+        errdefer rec.deinit();
+        var nb: [48]u8 = undefined;
+        try spool.writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&nb, "{d}.aux", .{cp.seq}), .data = aux });
+        try spool.writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&nb, "{d}.p2p", .{cp.seq}), .data = "" });
+        try rsApplyOpts(env, a, h.store, cp.seq, cp.blob, spool, rec);
+        var snap = h.store.snapshot();
+        defer snap.release();
+        try testing.expect(history.p2pBuilt(&snap, cp.seq));
+        try testing.expect(!history.p2pBuilt(&snap, cp.seq - 1));
+        try testing.expect(rec.isWaiting(cp.seq));
+        return .{ .env = env, .dir = dir, .h = h, .rec = rec, .node_dir = node_dir, .spool = spool, .bucket = bucket };
+    }
+
+    /// The process ends (nothing is settled or marked on the way out beyond what `deinit`
+    /// writes, which is nothing while no checkpoint settled) and starts again on the same dirs.
+    fn restart(n: *RsNode, a: std.mem.Allocator, cfg: reconcile.Config) !void {
+        n.rec.deinit();
+        n.h.store.deinit();
+        n.h.io.deinit();
+        n.h = try rsStore(n.env, a, n.dir);
+        n.rec = try reconcile.Reconciler.open(n.env.gpa, testing.io, n.h.store, n.node_dir, n.bucket, cfg);
+    }
+
+    fn deinit(n: *RsNode) void {
+        n.rec.deinit();
+        n.node_dir.close(testing.io);
+        n.spool.close(testing.io);
+        n.h.store.deinit();
+        n.h.io.deinit();
+    }
+
+    /// Every transaction's stored list, as the readers get it.
+    fn lists(n: *RsNode, a: std.mem.Allocator, cp: *const RsCp) ![]const []const u8 {
+        var snap = n.h.store.snapshot();
+        defer snap.release();
+        const out = try a.alloc([]const u8, cp.digests.len);
+        for (out, cp.digests) |*l, *d| l.* = try a.dupe(u8, std.mem.sliceAsBytes(history.loadedList(serve.objset.Ref, &snap, d)));
+        return out;
+    }
+};
+
+/// sui-node's lists of `cp` in the stored layout.
+fn rsWantLists(a: std.mem.Allocator, cp: *const RsCp) ![]const []const u8 {
+    const out = try a.alloc([]const u8, cp.digests.len);
+    for (out, cp.bucket.loaded) |*l, refs| l.* = try rsListBytes(a, refs);
+    return out;
+}
+
+fn rsSameLists(x: []const []const u8, y: []const []const u8) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| if (!std.mem.eql(u8, p, q)) return false;
+    return true;
+}
+
+/// The live stream's message for `cp`, after another source delivered it: a duplicate there.
+fn rsStreamDuplicate(env: *RsEnv, rec: *reconcile.Reconciler, cp: *const RsCp) !void {
+    const src: source_mod.Source = .{ .gpa = env.gpa, .io = testing.io, .kind = .none };
+    var applied: std.atomic.Value(u64) = .init(cp.seq + 1);
+    var f: source_mod.Fetcher = .{ .gpa = env.gpa, .io = testing.io, .source = &src, .spool = env.tmp.dir, .next = .init(cp.seq + 1), .applied_next = &applied, .window = 64, .poll_ms = 25, .to = std.math.maxInt(u64) };
+    var st: stream_mod.Stream = .{ .gpa = env.gpa, .io = testing.io, .base = "test", .fetcher = &f, .reconcile = rec };
+    var sc = source_mod.Scratch.init(env.gpa);
+    defer sc.deinit(env.gpa);
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(env.gpa);
+    st.handle(.{ .cursor = cp.seq, .checkpoint = cp.proto }, &sc, &blob);
+    try testing.expectEqual(@as(u64, 1), st.stats.dups.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), st.stats.delivered.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), st.stats.bad.load(.monotonic));
+}
+
+/// The p2p build's lists of `cp` damaged the ways the production shadow showed: one list in
+/// another order, one without an entry, one with an entry too many.
+const RsDamage = struct {
+    lists: []const []const convert.LoadedRef,
+    reordered: usize,
+    short: usize,
+    long: usize,
+    /// The entry `short` lost.
+    lost: convert.LoadedRef,
+};
+
+fn rsDamage(a: std.mem.Allocator, cp: *const RsCp, built: convert.Aux) !RsDamage {
+    const lists = try a.dupe([]const convert.LoadedRef, built.loaded);
+    // One with two or more entries, reversed.
+    const reordered = for (lists, 0..) |l, i| {
+        if (l.len >= 2) break i;
+    } else return error.SkipZigTest;
+    const rev = try a.dupe(convert.LoadedRef, lists[reordered]);
+    std.mem.reverse(convert.LoadedRef, rev);
+    lists[reordered] = rev;
+    // One that loses an entry whose object only the object set carries (not the blob).
+    var extras: std.AutoHashMapUnmanaged(RsKey, void) = .empty;
+    for (cp.bucket.objects) |raw| try extras.put(a, try exec.objects.keyOf(raw), {});
+    var short: usize = 0;
+    var lost: convert.LoadedRef = undefined;
+    const found = for (lists, 0..) |l, i| {
+        if (i == reordered) continue;
+        if (l.len == 0 or !extras.contains(.{ .id = l[0].id, .version = l[0].version })) continue;
+        short = i;
+        lost = l[0];
+        break true;
+    } else false;
+    if (!found) return error.SkipZigTest;
+    lists[short] = lists[short][1..];
+    // One that gains an entry (another transaction's).
+    const long = for (lists, 0..) |_, i| {
+        if (i != reordered and i != short) break i;
+    } else return error.SkipZigTest;
+    const more = try a.alloc(convert.LoadedRef, lists[long].len + 1);
+    @memcpy(more[0..lists[long].len], lists[long]);
+    more[lists[long].len] = rev[0];
+    lists[long] = more;
+    return .{ .lists = lists, .reordered = reordered, .short = short, .long = long, .lost = lost };
+}
+
+/// One checkpoint and its p2p build, shared by the reconcile scenarios.
+const RsShared = struct { cp: RsCp, built_aux: []const u8, built: convert.Aux };
+
+fn rsRepair(env: *RsEnv, a: std.mem.Allocator, sh: *const RsShared) anyerror!void {
+    const cp = sh.cp;
+    const seq = cp.seq;
+    const built = sh.built;
+    const dmg = try rsDamage(a, &cp, built);
+    // The lost entry's object is not in the damaged aux record either, and this store never
+    // held it (the node did not read it): the repair has to bring the object too.
+    var objs: std.ArrayList([]const u8) = .empty;
+    for (built.objects) |raw| {
+        const k = try exec.objects.keyOf(raw);
+        if (k.version == dmg.lost.version and std.mem.eql(u8, &k.id, &dmg.lost.id)) continue;
+        try objs.append(a, raw);
+    }
+    const skip: RsKey = .{ .id = dmg.lost.id, .version = dmg.lost.version };
+
+    // What the bucket path stores and serves.
+    const want_lists = try rsWantLists(a, &cp);
+    const want = blk: {
+        const bh = try rsBucketStore(env, a, &cp, "repair-bucket");
+        defer bh.io.deinit();
+        defer bh.store.deinit();
+        var svc = rsService(env, bh.store, seq);
+        defer svc.deinit();
+        break :blk [3][]const u8{ try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask), try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached), try rsBatchGet(a, &svc, seq, cp.digests) };
+    };
+
+    var node = try RsNode.init(env, a, &cp, "repair", try rsAuxBytes(a, dmg.lists, objs.items), skip, null, .{});
+    defer node.deinit();
+    const st = node.h.store;
+    const r = node.rec;
+    // Before: the three lists differ, the object is absent, and the answers are not sui-node's.
+    const before = try node.lists(a, &cp);
+    for (before, want_lists, 0..) |have, w, i| {
+        const damaged = i == dmg.reordered or i == dmg.short or i == dmg.long;
+        try testing.expectEqual(!damaged, std.mem.eql(u8, have, w));
+    }
+    {
+        var snap = st.snapshot();
+        defer snap.release();
+        try testing.expect(snap.objectAt(&skip.id, skip.version) == null);
+    }
+    var svc = rsService(env, st, seq);
+    defer svc.deinit();
+    const stale = try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached);
+    try testing.expect(!std.mem.eql(u8, stale, want[1]));
+    try testing.expect(svc.cp_cache.bytesHeld() > 0);
+    try testing.expectEqualSlices(u8, stale, try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached));
+
+    // The stream's copy arrives: a duplicate, handed to the reconciler.
+    try rsStreamDuplicate(env, r, &cp);
+    try testing.expectEqual(@as(u64, 1), r.stats.from_stream.load(.monotonic));
+    // Compared; the missing object has to be committed first, so nothing is served yet.
+    try testing.expect(try r.step());
+    try testing.expectEqual(@as(u64, 1), r.stats.reconciled.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), r.stats.repairs.load(.monotonic));
+    try testing.expect(rsSameLists(before, try node.lists(a, &cp)));
+    try testing.expect(!try r.step());
+    // The next checkpoint's commit group carries the object.
+    {
+        const b = try st.begin(seq + 1, cp.epoch);
+        try r.applied(seq + 1, false, b);
+        try st.commit(b);
+    }
+    try testing.expect(try r.step());
+    try testing.expectEqual(@as(u64, 3), r.stats.repairs.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), r.stats.repaired_checkpoints.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), r.stats.objects_added.load(.monotonic));
+    try testing.expect(!r.isWaiting(seq));
+    try testing.expectEqual(@as(u64, 0), r.stats.pending.load(.monotonic));
+
+    // After: the stored lists and object, and every answer, are the bucket path's.
+    try testing.expect(rsSameLists(want_lists, try node.lists(a, &cp)));
+    {
+        var snap = st.snapshot();
+        defer snap.release();
+        try testing.expect(snap.objectAt(&skip.id, skip.version) != null);
+    }
+    // The cached response was dropped: the same service answers the repaired bytes.
+    try testing.expectEqualSlices(u8, want[1], try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached));
+    try testing.expectEqualSlices(u8, want[0], try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask));
+    try testing.expectEqualSlices(u8, want[2], try rsBatchGet(a, &svc, seq, cp.digests));
+    // Nothing left to do, and a second copy is not wanted.
+    try testing.expect(!try r.step());
+    try testing.expect(!r.wantsCopy(seq));
+    // A restart serves the repaired lists from the log and does not compare the checkpoint again.
+    try node.restart(a, .{});
+    try testing.expectEqual(@as(u64, 3), node.rec.stats.loaded.load(.monotonic));
+    try testing.expect(!node.rec.isWaiting(seq));
+    try testing.expect(rsSameLists(want_lists, try node.lists(a, &cp)));
+}
+
+fn rsClean(env: *RsEnv) anyerror!void {
+    var compared: u64 = 0;
+    var s: u64 = 342451158;
+    const seqs = blk: {
+        var list: [13]u64 = undefined;
+        for (list[0..12]) |*x| {
+            x.* = s;
+            s += 1;
+        }
+        list[12] = 342453625;
+        break :blk list;
+    };
+    for (seqs) |seq| {
+        var arena: std.heap.ArenaAllocator = .init(env.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const cp = try rsLoad(env, a, seq);
+        const dir = try std.fmt.allocPrint(a, "clean-{d}", .{seq});
+        const built_aux = (try rsBuild(env, a, &cp, try std.fmt.allocPrint(a, "{s}-pre", .{dir}))) orelse return error.SkipZigTest;
+        var node = try RsNode.init(env, a, &cp, dir, built_aux, null, null, .{});
+        defer {
+            node.deinit();
+            for ([_][]const u8{ "", "-node", "-spool" }) |sfx| env.tmp.dir.deleteTree(testing.io, std.fmt.allocPrint(a, "{s}{s}", .{ dir, sfx }) catch dir) catch {};
+        }
+        const before = try node.lists(a, &cp);
+        try rsStreamDuplicate(env, node.rec, &cp);
+        try testing.expect(try node.rec.step());
+        const x = &node.rec.stats;
+        try testing.expectEqual(@as(u64, 1), x.reconciled.load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), x.repairs.load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), x.repaired_checkpoints.load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), x.objects_added.load(.monotonic));
+        try testing.expectEqual(@as(usize, 0), node.h.store.list_fix.count());
+        try testing.expectEqual(@as(u64, 0), node.h.store.list_fix.generation());
+        try testing.expect(!node.rec.isWaiting(seq));
+        try testing.expect(rsSameLists(before, try node.lists(a, &cp)));
+        // No repair record: a restart reinstalls nothing and has nothing waiting.
+        try node.restart(a, .{});
+        try testing.expectEqual(@as(u64, 0), node.rec.stats.loaded.load(.monotonic));
+        try testing.expect(!node.rec.isWaiting(seq));
+        compared += 1;
+    }
+    try testing.expectEqual(@as(u64, 13), compared);
+}
+
+fn rsCrash(env: *RsEnv, a: std.mem.Allocator, sh: *const RsShared) anyerror!void {
+    const cp = sh.cp;
+    const seq = cp.seq;
+    const built = sh.built;
+    // One list in another order (no object is missing: the repair is the log record alone).
+    const lists = try a.dupe([]const convert.LoadedRef, built.loaded);
+    const i = for (lists, 0..) |l, k| {
+        if (l.len >= 2) break k;
+    } else return error.SkipZigTest;
+    const rev = try a.dupe(convert.LoadedRef, lists[i]);
+    std.mem.reverse(convert.LoadedRef, rev);
+    lists[i] = rev;
+    const want_lists = try rsWantLists(a, &cp);
+    var node = try RsNode.init(env, a, &cp, "crash", try rsAuxBytes(a, lists, built.objects), null, null, .{});
+    defer node.deinit();
+    const old = try node.lists(a, &cp);
+    try testing.expect(!rsSameLists(old, want_lists));
+
+    // Killed between the compare and the commit: the old lists, the checkpoint still waiting.
+    {
+        const plan = try node.rec.compare(a, seq, cp.aux, .stream);
+        try testing.expectEqual(@as(usize, 1), plan.fixes.len);
+        try testing.expectEqual(@as(usize, 0), plan.objects.len);
+    }
+    try node.restart(a, .{});
+    try testing.expect(node.rec.isWaiting(seq));
+    try testing.expectEqual(@as(u64, 0), node.rec.stats.loaded.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), node.h.store.list_fix.count());
+    try testing.expect(rsSameLists(old, try node.lists(a, &cp)));
+
+    // Killed inside the commit (the log record is torn): the same.
+    const log_len = (try node.node_dir.statFile(testing.io, reconcile.log_name, .{})).size;
+    {
+        const plan = try node.rec.compare(a, seq, cp.aux, .stream);
+        try node.rec.commit(&plan);
+        try testing.expect(rsSameLists(want_lists, try node.lists(a, &cp)));
+    }
+    const full_len = (try node.node_dir.statFile(testing.io, reconcile.log_name, .{})).size;
+    try testing.expect(full_len > log_len);
+    {
+        const f = try node.node_dir.openFile(testing.io, reconcile.log_name, .{ .mode = .read_write });
+        defer f.close(testing.io);
+        try f.setLength(testing.io, full_len - 7);
+    }
+    try node.restart(a, .{});
+    try testing.expect(node.rec.isWaiting(seq));
+    try testing.expectEqual(@as(u64, 0), node.rec.stats.loaded.load(.monotonic));
+    try testing.expect(rsSameLists(old, try node.lists(a, &cp)));
+    try testing.expectEqual(log_len, (try node.node_dir.statFile(testing.io, reconcile.log_name, .{})).size);
+
+    // Killed right after the commit (before the checkpoint is settled or a watermark written):
+    // the repaired lists, and the checkpoint no longer waiting.
+    {
+        const plan = try node.rec.compare(a, seq, cp.aux, .stream);
+        try node.rec.commit(&plan);
+        try testing.expect(node.rec.isWaiting(seq));
+    }
+    try node.restart(a, .{});
+    try testing.expect(!node.rec.isWaiting(seq));
+    try testing.expectEqual(@as(u64, 1), node.rec.stats.loaded.load(.monotonic));
+    try testing.expect(rsSameLists(want_lists, try node.lists(a, &cp)));
+    // And again: the log is replayed the same way every time.
+    try node.restart(a, .{});
+    try testing.expect(!node.rec.isWaiting(seq));
+    try testing.expect(rsSameLists(want_lists, try node.lists(a, &cp)));
+}
+
+fn rsBucket(env: *RsEnv, a: std.mem.Allocator, sh: *const RsShared) anyerror!void {
+    const cp = sh.cp;
+    const seq = cp.seq;
+    const built = sh.built;
+    const lists = try a.dupe([]const convert.LoadedRef, built.loaded);
+    const i = for (lists, 0..) |l, k| {
+        if (l.len >= 2) break k;
+    } else return error.SkipZigTest;
+    const rev = try a.dupe(convert.LoadedRef, lists[i]);
+    std.mem.reverse(convert.LoadedRef, rev);
+    lists[i] = rev;
+    const want_lists = try rsWantLists(a, &cp);
+    // The bucket: a directory the checkpoint's archive proto appears in later.
+    try env.tmp.dir.createDir(testing.io, "the-bucket", .default_dir);
+    const bdir = try env.tmp.dir.openDir(testing.io, "the-bucket", .{});
+    const bucket: source_mod.Source = .{ .gpa = env.gpa, .io = testing.io, .kind = .{ .dir = bdir } };
+    var node = try RsNode.init(env, a, &cp, "bucket", try rsAuxBytes(a, lists, built.objects), null, &bucket, .{ .wait_ms = 3_600_000, .retry_ms = 0 });
+    defer node.deinit();
+    const r = node.rec;
+    const old = try node.lists(a, &cp);
+    // No duplicate from the stream. Within the wait the bucket is not asked.
+    try testing.expect(!try r.step());
+    try testing.expectEqual(@as(u64, 0), r.stats.bucket_waits.load(.monotonic));
+    // The wait is over, the bucket has not published the checkpoint yet: asked, still waiting.
+    r.cfg.wait_ms = 0;
+    try testing.expect(!try r.step());
+    try testing.expectEqual(@as(u64, 1), r.stats.bucket_waits.load(.monotonic));
+    try testing.expect(r.isWaiting(seq));
+    try testing.expect(rsSameLists(old, try node.lists(a, &cp)));
+    // Published: fetched once, compared, repaired.
+    {
+        var nb: [64]u8 = undefined;
+        const z = try readCorpus(env.gpa, try std.fmt.bufPrint(&nb, "binpb-done/{d}.binpb.zst", .{seq}));
+        defer env.gpa.free(z);
+        try bdir.writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&nb, "{d}.binpb.zst", .{seq}), .data = z });
+    }
+    try testing.expect(try r.step());
+    try testing.expectEqual(@as(u64, 1), r.stats.from_bucket.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), r.stats.from_stream.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), r.stats.reconciled.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), r.stats.repairs.load(.monotonic));
+    try testing.expect(!r.isWaiting(seq));
+    try testing.expect(rsSameLists(want_lists, try node.lists(a, &cp)));
+    try testing.expect(!try r.step());
+    try testing.expectEqual(@as(u64, 1), r.stats.from_bucket.load(.monotonic));
+}
+
+fn rsUntouched(env: *RsEnv, a: std.mem.Allocator, sh: *const RsShared) anyerror!void {
+    // A checkpoint from the bucket or the stream (no `.p2p` mark in the spool) is not marked,
+    // does not wait, and a copy offered for it before it was applied is dropped at apply.
+    const cp = sh.cp;
+    const seq = cp.seq;
+    const h = try rsStore(env, a, "untouched");
+    defer h.io.deinit();
+    defer h.store.deinit();
+    try types.indexCheckpointData(cp.blob, &env.idx);
+    try rsSeed(env, a, h.store, seq, cp.epoch, cp.blob, cp.bucket);
+    try env.tmp.dir.createDir(testing.io, "untouched-node", .default_dir);
+    const node_dir = try env.tmp.dir.openDir(testing.io, "untouched-node", .{});
+    try env.tmp.dir.createDir(testing.io, "untouched-spool", .default_dir);
+    const spool = try env.tmp.dir.openDir(testing.io, "untouched-spool", .{});
+    const r = try reconcile.Reconciler.open(env.gpa, testing.io, h.store, node_dir, null, .{});
+    defer r.deinit();
+    // Not applied yet: p2p may still build it, so the stream's copy is kept for now.
+    try testing.expect(r.wantsCopy(seq));
+    r.offer(seq, cp.aux, .stream);
+    try testing.expect(!r.wantsCopy(seq));
+    var nb: [48]u8 = undefined;
+    try spool.writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&nb, "{d}.aux", .{seq}), .data = cp.aux });
+    try rsApplyOpts(env, a, h.store, seq, cp.blob, spool, r);
+    var snap = h.store.snapshot();
+    defer snap.release();
+    try testing.expect(!history.p2pBuilt(&snap, seq));
+    try testing.expect(!r.isWaiting(seq));
+    try testing.expect(!r.wantsCopy(seq));
+    try testing.expectEqual(@as(usize, 0), r.held_bytes);
+    try testing.expect(!try r.step());
+    try testing.expectEqual(@as(u64, 0), r.stats.reconciled.load(.monotonic));
+    // The watermark still moves past it, so a restart does not look for its marker again.
+    try testing.expectEqual(seq + 1, r.settled_below);
+    try testing.expectEqual(seq + 1, r.marked_below);
+}
+
+fn rsThreaded(env: *RsEnv, a: std.mem.Allocator, sh: *const RsShared) anyerror!void {
+    // The node's wiring: the reconciler's own thread picks up the stream's duplicate.
+    const cp = sh.cp;
+    const seq = cp.seq;
+    const lists = try a.dupe([]const convert.LoadedRef, sh.built.loaded);
+    const i = for (lists, 0..) |l, k| {
+        if (l.len >= 2) break k;
+    } else return error.SkipZigTest;
+    const rev = try a.dupe(convert.LoadedRef, lists[i]);
+    std.mem.reverse(convert.LoadedRef, rev);
+    lists[i] = rev;
+    var node = try RsNode.init(env, a, &cp, "threaded", try rsAuxBytes(a, lists, sh.built.objects), null, null, .{ .tick_ms = 5 });
+    defer node.deinit();
+    try node.rec.start();
+    try rsStreamDuplicate(env, node.rec, &cp);
+    var waited: u32 = 0;
+    while (node.rec.isWaiting(seq) and waited < 2_000) : (waited += 1) testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    node.rec.stop();
+    try testing.expect(!node.rec.isWaiting(seq));
+    try testing.expectEqual(@as(u64, 1), node.rec.stats.repairs.load(.monotonic));
+    try testing.expect(rsSameLists(try rsWantLists(a, &cp), try node.lists(a, &cp)));
+}
+
+fn rsReconcileBody(_: void, env: *RsEnv) anyerror!void {
+    // The in-order build (the level-parallel one is compared with it in the read-set test).
+    env.pool = null;
+    var arena: std.heap.ArenaAllocator = .init(env.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cp = try rsLoad(env, a, 342451165);
+    const built_aux = (try rsBuild(env, a, &cp, "shared-pre")) orelse return error.SkipZigTest;
+    const sh: RsShared = .{ .cp = cp, .built_aux = built_aux, .built = try convert.Aux.parse(a, built_aux) };
+    // 1. wrong order, a missing entry (and its object), an extra entry: repaired from the
+    //    stream's duplicate; the cached GetCheckpoint response is dropped.
+    // 2. a kill before, inside and after the repair's commit.
+    // 3. no duplicate: the bucket's copy, after the wait, once it is published.
+    // 4. a checkpoint from the stream or the bucket is not marked and never compared.
+    inline for (.{ .{ "repair", rsRepair }, .{ "kill", rsCrash }, .{ "bucket", rsBucket }, .{ "other sources", rsUntouched }, .{ "thread", rsThreaded } }) |c| {
+        c[1](env, a, &sh) catch |e| {
+            std.debug.print("p2p reconcile ({s}): {s}\n", .{ c[0], @errorName(e) });
+            return e;
+        };
+    }
+    // 5. lists that already equal sui-node's (the read-set test's 13 checkpoints): no repair.
+    rsClean(env) catch |e| {
+        std.debug.print("p2p reconcile (13 clean checkpoints): {s}\n", .{@errorName(e)});
+        return e;
+    };
+}
+
+test "p2p reconcile: wrong, short and long lists are repaired from the stream's duplicate or the bucket's copy, across kills; equal lists and other sources' checkpoints are left alone" {
+    try rsWith({}, rsReconcileBody);
+}
+
+/// The GetCheckpoint response cache across a repair, on the lookup that runs before any store
+/// read (serve service.zig `getCheckpointCached`): a p2p-built checkpoint with one list in
+/// another order is served and cached, then repaired by the reconciler while its entry is still
+/// within the recheck time.
+fn rsCachedRepairBody(_: void, env: *RsEnv) anyerror!void {
+    env.pool = null;
+    var arena: std.heap.ArenaAllocator = .init(env.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const seq: u64 = 342451165;
+    const cp = try rsLoad(env, a, seq);
+    const built_aux = (try rsBuild(env, a, &cp, "cached-pre")) orelse return error.SkipZigTest;
+    const built = try convert.Aux.parse(a, built_aux);
+    const lists = try a.dupe([]const convert.LoadedRef, built.loaded);
+    const i = for (lists, 0..) |l, k| {
+        if (l.len >= 2) break k;
+    } else return error.SkipZigTest;
+    const rev = try a.dupe(convert.LoadedRef, lists[i]);
+    std.mem.reverse(convert.LoadedRef, rev);
+    lists[i] = rev;
+    // What the bucket path serves.
+    const want = blk: {
+        const bh = try rsBucketStore(env, a, &cp, "cached-bucket");
+        defer bh.io.deinit();
+        defer bh.store.deinit();
+        var svc = rsService(env, bh.store, seq);
+        defer svc.deinit();
+        break :blk try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached);
+    };
+    var node = try RsNode.init(env, a, &cp, "cached", try rsAuxBytes(a, lists, built.objects), null, null, .{});
+    defer node.deinit();
+    const st = node.h.store;
+    var svc = rsService(env, st, seq);
+    defer svc.deinit();
+    // Every call below is within the recheck time, however slow the machine.
+    svc.cp_recheck_ns = std.time.ns_per_hour;
+    const fast = &svc.cp_fast_hits;
+    const inserts = &svc.cp_cache.stats.inserts;
+
+    // Rendered from the store and cached; the same call again never reaches the store.
+    const stale = try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached);
+    try testing.expect(!std.mem.eql(u8, stale, want));
+    try testing.expectEqual(@as(u64, 1), inserts.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), fast.load(.monotonic));
+    try testing.expectEqualSlices(u8, stale, try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached));
+    try testing.expectEqual(@as(u64, 1), fast.load(.monotonic));
+
+    // A repaired list and a signature-order fix of ANOTHER checkpoint: this entry is not
+    // touched, and is still answered before any store read.
+    const da: [32]u8 = @splat(0x5a);
+    const db: [32]u8 = @splat(0x5b);
+    const dc: [32]u8 = @splat(0x5c);
+    try testing.expect(try st.list_fix.put(seq + 1, &da, try rsListBytes(a, rev)));
+    try testing.expectEqualSlices(u8, stale, try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached));
+    try testing.expectEqual(@as(u64, 2), fast.load(.monotonic));
+    try testing.expect(try st.tx_fix.put(seq + 1, &db, "x"));
+    try testing.expectEqualSlices(u8, stale, try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached));
+    try testing.expectEqual(@as(u64, 3), fast.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), inserts.load(.monotonic));
+
+    // The stream's duplicate arrives and the reconciler replaces the list (no object is
+    // missing: one step).
+    try rsStreamDuplicate(env, node.rec, &cp);
+    try testing.expect(try node.rec.step());
+    try testing.expectEqual(@as(u64, 1), node.rec.stats.repairs.load(.monotonic));
+    try testing.expect(!node.rec.isWaiting(seq));
+
+    // Within the recheck time: the entry is not answered ahead of the store. It is dropped, and
+    // the response is rendered again with the repaired list: the bucket path's bytes.
+    try testing.expectEqualSlices(u8, want, try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached));
+    try testing.expectEqual(@as(u64, 3), fast.load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), inserts.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), svc.cp_cache.entries());
+    // The new entry is answered before the store read again.
+    try testing.expectEqualSlices(u8, want, try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached));
+    try testing.expectEqual(@as(u64, 4), fast.load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), inserts.load(.monotonic));
+
+    // The same for a signature-order fix of this checkpoint (no transaction has the digest, so
+    // the bytes stay): dropped and rendered once, then answered before the store read again.
+    try testing.expect(try st.tx_fix.put(seq, &dc, "x"));
+    try testing.expectEqualSlices(u8, want, try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached));
+    try testing.expectEqual(@as(u64, 4), fast.load(.monotonic));
+    try testing.expectEqual(@as(u64, 3), inserts.load(.monotonic));
+    try testing.expectEqualSlices(u8, want, try rsGetCheckpoint(a, &svc, seq, &rs_cp_mask_cached));
+    try testing.expectEqual(@as(u64, 5), fast.load(.monotonic));
+    try testing.expectEqual(@as(u64, 3), inserts.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), svc.cp_cache.entries());
+}
+
+test "p2p reconcile: a list repaired within the recheck time drops the cached GetCheckpoint response before it is served ahead of the store; a fix of another checkpoint leaves it there" {
+    try rsWith({}, rsCachedRepairBody);
 }

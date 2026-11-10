@@ -115,10 +115,15 @@ pub const Conn = struct {
     plain_end: usize = 0,
     rec_end: usize = 0,
     closed: bool = false,
-    /// Outgoing records of one write (one send per `write`).
+    /// Outgoing records: those of one `write` (one send), or what `writeSome` sealed and the
+    /// socket has not taken yet (`out[out_off..]`).
     out: std.ArrayList(u8) = .empty,
+    out_off: usize = 0,
 
-    const vt: sock.Session.VTable = .{ .read = readFn, .write = writeFn, .buffered = bufferedFn, .deinit = deinitFn };
+    const vt: sock.Session.VTable = .{ .read = readFn, .write = writeFn, .buffered = bufferedFn, .deinit = deinitFn, .write_some = writeSomeFn, .unsent = unsentFn };
+    /// Plaintext `writeSome` seals per call (four records): what the socket does not take of it
+    /// is all the session ever holds.
+    const some_max = 4 * max_plain;
 
     fn handshake(srv: *Server, fd: std.c.fd_t) !*Conn {
         const gpa = srv.gpa;
@@ -257,8 +262,41 @@ pub const Conn = struct {
         }
     }
 
+    /// Sends sealed records a `writeSome` left, as far as the socket takes them now. True
+    /// when none are left.
+    fn sendSealed(c: *Conn) sock.Error!bool {
+        while (c.out_off < c.out.items.len) {
+            const n = try sock.rawWriteSome(c.fd, c.out.items[c.out_off..]);
+            if (n == 0) return false;
+            c.out_off += n;
+        }
+        c.out.clearRetainingCapacity();
+        c.out_off = 0;
+        return true;
+    }
+
+    /// sock.Session `write_some`: never waits for the peer. Records are sealed in order, so
+    /// what was sealed is sent before anything new is sealed.
+    fn writeSomeFn(ctx: *anyopaque, bytes: []const u8) sock.Error!usize {
+        const c: *Conn = @ptrCast(@alignCast(ctx));
+        if (!(try c.sendSealed())) return 0;
+        const n = @min(bytes.len, some_max);
+        if (n == 0) return 0;
+        sealInto(&c.out, c.gpa, &c.w, 23, bytes[0..n]) catch return error.Io;
+        _ = try c.sendSealed();
+        return n;
+    }
+
+    fn unsentFn(ctx: *anyopaque) usize {
+        const c: *Conn = @ptrCast(@alignCast(ctx));
+        return c.out.items.len - c.out_off;
+    }
+
     fn writeFn(ctx: *anyopaque, bytes: []const u8) sock.Error!void {
         const c: *Conn = @ptrCast(@alignCast(ctx));
+        // records a `writeSome` sealed go first
+        if (c.out_off < c.out.items.len) try sock.rawWriteAll(c.fd, c.out.items[c.out_off..]);
+        c.out_off = 0;
         c.out.clearRetainingCapacity();
         var off: usize = 0;
         while (off < bytes.len) {
@@ -267,7 +305,8 @@ pub const Conn = struct {
             off += n;
         }
         try sock.rawWriteAll(c.fd, c.out.items);
-        if (c.out.capacity > 1 << 20) c.out.clearAndFree(c.gpa);
+        // sent: nothing is left for `writeSome` to send again
+        if (c.out.capacity > 1 << 20) c.out.clearAndFree(c.gpa) else c.out.clearRetainingCapacity();
     }
 
     fn bufferedFn(ctx: *anyopaque) bool {
@@ -406,6 +445,93 @@ test "tcptls: std.crypto.tls.Client handshake and echo (small and multi-record w
     defer gpa.free(back);
     try cl.reader.readSliceAll(back);
     try std.testing.expectEqualSlices(u8, big, back);
+    cl.end() catch {};
+    sw.interface.flush() catch {};
+    stream.shutdown(io, .both) catch {};
+}
+
+// `sock.writeSome` on a TLS connection (the h2 runtime writes with it under the connection
+// lock): it returns when the socket is full, and what it sealed and could not send goes out with
+// the later calls, in order.
+test "tcptls: writeSome never waits for a peer that reads nothing; the sealed rest follows in order" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var seed: [32]u8 = undefined;
+    io.random(&seed);
+    const key = try P256.KeyPair.generateDeterministic(seed);
+    var serial: [16]u8 = @splat(7);
+    serial[0] = 1;
+    const now_unix: i64 = @intCast(@divTrunc(Io.Clock.real.now(io).toNanoseconds(), std.time.ns_per_s));
+    var srv = Server.init(gpa, io, cert_mod.generate(key, serial, now_unix, 13, "zui"));
+    var any: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(0) };
+    var ls = try any.listen(io, .{ .reuse_address = true });
+    defer ls.deinit(io);
+    const port = ls.socket.address.ip4.port;
+    const total: usize = 4 << 20;
+    const payload = try gpa.alloc(u8, total);
+    defer gpa.free(payload);
+    for (payload, 0..) |*x, i| x.* = @truncate(i *% 131 +% (i >> 9));
+
+    const Push = struct {
+        var full: std.atomic.Value(bool) = .init(false);
+        var held_max: std.atomic.Value(usize) = .init(0);
+        fn run(s: *Server, l: *Io.net.Server, iox: Io, bytes: []const u8) void {
+            const st = l.accept(iox) catch return;
+            const fd = st.socket.handle;
+            sock.tune(fd);
+            const sess = s.acceptor().accept(s, fd) orelse {
+                sock.close(fd);
+                return;
+            };
+            _ = sock.attach(fd, sess);
+            defer sock.close(fd);
+            var off: usize = 0;
+            while (off < bytes.len or sock.unsent(fd) > 0) {
+                const n = sock.writeSome(fd, bytes[off..]) catch return;
+                off += n;
+                if (n == 0) {
+                    // the socket is full: the call came back instead of waiting for the peer
+                    held_max.store(@max(held_max.load(.monotonic), sock.unsent(fd)), .monotonic);
+                    full.store(true, .release);
+                    _ = sock.waitConn(fd, false, true, null, 100) catch return;
+                }
+            }
+        }
+    };
+    Push.full.store(false, .release);
+    const t = try std.Thread.spawn(.{}, Push.run, .{ &srv, &ls, io, payload });
+    defer t.join();
+
+    var addr: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(port) };
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rb: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+    var wb: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+    var sr = stream.reader(io, &rb);
+    var sw = stream.writer(io, &wb);
+    var crb: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+    var cwb: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+    var ent: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+    io.random(&ent);
+    var cl = try std.crypto.tls.Client.init(&sr.interface, &sw.interface, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+        .read_buffer = &crb,
+        .write_buffer = &cwb,
+        .entropy = &ent,
+        .realtime_now = Io.Clock.real.now(io),
+    });
+    try sw.interface.flush();
+    // The client reads nothing yet: the server fills the socket and comes back.
+    var waited: u32 = 0;
+    while (!Push.full.load(.acquire) and waited < 5000) : (waited += 10) sock.sleepMs(10);
+    try std.testing.expect(Push.full.load(.acquire));
+    // what the session holds is a few records, not the rest of the payload
+    try std.testing.expect(Push.held_max.load(.monotonic) <= Conn.some_max + 4 * 64);
+    const back = try gpa.alloc(u8, total);
+    defer gpa.free(back);
+    try cl.reader.readSliceAll(back);
+    try std.testing.expectEqualSlices(u8, payload, back);
     cl.end() catch {};
     sw.interface.flush() catch {};
     stream.shutdown(io, .both) catch {};

@@ -59,12 +59,12 @@ Response bytes are compared with sui-node 1.83.1's for the same requests:
 | `rpc-execute`: ExecuteTransaction responses | 6,990 of 6,990 |
 | `epoch-pkg`: GetEpoch, package versions, names | 5,262 of 5,262 |
 | `render-json`: object json, Display, event json | 31,963 of 31,963 |
-| `rpc-simulate`: SimulateTransaction code, message, details, bytes | 1,726,232 pass, 0 fail, 45 skipped |
+| `rpc-simulate`: SimulateTransaction code, message, details, bytes | 2,804,052 of 2,804,052 |
 
 Live side-by-side runs at the mainnet tip match on every method that does not need the
 StateService index, including all six checkpoint stream masks frame for frame.
 
-## Known differences and open items
+## Behaviour notes
 
 - **GetCheckpoint `signature`** can differ: the archive and a given sui-node may hold different
   valid quorum certificates for the same summary, with different signer sets. Both verify.
@@ -73,8 +73,7 @@ StateService index, including all six checkpoint stream masks frame for frame.
 - **StateService after a restore**: the index is built from the restored live set and then
   replayed over the stored checkpoints. Until it reaches the tip, StateService answers
   `UNAVAILABLE rpc indexes are being built`, as sui-node does while its index builds.
-- **SimulateTransaction**: DevInspect command results and the `json` field of simulated objects
-  and events are not complete. Gas selection needs the StateService index.
+- **SimulateTransaction gas selection** uses the StateService index, as on sui-node.
 - **JSON-RPC and REST** are not served. sui-node 1.83.1 removed JSON-RPC too; unknown paths answer
   404 on both nodes.
 

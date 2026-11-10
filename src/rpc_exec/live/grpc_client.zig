@@ -17,6 +17,10 @@
 //! connection (every `keepalive_busy_ns` while calls are open, `keepalive_idle_ns` otherwise) and
 //! ends one whose PING is not acknowledged within `keepalive_timeout_ns`. A silently dead peer
 //! therefore fails its calls with UNAVAILABLE instead of holding them until the caller's deadline.
+//! The reader thread keeps the connect deadline itself too: the TCP connect is non-blocking
+//! (`dial`) and the handshake reads wait with a deadline (`SockReader`), so the thread is gone at
+//! the deadline instead of sitting in connect(2) for as long as the OS retries SYNs, and a
+//! connection is bounded even when no watchdog thread could be started.
 //!
 //! Writes: `start`, `cancel`, the reader and the watchdog all write under the connection lock. The
 //! socket writer bounds them (`SockWriter`): a write that makes no progress for `send_timeout_ns`
@@ -24,10 +28,20 @@
 //! in all (a peer that reads a trickle). A validator that stops reading therefore costs a caller
 //! the first once, not until TCP gives up.
 //!
+//! GOAWAY (RFC 9113 6.8): the peer is closing the connection and names the last stream it will
+//! answer. Calls on streams up to that one stay open and finish; the others are answered
+//! UNAVAILABLE at once (the peer did not act on them), and so is every call started afterwards.
+//! The connection is `draining` from then on: an owner asks `isDraining` and opens the next
+//! connection without waiting for this one, which ends by itself with its last open call.
+//!
 //! Lock order: nothing is held while taking a connection lock. Whether a connection is dead, when
 //! it died and whether it ever was ready are atomics, so an owner (the validator pool, the
 //! upstream) asks under its own lock without touching the connection's; the watchdog ticks
 //! connections outside its registry lock and skips one whose lock is busy.
+//!
+//! Concurrent streams: the peer's SETTINGS_MAX_CONCURRENT_STREAMS is kept. A call started while
+//! that many are open waits in the connection's queue (the one that holds calls started before
+//! the connection is ready, same byte limit) and is started, in order, as open ones finish.
 //!
 //! Limits against a misbehaving peer (sui-node tolerates f byzantine validators; so must this):
 //! SETTINGS values are validated (RFC 9113 6.5.2), a response body is capped at
@@ -99,6 +113,11 @@ const max_frame_in: u32 = 1 << 20;
 /// One unary response (gRPC prefix included); tonic's default `max_decoding_message_size` is
 /// 4 MiB, sui-node raises it for its clients; validators' effects replies stay far below this.
 pub var max_response_bytes: usize = 64 << 20;
+/// The response bytes one connection holds for all its open calls together. `max_response_bytes`
+/// bounds one call; a validator that feeds many open calls at once, each under that, is stopped
+/// here: the call whose DATA goes past it fails alone (RESOURCE_EXHAUSTED and RST), like one
+/// over its own limit.
+pub var max_conn_response_bytes: usize = 256 << 20;
 /// One HEADERS + CONTINUATION block (hyper's default max header list is 16 KiB).
 pub var max_header_block: usize = 64 << 10;
 pub var connect_timeout_ns: u64 = 10 * std.time.ns_per_s;
@@ -208,6 +227,113 @@ const SockWriter = struct {
     }
 };
 
+/// The socket's read side: std's `Io.net.Stream.Reader`, with a deadline for the reads of the
+/// connection setup (the TLS handshake). std's reader sits in recvmsg until the peer says
+/// something; here a read first waits for the socket to be readable, until `deadline`. A ready
+/// connection reads without one (`deadline` 0): the keepalive ends a silent peer.
+const SockReader = struct {
+    interface: Io.Reader,
+    io: Io,
+    stream: Io.net.Stream,
+    /// Monotonic ns after which a read fails; 0: none.
+    deadline: u64 = 0,
+    /// A read gave up at the deadline (the connection's reason is then the connect timeout).
+    timed_out: bool = false,
+
+    fn init(stream: Io.net.Stream, io: Io, buffer: []u8) SockReader {
+        return .{ .io = io, .stream = stream, .interface = .{ .vtable = &.{ .stream = streamImpl, .readVec = readVec }, .buffer = buffer, .seek = 0, .end = 0 } };
+    }
+
+    fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const r: *SockReader = @alignCast(@fieldParentPtr("interface", io_r));
+        var iovecs: [8][]u8 = undefined;
+        const dest_n, const data_size = try io_r.writableVector(&iovecs, data);
+        if (r.deadline != 0) try r.waitReadable();
+        const n = r.stream.read(r.io, iovecs[0..dest_n]) catch return error.ReadFailed;
+        if (n == 0) return error.EndOfStream;
+        if (n > data_size) {
+            r.interface.end += n - data_size;
+            return data_size;
+        }
+        return n;
+    }
+
+    /// Returns once recvmsg will not block (data, the peer's close, an error), or fails at the
+    /// deadline.
+    fn waitReadable(r: *SockReader) Io.Reader.Error!void {
+        var fds = [_]posix.pollfd{.{ .fd = r.stream.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
+        while (true) {
+            const now = monotonic(r.io);
+            if (now >= r.deadline) {
+                r.timed_out = true;
+                return error.ReadFailed;
+            }
+            const ms = @min((r.deadline - now) / std.time.ns_per_ms + 1, std.math.maxInt(i32));
+            fds[0].revents = 0;
+            switch (posix.errno(posix.system.poll(&fds, 1, @intCast(ms)))) {
+                .SUCCESS => if (fds[0].revents != 0) return,
+                .INTR => {},
+                else => return error.ReadFailed,
+            }
+        }
+    }
+};
+
+/// How often a connect in progress looks whether the connection was released or ended.
+const dial_poll_ms = 50;
+/// Addresses of one host tried at once.
+const max_dial = 8;
+
+/// A non-blocking TCP socket with a connect to `a` under way.
+pub fn startConnect(a: *const Io.net.IpAddress) !posix.socket_t {
+    var storage: Io.Threaded.PosixAddress = undefined;
+    const len = Io.Threaded.addressToPosix(a, &storage);
+    const at_open = builtin.os.tag == .linux; // elsewhere the flags are set after socket()
+    const kind: u32 = posix.SOCK.STREAM | if (at_open) posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK else 0;
+    const rc = posix.system.socket(storage.any.family, kind, posix.IPPROTO.TCP);
+    if (posix.errno(rc) != .SUCCESS) return error.ConnectFailed;
+    const fd: posix.socket_t = @intCast(rc);
+    errdefer closeFd(fd);
+    if (!at_open) {
+        _ = posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC));
+        if (!setNonBlocking(fd, true)) return error.ConnectFailed;
+    }
+    while (true) switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
+        .SUCCESS, .INPROGRESS, .ALREADY, .ISCONN => return fd,
+        .INTR => {}, // the connect goes on; the next call says ALREADY
+        else => return error.ConnectFailed,
+    };
+}
+
+fn setNonBlocking(fd: posix.socket_t, on: bool) bool {
+    const bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+    const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    if (posix.errno(rc) != .SUCCESS) return false;
+    const old: usize = @intCast(rc);
+    const new = if (on) old | bit else old & ~bit;
+    return posix.errno(posix.system.fcntl(fd, posix.F.SETFL, new)) == .SUCCESS;
+}
+
+/// SO_ERROR: 0 once a non-blocking connect went through.
+fn socketError(fd: posix.socket_t) c_int {
+    var v: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    if (posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&v), &len)) != .SUCCESS) return -1;
+    return v;
+}
+
+fn closeFd(fd: posix.socket_t) void {
+    _ = posix.system.close(fd);
+}
+
 /// Socket options of a fresh connection (best effort: a refused option changes nothing else).
 fn tuneSocket(fd: posix.socket_t) void {
     // as mysten-network's `tcp_nodelay(true)`: every write here is a whole flush (a request, an
@@ -252,14 +378,19 @@ pub const Conn = struct {
     dead: std.atomic.Value(bool) = .init(false),
     dead_reason: []const u8 = "",
     calls: std.AutoHashMapUnmanaged(u32, *Call) = .empty,
-    /// Calls started before the connection was ready, in order (stream ids not assigned yet).
+    /// Calls not started yet, in order (stream ids not assigned): the connection was not ready,
+    /// or the peer's limit of concurrent streams was reached.
     queued: std.ArrayList(Queued) = .empty,
     /// Path and body bytes held by `queued` (`max_queued_bytes`).
     queued_bytes: usize = 0,
+    /// Response bytes held by the open calls (`max_conn_response_bytes`).
+    buffered: usize = 0,
     next_stream: u32 = 1,
     conn_send_window: i64 = 65_535,
     peer_initial_window: i64 = 65_535,
     peer_max_frame: u32 = 16_384,
+    /// SETTINGS_MAX_CONCURRENT_STREAMS of the peer (RFC 9113: no limit until it sends one).
+    peer_max_streams: u32 = std.math.maxInt(u32),
     /// Set once the reader thread has the transport up.
     writer: ?*Io.Writer = null,
     /// The socket writer under TLS (the TLS writer's flush only encrypts into it).
@@ -283,6 +414,12 @@ pub const Conn = struct {
     died_at: std.atomic.Value(u64) = .init(0),
     /// Set once the connection reached `ready` (a pool backs off reconnects to peers that never do).
     was_ready: std.atomic.Value(bool) = .init(false),
+    /// Monotonic ns when it did (0: never): with `died_at`, how long the connection held.
+    ready_at: std.atomic.Value(u64) = .init(0),
+    /// The peer sent GOAWAY: no new calls; the open ones it covers finish (`isDraining`).
+    draining: std.atomic.Value(bool) = .init(false),
+    /// Monotonic ns of the first GOAWAY (0: none); set before `draining`.
+    goaway_at: std.atomic.Value(u64) = .init(0),
 
     const Queued = struct { id_slot: *u32, path: []u8, body: []u8, sink: Sink, tag: u64, timeout_ms: ?u64 };
 
@@ -310,6 +447,15 @@ pub const Conn = struct {
     /// Takes a reference for a caller that keeps the pointer (drop it with `unref`).
     pub fn retain(c: *Conn) void {
         _ = c.refs.fetchAdd(1, .acq_rel);
+    }
+
+    /// Drops the owner's reference to a draining connection without closing it: the calls the
+    /// peer's GOAWAY covers finish, and the connection ends with the last of them (or by its
+    /// callers cancelling, or the keepalive). The callers that still use it hold their own
+    /// references.
+    pub fn retire(c: *Conn) void {
+        if (c.isDead()) return c.release();
+        c.unref();
     }
 
     /// Drops the owner's reference: the connection closes and is freed once its reader exits.
@@ -364,6 +510,24 @@ pub const Conn = struct {
         return c.was_ready.load(.acquire);
     }
 
+    /// True once the peer sent GOAWAY (lock-free, like `isDead`): the connection takes no new
+    /// calls, an owner opens the next one.
+    pub fn isDraining(c: *const Conn) bool {
+        return c.draining.load(.acquire);
+    }
+
+    /// Monotonic ns when the connection stopped taking calls: the peer's GOAWAY, or its death.
+    pub fn closedAt(c: *const Conn) u64 {
+        const g = c.goaway_at.load(.acquire);
+        return if (g != 0) g else c.diedAt();
+    }
+
+    /// How long a dead or draining connection had been ready (0: it never was).
+    pub fn heldFor(c: *const Conn) u64 {
+        const at = c.ready_at.load(.acquire);
+        return if (at == 0) 0 else c.closedAt() -| at;
+    }
+
     /// Starts a unary call. `id_slot` receives the stream id (0 while queued), which `cancel`
     /// takes. Never blocks on the network beyond a socket write, and that within the send
     /// timeouts (the connection is then dead and the call answered UNAVAILABLE).
@@ -378,19 +542,49 @@ pub const Conn = struct {
             .connecting => {
                 if (path.len + body.len > max_queued_bytes -| c.queued_bytes)
                     return sink.done(sink.ctx, tag, .{ .status = .{ .code = 14, .message = "transport error: connecting, too many calls waiting" } });
-                const p = c.gpa.dupe(u8, path) catch return oom(sink, tag);
-                const b = c.gpa.dupe(u8, body) catch {
-                    c.gpa.free(p);
-                    return oom(sink, tag);
-                };
-                c.queued.append(c.gpa, .{ .id_slot = id_slot, .path = p, .body = b, .sink = sink, .tag = tag, .timeout_ms = timeout_ms }) catch {
-                    c.gpa.free(p);
-                    c.gpa.free(b);
-                    return oom(sink, tag);
-                };
-                c.queued_bytes += path.len + body.len;
+                c.enqueueLocked(id_slot, path, body, sink, tag, timeout_ms);
             },
-            .ready => c.startLocked(id_slot, path, body, sink, tag, timeout_ms),
+            .ready => if (c.draining.load(.monotonic)) {
+                // the peer takes no new streams: the caller's next connection will
+                sink.done(sink.ctx, tag, .{ .status = .{ .code = 14, .message = goaway_reason } });
+            } else if (c.queued.items.len == 0 and c.calls.count() < c.peer_max_streams) {
+                c.startLocked(id_slot, path, body, sink, tag, timeout_ms);
+            } else {
+                // as many streams open as the peer allows (or calls already waiting for that):
+                // behind them, started as open ones finish (`startQueuedLocked`)
+                if (path.len + body.len > max_queued_bytes -| c.queued_bytes)
+                    return sink.done(sink.ctx, tag, .{ .status = .{ .code = 14, .message = "transport error: too many calls waiting for a stream" } });
+                c.enqueueLocked(id_slot, path, body, sink, tag, timeout_ms);
+                c.startQueuedLocked(); // nothing, unless room appeared since the queue formed
+            },
+        }
+    }
+
+    fn enqueueLocked(c: *Conn, id_slot: *u32, path: []const u8, body: []const u8, sink: Sink, tag: u64, timeout_ms: ?u64) void {
+        const p = c.gpa.dupe(u8, path) catch return oom(sink, tag);
+        const b = c.gpa.dupe(u8, body) catch {
+            c.gpa.free(p);
+            return oom(sink, tag);
+        };
+        c.queued.append(c.gpa, .{ .id_slot = id_slot, .path = p, .body = b, .sink = sink, .tag = tag, .timeout_ms = timeout_ms }) catch {
+            c.gpa.free(p);
+            c.gpa.free(b);
+            return oom(sink, tag);
+        };
+        c.queued_bytes += path.len + body.len;
+    }
+
+    /// Starts waiting calls, oldest first, while the connection is ready and the peer's limit
+    /// of concurrent streams has room. Each call leaves the queue before it is started: a
+    /// write that fails in here ends the connection, and `dieLocked` answers the call just
+    /// started (it is open) and those still waiting, each once.
+    fn startQueuedLocked(c: *Conn) void {
+        while (c.state == .ready and !c.draining.load(.monotonic) and c.queued.items.len > 0 and c.calls.count() < c.peer_max_streams) {
+            const q = c.queued.orderedRemove(0);
+            c.queued_bytes -|= q.path.len + q.body.len;
+            c.startLocked(q.id_slot, q.path, q.body, q.sink, q.tag, q.timeout_ms);
+            c.gpa.free(q.path);
+            c.gpa.free(q.body);
         }
     }
 
@@ -412,14 +606,23 @@ pub const Conn = struct {
             return;
         }
         if (c.calls.fetchRemove(id_slot.*)) |kv| {
-            freeCall(c.gpa, kv.value);
+            c.dropCall(kv.value);
             if (c.state == .ready) {
                 var rst: [4]u8 = undefined;
                 std.mem.writeInt(u32, &rst, 8, .big);
                 c.writeFrame(frame_rst, 0, id_slot.*, &rst) catch {};
                 c.flush();
             }
+            // that was the last call a draining connection was kept for
+            if (c.state == .ready and c.draining.load(.monotonic) and c.calls.count() == 0) c.dieLocked(goaway_reason);
+            c.startQueuedLocked(); // its stream is free for a waiting call
         }
+    }
+
+    /// Frees a call taken out of `calls`; its response bytes no longer count for the connection.
+    fn dropCall(c: *Conn, call: *Call) void {
+        c.buffered -|= call.data.items.len;
+        freeCall(c.gpa, call);
     }
 
     fn oom(sink: Sink, tag: u64) void {
@@ -521,7 +724,7 @@ pub const Conn = struct {
     fn failCallLocked(c: *Conn, id: u32, msg: []const u8) void {
         if (c.calls.fetchRemove(id)) |kv| {
             kv.value.sink.done(kv.value.sink.ctx, kv.value.tag, .{ .status = .{ .code = 13, .message = msg } });
-            freeCall(c.gpa, kv.value);
+            c.dropCall(kv.value);
         }
     }
 
@@ -541,6 +744,7 @@ pub const Conn = struct {
             freeCall(c.gpa, kv.value_ptr.*);
         }
         c.calls.clearRetainingCapacity();
+        c.buffered = 0;
         for (c.queued.items) |q| {
             q.sink.done(q.sink.ctx, q.tag, .{ .status = .{ .code = 14, .message = reason } });
             c.gpa.free(q.path);
@@ -563,8 +767,9 @@ pub const Conn = struct {
     fn reasonOf(e: anyerror) []const u8 {
         return switch (e) {
             error.ConnectFailed => "transport error: connect failed",
+            error.ConnectTimeout => "transport error: connect timeout",
             error.TlsFailed => "transport error: tls handshake failed",
-            error.GoAway => "transport error: connection closed by peer (GOAWAY)",
+            error.GoAway => goaway_reason,
             error.EndOfStream => "transport error: connection closed",
             error.Protocol => "transport error: h2 protocol error",
             error.HeaderBlockTooLarge => "transport error: header block too large",
@@ -587,7 +792,7 @@ pub const Conn = struct {
     /// connection no longer points at it.
     const Transport = struct {
         bufs: []u8 = &.{},
-        sr: Io.net.Stream.Reader = undefined,
+        sr: SockReader = undefined,
         sw: SockWriter = undefined,
         tls: tls_client = undefined,
         bundle: std.crypto.Certificate.Bundle = .empty,
@@ -613,17 +818,77 @@ pub const Conn = struct {
         c.mu.unlock(c.io);
     }
 
+    /// The TCP connection, without ever sitting in connect(2). std's `HostName.connect` blocks
+    /// there for as long as the OS retries SYNs (75 s on macOS, about 130 s on Linux) and takes
+    /// no timeout (Io.Threaded: not implemented), so the reader thread of a connection the
+    /// watchdog had long ended stayed in it. Here every address of the host gets a non-blocking
+    /// socket, the first one connected wins, and the wait ends at the connect deadline, or within
+    /// `dial_poll_ms` of the connection being released or ended. The name lookup is std's (its
+    /// resolver has its own timeouts).
+    fn dial(c: *Conn) !Io.net.Stream {
+        const io = c.io;
+        const host = Io.net.HostName.init(c.ep.host) catch return error.ConnectFailed;
+        var name: [Io.net.HostName.max_len]u8 = undefined;
+        var found: [32]Io.net.HostName.LookupResult = undefined;
+        var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&found);
+        host.lookup(io, &queue, .{ .port = c.ep.port, .canonical_name_buffer = &name }) catch return error.ConnectFailed;
+
+        var fds: [max_dial]posix.pollfd = undefined;
+        var addrs: [max_dial]Io.net.IpAddress = undefined;
+        var n: usize = 0;
+        var won: ?usize = null;
+        defer for (fds[0..n], 0..) |p, i| if (won == null or won.? != i) closeFd(p.fd);
+        while (queue.getOneUncancelable(io)) |r| switch (r) {
+            .address => |a| if (n < max_dial) {
+                const fd = startConnect(&a) catch continue;
+                fds[n] = .{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 };
+                addrs[n] = a;
+                n += 1;
+            },
+            .canonical_name => {},
+        } else |_| {}
+
+        const deadline = c.opened_at +| connect_timeout_ns;
+        while (n > 0) {
+            if (c.shutting_down.load(.acquire) or c.isDead()) return error.EndOfStream;
+            const now = monotonic(io);
+            if (now >= deadline) return error.ConnectTimeout;
+            for (fds[0..n]) |*p| p.revents = 0;
+            const ms = @min((deadline - now) / std.time.ns_per_ms + 1, dial_poll_ms);
+            switch (posix.errno(posix.system.poll(&fds, @intCast(n), @intCast(ms)))) {
+                .SUCCESS, .INTR => {},
+                else => return error.ConnectFailed,
+            }
+            var i: usize = 0;
+            while (i < n) {
+                if (fds[i].revents == 0) {
+                    i += 1;
+                } else if (socketError(fds[i].fd) == 0) {
+                    // connected: back to blocking, which the reader and the writer expect
+                    if (!setNonBlocking(fds[i].fd, false)) return error.ConnectFailed;
+                    won = i;
+                    return .{ .socket = .{ .handle = fds[i].fd, .address = addrs[i] } };
+                } else {
+                    closeFd(fds[i].fd);
+                    n -= 1;
+                    fds[i] = fds[n];
+                    addrs[i] = addrs[n];
+                }
+            }
+        }
+        return error.ConnectFailed;
+    }
+
     fn runInner(c: *Conn, t: *Transport) !void {
         const io = c.io;
         const gpa = c.gpa;
-        const host = Io.net.HostName.init(c.ep.host) catch return error.ConnectFailed;
-        const stream = host.connect(io, c.ep.port, .{ .mode = .stream }) catch return error.ConnectFailed;
+        const stream = try c.dial();
         tuneSocket(stream.socket.handle);
         {
             c.mu.lockUncancelable(io);
             defer c.mu.unlock(io);
             c.stream = stream;
-            // released, or ended by the watchdog's connect deadline while connect was blocked
+            // released or ended while the connect was under way
             if (c.shutting_down.load(.acquire) or c.state == .dead) return error.EndOfStream;
         }
 
@@ -636,7 +901,10 @@ pub const Conn = struct {
         const sock_w = bufs[tls_client.min_buffer_len..][0..tls_client.min_buffer_len];
         const tls_r = bufs[2 * tls_client.min_buffer_len ..][0 .. tls_client.min_buffer_len + 32 * 1024];
         const tls_w = bufs[3 * tls_client.min_buffer_len + 32 * 1024 ..][0 .. tls_client.min_buffer_len];
-        t.sr = stream.reader(io, sock_r);
+        t.sr = .init(stream, io, sock_r);
+        // the handshake's reads end at the connect deadline; nothing is read before the peer's
+        // first frame on a cleartext connection
+        if (c.ep.security != .plain) t.sr.deadline = c.opened_at +| connect_timeout_ns;
         t.sw = .init(stream, io, sock_w);
         const sr = &t.sr;
         const sw = &t.sw;
@@ -666,8 +934,9 @@ pub const Conn = struct {
                 .allow_truncation_attacks = true,
             }) catch |e| {
                 log.debug("tls {s}:{d}: {s}", .{ c.ep.host, c.ep.port, @errorName(e) });
-                return error.TlsFailed;
+                return if (sr.timed_out) error.ConnectTimeout else error.TlsFailed;
             };
+            sr.deadline = 0;
             reader = &tls.reader;
             writer = &tls.writer;
         }
@@ -695,21 +964,9 @@ pub const Conn = struct {
             try c.writeFrame(frame_window, 0, 0, &wu);
             try c.flushOut();
             c.state = .ready;
+            c.ready_at.store(@max(monotonic(io), 1), .release);
             c.was_ready.store(true, .release);
-            // The queue is taken out first: a write that fails in here ends the connection, and
-            // `dieLocked` answers and frees whatever `queued` holds. With the calls still in it,
-            // those already started were answered twice and their copies freed twice.
-            var waiting = c.queued;
-            c.queued = .empty;
-            c.queued_bytes = 0;
-            defer waiting.deinit(gpa);
-            for (waiting.items) |q| {
-                if (c.state == .dead) {
-                    q.sink.done(q.sink.ctx, q.tag, .{ .status = .{ .code = 14, .message = c.dead_reason } });
-                } else c.startLocked(q.id_slot, q.path, q.body, q.sink, q.tag, q.timeout_ms);
-                gpa.free(q.path);
-                gpa.free(q.body);
-            }
+            c.startQueuedLocked();
         }
 
         var dec = hpack.Decoder.init(gpa);
@@ -752,6 +1009,7 @@ pub const Conn = struct {
                                 var it = c.calls.valueIterator();
                                 while (it.next()) |call| call.*.send_window += delta;
                             },
+                            3 => c.peer_max_streams = val,
                             5 => c.peer_max_frame = val,
                             else => {},
                         }
@@ -775,13 +1033,40 @@ pub const Conn = struct {
                     try c.pumpAllLocked();
                     try c.flushOut();
                 },
-                frame_goaway => return error.GoAway,
+                frame_goaway => {
+                    if (id != 0 or p.len < 8) return error.Protocol;
+                    const last = std.mem.readInt(u32, p[0..4], .big) & 0x7fff_ffff;
+                    if (c.goaway_at.load(.monotonic) == 0) c.goaway_at.store(@max(monotonic(io), 1), .release);
+                    c.draining.store(true, .release);
+                    // The streams above `last` were not and will not be acted on: UNAVAILABLE,
+                    // the caller sends them elsewhere. The others finish here (a second GOAWAY
+                    // may lower `last` again).
+                    while (true) {
+                        var over: ?u32 = null;
+                        var it = c.calls.keyIterator();
+                        while (it.next()) |k| if (k.* > last) {
+                            over = k.*;
+                            break;
+                        };
+                        const kv = c.calls.fetchRemove(over orelse break).?;
+                        kv.value.sink.done(kv.value.sink.ctx, kv.value.tag, .{ .status = .{ .code = 14, .message = goaway_reason } });
+                        c.dropCall(kv.value);
+                    }
+                    // and the calls still waiting for a stream were never sent
+                    for (c.queued.items) |q| {
+                        q.sink.done(q.sink.ctx, q.tag, .{ .status = .{ .code = 14, .message = goaway_reason } });
+                        gpa.free(q.path);
+                        gpa.free(q.body);
+                    }
+                    c.queued.clearRetainingCapacity();
+                    c.queued_bytes = 0;
+                },
                 frame_rst => {
                     if (c.calls.fetchRemove(id)) |kv| {
                         const code = if (p.len >= 4) std.mem.readInt(u32, p[0..4], .big) else 0;
                         const msg = if (code == 7) "h2 protocol error: stream refused" else "h2 protocol error: stream reset";
                         kv.value.sink.done(kv.value.sink.ctx, kv.value.tag, .{ .status = .{ .code = if (code == 7) 14 else 13, .message = msg } });
-                        freeCall(gpa, kv.value);
+                        c.dropCall(kv.value);
                     }
                 },
                 frame_headers, frame_continuation => {
@@ -838,18 +1123,23 @@ pub const Conn = struct {
                         if (pad > body.len) return error.Protocol;
                         body = body[0 .. body.len - pad];
                     }
-                    var overflow = false;
+                    var overflow: ?[]const u8 = null;
                     if (c.calls.get(id)) |call| {
                         if (call.data.items.len + body.len > max_response_bytes) {
-                            overflow = true;
-                        } else try call.data.appendSlice(gpa, body);
+                            overflow = "response message too large";
+                        } else if (body.len > max_conn_response_bytes -| c.buffered) {
+                            overflow = "response buffers of the connection are full";
+                        } else {
+                            try call.data.appendSlice(gpa, body);
+                            c.buffered += body.len;
+                        }
                     }
-                    if (overflow) {
+                    if (overflow) |why| {
                         // the call fails alone (RESOURCE_EXHAUSTED, as tonic's decode limit) and its
                         // stream is reset; the connection keeps serving the others
                         if (c.calls.fetchRemove(id)) |kv| {
-                            kv.value.sink.done(kv.value.sink.ctx, kv.value.tag, .{ .status = .{ .code = 8, .message = "response message too large" } });
-                            freeCall(gpa, kv.value);
+                            kv.value.sink.done(kv.value.sink.ctx, kv.value.tag, .{ .status = .{ .code = 8, .message = why } });
+                            c.dropCall(kv.value);
                         }
                         var rst: [4]u8 = undefined;
                         std.mem.writeInt(u32, &rst, 8, .big);
@@ -875,6 +1165,11 @@ pub const Conn = struct {
                 },
                 else => {},
             }
+            // a draining connection ends with the last call it was kept for
+            if (c.draining.load(.monotonic) and c.calls.count() == 0) return error.GoAway;
+            // a stream ended, or the peer raised its limit: the next waiting calls
+            c.startQueuedLocked();
+            if (c.state == .dead) return error.EndOfStream;
         }
     }
 
@@ -887,7 +1182,7 @@ pub const Conn = struct {
     fn finishLocked(c: *Conn, id: u32) void {
         const kv = c.calls.fetchRemove(id) orelse return;
         const call = kv.value;
-        defer freeCall(c.gpa, call);
+        defer c.dropCall(call);
         const sink = call.sink;
         const st: u8 = call.grpc_status orelse blk: {
             // tonic: no grpc-status -> from the HTTP status
@@ -939,6 +1234,8 @@ pub const Conn = struct {
     }
 };
 
+const goaway_reason = "transport error: connection closed by peer (GOAWAY)";
+
 /// RFC 9113 6.5.2: values a peer may not send (a PROTOCOL_ERROR / FLOW_CONTROL_ERROR that ends
 /// the connection). A MAX_FRAME_SIZE of 0 used to make every write loop forever.
 pub fn settingValid(key: u16, val: u32) bool {
@@ -974,6 +1271,8 @@ pub const watchdog = struct {
     var started = false;
     var io_: Io = undefined;
     pub var period_ns: u64 = std.time.ns_per_s;
+    /// Tests: the thread makes no pass (what a connection does without a watchdog).
+    pub var paused = false;
 
     fn register(c: *Conn) void {
         mu.lockUncancelable(c.io);
@@ -993,7 +1292,7 @@ pub const watchdog = struct {
     fn loop() void {
         while (true) {
             Io.sleep(io_, .fromNanoseconds(@intCast(period_ns)), .awake) catch {};
-            sweep(io_, monotonic(io_));
+            if (!paused) sweep(io_, monotonic(io_));
         }
     }
 

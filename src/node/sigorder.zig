@@ -31,7 +31,9 @@
 //! from the node's, with the very same signatures, gets the reordered envelope installed in the
 //! store (store txfix.zig: every transaction read then returns it) and appended to
 //! `node/sig-order.log`; the log also records how far the sweep got, so a restart reinstalls the
-//! fixes before serving and resumes where it stopped. A store without the log (older builds, a
+//! fixes before serving and resumes where it stopped. The restart installs each fix from the
+//! logged bytes alone (`selfProven`: no stored transaction is read), for the checkpoints the
+//! store still holds. A store without the log (older builds, a
 //! restore) is swept from its lowest available checkpoint. Why the order cannot be rebuilt
 //! without asking: contents V2 put the signatures in `required_signers` order (sui-core
 //! authority_per_epoch_store.rs `process_user_signatures`, messages_checkpoint.rs
@@ -43,6 +45,7 @@ const Atomic = std.atomic.Value;
 const bcs = @import("bcs");
 const types = @import("types");
 const store = @import("store");
+const hash = @import("hash");
 const netguard = @import("netguard.zig");
 const stream = @import("stream.zig");
 const b58 = @import("serve").b58;
@@ -644,15 +647,18 @@ pub const SweepStats = struct {
 };
 
 /// `node/sig-order.log`: magic, then records `crc32 (of the rest) u32, kind u8, pad 3, len u32,
-/// seq u64, digest [32], len bytes`. Kind 1: a fix (the envelope to serve for `digest` in
-/// checkpoint `seq`). Kind 2: every checkpoint up to `seq` is swept. A torn tail is cut.
+/// seq u64, digest [32], len bytes`. Kind 1: a fix (`len` bytes: the whole envelope to serve for
+/// transaction `digest` of checkpoint `seq`). Kind 2: every checkpoint up to `seq` is swept
+/// (no bytes, a zero digest). A torn tail is cut.
 pub const log_name = "sig-order.log";
-const log_magic = "ZUISIGO1";
-const rec_head = 52;
-const kind_fix: u8 = 1;
-const kind_mark: u8 = 2;
+/// A rewrite's new log until it is renamed over the old one (`Sweep.rewrite`).
+pub const log_tmp = "sig-order.log.tmp";
+pub const log_magic = "ZUISIGO1";
+pub const rec_head = 52;
+pub const kind_fix: u8 = 1;
+pub const kind_mark: u8 = 2;
 
-fn encodeRec(a: std.mem.Allocator, out: *std.ArrayList(u8), kind: u8, seq: u64, digest: *const [32]u8, payload: []const u8) !void {
+pub fn encodeRec(a: std.mem.Allocator, out: *std.ArrayList(u8), kind: u8, seq: u64, digest: *const [32]u8, payload: []const u8) !void {
     const at = out.items.len;
     try out.appendNTimes(a, 0, rec_head);
     try out.appendSlice(a, payload);
@@ -663,6 +669,147 @@ fn encodeRec(a: std.mem.Allocator, out: *std.ArrayList(u8), kind: u8, seq: u64, 
     r[20..52].* = digest.*;
     std.mem.writeInt(u32, r[0..4], std.hash.Crc32.hash(r[4..]), .little);
 }
+
+const Rec = struct { kind: u8, seq: u64, digest: *const [32]u8, payload: []const u8 };
+
+/// How the log reads at one position.
+const Parsed = union(enum) {
+    ok: Rec,
+    /// A record's frame (its length fits) with a bad checksum or an unknown kind; the frame's
+    /// size, which is where the next record starts if the length field is intact.
+    bad: usize,
+    /// Too short for the record its header names.
+    none,
+};
+
+fn parseRec(r: []const u8) Parsed {
+    if (r.len < rec_head) return .none;
+    const len = std.mem.readInt(u32, r[8..12], .little);
+    if (len > r.len - rec_head) return .none;
+    const n = rec_head + len;
+    if (r[4] != kind_fix and r[4] != kind_mark) return .{ .bad = n };
+    if (std.hash.Crc32.hash(r[4..n]) != std.mem.readInt(u32, r[0..4], .little)) return .{ .bad = n };
+    return .{ .ok = .{ .kind = r[4], .seq = std.mem.readInt(u64, r[12..20], .little), .digest = r[20..52], .payload = r[rec_head..n] } };
+}
+
+/// What a logged fix shows by itself, with no stored transaction read: `fix` is one transaction
+/// envelope with two or more signatures and nothing after them, and its TransactionData hashes
+/// to `digest`. So the bytes up to the signatures are those of the transaction the store holds
+/// under `digest` (the envelope's leading count and intent, which no digest covers, stand on
+/// the record's checksum).
+///
+/// What it does not show is that the signatures are the stored ones in another order: nothing
+/// in an envelope or a digest covers them, only the stored transaction (`Sweep.validFix`) or
+/// the checkpoint contents do. That was proven against the stored envelope when the fix was
+/// made (`reorder`), before the record was written, and the record's checksum says the bytes
+/// are the ones written then. It holds for every store of the chain, not only the one the fix
+/// was made on: a digest is executed once, with the signatures its checkpoint contents
+/// certify. A transaction read still serves a fix only in place of a stored envelope of the
+/// same length (store.zig `txAt`).
+pub fn selfProven(digest: *const [32]u8, fix: []const u8) bool {
+    var r = bcs.Reader.init(fix);
+    if ((r.length() catch return false) != 1) return false;
+    _ = r.bytes(3) catch return false; // intent
+    const from = r.pos();
+    bcs.skip(types.TransactionData, &r) catch return false;
+    const to = r.pos();
+    const n = r.length() catch return false;
+    if (n < 2 or n > 64) return false;
+    for (0..n) |_| _ = r.bytes(r.length() catch return false) catch return false;
+    if (r.remaining() != 0) return false;
+    return std.mem.eql(u8, &hash.blake2b256(&.{ "TransactionData::", fix[from..to] }), digest);
+}
+
+/// How `Sweep.open` trusts a logged fix.
+pub const Proof = enum {
+    /// By the record itself (`selfProven`). A record with a good checksum that fails it is
+    /// looked up in the store and taken if the stored transaction proves it (`validFix`), so
+    /// this never drops a fix that `store` would install.
+    log,
+    /// As before this existed (`ZUI_SIG_ORDER_RELOAD=store`): every fix against its stored
+    /// transaction (one chunk decoded per fix), the log read up to its first bad record.
+    store,
+};
+
+pub const OpenOptions = struct {
+    proof: Proof = .log,
+    /// `Proof.log`: the log is rewritten without its dead records (fixes of pruned checkpoints,
+    /// fixes logged again later, marks before the last) when they take at least `compact_min`
+    /// bytes and either a quarter of the log or `compact_bytes`, so a start with little to drop
+    /// leaves the log alone; and whenever a record was rejected.
+    compact_min: u64 = 64 << 10,
+    compact_bytes: u64 = 16 << 20,
+    /// Tests: `error.CrashInjected` at this point of a rewrite, as a crash would stop there.
+    crash_at: ?Crash = null,
+
+    pub const Crash = enum { before_rename, after_rename };
+};
+
+/// What `Sweep.open` did with the log.
+pub const Reload = struct {
+    /// Size of the log as found.
+    bytes: u64 = 0,
+    /// Fix and mark records with a good checksum.
+    fixes: u64 = 0,
+    marks: u64 = 0,
+    /// Fixes installed in the store's table.
+    installed: u64 = 0,
+    /// Fixes of checkpoints below `floor` (pruned: never served again), not installed.
+    pruned: u64 = 0,
+    /// The store's lowest checkpoint when the log was read (0: an empty store).
+    floor: u64 = 0,
+    /// Fixes replaced by a later record of the same transaction.
+    superseded: u64 = 0,
+    /// Bytes of records the log no longer needs: pruned, superseded and rejected fixes, and
+    /// the marks before the last one that counts.
+    dead_bytes: u64 = 0,
+    /// The log was rewritten without them (`size` is the new log).
+    compacted: bool = false,
+    /// Size of the log after `open`.
+    size: u64 = 0,
+    /// Records dropped: a bad checksum between intact records, or a fix that neither proves
+    /// itself nor is proven by the stored transaction. Marks after the first one do not count.
+    rejected: u64 = 0,
+    /// `Proof.store`: fixes the store does not prove (not installed, as before).
+    unproven: u64 = 0,
+    /// Stored transactions read (`Proof.log`: only for records that fail `selfProven`).
+    store_lookups: u64 = 0,
+    /// Bytes of torn tail cut.
+    cut: u64 = 0,
+    ns: u64 = 0,
+};
+
+/// The stored transaction's word on a logged fix (`Sweep.validFix`), for the records that need
+/// it. A snapshot keeps every chunk it decoded alive until it is released, so one snapshot held
+/// across tens of thousands of fixes (each in another checkpoint) pinned over 12 GB on the node
+/// box at 65k fixes: a fresh one every `snap_every` lookups.
+const StoreProof = struct {
+    st: *store.Store,
+    arena: std.heap.ArenaAllocator,
+    snap: ?store.Snapshot = null,
+    lookups: u64 = 0,
+
+    const snap_every = 1024;
+
+    fn holds(p: *StoreProof, rec: Rec) bool {
+        if (p.lookups % snap_every == 0) p.release();
+        if (p.snap == null) p.snap = p.st.snapshot();
+        p.lookups += 1;
+        const t = p.snap.?.transaction(rec.digest) orelse return false;
+        _ = p.arena.reset(.retain_capacity);
+        return t.checkpoint == rec.seq and Sweep.validFix(p.arena.allocator(), t.tx, rec.payload);
+    }
+
+    fn release(p: *StoreProof) void {
+        if (p.snap) |*s| s.release();
+        p.snap = null;
+    }
+
+    fn deinit(p: *StoreProof) void {
+        p.release();
+        p.arena.deinit();
+    }
+};
 
 pub const Sweep = struct {
     gpa: std.mem.Allocator,
@@ -693,82 +840,219 @@ pub const Sweep = struct {
     /// NOT_FOUND answers of the current pass for recent transactions (counted as unavailable
     /// when the retries run out).
     pending_nf: u64 = 0,
+    /// What `open` did with the log.
+    reload: Reload = .{},
 
-    /// Opens (or creates) `dir/sig-order.log`, reinstalls its fixes into the store (each checked
-    /// against the stored envelope: a permutation of the same signatures) and resumes after its
-    /// last mark. A mark above the store's committed tip (another store under the same dir) is
-    /// ignored: the sweep then starts from the store's lowest checkpoint.
+    /// Opens (or creates) `dir/sig-order.log`, reinstalls its fixes into the store and resumes
+    /// after its last mark. A mark above the store's committed tip (another store under the same
+    /// dir) is ignored: the sweep then starts from the store's lowest checkpoint.
     pub fn open(gpa: std.mem.Allocator, io: Io, st: *store.Store, ov: *Overlay, dir: Io.Dir) !*Sweep {
+        var opts: OpenOptions = .{};
+        if (std.c.getenv("ZUI_SIG_ORDER_RELOAD")) |v| {
+            if (std.mem.eql(u8, std.mem.span(v), "store")) opts.proof = .store;
+        }
+        return openWith(gpa, io, st, ov, dir, opts);
+    }
+
+    /// `open`. The store is read once for the whole log: its committed tip and its lowest
+    /// checkpoint (a binary search over checkpoint records, the snapshot released before the
+    /// first record). A fix below that floor is skipped; one at or above it is installed from
+    /// the logged bytes when it proves itself (`selfProven`), so a reload costs the log's own
+    /// bytes and no chunk of the store. Only a record that does not prove itself is looked up
+    /// (`Proof.log`).
+    ///
+    /// A record with a bad checksum, followed (by the lengths in the headers) by an intact one,
+    /// is skipped; with nothing intact after it, it is the torn tail and is cut. A skipped or
+    /// unproven fix is lost, so no mark after it counts: the sweep resumes from the last mark
+    /// before it and finds the fix again, while the intact fixes after it are served meanwhile.
+    ///
+    /// The log is then rewritten without what it no longer needs (`OpenOptions.compact_min`,
+    /// `rewrite`): the fixes of pruned checkpoints, which the table drops as the store prunes
+    /// (store.zig `dropFixesBelow`) but the log kept forever, fixes logged again later, and
+    /// rejected records with the marks that no longer count.
+    pub fn openWith(gpa: std.mem.Allocator, io: Io, st: *store.Store, ov: *Overlay, dir: Io.Dir, opts: OpenOptions) !*Sweep {
+        const t0 = @import("source.zig").nowNs();
         const data = dir.readFileAlloc(io, log_name, gpa, .unlimited) catch |e| switch (e) {
             error.FileNotFound => try gpa.dupe(u8, ""),
             else => return e,
         };
         defer gpa.free(data);
-        const f = try dir.createFile(io, log_name, .{ .read = true, .truncate = false });
-        errdefer f.close(io);
+        // A rewrite that a crash stopped before its rename: the log is still the old one.
+        dir.deleteFile(io, log_tmp) catch {};
         const sw = try gpa.create(Sweep);
         errdefer gpa.destroy(sw);
-        sw.* = .{ .gpa = gpa, .io = io, .st = st, .ov = ov, .file = f, .end = 0 };
+        sw.* = .{ .gpa = gpa, .io = io, .st = st, .ov = ov, .file = undefined, .end = 0 };
         if (data.len < log_magic.len or !std.mem.eql(u8, data[0..log_magic.len], log_magic)) {
+            const f = try dir.createFile(io, log_name, .{ .read = true, .truncate = false });
+            errdefer f.close(io);
             try f.setLength(io, 0);
             try f.writePositionalAll(io, log_magic, 0);
             try f.sync(io);
+            sw.file = f;
             sw.end = log_magic.len;
             return sw;
         }
-        var arena: std.heap.ArenaAllocator = .init(gpa);
-        defer arena.deinit();
-        var snap = st.snapshot();
-        defer snap.release();
-        const top = snap.highestCommitted();
-        var mark: ?u64 = null;
-        var at: usize = log_magic.len;
+        var rep: Reload = .{ .bytes = data.len };
+        var top: ?u64 = null;
+        {
+            var snap = st.snapshot();
+            defer snap.release();
+            top = snap.highestCommitted();
+            // Checkpoints are held from the lowest one up (store.zig `lowestCheckpoint`), and a
+            // transaction with its checkpoint: below it, the old per-fix lookup found nothing.
+            if (opts.proof == .log and data.len > log_magic.len) rep.floor = snap.lowestCheckpoint() orelse 0;
+        }
+        var proof: StoreProof = .{ .st = st, .arena = .init(gpa) };
+        defer proof.deinit();
         // Collected, then installed in one bulk build (one sort, one published set).
         var loaded: std.ArrayList(store.txfix.Entry) = .empty;
         defer loaded.deinit(gpa);
-        // A snapshot keeps every chunk it decoded alive until it is released, so one snapshot
-        // held across tens of thousands of fixes (each in another checkpoint) pinned over 12 GB
-        // on a production node at 65k fixes. Take a fresh one every `snap_every` lookups.
-        const snap_every = 1024;
-        var lookups: usize = 0;
-        while (data.len - at >= rec_head) {
-            const r = data[at..];
-            const len = std.mem.readInt(u32, r[8..12], .little);
-            if (len > r.len - rec_head) break;
-            const rec = r[0 .. rec_head + len];
-            if (std.hash.Crc32.hash(rec[4..]) != std.mem.readInt(u32, rec[0..4], .little)) break;
-            const seq = std.mem.readInt(u64, rec[12..20], .little);
-            const digest: *const [32]u8 = rec[20..52];
-            switch (rec[4]) {
-                kind_fix => if (blk: {
-                    lookups += 1;
-                    if (lookups % snap_every == 0) {
-                        snap.release();
-                        snap = st.snapshot();
-                    }
-                    break :blk snap.transaction(digest);
-                }) |t| {
-                    _ = arena.reset(.retain_capacity);
-                    if (t.checkpoint == seq and validFix(arena.allocator(), t.tx, rec[rec_head..]))
-                        try loaded.append(gpa, .{ .seq = seq, .digest = digest.*, .tx = rec[rec_head..] });
+        // Each transaction's newest fix (its index in `loaded`): a later record replaces it.
+        var newest: std.AutoHashMapUnmanaged([32]u8, u32) = .empty;
+        defer newest.deinit(gpa);
+        var mark: ?u64 = null;
+        var lost = false;
+        var at: usize = log_magic.len;
+        scan: while (true) {
+            const rec = switch (parseRec(data[at..])) {
+                .ok => |r| r,
+                .none => break,
+                .bad => |first| {
+                    if (opts.proof == .store) break;
+                    var to = at + first;
+                    var n: u64 = 1;
+                    while (true) switch (parseRec(data[to..])) {
+                        .ok => break,
+                        .none => break :scan, // nothing intact after it: the torn tail
+                        .bad => |k| {
+                            to += k;
+                            n += 1;
+                        },
+                    };
+                    std.log.warn("signature order log: {d} record(s) with a bad checksum at bytes {d}..{d}: rejected", .{ n, at, to });
+                    rep.rejected += n;
+                    lost = true;
+                    at = to;
+                    continue;
                 },
-                kind_mark => mark = seq,
-                else => break,
+            };
+            at += rec_head + rec.payload.len;
+            if (rec.kind == kind_mark) {
+                rep.marks += 1;
+                if (!lost) mark = rec.seq;
+                continue;
             }
-            at += rec.len;
+            rep.fixes += 1;
+            if (rec.seq < rep.floor) {
+                rep.pruned += 1;
+                continue;
+            }
+            const proven = switch (opts.proof) {
+                .log => selfProven(rec.digest, rec.payload) or proof.holds(rec),
+                .store => proof.holds(rec),
+            };
+            if (!proven) {
+                if (opts.proof == .store) {
+                    rep.unproven += 1;
+                    continue;
+                }
+                if (rep.rejected < 8) {
+                    var tb: [b58.max_len_32]u8 = undefined;
+                    std.log.warn("signature order log: the fix of {s} in checkpoint {d} is not its transaction with the stored signatures: rejected", .{ b58.encode32(&tb, rec.digest), rec.seq });
+                }
+                rep.rejected += 1;
+                lost = true;
+                continue;
+            }
+            const gop = try newest.getOrPut(gpa, rec.digest.*);
+            if (gop.found_existing) rep.superseded += 1;
+            gop.value_ptr.* = @intCast(loaded.items.len);
+            try loaded.append(gpa, .{ .seq = rec.seq, .digest = rec.digest.*, .tx = rec.payload });
         }
-        _ = sw.stats.loaded.fetchAdd(try st.tx_fix.load(loaded.items), .monotonic);
-        if (at != data.len) {
+        rep.store_lookups = proof.lookups;
+        proof.release();
+        if (rep.superseded > 0) {
+            var k: usize = 0;
+            for (loaded.items, 0..) |e, i| {
+                if (newest.get(e.digest).? != i) continue;
+                loaded.items[k] = e;
+                k += 1;
+            }
+            loaded.shrinkRetainingCapacity(k);
+        }
+        newest.clearAndFree(gpa);
+        rep.installed = try st.tx_fix.load(loaded.items);
+        _ = sw.stats.loaded.fetchAdd(rep.installed, .monotonic);
+        rep.cut = data.len - at;
+        rep.size = at;
+        if (opts.proof == .log) {
+            // What a rewrite keeps: the installed fixes and the last mark that counts.
+            var live: u64 = if (mark != null) rec_head else 0;
+            for (loaded.items) |e| live += rec_head + e.tx.len;
+            const body = at - log_magic.len;
+            rep.dead_bytes = body - live;
+            if (rep.rejected > 0 or (rep.dead_bytes >= opts.compact_min and (rep.dead_bytes * 4 > body or rep.dead_bytes >= opts.compact_bytes))) {
+                if (rewrite(gpa, io, dir, loaded.items, mark, opts.crash_at)) |n| {
+                    rep.compacted = true;
+                    rep.size = n;
+                } else |e| {
+                    if (e == error.CrashInjected) return e;
+                    // The rename did not happen: the old log stands.
+                    std.log.warn("signature order log: not rewritten ({s}); {d} dead bytes stay", .{ @errorName(e), rep.dead_bytes });
+                    dir.deleteFile(io, log_tmp) catch {};
+                }
+            }
+        }
+        const f = try dir.createFile(io, log_name, .{ .read = true, .truncate = false });
+        errdefer f.close(io);
+        if (rep.cut > 0 and !rep.compacted) {
             std.log.warn("signature order log: torn or corrupt tail at byte {d} of {d}; cut", .{ at, data.len });
             try f.setLength(io, at);
             try f.sync(io);
         }
-        sw.end = at;
+        sw.file = f;
+        sw.end = rep.size;
         if (mark) |m| if (top != null and m <= top.?) {
             sw.next = m + 1;
             sw.last_mark = m;
         };
+        rep.ns = @import("source.zig").nowNs() - t0;
+        sw.reload = rep;
+        if (rep.fixes > 0) std.log.info("signature order log: {d} of {d} logged fixes installed in {d} ms ({d} bytes; {d} below checkpoint {d}, {d} superseded, {d} rejected, {d} unproven, {d} stored transactions read; {s} {d} dead bytes, now {d} bytes)", .{ rep.installed, rep.fixes, rep.ns / std.time.ns_per_ms, rep.bytes, rep.pruned, rep.floor, rep.superseded, rep.rejected, rep.unproven, rep.store_lookups, if (rep.compacted) "rewritten without" else "kept with", rep.dead_bytes, rep.size });
         return sw;
+    }
+
+    /// Writes the log anew: `fixes` in their order, then `mark`. The new log is written beside
+    /// the old one and synced, renamed over it, and the directory synced: a crash at any point
+    /// leaves the old log or the new one, whole (a leftover `log_tmp` is removed by `open`).
+    /// Returns the new log's size. An error means the old log stands.
+    fn rewrite(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, fixes: []const Item, mark: ?u64, crash_at: ?OpenOptions.Crash) !u64 {
+        var end: u64 = 0;
+        {
+            const f = try dir.createFile(io, log_tmp, .{ .truncate = true });
+            defer f.close(io);
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(gpa);
+            try buf.appendSlice(gpa, log_magic);
+            for (fixes) |*e| {
+                try encodeRec(gpa, &buf, kind_fix, e.seq, &e.digest, e.tx);
+                if (buf.items.len < 1 << 20) continue;
+                try f.writePositionalAll(io, buf.items, end);
+                end += buf.items.len;
+                buf.clearRetainingCapacity();
+            }
+            // After the fixes, as `flush` writes it: a mark is never ahead of a fix it covers.
+            if (mark) |m| try encodeRec(gpa, &buf, kind_mark, m, &@as([32]u8, @splat(0)), "");
+            try f.writePositionalAll(io, buf.items, end);
+            end += buf.items.len;
+            try f.sync(io);
+        }
+        if (crash_at) |c| if (c == .before_rename) return error.CrashInjected;
+        try dir.rename(log_tmp, dir, log_name, io);
+        if (crash_at) |c| if (c == .after_rename) return error.CrashInjected;
+        // The rename is done: the new log is the log whether or not this sync succeeds.
+        @import("trust.zig").syncDir(io, dir) catch |e| std.log.warn("signature order log: directory sync after the rewrite: {s}", .{@errorName(e)});
+        return end;
     }
 
     /// `fix` is the stored envelope `stored` with the same signatures in some order.

@@ -1,4 +1,4 @@
-//! zui/1 edge feed methods (docs/EDGE.md): `get_checkpoint_feed` (0x0e) and `get_dictionary` (0x0b).
+//! zui/1 edge feed method (docs/EDGE.md): `get_checkpoint_feed` (0x0e). `get_dictionary` is dicts.zig.
 //!
 //! The feed of checkpoint `seq` is assembled from the store the way any read is: the certified
 //! summary and contents, each transaction's envelope, effects and events as stored, and the output
@@ -6,15 +6,15 @@
 //! edge, so edges can feed from each other. Nothing here is trusted by the receiver: it rebuilds
 //! the checkpoint blob and verifies it like any other source (src/edge, docs/EDGE.md section 2).
 //!
-//! The dictionary (kind 1, `Hello.dictionaries`) is sampled once, by the node's warm thread, from
-//! checkpoints spread over the newest part of the store, and published through an atomic pointer
-//! for the life of the process: its id changes only when the process restarts. No request ever
-//! builds it (until it is published, feeds are plain zstd and get_dictionary is UNAVAILABLE).
+//! The dictionary is the node's checkpoint dictionary (dicts.zig, kind 1, `Hello.dictionaries`),
+//! sampled once by the node's warm thread and published for the life of the process: its id
+//! changes only when the process restarts. Until it is published, feeds are plain zstd frames.
 //!
 //!   request  FeedReq  { seq: u64, dict: u32 }   dict: the id the client holds (0: none)
-//!   response Option<bytes>                      the frame (edgewire dict.zig), `resp_zstd` set;
-//!                                               None: that checkpoint is not held yet
-//!                                               with flag_zstd_ok clear: the raw feed, no frame
+//!   response Option<bytes>                      with flag_zstd_ok: the frame (edgewire dict.zig);
+//!                                               without: the raw feed. None: not held yet.
+//!                                               The response header never sets ZSTD (the frame
+//!                                               is its own envelope; spec 2.2).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const store = @import("store");
@@ -24,70 +24,25 @@ const R = proto.R;
 const W = proto.W;
 const feed = edgewire.feed;
 const dict = edgewire.dict;
+const Dicts = @import("dicts.zig").Dicts;
 
 pub const Feeder = struct {
-    gpa: Allocator,
-    /// Serializes builds (the warm thread only); readers never take it.
-    mu: std.atomic.Mutex = .unlocked,
-    /// The built dictionary, published once with release; read lock-free by every request and by
-    /// hello on the listener's I/O thread. Never replaced while the process runs.
-    published: std.atomic.Value(?*const dict.Dictionary) = .init(null),
-    d: dict.Dictionary = undefined,
-    built: bool = false,
-    /// Checkpoints sampled for the dictionary, and the stride between them.
-    samples: u32 = 24,
-    stride: u64 = 256,
-    level: i32 = 3,
+    /// The node's response dictionaries: the feed uses the checkpoint kind (dicts.zig builds it
+    /// from feeds on the warm thread; requests never build it).
+    dicts: *const Dicts,
 
-    pub fn init(gpa: Allocator) Feeder {
-        return .{ .gpa = gpa };
+    pub fn init(dicts: *const Dicts) Feeder {
+        return .{ .dicts = dicts };
     }
 
-    pub fn deinit(f: *Feeder) void {
-        if (f.built) f.d.deinit(f.gpa);
-    }
-
-    /// The published dictionary (null until `warm` built it). Lock-free, never builds: requests
-    /// answer with plain zstd or UNAVAILABLE until the warm thread has published.
+    /// The published checkpoint dictionary (null until the warm thread built it). Lock-free:
+    /// until it exists, feeds go out as plain zstd frames.
     pub fn peek(f: *const Feeder) ?*const dict.Dictionary {
-        return f.published.load(.acquire);
+        return f.dicts.get(.checkpoint);
     }
 
-    /// Builds the dictionary from the snapshot and publishes it. Only the warm thread calls this
-    /// (it may take a while: it assembles `samples` checkpoints). Error: too few checkpoints yet,
-    /// try again later.
-    pub fn warm(f: *Feeder, snap: *store.Snapshot) !*const dict.Dictionary {
-        if (f.peek()) |d| return d;
-        while (!f.mu.tryLock()) std.atomic.spinLoopHint();
-        defer f.mu.unlock();
-        if (f.built) return &f.d;
-        try f.build(snap);
-        f.built = true;
-        f.published.store(&f.d, .release);
-        return &f.d;
-    }
-
-    fn build(f: *Feeder, snap: *store.Snapshot) !void {
-        const hi = snap.highestCommitted() orelse return error.Unavailable;
-        const lo = snap.lowestAvailable() orelse 0;
-        var arena = std.heap.ArenaAllocator.init(f.gpa);
-        defer arena.deinit();
-        const a = arena.allocator();
-        var samples: std.ArrayList([]const u8) = .empty;
-        var seq = hi;
-        while (samples.items.len < f.samples and seq >= lo) {
-            var out: std.ArrayList(u8) = .empty;
-            if (try assemble(a, snap, seq, &out)) try samples.append(a, out.items);
-            if (seq < f.stride) break;
-            seq -= f.stride;
-        }
-        if (samples.items.len < 2) return error.Unavailable;
-        const content = try dict.build(f.gpa, samples.items, dict.default_dict);
-        defer f.gpa.free(content);
-        f.d = try dict.Dictionary.init(f.gpa, content, f.level);
-    }
-
-    /// `get_checkpoint_feed`: whole response into `out`.
+    /// `get_checkpoint_feed`: whole response into `out`. The response header never sets ZSTD:
+    /// with `flag_zstd_ok` the body's bytes are a dict.zig frame (its own envelope).
     pub fn handle(f: *Feeder, a: Allocator, snap: *store.Snapshot, req: proto.Request, out: *std.ArrayList(u8)) !void {
         if (req.flags & ~(proto.flag_verify | proto.flag_zstd_ok) != 0) return error.Malformed;
         var r: R = .{ .b = req.body };
@@ -105,12 +60,9 @@ pub const Feeder = struct {
             else => return e,
         };
         const w: W = .{ .gpa = a, .out = out };
-        if (!have) {
-            try proto.okHeader(out, a, 0);
-            return w.u8_(0);
-        }
+        try proto.okHeader(out, a, 0);
+        if (!have) return w.u8_(0);
         if (req.flags & proto.flag_zstd_ok == 0) {
-            try proto.okHeader(out, a, 0);
             try w.u8_(1);
             return w.bytes(raw.items);
         }
@@ -121,19 +73,8 @@ pub const Feeder = struct {
             break :blk if (d.id == want_dict) d else null;
         };
         const frame = try dict.compress(a, dc, raw.items);
-        try proto.okHeader(out, a, proto.resp_zstd);
         try w.u8_(1);
         try w.bytes(frame);
-    }
-
-    /// `get_dictionary`: the content of dictionary `id` (bytes), or NOT_FOUND.
-    pub fn handleDict(f: *Feeder, a: Allocator, snap: *store.Snapshot, id: u32, out: *std.ArrayList(u8)) !void {
-        _ = snap;
-        const d = f.peek() orelse return proto.errorResponse(out, a, .unavailable, "no dictionary yet", "");
-        if (d.id != id) return proto.errorResponse(out, a, .not_found, "unknown dictionary", "");
-        try proto.okHeader(out, a, 0);
-        const w: W = .{ .gpa = a, .out = out };
-        try w.bytes(d.content);
     }
 };
 

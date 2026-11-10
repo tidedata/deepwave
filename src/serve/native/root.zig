@@ -16,9 +16,14 @@ pub const tcptls = @import("tcptls.zig");
 pub const indexq = @import("indexq.zig");
 pub const jobs = @import("jobs.zig");
 pub const edgefeed = @import("edgefeed.zig");
+pub const dicts = @import("dicts.zig");
+pub const agentpass = @import("agentpass.zig");
 
 test {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(listener.Listener);
     std.testing.refAllDecls(dispatch.Dispatcher);
+    std.testing.refAllDecls(dicts.Dicts);
+    std.testing.refAllDecls(agentpass.Policy);
+    std.testing.refAllDecls(agentpass.Pass);
 }

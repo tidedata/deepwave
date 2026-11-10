@@ -7,6 +7,8 @@ const serve = @import("serve");
 const h2 = serve.h2;
 const grpc = @import("grpc_client.zig");
 const Upstream = @import("upstream.zig").Upstream;
+const validators = @import("validators.zig");
+const cm = @import("../driver/root.zig").committee;
 
 const io = testing.io;
 const gpa = std.heap.smp_allocator; // connection reader threads may outlive a test
@@ -65,6 +67,8 @@ const Peer = struct {
     port: u16 = 0,
     script: []const u8 = "",
     wait_headers: bool = true,
+    /// With `wait_headers`: the script goes out once this many HEADERS frames have come.
+    headers_wanted: u32 = 1,
     close_after: bool = false,
     /// Never answer anything (not even read): a black hole after the TCP accept.
     silent: bool = false,
@@ -105,9 +109,13 @@ const Peer = struct {
                 if (got.items.len < 24) continue;
                 if (!p.wait_headers) break;
                 var pos: usize = 24;
+                var seen: u32 = 0;
                 while (pos + 9 <= got.items.len) {
                     const len = std.mem.readInt(u24, got.items[pos..][0..3], .big);
-                    if (got.items[pos + 3] == 1) break :outer;
+                    if (got.items[pos + 3] == 1) {
+                        seen += 1;
+                        if (seen >= p.headers_wanted) break :outer;
+                    }
                     pos += 9 + len;
                 }
             }
@@ -166,6 +174,300 @@ fn trailersOk(out: *std.ArrayList(u8)) !void {
     defer hb.deinit(gpa);
     try h2.hpack.encodeLiteral(&hb, gpa, "grpc-status", "0");
     try frame(out, 1, 4 | 1, 1, hb.items);
+}
+
+/// A whole answer on stream `sid`: HEADERS, one gRPC message, trailers with grpc-status 0.
+fn responseOk(out: *std.ArrayList(u8), sid: u32, msg: []const u8) !void {
+    var hb: std.ArrayList(u8) = .empty;
+    defer hb.deinit(gpa);
+    try hb.append(gpa, 0x88);
+    try h2.hpack.encodeLiteral(&hb, gpa, "content-type", "application/grpc");
+    try frame(out, 1, 4, sid, hb.items);
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(gpa);
+    try data.appendSlice(gpa, &.{ 0, 0, 0, 0, @intCast(msg.len) });
+    try data.appendSlice(gpa, msg);
+    try frame(out, 0, 0, sid, data.items);
+    hb.clearRetainingCapacity();
+    try h2.hpack.encodeLiteral(&hb, gpa, "grpc-status", "0");
+    try frame(out, 1, 4 | 1, sid, hb.items);
+}
+
+/// GOAWAY(NO_ERROR) naming `last` as the last stream the peer answers.
+fn goawayFrame(out: *std.ArrayList(u8), last: u32) !void {
+    var b: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, b[0..4], last, .big);
+    try frame(out, 7, 0, 0, &b);
+}
+
+/// The answers of a few calls, by tag: 0xff until answered, then the status code (0: a message).
+const Answers = struct {
+    codes: [4]std.atomic.Value(u32) = @splat(.init(0xff)),
+    count: std.atomic.Value(u32) = .init(0),
+    text: [4][64]u8 = undefined,
+    len: [4]usize = @splat(0),
+
+    fn sink(ctx: *anyopaque, tag: u64, r: grpc.Result) void {
+        const a: *Answers = @ptrCast(@alignCast(ctx));
+        const t: []const u8 = switch (r) {
+            .ok => |b| b,
+            .status => |st| st.message,
+        };
+        a.len[tag] = @min(t.len, 64);
+        @memcpy(a.text[tag][0..a.len[tag]], t[0..a.len[tag]]);
+        a.codes[tag].store(if (r == .status) r.status.code else 0, .release);
+        _ = a.count.fetchAdd(1, .release);
+    }
+
+    fn textOf(a: *const Answers, tag: usize) []const u8 {
+        return a.text[tag][0..a.len[tag]];
+    }
+
+    fn waitCount(a: *const Answers, n: u32, ms: u32) !void {
+        var i: u32 = 0;
+        while (a.count.load(.acquire) < n and i < ms) : (i += 1) try Io.sleep(io, .fromMilliseconds(1), .awake);
+        try testing.expect(a.count.load(.acquire) >= n);
+    }
+};
+
+/// An h2c peer that allows `limit` concurrent streams and answers each request `delay_ms`
+/// after its last byte; it records how many streams the client had open at once. Its thread
+/// waits in poll with the stop flag, like `Peer`.
+const LimitPeer = struct {
+    server: Io.net.Server = undefined,
+    port: u16 = 0,
+    limit: u32,
+    delay_ms: i96 = 30,
+    max_open: std.atomic.Value(u32) = .init(0),
+    close: std.atomic.Value(bool) = .init(false),
+    exited: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    const Due = struct { sid: u32, at: i96 };
+
+    fn start(p: *LimitPeer) !void {
+        var addr = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        p.server = try addr.listen(io, .{ .reuse_address = true });
+        p.port = p.server.socket.address.getPort();
+        p.thread = try std.Thread.spawn(.{}, run, .{p});
+    }
+
+    fn stop(p: *LimitPeer) void {
+        p.close.store(true, .release);
+        if (p.thread) |t| joinBounded(t, &p.exited, "limit peer");
+        p.server.deinit(io);
+    }
+
+    fn run(p: *LimitPeer) void {
+        defer p.exited.store(true, .release);
+        if (!readable(p.server.socket.handle, &p.close)) return;
+        const st = p.server.accept(io) catch return;
+        defer st.close(io);
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(gpa);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        var due: std.ArrayList(Due) = .empty;
+        defer due.deinit(gpa);
+        var wbuf: [4096]u8 = undefined;
+        var w = st.writer(io, &wbuf);
+        var rbuf: [4096]u8 = undefined;
+        var pos: usize = 24; // frames are parsed from here, after the preface
+        var greeted = false;
+        var open: u32 = 0;
+        var fds = [_]std.posix.pollfd{.{ .fd = st.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        while (!p.close.load(.acquire)) {
+            fds[0].revents = 0;
+            if (std.posix.errno(std.posix.system.poll(&fds, 1, 5)) == .SUCCESS and fds[0].revents != 0) {
+                var iov = [_][]u8{&rbuf};
+                const n = st.read(io, &iov) catch return;
+                if (n == 0) return;
+                got.appendSlice(gpa, rbuf[0..n]) catch return;
+            }
+            if (got.items.len < 24) continue;
+            out.clearRetainingCapacity();
+            if (!greeted) {
+                settingsFrame(&out, 3, p.limit) catch return; // MAX_CONCURRENT_STREAMS
+                greeted = true;
+            }
+            const now = Io.Clock.awake.now(io).nanoseconds;
+            while (pos + 9 <= got.items.len) {
+                const len = std.mem.readInt(u24, got.items[pos..][0..3], .big);
+                if (pos + 9 + len > got.items.len) break;
+                const ty = got.items[pos + 3];
+                const fl = got.items[pos + 4];
+                const sid = std.mem.readInt(u32, got.items[pos + 5 ..][0..4], .big) & 0x7fff_ffff;
+                if (ty == 1) {
+                    open += 1;
+                    if (open > p.max_open.load(.monotonic)) p.max_open.store(open, .release);
+                }
+                // the request is complete: its answer is due
+                if ((ty == 0 or ty == 1) and fl & 1 != 0) due.append(gpa, .{ .sid = sid, .at = now + p.delay_ms * std.time.ns_per_ms }) catch return;
+                pos += 9 + len;
+            }
+            var k: usize = 0;
+            while (k < due.items.len) {
+                if (due.items[k].at > now) {
+                    k += 1;
+                    continue;
+                }
+                responseOk(&out, due.items[k].sid, "ok") catch return;
+                open -= 1;
+                _ = due.orderedRemove(k);
+            }
+            if (out.items.len == 0) continue;
+            w.interface.writeAll(out.items) catch return;
+            w.interface.flush() catch return;
+        }
+    }
+};
+
+test "the peer's limit of concurrent streams is kept: further calls wait and are started in order" {
+    var peer: LimitPeer = .{ .limit = 1 };
+    try peer.start();
+    defer peer.stop();
+    const c = try plainConn(peer.port);
+    defer releaseAndJoin(c);
+    var i: u32 = 0;
+    while (i < 5000) : (i += 1) {
+        c.mu.lockUncancelable(io);
+        const known = c.peer_max_streams == 1;
+        c.mu.unlock(io);
+        if (known) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    var ans: Answers = .{};
+    var slots: [4]u32 = @splat(0);
+    for (&slots, 0..) |*slot, k| c.start(slot, "/x/Y", "body", .{ .ctx = &ans, .done = Answers.sink }, k, null);
+    try ans.waitCount(4, 5000);
+    for (0..4) |k| {
+        try testing.expectEqual(@as(u32, 0), ans.codes[k].load(.acquire));
+        try testing.expectEqualStrings("ok", ans.textOf(k));
+    }
+    // each stream id belongs to the call started in that order
+    try testing.expectEqualSlices(u32, &.{ 1, 3, 5, 7 }, &slots);
+    try testing.expectEqual(@as(u32, 1), peer.max_open.load(.acquire));
+    try testing.expect(!c.isDead());
+}
+
+test "the response bytes a connection holds for its open calls together are capped" {
+    const saved = grpc.max_conn_response_bytes;
+    grpc.max_conn_response_bytes = 100;
+    defer grpc.max_conn_response_bytes = saved;
+    // two calls open; the peer sends 80 bytes of answer on each and ends neither: the second
+    // 80 would make 160. Then the first call's answer ends.
+    var hb: std.ArrayList(u8) = .empty;
+    defer hb.deinit(gpa);
+    try hb.append(gpa, 0x88);
+    try h2.hpack.encodeLiteral(&hb, gpa, "content-type", "application/grpc");
+    var msg: [80]u8 = @splat('m');
+    @memcpy(msg[0..5], &[_]u8{ 0, 0, 0, 0, 75 }); // one gRPC message of 75 bytes
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try frame(&script, 1, 4, 1, hb.items);
+    try frame(&script, 0, 0, 1, &msg);
+    try frame(&script, 1, 4, 3, hb.items);
+    try frame(&script, 0, 0, 3, &msg);
+    hb.clearRetainingCapacity();
+    try h2.hpack.encodeLiteral(&hb, gpa, "grpc-status", "0");
+    try frame(&script, 1, 4 | 1, 1, hb.items);
+    var peer: Peer = .{ .script = script.items, .headers_wanted = 2 };
+    try peer.start();
+    defer peer.stop();
+    const c = try plainConn(peer.port);
+    defer releaseAndJoin(c);
+    var ans: Answers = .{};
+    var slots: [2]u32 = @splat(0);
+    const sink: grpc.Sink = .{ .ctx = &ans, .done = Answers.sink };
+    c.start(&slots[0], "/x/Y", "one", sink, 0, null); // stream 1
+    c.start(&slots[1], "/x/Y", "two", sink, 1, null); // stream 3
+    try ans.waitCount(2, 5000);
+    // the call that went past the connection's limit fails alone
+    try testing.expectEqual(@as(u32, 8), ans.codes[1].load(.acquire));
+    try testing.expectEqualStrings("response buffers of the connection are full", ans.textOf(1));
+    try testing.expectEqual(@as(u32, 0), ans.codes[0].load(.acquire));
+    try testing.expect(!c.isDead());
+    // and a finished call gives its bytes back
+    c.mu.lockUncancelable(io);
+    const held = c.buffered;
+    c.mu.unlock(io);
+    try testing.expectEqual(@as(usize, 0), held);
+}
+
+const goaway_text = "transport error: connection closed by peer (GOAWAY)";
+
+test "GOAWAY: the calls it covers finish, the others and new ones are answered UNAVAILABLE" {
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try goawayFrame(&script, 1); // stream 1 will be answered, stream 3 will not
+    try responseOk(&script, 1, "ok");
+    var peer: Peer = .{ .script = script.items, .headers_wanted = 2 };
+    try peer.start();
+    defer peer.stop();
+    const c = try plainConn(peer.port);
+    defer releaseAndJoin(c);
+    var ans: Answers = .{};
+    var slots: [3]u32 = @splat(0);
+    const sink: grpc.Sink = .{ .ctx = &ans, .done = Answers.sink };
+    c.start(&slots[0], "/x/Y", "one", sink, 0, null); // stream 1
+    c.start(&slots[1], "/x/Y", "two", sink, 1, null); // stream 3
+    try ans.waitCount(2, 5000);
+    try testing.expectEqual(@as(u32, 0), ans.codes[0].load(.acquire));
+    try testing.expectEqualStrings("ok", ans.textOf(0));
+    try testing.expectEqual(@as(u32, 14), ans.codes[1].load(.acquire));
+    try testing.expectEqualStrings(goaway_text, ans.textOf(1));
+    try testing.expect(c.isDraining());
+    // a call started after the GOAWAY is answered at once, whether the connection has ended
+    // (its last call is done) or not yet
+    c.start(&slots[2], "/x/Y", "three", sink, 2, null);
+    try testing.expectEqual(@as(u32, 14), ans.codes[2].load(.acquire));
+    try testing.expectEqualStrings(goaway_text, ans.textOf(2));
+    try waitDead(c, 5000); // it ends by itself with its last call
+}
+
+test "GOAWAY: the pool opens the next connection at once and the open call keeps the old one" {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const members = try arena_state.allocator().alloc(cm.Member, 1);
+    members[0] = .{ .name = @splat(7), .stake = 10_000 };
+    members[0].network_address = "/ip4/127.0.0.1/tcp/1/http";
+    members[0].network_key = @splat(0);
+    const committee = try cm.Committee.init(arena_state.allocator(), 1, members);
+    var pool = try validators.Pool.init(gpa, io, &committee);
+    defer pool.deinit();
+
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try goawayFrame(&script, 1); // and no answer: the call stays open
+    var peer: Peer = .{ .script = script.items };
+    try peer.start();
+    defer peer.stop();
+    const c = try plainConn(peer.port);
+    c.retain(); // ours, past the pool's
+    defer {
+        waitReaderGone(c) catch {};
+        c.unref();
+    }
+    pool.conns[0] = c;
+    var ans: Answers = .{};
+    var slot: u32 = 0;
+    c.start(&slot, "/x/Y", "one", .{ .ctx = &ans, .done = Answers.sink }, 0, null);
+    var i: u32 = 0;
+    while (!c.isDraining() and !c.isDead() and i < 5000) : (i += 1) try Io.sleep(io, .fromMilliseconds(1), .awake);
+    try testing.expect(c.isDraining() and !c.isDead());
+    // no cooldown for a connection the peer closes in an orderly way
+    const next = pool.get(0).?;
+    defer {
+        waitReaderGone(next) catch {};
+        next.unref();
+    }
+    try testing.expect(next != c);
+    // the old connection is still there for its open call
+    try testing.expect(!c.isDead());
+    try testing.expectEqual(@as(u32, 0), ans.count.load(.acquire));
+    // and ends once that call is gone
+    c.cancel(&slot, 0);
+    try waitDead(c, 5000);
 }
 
 fn waitDead(c: *grpc.Conn, ms: u32) !void {
@@ -688,6 +990,131 @@ test "the upstream replaces a dead connection without waiting for its lock" {
     waitReaderGone(c1) catch {};
     try testing.expect(in_time);
     try testing.expect(t.got != null and t.got.? != c1);
+}
+
+/// A port where a TCP connect gets no answer: a listener nobody accepts on, its backlog full
+/// (the kernel then drops the SYNs of further connects).
+const BlackHole = struct {
+    server: Io.net.Server,
+    port: u16,
+    fill: [8]?std.posix.socket_t = @splat(null),
+
+    fn open() !BlackHole {
+        var addr = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var b: BlackHole = .{ .server = try addr.listen(io, .{ .reuse_address = true, .kernel_backlog = 1 }), .port = 0 };
+        b.port = b.server.socket.address.getPort();
+        const to = try Io.net.IpAddress.parseIp4("127.0.0.1", b.port);
+        for (&b.fill) |*f| f.* = grpc.startConnect(&to) catch null;
+        try Io.sleep(io, .fromMilliseconds(100), .awake);
+        return b;
+    }
+
+    fn close(b: *BlackHole) void {
+        for (b.fill) |f| if (f) |fd| {
+            _ = std.posix.system.close(fd);
+        };
+        b.server.deinit(io);
+    }
+};
+
+test "a connect that gets no answer ends at the connect deadline, its reader thread with it" {
+    const saved = grpc.connect_timeout_ns;
+    grpc.connect_timeout_ns = 300 * std.time.ns_per_ms;
+    grpc.watchdog.paused = true; // the connection keeps the deadline itself
+    defer {
+        grpc.connect_timeout_ns = saved;
+        grpc.watchdog.paused = false;
+    }
+    var hole = try BlackHole.open();
+    var hole_open = true;
+    defer if (hole_open) hole.close();
+    const c = try plainConn(hole.port);
+    defer releaseAndJoin(c);
+    var a = std.heap.ArenaAllocator.init(gpa);
+    defer a.deinit();
+    const r = try grpc.callBlocking(a.allocator(), c, "/x/Y", "body", 3000);
+    const reader_gone = if (waitReaderGone(c)) true else |_| false;
+    // closing the listener refuses what is still connecting: a reader that sat in connect(2)
+    // with no deadline returns now, and the test can end
+    hole.close();
+    hole_open = false;
+    try testing.expectEqual(@as(u8, 14), r.status.code);
+    try testing.expectEqualStrings("transport error: connect timeout", r.status.message);
+    try testing.expect(reader_gone);
+}
+
+test "a TLS handshake that gets no answer ends at the connect deadline without the watchdog" {
+    const saved = grpc.connect_timeout_ns;
+    grpc.connect_timeout_ns = 300 * std.time.ns_per_ms;
+    grpc.watchdog.paused = true;
+    defer {
+        grpc.connect_timeout_ns = saved;
+        grpc.watchdog.paused = false;
+    }
+    var peer: Peer = .{ .silent = true };
+    try peer.start();
+    defer peer.stop();
+    const c = try grpc.Conn.open(gpa, io, .{ .host = "127.0.0.1", .port = peer.port, .security = .{ .pinned = @splat(1) } });
+    defer releaseAndJoin(c);
+    var a = std.heap.ArenaAllocator.init(gpa);
+    defer a.deinit();
+    const r = try grpc.callBlocking(a.allocator(), c, "/x/Y", "body", 3000);
+    try testing.expectEqual(@as(u8, 14), r.status.code);
+    try testing.expectEqualStrings("transport error: connect timeout", r.status.message);
+}
+
+test "a validator whose connections get ready and then drop is redialled with backoff" {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const members = try arena_state.allocator().alloc(cm.Member, 1);
+    members[0] = .{ .name = @splat(7), .stake = 10_000 };
+    members[0].network_address = "/ip4/127.0.0.1/tcp/1/http"; // nobody listens: the pool's own redials never get ready
+    members[0].network_key = @splat(0);
+    const committee = try cm.Committee.init(arena_state.allocator(), 1, members);
+    var pool = try validators.Pool.init(gpa, io, &committee);
+    defer pool.deinit();
+
+    // the wait doubles per failure up to the cap, spread over its last quarter from the first
+    // failure on; no failure: the plain cooldown
+    const base = pool.reconnect_cooldown;
+    const cap = pool.max_reconnect_cooldown;
+    try testing.expectEqual(base, pool.cooldown(0, 0, 12345));
+    var f: u8 = 1;
+    while (f < 12) : (f += 1) {
+        const full = @min(base << @intCast(@min(f, 8)), cap);
+        const d = pool.cooldown(0, f, 12345);
+        try testing.expect(d >= full - full / 4 and d <= full);
+        try testing.expectEqual(d, pool.cooldown(0, f, 12345)); // one value per wait
+    }
+    var differs = false;
+    for (1..16) |i| differs = differs or pool.cooldown(@intCast(i), 3, 12345) != pool.cooldown(0, 3, 12345);
+    try testing.expect(differs); // members that dropped together are not redialled together
+    // the streak: over once a connection held for `stable_ns`
+    try testing.expectEqual(@as(u8, 4), pool.streakAfter(3, false, 0));
+    try testing.expectEqual(@as(u8, 4), pool.streakAfter(3, true, pool.stable_ns - 1));
+    try testing.expectEqual(@as(u8, 0), pool.streakAfter(3, true, pool.stable_ns));
+
+    // and in the pool: a connection that got ready and dropped within milliseconds counts
+    var peer: Peer = .{ .wait_headers = false, .close_after = true }; // takes the preface, closes
+    try peer.start();
+    defer peer.stop();
+    const c = try plainConn(peer.port);
+    c.retain(); // ours, past the pool's release
+    defer {
+        waitReaderGone(c) catch {};
+        c.unref();
+    }
+    pool.conns[0] = c;
+    try waitDead(c, 5000);
+    try testing.expect(c.wasReady());
+    pool.reconnect_cooldown = 0; // redial at once
+    const next = pool.get(0).?;
+    defer {
+        waitReaderGone(next) catch {};
+        next.unref();
+    }
+    try testing.expect(next != c);
+    try testing.expectEqual(@as(u8, 1), pool.connect_fails[0]);
 }
 
 test "the upstream reconnects after its connection died" {

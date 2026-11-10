@@ -190,6 +190,9 @@ fn runReplayWith(ctx: *harness.Ctx, only_system: bool) !void {
     try ctx.forEachFile("chk", ".chk", &tally, replayFile);
     @import("perf.zig").finish(ctx.io) catch |e| ctx.stderr.print("exec-replay perf: writing the output failed: {s}\n", .{@errorName(e)}) catch {};
     tally.print(ctx.stderr);
+    var stats: [640]u8 = undefined;
+    ctx.stderr.print("{s}\n", .{ptb.pkgs.statsLine(&stats)}) catch {};
+    ctx.stderr.flush() catch {};
 }
 
 fn replayFile(tally: *Tally, ctx: *harness.Ctx, name: []const u8) !void {

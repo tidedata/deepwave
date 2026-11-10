@@ -78,6 +78,8 @@ const usage =
     \\  --tiles                             run the p2p tip path as pinned tiles on shared-memory rings (ingest, verify, exec, store, notify); default off
     \\  --tile-cpus A,B,C,D,E                cores for the five tiles in order (default: not pinned); --tile-spin: never sleep when idle
     \\  --p2p-exec-threads N                 threads executing a checkpoint's independent transactions (default 4; 1: in order)
+    \\  --p2p-reconcile-wait S               a checkpoint built over p2p has its read sets compared with sui-node's copy and repaired
+    \\                                       (the stream's duplicate, or the bucket's after S seconds; default 10; 0: off)
     \\  --sig-fast                           signature speed layer: decoded public-key caches, zkLogin proof cache, multisig batch (on with --sig-parallel; same verdicts)
     \\  --sig-parallel MODE                  auto|on|off: batch signature and certificate checks on every core (CPU pool from the hw plan) and on
     \\                                       the GPU when one passes its startup self-check; auto = on with more than 2 cores or such a GPU (default auto;
@@ -113,6 +115,8 @@ const usage =
     \\  --epochs FILE                        epoch index (epochs.jsonl) to find end-of-epoch checkpoints fast
     \\  --trust-dir PATH                     local checkpoints tried first during the committee walk
     \\  --serve ADDR                         sui.rpc.v2 gRPC (h2c), e.g. 127.0.0.1:9000
+    \\  --h2-max-cancelled N                 calls a peer cancelled that are still running, per connection, before it is closed
+    \\                                       with GOAWAY(ENHANCE_YOUR_CALM) (default 4096; deepwave's rapid-reset bound)
     \\  --serve-tls ADDR                     the same sui.rpc.v2 over TLS 1.3 (sui-node rpc.https-address); needs --serve
     \\  --serve-tls-cert FILE --serve-tls-key FILE  PEM certificate chain and private key (rpc.tls; P-256, P-384,
     \\                                       Ed25519 or RSA); without them a self-signed P-256 cert for localhost (13 days)
@@ -122,6 +126,8 @@ const usage =
     \\  --native-listen ADDR                 zui/1 native protocol on UDP (QUIC zui/1 + WebTransport), off by default
     \\  --native-cert-hash-file FILE         write the WebTransport cert sha256 and the zui/1 key (hex lines)
     \\  --native-identity-file FILE          zui/1 Ed25519 seed, kept across restarts (default <dir>/node/native-identity.seed)
+    \\  --native-keys FILE                   zui/1 API keys: `<key> <tier> [<Agent Pass hex>]` per line (NATIVE-PROTOCOL.md 6.1)
+    \\  --native-pass-dir DIR                Agent Pass ledgers (default <dir>/node/agent-pass)
     \\  --rpc-release 1.83 | 1.84 | N        GetEpoch protocol_config lists the fields of this sui-node release (default 1.83, as sui-node 1.83.1; raised to the chain's protocol version when newer)
     \\  --indexes | --no-indexes             StateService indexes (on disk in DIR/state-index: built from the live set once, then replayed from its watermark)
     \\  --metrics ADDR                       Prometheus text at http://ADDR/metrics
@@ -186,6 +192,10 @@ const usage =
     \\  --policy KEY=VALUE                   policy-config (traffic controller) key (repeatable; `off` = policy-config: null)
     \\  --early-validation true|false        ExecuteTransaction's early validation (default true; false also skips the
     \\                                       transaction-deny-config checks, as transaction-driver-config does)
+    \\  --dev-inspect-disabled true|false    SimulateTransaction with checks disabled (fullnode.yaml dev-inspect-disabled):
+    \\                                       true refuses it as sui-node does, false runs it as sui-node's dev-inspect
+    \\                                       (private functions and arbitrary values from any client). Not given: no
+    \\                                       dev-inspect execution, requests that need its rules answer UNIMPLEMENTED
     \\  --ledger-history KEY=VALUE           a ListTransactions/ListEvents/ListCheckpoints limit (fullnode.yaml rpc.ledger-history,
     \\                                       e.g. list-checkpoints.max-limit-items=100); repeatable
     \\  --snapshot-write DIR                 at every epoch end write DIR/epoch_<E>/, a formal snapshot (Mysten's format) checked
@@ -518,6 +528,8 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.p2p_pinned = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--p2p-exec-threads")) {
             cfg.p2p_exec_threads = try std.fmt.parseInt(u8, try need(args, &i), 10);
+        } else if (std.mem.eql(u8, a, "--p2p-reconcile-wait")) {
+            cfg.p2p_reconcile_wait_s = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--p2p-listen")) {
             const v = try need(args, &i);
             cfg.p2p_listen = if (std.mem.eql(u8, v, "off")) null else v;
@@ -574,6 +586,8 @@ pub fn main(init: std.process.Init) !u8 {
             exec_driver = std.meta.stringToEnum(rpc_exec.live.node_exec.NodeExec.Driver, v) orelse return error.BadExecDriver;
         } else if (std.mem.eql(u8, a, "--serve")) {
             cfg.serve_addr = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--h2-max-cancelled")) {
+            cfg.serve_opts.h2.max_reset_running = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--serve-tls")) {
             cfg.serve_tls_addr = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--serve-tls-cert")) {
@@ -588,6 +602,10 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.native_cert_hash_file = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--native-identity-file")) {
             cfg.native_identity_file = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--native-keys")) {
+            cfg.native_keys = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--native-pass-dir")) {
+            cfg.native_pass_dir = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--rpc-release")) {
             cfg.rpc_release_max = node.node.parseRpcRelease(try need(args, &i)) orelse return usageErr("--rpc-release 1.83 | 1.84 | protocol version");
         } else if (std.mem.eql(u8, a, "--indexes")) {
@@ -710,6 +728,13 @@ pub fn main(init: std.process.Init) !u8 {
             } else if (std.mem.eql(u8, v, "false")) {
                 rpc_exec.live.early.enabled.store(false, .monotonic);
             } else return usageErr("--early-validation takes true or false");
+        } else if (std.mem.eql(u8, a, "--dev-inspect-disabled")) {
+            const v = try need(args, &i);
+            if (std.mem.eql(u8, v, "true")) {
+                cfg.dev_inspect_disabled = true;
+            } else if (std.mem.eql(u8, v, "false")) {
+                cfg.dev_inspect_disabled = false;
+            } else return usageErr("--dev-inspect-disabled takes true or false");
         } else if (std.mem.eql(u8, a, "--deny-state")) {
             cfg.deny_state = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--ledger-history")) {

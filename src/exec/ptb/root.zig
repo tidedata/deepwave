@@ -32,6 +32,12 @@ pub const typing = @import("typing.zig");
 pub const run = @import("run.zig");
 pub const archive = @import("archive.zig");
 pub const deny = @import("deny.zig");
+/// Test support: Rust-made deny list vectors with the store reads in order (also rpc-exec's tests).
+pub const deny_order_vectors = @import("deny_order_vectors.zig");
+/// Test support and tests for `Inputs.skip_all_checks` and `Inputs.track_results` (also rpc-exec's tests).
+pub const devinspect_test = @import("devinspect_test.zig");
+/// Fuzz harness: every native of the system packages through `skip_all_checks`.
+pub const devinspect_fuzz = @import("devinspect_fuzz.zig");
 pub const borrow = @import("borrow.zig");
 pub const compat = @import("compat.zig");
 const versions = @import("../versions/root.zig");
@@ -90,7 +96,14 @@ pub const Inputs = struct {
     /// `execution_mode::DevInspect` command results (`Mode::TRACK_EXECUTION`): `Output.command_results`
     /// holds one entry per executed command when the transaction succeeds. Effects are unchanged.
     track_results: bool = false,
-    /// `DevInspect<true>` (checks disabled). Not modeled yet: `true` is `.unsupported`.
+    /// `DevInspect<true>` (checks disabled; rpc-exec SimulateTransaction with `checks: DISABLED`):
+    /// `Mode::allow_arbitrary_function_calls`, `allow_arbitrary_values` and
+    /// `skip_conservation_checks` answer true. Private and friend functions are callable, a pure
+    /// input instantiates any type from its BCS bytes, an `ImmOrOwnedObject` input may be owned
+    /// by an object or be a consensus object, reference returns, unused values without drop and
+    /// hot arguments to private entry functions pass. (The executor does not run the
+    /// conservation checks in any mode: they only fail under this mode's rules.) Not modeled on
+    /// the dynamic cuts. `false` leaves execution exactly as it was.
     skip_all_checks: bool = false,
 };
 
@@ -532,6 +545,21 @@ const Exec = struct {
 /// (owner, coin type `T` as BCS TypeTag bytes) and a reserved amount.
 const GaslessKey = struct { owner: Id, ty: []const u8, amount: u64 };
 
+/// The `T` of a rewritten coin reservation's `Withdrawal<Balance<T>>`; null while typing has not
+/// resolved it.
+fn reservedCoinType(t: *const move_vm.Type) ?*const move_vm.Type {
+    const withdrawal = switch (t.*) {
+        .datatype => |d| d,
+        else => return null,
+    };
+    if (withdrawal.args.len != 1) return null;
+    const balance = switch (withdrawal.args[0].*) {
+        .datatype => |d| d,
+        else => return null,
+    };
+    return if (balance.args.len == 1) balance.args[0] else null;
+}
+
 /// The minimum transfer of an allowed gasless token (`get_gasless_allowed_token_types`), by the
 /// BCS bytes of its TypeTag; null when the type is not in the list.
 fn gaslessMinimum(arena: Allocator, cfg: *const protocol.ProtocolConfig, ty: []const u8) !?u64 {
@@ -751,6 +779,9 @@ const Resolve = struct {
     cache: *pkgs.Cache,
     e: *Exec,
     gap: ?[]const u8 = null,
+    /// `Inputs.skip_all_checks` over a simulation pre-state: no signing check tied a receiving
+    /// ref to a stored object, so a version the store does not hold is a plain miss.
+    unchecked_receiving: bool = false,
 
     fn stored(r: *Resolve, id: *const Id, version: u64) ?*const objrt.StoredObject {
         const raw = r.objs.get(r.objs.ctx, id, version) orelse {
@@ -816,6 +847,17 @@ const Resolve = struct {
         // unless one was written during the epoch (the next-epoch value can change).
         if (upper == objrt.sequence_number_max) {
             const latest = r.objs.latest orelse {
+                // Simulation over a pre-state: the backing store's `read_child_object(config,
+                // setting, SequenceNumber::MAX)`, the newest version it holds. sui-core reads
+                // it through the `TrackingBackingStore`, so the setting is one of the
+                // transaction's loaded runtime objects like any other child read.
+                if (r.fx == null) if (r.state) |st| {
+                    const raw = st.vtable.child_at_most(st.ctx, child, upper) orelse return null;
+                    return r.storedFrom(raw) catch {
+                        r.gap = "config setting does not parse";
+                        return null;
+                    };
+                };
                 r.gap = "per-epoch config read without the store's latest objects";
                 return null;
             };
@@ -868,7 +910,8 @@ const Resolve = struct {
         _ = epoch;
         const r: *Resolve = @ptrCast(@alignCast(ctx));
         const raw = r.objs.get(r.objs.ctx, child, version) orelse {
-            r.gap = "receiving object not in corpus";
+            // `get_object_received_at_version`: no object at that version answers `None`
+            if (!r.unchecked_receiving) r.gap = "receiving object not in corpus";
             return null;
         };
         // The store keeps the version after it is received; Sui's Received marker hides it
@@ -1102,7 +1145,7 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
         else => return unsupported(arena, "not programmable", .{}),
     };
     if (in.track_results and versions.executorOf(cfg) == .dynamic) return unsupported(arena, "command results (DevInspect) on a dynamic cut", .{});
-    if (in.skip_all_checks) return unsupported(arena, "DevInspect<true> (checks disabled) not modeled", .{});
+    if (in.skip_all_checks and versions.executorOf(cfg) == .dynamic) return unsupported(arena, "DevInspect<true> (checks disabled) on a dynamic cut", .{});
     // is_gasless_transaction: address-balance gas at price 0 (`PaymentKind::gasless`; the legacy
     // path also needs `enable_gasless`)
     const gasless = data.gas_data.payment.len == 0 and data.gas_data.price == 0 and (bump_only or cfg.feature_flags.enable_gasless);
@@ -1212,15 +1255,12 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
         // no payment: no gas coin, no balance charged (`payer` only keeps the effects' gas
         // object index empty)
         e.payer = e.ab_owner;
-        for (pt.inputs) |*arg| switch (arg.*) {
-            .Object => |*oa| switch (oa.*) {
-                .ImmOrOwnedObject => |r| if (inputs_mod.isCoinReservation(&r[2].@"0".@"0")) return unsupported(arena, "gasless transaction with a coin reservation input", .{}),
-                else => {},
-            },
-            else => {},
-        };
         // compute_input_reservations (always on the bump-only path) / the legacy
-        // `gasless_withdrawal_reservations` (behind `gasless_verify_remaining_balance`)
+        // `gasless_withdrawal_reservations` (behind `gasless_verify_remaining_balance`). Both
+        // read the kind sui-core hands the executor, in which a coin reservation input is
+        // already a sender FundsWithdrawal of its `Balance<T>`
+        // (`rewrite_transaction_for_coin_reservations`); those are added once typing has
+        // resolved their `T` (below, after the commands ran).
         if (bump_only or cfg.feature_flags.gasless_verify_remaining_balance) {
             var rs: std.ArrayList(GaslessKey) = .empty;
             for (pt.inputs) |*arg| switch (arg.*) {
@@ -1377,8 +1417,9 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
             .sponsor = if (std.mem.eql(u8, &data.gas_data.owner.@"0", &e.sender)) null else data.gas_data.owner.@"0",
             .reservations = reservations,
             .accumulator_types = if (reservations.len == 0) &.{} else if (in.reservation_types) |t| t else if (in.effects) |fx| try accumulatorCoinTypes(arena, fx) else return unsupported(arena, "coin reservation types unknown", .{}),
+            .skip_checks = in.skip_all_checks,
         };
-        var resolve: Resolve = .{ .arena = arena, .objs = in.objs, .fx = in.effects, .state = in.state, .unchanged = in.unchanged_loaded, .unsettled = in.unsettled, .cache = cache, .e = &e };
+        var resolve: Resolve = .{ .arena = arena, .objs = in.objs, .fx = in.effects, .state = in.state, .unchanged = in.unchanged_loaded, .unsettled = in.unsettled, .cache = cache, .e = &e, .unchecked_receiving = in.skip_all_checks and in.effects == null and in.state != null };
         var host: move_vm.Host = .{
             .cfg = cfg,
             .tx = .{
@@ -1393,6 +1434,7 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
             },
             .tx_arena = arena,
             .ty_cache = &cache.ty_args,
+            .arbitrary_calls = in.skip_all_checks,
         };
         host.rt.epoch = env.epoch;
         host.rt.resolver = .{ .ctx = &resolve, .vtable = &Resolve.vtable };
@@ -1418,6 +1460,29 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
         gap = resolve.gap;
         if (outcome) |o| {
             res = o;
+            // gasless: the coin reservation inputs' share of the input reservations, keyed like
+            // the FundsWithdrawal inputs above (owner the sender, coin type `T`, amounts added).
+            // Only a successful run needs them: after a failure the requirements are checked on
+            // the reset store, where a transaction with coin inputs fails them whatever is
+            // reserved (the coins are not deleted) and one without writes nothing either way.
+            if (e.gasless_reservations) |known| {
+                var rs: std.ArrayList(GaslessKey) = .empty;
+                try rs.appendSlice(arena, known);
+                var any = false;
+                for (p.withdrawals.items) |*w| if (w.compat) {
+                    any = true;
+                    const coin_ty = reservedCoinType(w.ty) orelse return unsupported(arena, "gasless coin reservation of an unresolved type", .{});
+                    const ty = try bcs.encodeAlloc(types.TypeTag, arena, try move_vm.host.typeTag(arena, coin_ty, .defining));
+                    const amount = std.math.cast(u64, w.amount) orelse std.math.maxInt(u64);
+                    for (rs.items) |*r| {
+                        if (std.mem.eql(u8, &r.owner, &e.sender) and std.mem.eql(u8, r.ty, ty)) {
+                            r.amount +|= amount;
+                            break;
+                        }
+                    } else try rs.append(arena, .{ .owner = e.sender, .ty = ty, .amount = amount });
+                };
+                if (any) e.gasless_reservations = rs.items;
+            }
         } else {
             exec_err = diag.fail;
             aborted = diag.fail.kind == .MoveAbort;
@@ -1425,20 +1490,28 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
     }
     if (gap) |g| return .{ .unsupported = g };
 
-    // context::finish (after the VM): deny-list charge, then record the results.
+    // context::finish (after the VM): the deny-list check, its charge, then record the results.
     if (res) |r| {
         if (r.non_gas_coin_owners > 0) {
+            // `state_view.check_coin_deny_list(..)` runs first and reads the whole deny-list
+            // state it needs (deny.check), then `charge_coin_transfers(..)?`, then `result?`:
+            // a charge that runs out of gas hides a denial, and the store reads were made
+            // either way.
+            if (!e.inputs.contains(deny_list_id)) e.per_epoch_deny_list = true;
+            var denied: ?deny.Denied = null;
+            if (in.objs.latest) |latest|
+                denied = try deny.check(arena, .{ .ctx = in.objs.ctx, .get = latest }, env.epoch, r.deny_pairs);
             const cost_per_byte = cfg.getOpt("dynamic_field_borrow_child_object_type_cost_per_byte") orelse 0;
             if (e.gas.chargeStorageRead(1000 * cost_per_byte * r.non_gas_coin_owners)) |_| {
                 exec_err = .{ .kind = .InsufficientGas };
+            } else if (denied) |d| {
+                exec_err = .{ .kind = d.kind() };
+            } else if (in.objs.latest == null and in.effects != null) {
+                // Replay without the store's latest objects cannot tell a denial. (Simulation,
+                // rpc-exec, has no `effects` and goes on: its caller replays the reads from
+                // `Output.deny_pairs`.)
+                return unsupported(arena, "coin deny list state not available", .{});
             }
-            if (!e.inputs.contains(deny_list_id)) e.per_epoch_deny_list = true;
-            // check_coin_deny_list_v2_during_execution: charge_coin_transfers, then the result
-            // Simulation without `objs.latest` (rpc-exec): the caller checks `Output.deny_pairs`.
-            if (exec_err == null) if (in.objs.latest) |latest| {
-                if (try deny.check(arena, .{ .ctx = in.objs.ctx, .get = latest }, env.epoch, r.deny_pairs)) |d|
-                    exec_err = .{ .kind = d.kind() };
-            } else if (in.effects != null) return unsupported(arena, "coin deny list state not available", .{});
         }
         if (exec_err == null) try record(&e, &r);
     }

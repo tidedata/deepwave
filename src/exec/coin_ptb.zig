@@ -1125,6 +1125,19 @@ fn readUleb(raw: []const u8, at: *usize) ?u64 {
     }
 }
 
+// `context::finish` reads the deny-list state before `charge_coin_transfers`: a transaction
+// that runs out of gas at that charge has made the reads, and one that runs out earlier has
+// not (Rust-made vectors, `ptb/deny_order_vectors.zig`).
+test "the deny list is read before its charge: out of gas at the charge (coin executor)" {
+    const vectors = @import("ptb/deny_order_vectors.zig");
+    try std.testing.expectEqual(@as(usize, 6), try vectors.run(std.testing.allocator, std.testing.io, .out_of_gas, .coin));
+}
+
+test "the deny list is read before its charge: out of gas at the charge (Move-call executor)" {
+    const vectors = @import("ptb/deny_order_vectors.zig");
+    try std.testing.expectEqual(@as(usize, 6), try vectors.run(std.testing.allocator, std.testing.io, .out_of_gas, .move));
+}
+
 test "object type node counts" {
     // Coin(TypeTag::Struct(0x2::sui::SUI)): Coin<SUI> = 2 nodes.
     var buf: std.ArrayList(u8) = .empty;
@@ -1323,18 +1336,21 @@ fn runCommands(p: *Ptb, pt: *const types.ProgrammableTransaction, input_obj_id: 
         if (n > 0) {
             const cost_per_byte = e.cfg.getOpt("dynamic_field_borrow_child_object_type_cost_per_byte") orelse 0;
             const cost = 1000 * cost_per_byte * n;
-            // check_coin_deny_list records 0x403 as a loaded per-epoch config object before
-            // charge_coin_transfers runs, so it stays in the effects when the charge fails.
+            // `state_view.check_coin_deny_list(..)` runs first: it reads the whole deny-list
+            // state it needs (deny.check) and records 0x403 as a loaded per-epoch config object.
+            // Then `charge_coin_transfers(..)?`, then `result?`: a charge that runs out of gas
+            // hides a denial, 0x403 stays in the effects, and the store reads were made either way.
             if (!e.inputs.contains(deny_list_id)) e.per_epoch_deny_list = true;
+            var denied: ?deny.Denied = null;
+            if (e.objs.latest) |latest|
+                denied = try deny.check(arena, .{ .ctx = e.objs.ctx, .get = latest }, e.epoch, pairs.items);
             if (e.gas.chargeStorageRead(cost)) |_| return .{ .kind = .InsufficientGas, .command = null };
             e.non_gas_coin_owners = n;
-            // check_coin_deny_list_v2_during_execution: the result after the charge
-            const latest = e.objs.latest orelse {
+            if (e.objs.latest == null) {
                 e.unsupported_reason = "coin deny list state not available";
                 return error.Unsupported;
-            };
-            if (try deny.check(arena, .{ .ctx = e.objs.ctx, .get = latest }, e.epoch, pairs.items)) |d|
-                return .{ .kind = .Denied, .command = null, .denied = d };
+            }
+            if (denied) |d| return .{ .kind = .Denied, .command = null, .denied = d };
         }
     }
 

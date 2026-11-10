@@ -15,6 +15,102 @@ const Allocator = std.mem.Allocator;
 const err = @import("error.zig");
 const digest_mod = @import("digest.zig");
 
+// ---------------------------------------------------------------- tombstones
+
+/// Zig's hash map never reclaims tombstones. A remove leaves one and gives the slot back to
+/// `available`, so tombstones never make the table grow; a lookup for an absent key stops only at
+/// a never-used slot (or after `capacity` slots); and an insert turns a never-used slot into a
+/// used one whenever its probe starts on one. A map with steady insert-and-remove churn (the DAG
+/// window, the vote tracker, the finalizer's block map, an evictable MemStore) therefore runs out
+/// of never-used slots, and from then on every lookup of an absent key reads the whole table.
+/// `Churn` counts removals per map and rehashes the map in place once they reach a quarter of its
+/// capacity. Behind a switch, off by default: `ZUI_CONSENSUS_REHASH=1`.
+pub const Churn = struct {
+    removed: usize = 0,
+    rehashes: u64 = 0,
+
+    /// Call after a batch of `n` removals from `map` (a pointer to an unmanaged hash map with
+    /// context `ctx`). A rehash moves the entries: no pointer into the map may be held across it.
+    pub fn after(self: *Churn, map: anytype, ctx: anytype, n: usize) void {
+        if (n == 0) return;
+        self.removed += n;
+        if (self.removed * 4 < map.capacity() or !rehashOnEvict()) return;
+        map.rehash(ctx);
+        self.removed = 0;
+        self.rehashes += 1;
+    }
+};
+
+/// 0: not read yet, 1: off, 2: on.
+var rehash_switch: std.atomic.Value(u8) = .init(0);
+
+/// A switch variable's value: "1" is on, "0" is off, anything else is not understood (null).
+pub fn parseOnOff(v: []const u8) ?bool {
+    if (std.mem.eql(u8, v, "1")) return true;
+    if (std.mem.eql(u8, v, "0")) return false;
+    return null;
+}
+
+fn rehashEnv() ?[]const u8 {
+    if (!@import("builtin").link_libc) return null;
+    return std.mem.span(std.c.getenv("ZUI_CONSENSUS_REHASH") orelse return null);
+}
+
+/// The value of ZUI_CONSENSUS_REHASH when it is set to something other than 0 or 1. The switch
+/// then stays off, and the finalizer's startup lines (commit_finalizer.zig) name the value.
+pub fn rehashEnvUnknown() ?[]const u8 {
+    const v = rehashEnv() orelse return null;
+    return if (parseOnOff(v) == null) v else null;
+}
+
+pub fn rehashOnEvict() bool {
+    const s = rehash_switch.load(.monotonic);
+    if (s != 0) return s == 2;
+    const on = if (rehashEnv()) |v| parseOnOff(v) orelse false else false;
+    _ = rehash_switch.cmpxchgStrong(0, if (on) 2 else 1, .monotonic, .monotonic);
+    return rehash_switch.load(.monotonic) == 2;
+}
+
+pub fn setRehashOnEvict(on: bool) void {
+    rehash_switch.store(if (on) 2 else 1, .monotonic);
+}
+
+/// Sets the switch and returns what it was (the environment's answer when nothing set it yet).
+/// A test that needs the switch one way puts it back when it ends, so the tests after it in the
+/// binary run as the environment asked:
+///   const was = swapRehashOnEvict(true);
+///   defer setRehashOnEvict(was);
+pub fn swapRehashOnEvict(on: bool) bool {
+    const was = rehashOnEvict();
+    setRehashOnEvict(on);
+    return was;
+}
+
+/// Slots a lookup for an absent key with hash `h` reads in `map` before it stops (std's probe
+/// loop: from the home slot to the first never-used slot, at most `capacity` slots).
+pub fn absentProbes(map: anytype, h: u64) usize {
+    const cap: usize = map.capacity();
+    if (cap == 0 or map.count() == 0) return 0;
+    const mask = cap - 1;
+    const md = map.metadata.?;
+    var idx: usize = @as(usize, @truncate(h)) & mask;
+    var n: usize = 0;
+    while (n < cap and !md[idx].isFree()) : (n += 1) idx = (idx + 1) & mask;
+    return n;
+}
+
+/// Mean of `absentProbes` over 256 spread-out hashes.
+pub fn meanAbsentProbes(map: anytype) usize {
+    var sum: usize = 0;
+    var h: u64 = 0x9e3779b97f4a7c15;
+    for (0..256) |_| {
+        sum += absentProbes(map, h);
+        h = h *% 0xd1342543de82ef95 +% 0x2545f4914f6cdd1d;
+        h ^= h >> 29;
+    }
+    return sum / 256;
+}
+
 pub const CommitInfoEntry = struct { ref: types.CommitRef, info: types.CommitInfo };
 pub const FinalizedEntry = struct { ref: types.CommitRef, rejected: []const types.RejectedInBlock };
 
@@ -149,6 +245,8 @@ pub const MemStore = struct {
     evictable: bool = false,
     boxes: std.HashMapUnmanaged(types.BlockRef, *std.heap.ArenaAllocator, RefContext, 80) = .empty,
     max_round: types.Round = 0,
+    churn: Churn = .{},
+    boxes_churn: Churn = .{},
 
     pub fn init(gpa: std.mem.Allocator) MemStore {
         return .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -176,14 +274,21 @@ pub const MemStore = struct {
     pub fn evictBelow(self: *MemStore, cutoff: types.Round) void {
         if (!self.evictable) return;
         var w: usize = 0;
+        var dropped: usize = 0;
+        var dropped_boxes: usize = 0;
+        defer {
+            self.churn.after(&self.blocks, RefContext{}, dropped);
+            self.boxes_churn.after(&self.boxes, RefContext{}, dropped_boxes);
+        }
         for (self.by_author.items) |*list| {
             w = 0;
             for (list.items) |r| {
                 if (r.round < cutoff) {
-                    _ = self.blocks.remove(r);
+                    if (self.blocks.remove(r)) dropped += 1;
                     if (self.boxes.fetchRemove(r)) |kv| {
                         kv.value.deinit();
                         self.gpa.destroy(kv.value);
+                        dropped_boxes += 1;
                     }
                 } else {
                     list.items[w] = r;
@@ -733,5 +838,100 @@ test "LogStore: groups survive reopen, a torn tail is dropped" {
         for (&refs, blocks.items) |*r, b| r.* = b.reference();
         try ls.store().containsBlocks(&refs, &out);
         for (out) |o| try std.testing.expect(o);
+    }
+}
+
+test "rehash after eviction batches keeps absent-key lookups short through two million insert and remove cycles; without it they grow to the table size" {
+    const gpa = std.testing.allocator;
+    const Map = std.HashMapUnmanaged(types.BlockRef, usize, RefContext, 80);
+    const live: usize = 5_000;
+    const batch: usize = 100; // one round of 100 authorities in, the oldest round out
+    const Run = struct {
+        fn refOf(i: usize) types.BlockRef {
+            var d: [32]u8 = @splat(0);
+            std.mem.writeInt(u64, d[0..8], @as(u64, i) *% 0x9e3779b97f4a7c15 +% 0x7f4a7c15, .little);
+            return .{ .round = @intCast(i / batch), .author = @intCast(i % batch), .digest = d };
+        }
+        /// Returns the largest mean absent-key probe length sampled, and the capacity.
+        fn go(g: std.mem.Allocator, cycles: usize, rehash: bool) !struct { worst: usize, capacity: usize, rehashes: u64 } {
+            const was = swapRehashOnEvict(rehash);
+            defer setRehashOnEvict(was);
+            var map: Map = .empty;
+            defer map.deinit(g);
+            var churn: Churn = .{};
+            for (0..live) |i| try map.put(g, refOf(i), i);
+            var worst: usize = 0;
+            var i: usize = live;
+            while (i < live + cycles) : (i += batch) {
+                for (i..i + batch) |k| try map.put(g, refOf(k), k);
+                for (i - live..i - live + batch) |k| if (!map.remove(refOf(k))) return error.TestUnexpectedResult;
+                churn.after(&map, RefContext{}, batch);
+                if ((i / batch) % 500 == 0) worst = @max(worst, meanAbsentProbes(&map));
+            }
+            worst = @max(worst, meanAbsentProbes(&map));
+            // nothing lost, nothing extra: exactly the last `live` keys, each with its value
+            if (map.count() != live) return error.TestUnexpectedResult;
+            for (i - live..i) |k| if ((map.get(refOf(k)) orelse return error.TestUnexpectedResult) != k) return error.TestUnexpectedResult;
+            if (map.contains(refOf(i - live - 1)) or map.contains(refOf(i))) return error.TestUnexpectedResult;
+            return .{ .worst = worst, .capacity = map.capacity(), .rehashes = churn.rehashes };
+        }
+    };
+    const on = try Run.go(gpa, 2_000_000, true);
+    try std.testing.expect(on.rehashes > 100);
+    // at most 80% used plus a quarter of the table in tombstones before the next rehash
+    try std.testing.expect(on.worst <= 256);
+    // The same churn without the rehash: the never-used slots run out (after about
+    // capacity * ln(free slots) inserts) and an absent key costs a scan of the whole table.
+    const off = try Run.go(gpa, 150_000, false);
+    try std.testing.expectEqual(@as(u64, 0), off.rehashes);
+    try std.testing.expectEqual(on.capacity, off.capacity);
+    try std.testing.expect(off.worst >= off.capacity / 2);
+}
+
+test "evictable MemStore rehashes after eviction batches and still reads every kept block" {
+    const gpa = std.testing.allocator;
+    const was = swapRehashOnEvict(true);
+    defer setRehashOnEvict(was);
+    var mem = MemStore.init(gpa);
+    defer mem.deinit();
+    mem.evictable = true;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const st = mem.store();
+    var round: types.Round = 1;
+    while (round <= 400) : (round += 1) {
+        var blocks: [8]types.VerifiedBlock = undefined;
+        for (&blocks, 0..) |*b, au| b.* = try digest_mod.verifiedForTest(a, .{ .V2 = .{ .epoch = 0, .round = round, .author = @intCast(au), .timestamp_ms = round, .ancestors = &.{}, .transactions = &.{}, .transaction_votes = &.{}, .commit_votes = &.{}, .misbehavior_reports = &.{} } });
+        try st.write(&.{ .blocks = &blocks });
+        if (round > 20) mem.evictBelow(round - 20);
+        var out: [2]?types.VerifiedBlock = .{ null, null };
+        const gone: types.BlockRef = .{ .round = round -| 21, .author = 3, .digest = blocks[3].digest };
+        try st.readBlocks(&.{ blocks[3].reference(), gone }, &out);
+        try std.testing.expect(out[0] != null and out[0].?.reference().eql(blocks[3].reference()));
+        try std.testing.expect(out[1] == null);
+    }
+    try std.testing.expect(mem.churn.rehashes > 0);
+    try std.testing.expect(mem.boxes_churn.rehashes > 0);
+    try std.testing.expectEqual(@as(usize, 8 * 21), mem.blocks.count()); // rounds 380 to 400
+    try std.testing.expectEqual(@as(usize, 8 * 21), mem.boxes.count());
+    try std.testing.expect(meanAbsentProbes(&mem.blocks) < 64);
+    try std.testing.expect(meanAbsentProbes(&mem.boxes) < 64);
+}
+
+test "swapRehashOnEvict returns the switch as it was, so a test can put it back" {
+    const at_start = rehashOnEvict();
+    defer setRehashOnEvict(at_start);
+    for ([_]bool{ true, false }) |outer| {
+        setRehashOnEvict(outer);
+        for ([_]bool{ true, false }) |inner| {
+            {
+                const was = swapRehashOnEvict(inner);
+                defer setRehashOnEvict(was);
+                try std.testing.expectEqual(outer, was);
+                try std.testing.expectEqual(inner, rehashOnEvict());
+            }
+            try std.testing.expectEqual(outer, rehashOnEvict());
+        }
     }
 }

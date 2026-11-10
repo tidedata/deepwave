@@ -26,6 +26,7 @@ extern fn ZSTD_freeCCtx(cctx: *CCtx) usize;
 extern fn ZSTD_CCtx_setParameter(cctx: *CCtx, param: c_int, value: c_int) usize;
 extern fn ZSTD_compress2(cctx: *CCtx, dst: [*]u8, dst_cap: usize, src: [*]const u8, src_size: usize) usize;
 extern fn ZSTD_compressBound(src_size: usize) usize;
+extern fn ZSTD_compressCCtx(cctx: *CCtx, dst: [*]u8, dst_cap: usize, src: [*]const u8, src_size: usize, level: c_int) usize;
 const ZSTD_c_compressionLevel: c_int = 100;
 const InBuf = extern struct { src: ?*const anyopaque, size: usize, pos: usize };
 const OutBuf = extern struct { dst: ?*anyopaque, size: usize, pos: usize };
@@ -317,6 +318,16 @@ pub const Dict = struct {
         if (ZSTD_isError(n) != 0 or n != out.len) return error.Corrupt;
     }
 };
+
+/// One plain zstd frame (no dictionary) of `src` at level `lvl` into `dst`, with a context
+/// borrowed from the process-wide pool (any thread, no setup per call). Null when it does not fit.
+pub fn compressPooled(src: []const u8, dst: []u8, lvl: i32) Error!?usize {
+    const cc = try cctx_pool.get();
+    defer cctx_pool.put(cc);
+    const n = ZSTD_compressCCtx(cc, dst.ptr, dst.len, src.ptr, src.len, lvl);
+    if (ZSTD_isError(n) != 0) return null;
+    return n;
+}
 
 pub fn compressBound(n: usize) usize {
     return ZSTD_compressBound(n);

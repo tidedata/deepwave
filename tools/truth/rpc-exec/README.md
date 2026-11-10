@@ -12,6 +12,7 @@ T=$CARGO_TARGET_DIR/release/zui-truth-rpc-exec
 $T gen $ZUI_CORPUS $ZUI_CORPUS/vectors/rpc-simulate [seq]   # every checkpoint at protocol >= 119
 $T fetch-packages $ZUI_CORPUS https://archive.mainnet.sui.io:443 <ids file>  # into vectors/rpc-simulate-pkgs
 $T bench simulate --iters N --list <file>                 # harness baseline (case 1, one thread)
+$T synth $ZUI_CORPUS <out.rec.zst> <seq>                  # synthetic DevInspect<true> transactions (below)
 ```
 
 `gen` writes `missing-packages.txt`: package ids execution asked for that neither `packages/` nor
@@ -61,3 +62,21 @@ zstd of repeated transaction blocks, little endian:
 14,646 checkpoints, 215,642 user transactions. With the 11 fetched packages (16:40), Rust's
 simulated effects equal the certified effects for 212,884 (flag bit 0; the suite compares deepwave with
 Rust's simulation either way), 0 package ids missing, 331 s on 8 threads. No S3 spend.
+
+## synth (`src/rpc_exec/testdata/devinspect_ill_typed.rec.zst`)
+
+`synth <corpus> <out file> <seq>` writes one record block (the format above) of synthetic
+transactions, run with checks disabled and a mock gas coin at the epoch of checkpoint `<seq>`
+(its system state and packages; the record keeps only the objects the transactions read). They
+call natives whose result is not of its declared type, in every position sui-node consumes such
+a value, next to the same calls with a type that fits (cases 30 to 47; 80 to 97 are the same
+with `command_outputs` in the mask):
+
+- 30 to 37, 47: `funds_accumulator::withdraw_from_accumulator_address<T>` (a struct of one u64
+  whatever `T` is) from the PTB, through `withdraw_impl` and through `redeem`.
+- 38 to 46: `config::read_setting_impl` over a stored `Setting<u64>` or `Setting<ID>` with a
+  `Value` type argument that is or is not the stored one.
+
+The committed file was made on 2026-11-10 (PST) with `<seq>` 342456160 (epoch 1304, protocol
+141): `$T synth $ZUI_CORPUS src/rpc_exec/testdata/devinspect_ill_typed.rec.zst 342456160`.
+rpc_exec's unit test replays it.

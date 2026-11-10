@@ -196,7 +196,7 @@ pub const Run = struct {
             .pure => |i| {
                 const pl = r.p.pure.items[i];
                 var rd = move_vm.loader.Reader{ .bytes = r.p.pureBytes(pl.input) };
-                const v = move_vm.types.deserialize(r.heap(), pl.ty, &rd, 0) catch return r.diag().unsupported("pure value does not deserialize");
+                const v = if (r.p.skip_checks) try r.arbitraryPure(pl.ty, &rd) else move_vm.types.deserialize(r.heap(), pl.ty, &rd, 0) catch return r.diag().unsupported("pure value does not deserialize");
                 try r.charge(move_vm.Meter.chargeCopyLoc, .{r.sizeOf(v)});
                 try r.charge(move_vm.Meter.chargeStoreLoc, .{});
                 s.* = v;
@@ -228,6 +228,33 @@ pub const Run = struct {
                 return Value.refSlot(s);
             },
         }
+    }
+
+    /// `load_pure_value` under `Mode::allow_arbitrary_values()` (DevInspect<true>): typing did
+    /// not validate the bytes, so `Value::deserialize` (`simple_deserialize` over the type's
+    /// runtime layout, the whole input) can fail, which is `invariant_violation!("unable to
+    /// deserialize value to type ..")` in the command that first uses the input, before its
+    /// load charges.
+    fn arbitraryPure(r: *Run, ty: Ty, rd: *move_vm.loader.Reader) Error!Value {
+        // `env.runtime_layout(&ty)?` comes first; its failure for a type over the layout limits
+        // is not modeled
+        _ = (try vm_host.layoutLimited(r.arena, ty, vm_host.Limits.of(r.sess.cfg))) orelse return r.diag().unsupported("checks disabled: pure value layout over the limits");
+        const v = move_vm.types.deserialize(r.heap(), ty, rd, 0) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.EndOfInput, error.BadUleb, error.BadBool, error.BadTag, error.TooDeep => return r.diag().failWith(.InvariantViolation, null),
+            else => return r.diag().unsupported("checks disabled: the type of a pure value does not load"),
+        };
+        if (rd.pos != rd.bytes.len) return r.diag().failWith(.InvariantViolation, null);
+        return v;
+    }
+
+    /// `Host.ill_typed` (DevInspect<true> only): a native returned a value that is not of its
+    /// declared type and did not say what layout it has (`abi.Outcome.ok.actual`), so where
+    /// sui-node would fail on it cannot be followed. The natives that can do this in sui-node
+    /// (`withdraw_from_accumulator_address`, `read_setting_impl`) do say; this is the guard for
+    /// any other.
+    fn illTyped(r: *Run) error{Unsupported} {
+        return r.diag().unsupported("checks disabled: a native returned a value that is not of its declared type");
     }
 
     fn argument(r: *Run, a: typing.Arg) Error!Value {
@@ -478,14 +505,25 @@ fn command(r: *Run, c: *typing.Cmd) Error!void {
             const f = r.sess.link.function(&call.pkg.original_id, call.module, call.name) catch return r.diag().unsupported("function does not link");
             const res = r.sess.run(f, call.ty_args, args) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.NativeUnsupported => return r.diag().unsupported("native not implemented"),
+                error.NativeUnsupported => return if (r.sess.taint_stopped) r.diag().unsupported("checks disabled: a native result that is not of its declared type reaches bytecode that does more than move it") else r.diag().unsupported("native not implemented"),
                 else => return r.diag().unsupported("VM load error"),
             };
             switch (res) {
                 .ok => |vals| out = try arena.dupe(Value, vals),
-                .err => |e| return r.diag().failWith(vmError(r, e), null),
+                .err => |e| return if (r.host.ill_typed) r.illTyped() else r.diag().failWith(vmError(r, e), null),
             }
             try takeEvents(r, call);
+            // DevInspect<true> only: a native handed back a value that is not of its declared
+            // type and it may be among the results. sui-node serializes every command result
+            // with its declared type's layout right here (`tracked_results`; `TRACK_EXECUTION` is
+            // on for every simulation, whatever the read mask says), and a value that does not
+            // fit is `invariant_violation!("Failed to serialize Move value")` in this command.
+            if (r.sess.tainted) {
+                if (out.len != call.returns.len) return r.diag().unsupported("command results and result types differ");
+                for (out, call.returns) |v, t| if (!try vm_host.valueSerializesAs(arena, t, v)) return r.diag().failWith(.InvariantViolation, null);
+                // the value was dropped on the way: nothing wrongly typed is left
+                r.sess.tainted = false;
+            }
         },
         .transfer => {
             const n = c.args.len - 1;
@@ -728,6 +766,12 @@ pub fn finish(r: *Run) Error!Results {
             if (std.mem.eql(u8, &w.id, &r.gas.id)) break i;
         } else return r.diag().unsupported("gas coin wrapped or destroyed");
         const w = &writes[wi];
+        // `coin_ref_value` / `coin_ref_add_balance` borrow field 1 of the written value, then its
+        // field 0 as a u64; each step that does not fit is `make_invariant_violation!`. Under
+        // DevInspect<true> the write under the gas coin's id need not be a coin (an object built
+        // from pure bytes with that id).
+        if (w.value != .@"struct" or w.value.@"struct".len < 2 or w.value.@"struct"[1] != .@"struct" or w.value.@"struct"[1].@"struct".len < 1 or w.value.@"struct"[1].@"struct"[0] != .u64)
+            return r.diag().failWith(.InvariantViolation, null);
         const fields = try arena.dupe(LV, w.value.@"struct");
         const bal = try arena.dupe(LV, fields[1].@"struct");
         bal[0] = .{ .u64 = std.math.add(u64, bal[0].u64, r.budget) catch return r.diag().failWith(.CoinBalanceOverflow, null) };
@@ -1224,7 +1268,7 @@ fn buildAndInit(r: *Run, pb: *const typing.Publish, mods: []ff.CompiledModule, b
             };
             switch (res) {
                 .ok => |vals| if (vals.len != 0) return r.diag().unsupported("init returned values"),
-                .err => |e| return r.diag().failWith(vmError(r, e), null),
+                .err => |e| return if (r.host.ill_typed) r.illTyped() else r.diag().failWith(vmError(r, e), null),
             }
             try takeEventsAt(r, id, m.selfName());
         }

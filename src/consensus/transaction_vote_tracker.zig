@@ -43,6 +43,8 @@ pub const TransactionVoteTracker = struct {
     votes: std.HashMapUnmanaged(types.BlockRef, *VoteInfo, store_mod.RefContext, 80) = .empty,
     order: std.ArrayList(types.BlockRef) = .empty,
     gc_round: types.Round = types.GENESIS_ROUND,
+    /// Removals from `votes` since its last rehash (store.zig `Churn`).
+    churn: store_mod.Churn = .{},
 
     pub fn init(gpa: Allocator, context: *const Context, dag: *dag_mod.DagState, tx_verifier: iface.TransactionVerifier) TransactionVoteTracker {
         return .{ .gpa = gpa, .context = context, .dag = dag, .tx_verifier = tx_verifier };
@@ -163,6 +165,7 @@ pub const TransactionVoteTracker = struct {
         if (cut > 0) {
             std.mem.copyForwards(types.BlockRef, self.order.items, self.order.items[cut..]);
             self.order.shrinkRetainingCapacity(self.order.items.len - cut);
+            self.churn.after(&self.votes, store_mod.RefContext{}, cut);
         }
     }
 };

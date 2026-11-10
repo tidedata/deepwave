@@ -1111,6 +1111,10 @@ pub const Store = struct {
     committed1: std.atomic.Value(u64) = .init(0),
     /// Envelopes served in place of stored ones (submitted signature order, txfix.zig).
     tx_fix: txfix.Table = .{},
+    /// Loaded runtime object lists served in place of stored aux records (txfix.zig, second use;
+    /// node/history.zig reads it, node/reconcile.zig installs). Memory only, like `tx_fix`: the
+    /// node's own log reinstalls it at start. Empty unless a repair happened.
+    list_fix: txfix.Table = .{},
     /// Checksum of the newest commit record (the chain anchor for the next group).
     last_commit: ?u64 = null,
     /// Highest committed checkpoint some meta ever recorded (never written lower).
@@ -1249,6 +1253,7 @@ pub const Store = struct {
         };
         s.cfg.dir = "";
         s.tx_fix = .{ .gpa = gpa, .readers = &s.creaders };
+        s.list_fix = .{ .gpa = gpa, .readers = &s.creaders };
         if (cfg.uaf_guard orelse (uaf_guard.default_on or uaf_guard.fromEnv())) {
             s.cache.mem = uaf_guard.allocator;
             switch (backend) {
@@ -1307,10 +1312,16 @@ pub const Store = struct {
         s.chunkReclaim();
         s.rcu.poll(s, reclaim);
         s.tx_fix.collect();
+        s.list_fix.collect();
     }
 
     /// Drops the transaction fixes (txfix.zig) of checkpoints below `floor`, no longer served.
     fn dropFixesBelow(s: *Store, floor: u64) void {
+        if (s.list_fix.count() > 0) {
+            if (s.list_fix.dropBelow(floor)) |n| {
+                if (n > 0) std.log.info("loaded list fixes: dropped {d} below checkpoint {d}", .{ n, floor });
+            } else |_| {} // memory only: retried at the next prune
+        }
         if (s.tx_fix.count() == 0) return;
         const n = s.tx_fix.dropBelow(floor) catch return; // memory only: retried at the next prune
         if (n > 0) std.log.info("transaction fixes: dropped {d} below checkpoint {d}", .{ n, floor });
@@ -1388,6 +1399,7 @@ pub const Store = struct {
         const gpa = s.gpa;
         s.pending_frees.deinit(gpa);
         s.tx_fix.deinit();
+        s.list_fix.deinit();
         s.stopAger();
         s.ager.batch_c = null;
         s.ageHandoffLocked();
@@ -4359,7 +4371,7 @@ pub const Store = struct {
         try s.backend.syncDir();
         s.clean.due = true;
         // Checkpoints in the aged segments are gone: so are their transaction fixes.
-        if (s.tx_fix.count() > 0) {
+        if (s.tx_fix.count() > 0 or s.list_fix.count() > 0) {
             var snap = s.snapshot();
             const low = snap.lowestCheckpoint();
             snap.release();

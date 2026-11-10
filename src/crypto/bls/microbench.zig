@@ -73,6 +73,26 @@ test "microbench" {
     t0 = now();
     for (0..n) |_| x = x.add(y);
     report("fp add", n, t0);
+    // the two carry forms `field.big_carry` picks between (it is false: per limb everywhere)
+    inline for (.{ false, true }) |big| {
+        const C = Fp.CarryForm(big);
+        const tag = if (big) "big-int " else "per-limb";
+        t0 = now();
+        for (0..n) |_| x = C.add(x, y);
+        report("fp add " ++ tag, n, t0);
+        t0 = now();
+        for (0..n) |_| x = C.sub(x, y);
+        report("fp sub " ++ tag, n, t0);
+        var wa = Fp.mulWide(x.l, y.l);
+        const wb = Fp.mulWide(y.l, y.l);
+        t0 = now();
+        for (0..n) |_| wa = C.addWideModMR(wa, wb);
+        report("fp wide add mod mR " ++ tag, n, t0);
+        t0 = now();
+        for (0..n) |_| wa = C.subWideModMR(wa, wb);
+        report("fp wide sub mod mR " ++ tag, n, t0);
+        std.mem.doNotOptimizeAway(&wa);
+    }
     var x2 = curve.g2_generator.x;
     const y2 = curve.g2_generator.y;
     t0 = now();
@@ -85,8 +105,23 @@ test "microbench" {
     for (0..1000) |_| x = x.inv();
     report("fp inv", 1000, t0);
     t0 = now();
-    for (0..1000) |_| x = x.add(y).invVartime();
-    report("fp inv vartime", 1000, t0);
+    for (0..10000) |_| x = x.add(y).invVartime();
+    report("fp inv vartime", 10000, t0);
+    t0 = now();
+    for (0..10000) |_| x = x.add(y).invEuclid();
+    report("fp inv euclid (old)", 10000, t0);
+    t0 = now();
+    for (0..10000) |_| x = Fp.invDivsteps(x.add(y)).?;
+    report("fp inv divsteps unchecked", 10000, t0);
+    var s = field.Fr.fromU64(0x1234567);
+    const s1 = field.Fr.fromU64(977);
+    t0 = now();
+    for (0..10000) |_| s = s.add(s1).invVartime();
+    report("fr inv vartime", 10000, t0);
+    t0 = now();
+    for (0..10000) |_| s = s.add(s1).invEuclid();
+    report("fr inv euclid (old)", 10000, t0);
+    std.mem.doNotOptimizeAway(&s);
     t0 = now();
     for (0..1000) |_| x = encoding.sqrtFp(x.sqr()).?;
     report("fp sqrt", 1000, t0);

@@ -221,7 +221,9 @@ pub fn loadPackagesSkipping(rt: *loader.Runtime, bytes: []const u8, skip_present
     var r = loader.Reader{ .bytes = bytes, .pos = 8 };
     const n = try rd32(&r);
     for (0..n) |_| {
-        var in: loader.PackageInput = undefined;
+        // Every field without a default is set below; the rest keep their defaults (`pre` is
+        // read by `addPackage`: left undefined it is a wild pointer).
+        var in: loader.PackageInput = .{ .version_id = undefined, .original_id = undefined, .version = undefined, .linkage = undefined, .type_origins = undefined, .modules = undefined };
         in.version_id = (try r.take(32))[0..32].*;
         in.original_id = (try r.take(32))[0..32].*;
         in.version = std.mem.readInt(u64, (try r.take(8))[0..8], .little);
@@ -1051,6 +1053,71 @@ fn frameworkRuntime(gpa: Allocator) !*loader.Runtime {
         _ = try rt.addPackage(.{ .version_id = p.id, .original_id = p.id, .version = 1, .linkage = link, .type_origins = &.{}, .modules = mods });
     }
     return rt;
+}
+
+test "loadPackages reads a packages.bin into a runtime (the input's optional fields at their defaults)" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const vers = try natives.framework.load(a);
+    const v = natives.framework.snapshot(vers, 141).?;
+    // packages.bin as the truth tool writes it: every package of the snapshot.
+    var bin: std.ArrayList(u8) = .empty;
+    const W = struct {
+        fn int(al: Allocator, l: *std.ArrayList(u8), comptime T: type, x: T) !void {
+            var b: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &b, x, .little);
+            try l.appendSlice(al, &b);
+        }
+    };
+    try bin.appendSlice(a, "ZUIMVPK1");
+    try W.int(a, &bin, u32, @intCast(v.packages.len));
+    for (v.packages) |p| {
+        try bin.appendSlice(a, &p.id);
+        try bin.appendSlice(a, &p.id);
+        try W.int(a, &bin, u64, 1);
+        try W.int(a, &bin, u32, @intCast(p.deps.len + 1));
+        try bin.appendSlice(a, &p.id);
+        try bin.appendSlice(a, &p.id);
+        for (p.deps) |d| {
+            try bin.appendSlice(a, &d);
+            try bin.appendSlice(a, &d);
+        }
+        try W.int(a, &bin, u32, 0); // type origins
+        try W.int(a, &bin, u32, @intCast(p.modules.len));
+        for (p.modules) |b| {
+            const cfg: move_format.BinaryConfig = .{};
+            const cm = switch (try move_format.deserialize(a, b, &cfg)) {
+                .ok => |cm| cm,
+                else => return error.BadModule,
+            };
+            try W.int(a, &bin, u32, @intCast(cm.selfName().len));
+            try bin.appendSlice(a, cm.selfName());
+            try W.int(a, &bin, u32, @intCast(b.len));
+            try bin.appendSlice(a, b);
+        }
+    }
+    var rt = loader.Runtime.init(gpa, try binaryConfig(protocol.max_protocol_version));
+    defer rt.deinit();
+    const before = loader.predecoded_loads.load(.monotonic);
+    try loadPackages(&rt, bin.items);
+    // Loaded from the bytes: packages.bin carries no predecoded modules.
+    try std.testing.expectEqual(before, loader.predecoded_loads.load(.monotonic));
+    const want = try frameworkRuntime(gpa);
+    defer {
+        want.deinit();
+        gpa.destroy(want);
+    }
+    for (v.packages) |p| {
+        const got = rt.package(&p.id) orelse return error.PackageNotLoaded;
+        try std.testing.expect(got.refused == null);
+        try loader.expectSamePackage(want.package(&p.id).?, got);
+    }
+    // With `skip_present` a second read of the same file adds nothing.
+    const count = rt.by_version.count();
+    try loadPackagesSkipping(&rt, bin.items, true);
+    try std.testing.expectEqual(count, rt.by_version.count());
 }
 
 test "verifier config across chains: only bytecode_version differs (testnet 52 to 54), and validation follows the chain" {

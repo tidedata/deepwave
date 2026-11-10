@@ -444,7 +444,7 @@ pub const Store = struct {
             if (!p.fetcher.markDone(m.seq)) {
                 m.outcome = .lost;
                 _ = p.stats.lost_race.fetchAdd(1, .monotonic);
-            } else if (p.fetcher.writeSpool(m.seq, m.blob, m.aux)) |_| {
+            } else if (p.fetcher.writeSpoolBuilt(m.seq, m.blob, m.aux)) |_| {
                 m.spooled = true;
                 m.spool_ms = source.wallMs();
             } else |_| {

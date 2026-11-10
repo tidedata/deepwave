@@ -35,6 +35,27 @@ const Atomic = std.atomic.Value(u64);
 /// Version under which a transaction's loaded runtime object list is stored.
 pub const loaded_version: u64 = std.math.maxInt(u64);
 
+/// Version under which a checkpoint the node built itself (p2p_exec.zig) is marked: an aux
+/// record `(p2pMarkId(seq), p2p_built_version)` in the checkpoint's own commit group, so the
+/// store says which checkpoints' read sets are deepwave's own word and still to be compared with
+/// sui-node's (reconcile.zig). Like `loaded_version` it is above every object version; the
+/// store's own aux keys are u64::MAX - 1 to - 3.
+pub const p2p_built_version: u64 = std.math.maxInt(u64) - 8;
+
+/// The marker's id: a fixed tag and the sequence number (never an object id: those are hashes).
+pub fn p2pMarkId(seq: u64) [32]u8 {
+    var id: [32]u8 = @splat(0);
+    const tag = "zui p2p-built checkpoint";
+    @memcpy(id[0..tag.len], tag);
+    std.mem.writeInt(u64, id[24..32], seq, .little);
+    return id;
+}
+
+/// Whether checkpoint `seq` was stored from a p2p build (and is still in the history window).
+pub fn p2pBuilt(snap: *const store.Snapshot, seq: u64) bool {
+    return snap.objectAt(&p2pMarkId(seq), p2p_built_version) != null;
+}
+
 /// One loaded runtime object in the stored list: `version` u64 le, then the 32-byte id. This is
 /// the in-memory layout of `serve.objset.Ref` (checked at compile time), so the provider hands
 /// serve the stored bytes without copying.
@@ -75,6 +96,11 @@ pub const History = struct {
     idx: types.CheckpointIndex,
     arena: std.heap.ArenaAllocator,
     buf: std.ArrayList(u8) = .empty,
+    /// Mark the checkpoints built here (`p2p_built_version`); set by the node when it
+    /// reconciles them (reconcile.zig).
+    mark_built: bool = false,
+    /// The last `onBatch`'s checkpoint was built here (and marked).
+    last_built: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, aux_dir: ?Io.Dir) !History {
         return .{ .gpa = gpa, .io = io, .aux_dir = aux_dir, .idx = try types.CheckpointIndex.init(gpa), .arena = .init(gpa) };
@@ -103,10 +129,26 @@ pub const History = struct {
         return h.buf.items;
     }
 
+    /// Whether the spool says checkpoint `seq` was built here: `<seq>.p2p` beside its blob
+    /// (source.zig `writeSpoolBuilt`).
+    fn builtHere(h: *History, seq: u64) bool {
+        const d = h.aux_dir orelse return false;
+        var nb: [48]u8 = undefined;
+        const name = std.fmt.bufPrint(&nb, "{d}.p2p", .{seq}) catch unreachable;
+        _ = d.statFile(h.io, name, .{}) catch return false;
+        return true;
+    }
+
     /// The follower's batch hook: adds the checkpoint's read set to its open batch.
     pub fn onBatch(h: *History, st: *store.Store, seq: u64, c: *const sync.verify.Checked, blob: []const u8, b: *store.Batch) !void {
         _ = h.arena.reset(.retain_capacity);
         const a = h.arena.allocator();
+        h.last_built = h.mark_built and h.builtHere(seq);
+        if (h.last_built) {
+            var le: [8]u8 = undefined;
+            std.mem.writeInt(u64, &le, seq, .little);
+            try b.putHistorical(&p2pMarkId(seq), p2p_built_version, &@as([32]u8, @splat(0)), &le);
+        }
         const aux_bytes = try h.readAux(seq);
         const aux: ?convert.Aux = if (aux_bytes.len == 0) null else try convert.Aux.parse(a, aux_bytes);
         if (aux == null) _ = h.stats.no_aux.fetchAdd(1, .monotonic);
@@ -278,7 +320,10 @@ pub fn loadedListNear(comptime T: type, snap: *const store.Snapshot, tx_digest: 
         std.debug.assert(@sizeOf(T) == entry_len and @offsetOf(T, "version") == 0 and @offsetOf(T, "id") == 8);
         std.debug.assert(@import("builtin").cpu.arch.endian() == .little);
     }
-    const bytes = snap.objectNear(tx_digest, loaded_version, at) orelse return &.{};
+    // A list installed in place of the stored record (store `list_fix`, reconcile.zig): the one
+    // read every reader shares, so a repaired list is served by all of them. One atomic load
+    // when the table is empty.
+    const bytes: []const u8 = if (snap.store.list_fix.find(tx_digest)) |fx| fx.tx else snap.objectNear(tx_digest, loaded_version, at) orelse return &.{};
     if (bytes.len % entry_len != 0 or @intFromPtr(bytes.ptr) % @alignOf(T) != 0) return &.{};
     const p: [*]const T = @ptrCast(@alignCast(bytes.ptr));
     return p[0 .. bytes.len / entry_len];

@@ -808,6 +808,10 @@ pub const Listener = struct {
             proto.errorResponse(&out, a, .rate_limited, "too many feed requests in flight", &.{ 0, 0, 0, 0 }) catch return;
             return l.respond(s, id, out.items);
         }
+        // a token in hello replaces the connection's principal when it is accepted (spec 6)
+        if (req.method == .hello) if (dispatch.helloToken(req.body)) |t| if (l.disp.hooks.auth) |au| if (au.check(au.ctx, t)) |p| {
+            s.principal = p;
+        };
         l.disp.handle(a, req, s.principal, &out);
         l.respond(s, id, out.items);
     }
@@ -1101,17 +1105,28 @@ pub const Listener = struct {
                 continue;
             }
             var budget: u32 = 64;
+            var failed: ?anyerror = null;
             while (budget > 0 and sb.cursor <= tip and c.streamUnsent(sb.data) < l.opts.sub_backlog) : (budget -= 1) {
                 if (sb.credit_on and sb.delivered >= sb.granted) break; // out of credit
                 const rec = snap.checkpoint(sb.cursor) orelse break;
                 _ = arena_state.reset(.retain_capacity);
                 out.clearRetainingCapacity();
-                const n = sub.produce(l.gpa, arena_state.allocator(), l.disp.svc, &snap, &l.keys, &sb.req, rec, &out) catch break;
+                const n = sub.produce(l.gpa, arena_state.allocator(), l.disp.svc, &snap, &l.keys, &sb.req, rec, &out) catch |e| {
+                    failed = e;
+                    break;
+                };
                 c.streamWrite(sb.data, out.items, false) catch break;
                 _ = l.stats.sub_frames.fetchAdd(1, .monotonic);
                 sb.cursor += 1;
                 sb.delivered += 1;
                 if (n > 0) sb.last_match_ms = l.nowMs();
+            }
+            if (failed) |e| {
+                // A checkpoint whose frames cannot be built (say its input objects are not held)
+                // would stall the stream forever: end it, naming the last checkpoint delivered.
+                std.log.warn("zui/1 subscription: checkpoint {d}: {s}; ending it (UNAVAILABLE)", .{ sb.cursor, @errorName(e) });
+                l.endSub(s, i, .unavailable, sb.cursor -| 1);
+                continue;
             }
             if (sb.live and sb.req.filter != .checkpoints) {
                 const now = l.nowMs();

@@ -9,6 +9,7 @@ pub const Verdict = verdict.Verdict;
 pub const Reason = verdict.Reason;
 pub const ed25519 = @import("ed25519.zig");
 pub const ed25519_ifma = @import("ed25519_ifma.zig");
+pub const ed25519_avx2 = @import("ed25519_avx2.zig");
 pub const ecdsa = @import("ecdsa.zig");
 pub const secp256k1 = ecdsa.secp256k1;
 pub const secp256r1 = ecdsa.secp256r1;

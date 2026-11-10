@@ -52,11 +52,16 @@ pub const Upstream = struct {
     pub fn acquire(u: *Upstream) ?*grpc.Conn {
         // released after the upstream lock: no connection lock is taken under it
         var stale: ?*grpc.Conn = null;
-        defer if (stale) |c| c.release();
+        defer if (stale) |c| c.retire();
         u.mu.lockUncancelable(u.io);
         defer u.mu.unlock(u.io);
         if (u.conn) |c| {
-            if (!c.isDead() or @as(u64, @intCast(Io.Clock.awake.now(u.io).nanoseconds)) -| c.diedAt() < u.cooldown_ns) {
+            // died: after the cooldown. Closed or closing with GOAWAY: at once (its open calls
+            // finish on it), unless it had held for less than the cooldown (a peer that sends
+            // GOAWAY to every new connection is not redialled for every call).
+            const going = c.isDraining();
+            const wait = if (!going or c.heldFor() < u.cooldown_ns) u.cooldown_ns else 0;
+            if ((!c.isDead() and !going) or @as(u64, @intCast(Io.Clock.awake.now(u.io).nanoseconds)) -| c.closedAt() < wait) {
                 c.retain();
                 return c;
             }

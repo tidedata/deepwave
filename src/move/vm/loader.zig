@@ -16,6 +16,7 @@ const move_format = @import("move_format");
 const value = @import("value.zig");
 const gas = @import("gas.zig");
 const types_mod = @import("types.zig");
+const loopaccel = @import("loopaccel.zig"); // loop accelerator attach point, see addPackage
 
 const Allocator = std.mem.Allocator;
 const ff = move_format.file_format;
@@ -134,7 +135,63 @@ pub const PackageInput = struct {
     linkage: []const [2]Address,
     type_origins: []const TypeOrigin,
     modules: []const NamedModule,
+    /// The modules already deserialized (a process-wide table hands them to every runtime, so
+    /// each thread stops deserializing and hashing the same bytes). Used only when it was made
+    /// from these very module slices under the runtime's binary config (`Predecoded.matches`);
+    /// otherwise `addPackage` deserializes as if it were null. It must outlive the runtime.
+    pre: ?*const Predecoded = null,
 };
+
+/// A package's modules deserialized ahead of `Runtime.addPackage`. Everything here is a pure
+/// function of the module bytes and the binary config, so one copy serves every runtime.
+/// Built by `predecode`; only a package whose modules all deserialize has one.
+pub const Predecoded = struct {
+    /// The modules in `addPackage`'s order (`sortModules`).
+    sorted: []const NamedModule,
+    /// `move_format.deserialize(sorted[i].bytes, binary)`.
+    cms: []const ff.CompiledModule,
+    binary: move_format.BinaryConfig,
+    /// `VerifiedSet.modulesDigest(sorted)`.
+    digest: [32]u8,
+
+    /// True when `sorted` (a runtime's own sorted copy of its input) is these modules, slice
+    /// for slice, and `binary` is the config they were deserialized under.
+    pub fn matches(x: *const Predecoded, binary: *const move_format.BinaryConfig, sorted: []const NamedModule) bool {
+        if (!std.meta.eql(x.binary, binary.*)) return false;
+        if (x.sorted.len != sorted.len or x.cms.len != sorted.len) return false;
+        for (x.sorted, sorted) |a, b| {
+            if (a.name.ptr != b.name.ptr or a.name.len != b.name.len) return false;
+            if (a.bytes.ptr != b.bytes.ptr or a.bytes.len != b.bytes.len) return false;
+        }
+        return true;
+    }
+};
+
+/// `addPackage`'s module order: by name (stable).
+pub fn sortModules(mods: []NamedModule) void {
+    std.mem.sort(NamedModule, mods, {}, struct {
+        fn lt(_: void, a: NamedModule, b: NamedModule) bool {
+            return std.mem.order(u8, a.name, b.name) == .lt;
+        }
+    }.lt);
+}
+
+/// Deserializes `modules` under `binary` into `arena` (which must outlive every runtime given
+/// the result). `digest`: `VerifiedSet.modulesDigest` of the sorted modules when the caller
+/// already has it. Null when a module does not deserialize: such a package is left to
+/// `addPackage`, which reports the refusal exactly as before.
+pub fn predecode(arena: Allocator, modules: []const NamedModule, binary: *const move_format.BinaryConfig, digest: ?[32]u8) Allocator.Error!?*const Predecoded {
+    const sorted = try arena.dupe(NamedModule, modules);
+    sortModules(sorted);
+    const cms = try arena.alloc(ff.CompiledModule, sorted.len);
+    for (sorted, cms) |nm, *cm| cm.* = switch (try move_format.deserialize(arena, nm.bytes, binary)) {
+        .ok => |x| x,
+        .err => return null,
+    };
+    const out = try arena.create(Predecoded);
+    out.* = .{ .sorted = sorted, .cms = cms, .binary = binary.*, .digest = digest orelse VerifiedSet.modulesDigest(sorted) };
+    return out;
+}
 
 pub const Package = struct {
     rt: *Runtime,
@@ -195,6 +252,9 @@ pub const Function = struct {
     /// The compiled code (interp.AotFn) of this function when the aot tier is on and the
     /// module's bytecode digest matched a compiled module (aot.attach); null: interpreted.
     aot: ?*const anyopaque = null,
+    /// The loop accelerators of this function (loopaccel.Attached) when loopaccel is on and the
+    /// module's bytecode matched a registered template (loopaccel.attach); null: none.
+    accel: ?*const anyopaque = null,
 };
 
 pub const Module = struct {
@@ -324,10 +384,15 @@ pub const VerifiedSet = struct {
     }
 
     pub fn key(pv: u64, sorted: []const NamedModule) [32]u8 {
+        return keyOf(pv, &modulesDigest(sorted));
+    }
+
+    /// Blake2b256 over the sorted (name, bytes) modules: the part of the key that does not
+    /// depend on the protocol version, so it is hashed once per package and kept
+    /// (`Predecoded.digest`).
+    pub fn modulesDigest(sorted: []const NamedModule) [32]u8 {
         var h = std.crypto.hash.blake2.Blake2b256.init(.{});
         var b8: [8]u8 = undefined;
-        std.mem.writeInt(u64, &b8, pv, .little);
-        h.update(&b8);
         for (sorted) |m| {
             std.mem.writeInt(u64, &b8, m.name.len, .little);
             h.update(&b8);
@@ -340,11 +405,26 @@ pub const VerifiedSet = struct {
         h.final(&out);
         return out;
     }
+
+    /// The set's key for a protocol version and a `modulesDigest`.
+    pub fn keyOf(pv: u64, digest: *const [32]u8) [32]u8 {
+        var h = std.crypto.hash.blake2.Blake2b256.init(.{});
+        var b8: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b8, pv, .little);
+        h.update(&b8);
+        h.update(digest);
+        var out: [32]u8 = undefined;
+        h.final(&out);
+        return out;
+    }
 };
 
 /// The process's verified-package set (see `VerifiedSet`). `enabled = false` turns sharing off.
 pub var verified: VerifiedSet = .{};
 pub var verified_enabled: bool = true;
+
+/// Packages `addPackage` loaded from a `Predecoded` (no deserialization, no hash over the bytes).
+pub var predecoded_loads: std.atomic.Value(u64) = .init(0);
 
 /// Called with every newly loaded, accepted package (aot.zig sets it when the tier is on).
 pub var aot_hook: ?*const fn (*Package) void = null;
@@ -447,13 +527,11 @@ pub const Runtime = struct {
         };
         try rt.by_version.put(rt.gpa, in.version_id, p);
         const sorted = try arena.dupe(NamedModule, in.modules);
-        std.mem.sort(NamedModule, sorted, {}, struct {
-            fn lt(_: void, a: NamedModule, b: NamedModule) bool {
-                return std.mem.order(u8, a.name, b.name) == .lt;
-            }
-        }.lt);
+        sortModules(sorted);
         const cms = try arena.alloc(ff.CompiledModule, sorted.len);
-        if (try rt.validate(p, sorted, cms)) |r| {
+        const pre: ?*const Predecoded = if (in.pre) |x| (if (x.matches(&rt.binary, sorted)) x else null) else null;
+        if (pre != null) _ = predecoded_loads.fetchAdd(1, .monotonic);
+        if (try rt.validate(p, sorted, cms, pre)) |r| {
             p.refused = r;
             return p;
         }
@@ -478,6 +556,7 @@ pub const Runtime = struct {
         // Same-package call targets need every module of the package.
         for (mods) |*m| try linkLocalCalls(m);
         if (aot_hook) |h| h(p);
+        loopaccel.attach(p); // loop accelerator attach point (a no-op unless loopaccel is on)
         const gop = try rt.by_original.getOrPut(rt.gpa, in.original_id);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(rt.gpa, p);
@@ -486,7 +565,12 @@ pub const Runtime = struct {
 
     /// `deserialization::translate::package` then `verification::translate::package`, with
     /// the errors as `expect_no_verification_errors` reports them. Fills `cms`.
-    fn validate(rt: *Runtime, p: *const Package, sorted: []const NamedModule, cms: []ff.CompiledModule) LoadError!?Refusal {
+    ///
+    /// `pre`: the same modules already deserialized under this runtime's binary config (every
+    /// one of them succeeded), with the digest of their bytes. Each module is then taken from
+    /// it instead of being deserialized again, and the verified-set key comes from its digest
+    /// instead of a hash over the bytes; every check runs in the same order on the same data.
+    fn validate(rt: *Runtime, p: *const Package, sorted: []const NamedModule, cms: []ff.CompiledModule, pre: ?*const Predecoded) LoadError!?Refusal {
         const arena = rt.arena_state.allocator();
         const vid = p.version_id;
         const at_pkg: Loc = .{ .package = vid };
@@ -496,7 +580,7 @@ pub const Runtime = struct {
             }
         }.f;
         for (sorted, cms, 0..) |nm, *cm, i| {
-            cm.* = switch (try move_format.deserialize(arena, nm.bytes, &rt.binary)) {
+            cm.* = if (pre) |x| x.cms[i] else switch (try move_format.deserialize(arena, nm.bytes, &rt.binary)) {
                 .ok => |x| x,
                 .err => |e| return refuse(e, at_pkg),
             };
@@ -510,7 +594,7 @@ pub const Runtime = struct {
         }
         const val = rt.validation orelse return null;
         if (sorted.len == 0) return refuse(ff.PartialVmError.new(.EMPTY_PACKAGE), at_pkg);
-        const vkey: ?[32]u8 = if (verified_enabled) if (val.cache_pv) |pv| VerifiedSet.key(pv, sorted) else null else null;
+        const vkey: ?[32]u8 = if (verified_enabled) if (val.cache_pv) |pv| (if (pre) |x| VerifiedSet.keyOf(pv, &x.digest) else VerifiedSet.key(pv, sorted)) else null else null;
         if (vkey) |k| if (verified.contains(&k)) {
             _ = verified.hits.fetchAdd(1, .monotonic);
             return null;
@@ -775,4 +859,218 @@ test "a huge vector length fails on the input, not the allocator" {
 test "reader uleb" {
     var r = Reader{ .bytes = &.{ 0x80, 0x01 } };
     try std.testing.expectEqual(@as(u64, 128), try r.uleb());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Predecoded modules: the package a runtime builds from them is the one it builds from bytes.
+
+/// Test helper: fails unless `a` and `b` (the same package loaded into two runtimes) agree in
+/// everything a session reads: the refusal, the package's tables, and per module the compiled
+/// module, the functions (code included), the datatypes, the constants and the call targets.
+pub fn expectSamePackage(a: *const Package, b: *const Package) !void {
+    const t = std.testing;
+    try t.expectEqual(a.refused == null, b.refused == null);
+    if (a.refused) |x| {
+        const y = b.refused.?;
+        try t.expectEqual(x.stage, y.stage);
+        try t.expectEqual(x.fail.err.major, y.fail.err.major);
+        try t.expectEqual(x.fail.err.sub_status, y.fail.err.sub_status);
+        try t.expectEqual(x.fail.err.n_indices, y.fail.err.n_indices);
+        try t.expectEqual(x.fail.err.n_offsets, y.fail.err.n_offsets);
+        try t.expectEqual(std.meta.activeTag(x.fail.loc), std.meta.activeTag(y.fail.loc));
+    }
+    try t.expectEqualSlices(u8, &a.version_id, &b.version_id);
+    try t.expectEqualSlices(u8, &a.original_id, &b.original_id);
+    try t.expectEqual(a.version, b.version);
+    try t.expectEqualDeep(a.linkage, b.linkage);
+    try t.expectEqualDeep(a.type_origins, b.type_origins);
+    try t.expectEqual(a.modules.len, b.modules.len);
+    for (a.modules, b.modules) |*m, *n| {
+        try t.expectEqualStrings(m.name, n.name);
+        try t.expectEqualDeep(m.cm, n.cm);
+        try t.expectEqualSlices(bool, m.gen_concrete, n.gen_concrete);
+        try t.expectEqual(m.functions.len, n.functions.len);
+        for (m.functions, n.functions) |*f, *g| {
+            try t.expectEqualStrings(f.name, g.name);
+            try t.expectEqual(f.def_idx, g.def_idx);
+            try t.expectEqual(f.is_native, g.is_native);
+            try t.expectEqual(f.n_locals, g.n_locals);
+            try t.expectEqual(f.n_type_params, g.n_type_params);
+            try t.expectEqualDeep(f.code, g.code);
+            try t.expectEqualDeep(f.jump_tables, g.jump_tables);
+            try t.expectEqualDeep(f.params, g.params);
+            try t.expectEqualDeep(f.locals, g.locals);
+            try t.expectEqualDeep(f.returns, g.returns);
+        }
+        inline for (.{ "structs", "enums" }) |field| {
+            const xs = @field(m, field);
+            const ys = @field(n, field);
+            try t.expectEqual(xs.len, ys.len);
+            for (xs, ys) |*d, *e| {
+                try t.expectEqualStrings(d.name, e.name);
+                try t.expectEqualStrings(d.module.name, e.module.name);
+                try t.expectEqual(d.def_idx, e.def_idx);
+                try t.expectEqual(d.is_enum, e.is_enum);
+                try t.expectEqual(d.n_type_params, e.n_type_params);
+                try t.expectEqualSlices(u8, &d.defining_id, &e.defining_id);
+                try t.expectEqualDeep(d.fields, e.fields);
+                try t.expectEqualDeep(d.variants, e.variants);
+            }
+        }
+        try t.expectEqual(m.constants.len, n.constants.len);
+        for (m.constants, n.constants) |c, d| {
+            try t.expectEqual(c.abstract_size, d.abstract_size);
+            try t.expectEqual(c.byte_len, d.byte_len);
+            try t.expect(value.equals(c.value, d.value));
+        }
+        try t.expectEqual(m.local_calls.len, n.local_calls.len);
+        for (m.local_calls, n.local_calls) |x, y| {
+            try t.expectEqual(x == null, y == null);
+            if (x) |f| {
+                try t.expectEqualStrings(f.module.name, y.?.module.name);
+                try t.expectEqualStrings(f.name, y.?.name);
+            }
+        }
+        try t.expectEqual(m.dt_handles.len, n.dt_handles.len);
+        for (m.dt_handles, n.dt_handles) |x, y| {
+            try t.expectEqual(x == null, y == null);
+            if (x) |d| try t.expectEqualStrings(d.name, y.?.name);
+        }
+    }
+}
+
+fn testBinaryConfig(pv: u64) !move_format.BinaryConfig {
+    const protocol = @import("protocol");
+    const b = try protocol.derived.binaryConfig(try protocol.get(pv, .mainnet), null);
+    var out: move_format.BinaryConfig = .{
+        .max_binary_format_version = b.max_binary_format_version,
+        .min_binary_format_version = b.min_binary_format_version,
+        .check_no_extraneous_bytes = b.check_no_extraneous_bytes,
+        .deprecate_global_storage_ops = b.deprecate_global_storage_ops,
+        .type_parameter_index_max = b.type_parameter_index_max,
+        .table_config = undefined,
+    };
+    inline for (@typeInfo(@TypeOf(b.table_config)).@"struct".field_names) |f| {
+        @field(out.table_config, f) = @field(b.table_config, f);
+    }
+    return out;
+}
+
+/// The embedded framework package as a loader input (module names from the modules).
+fn testInput(a: Allocator, p: anytype) !PackageInput {
+    const mods = try a.alloc(NamedModule, p.modules.len);
+    for (p.modules, mods) |b, *m| {
+        const cfg: move_format.BinaryConfig = .{};
+        const cm = switch (try move_format.deserialize(a, b, &cfg)) {
+            .ok => |cm| cm,
+            else => return error.BadModule,
+        };
+        m.* = .{ .name = cm.selfName(), .bytes = b };
+    }
+    const link = try a.alloc([2]Address, p.deps.len + 1);
+    link[0] = .{ p.id, p.id };
+    for (p.deps, link[1..]) |d, *l| l.* = .{ d, d };
+    return .{ .version_id = p.id, .original_id = p.id, .version = 1, .linkage = link, .type_origins = &.{}, .modules = mods };
+}
+
+test "a package loaded from predecoded modules is the package loaded from bytes (every embedded framework snapshot)" {
+    const protocol = @import("protocol");
+    const framework = @import("natives").framework;
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const vers = try framework.load(a);
+    var packages: usize = 0;
+    var validated: usize = 0;
+    for (vers, 0..) |*v, vi| {
+        if (v.version < protocol.min_protocol_version or v.version > protocol.max_protocol_version) continue;
+        const binary = testBinaryConfig(v.version) catch continue;
+        // The last three snapshots also run the load-time validation (the bytecode verifier
+        // and the verified set); the earlier ones only deserialize, check and build.
+        const validate_too = vi + 3 >= vers.len;
+        var cold = Runtime.init(gpa, binary);
+        defer cold.deinit();
+        var warm = Runtime.init(gpa, binary);
+        defer warm.deinit();
+        if (validate_too) {
+            const val = try @import("conformance.zig").validation(a, v.version, .mainnet);
+            cold.validation = val;
+            warm.validation = val;
+        }
+        for (v.packages) |*p| {
+            var in = try testInput(a, p);
+            const x = try cold.addPackage(in);
+            try std.testing.expect(x.refused == null);
+            const pre = (try predecode(a, in.modules, &binary, null)).?;
+            in.pre = pre;
+            const loads = predecoded_loads.load(.monotonic);
+            const hits = verified.hits.load(.monotonic);
+            const y = try warm.addPackage(in);
+            try std.testing.expectEqual(loads + 1, predecoded_loads.load(.monotonic));
+            // The key made from the kept digest is the key made from the bytes: the cold load
+            // recorded the verifier's acceptance and this one finds it.
+            if (validate_too and verified_enabled) {
+                try std.testing.expectEqual(hits + 1, verified.hits.load(.monotonic));
+                try std.testing.expectEqualSlices(u8, &VerifiedSet.key(v.version, pre.sorted), &VerifiedSet.keyOf(v.version, &pre.digest));
+                validated += 1;
+            }
+            try expectSamePackage(x, y);
+            packages += 1;
+        }
+    }
+    try std.testing.expect(packages >= 300);
+    try std.testing.expect(validated >= 10);
+}
+
+test "predecoded modules are used only for the same slices under the same binary config" {
+    const framework = @import("natives").framework;
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const vers = try framework.load(a);
+    const p = &vers[vers.len - 1].packages[0];
+    const binary: move_format.BinaryConfig = .{};
+    var in = try testInput(a, p);
+    var ref = Runtime.init(gpa, binary);
+    defer ref.deinit();
+    const want = try ref.addPackage(in);
+
+    // Made under another binary config: ignored, the runtime deserializes for itself.
+    var other = binary;
+    other.check_no_extraneous_bytes = !other.check_no_extraneous_bytes;
+    in.pre = (try predecode(a, in.modules, &other, null)).?;
+    {
+        var rt = Runtime.init(gpa, binary);
+        defer rt.deinit();
+        const loads = predecoded_loads.load(.monotonic);
+        try expectSamePackage(want, try rt.addPackage(in));
+        try std.testing.expectEqual(loads, predecoded_loads.load(.monotonic));
+    }
+    // Made from other memory holding the same bytes: ignored too.
+    const copies = try a.alloc(NamedModule, in.modules.len);
+    for (in.modules, copies) |m, *c| c.* = .{ .name = m.name, .bytes = try a.dupe(u8, m.bytes) };
+    in.pre = (try predecode(a, copies, &binary, null)).?;
+    {
+        var rt = Runtime.init(gpa, binary);
+        defer rt.deinit();
+        const loads = predecoded_loads.load(.monotonic);
+        try expectSamePackage(want, try rt.addPackage(in));
+        try std.testing.expectEqual(loads, predecoded_loads.load(.monotonic));
+    }
+    // A module that does not deserialize: no predecoded form, and the runtime refuses the
+    // package as before.
+    const broken = try a.dupe(NamedModule, in.modules);
+    broken[0].bytes = broken[0].bytes[0 .. broken[0].bytes.len / 2];
+    try std.testing.expect((try predecode(a, broken, &binary, null)) == null);
+    in.pre = null;
+    in.modules = broken;
+    {
+        var rt = Runtime.init(gpa, binary);
+        defer rt.deinit();
+        const got = try rt.addPackage(in);
+        try std.testing.expect(got.refused != null);
+        try std.testing.expect(rt.package(&in.version_id) == null);
+    }
 }

@@ -66,6 +66,23 @@ pub const Engine = struct {
     proposers: ?ProposerSelector = null,
     /// The request's `x-sui-client-protocol-version` header; set on a copy per request.
     client_protocol_version: ?u64 = null,
+    /// What a request with checks disabled gets (`--dev-inspect-disabled`, fullnode.yaml
+    /// `dev-inspect-disabled`).
+    dev_inspect: DevInspect = default_dev_inspect,
+
+    pub const DevInspect = enum {
+        /// `dev-inspect-disabled: true`: sui-node's refusal (`AuthorityState::simulate_transaction`).
+        refused,
+        /// The operator did not say (deepwave's default for now): no DevInspect<true> execution. The
+        /// transaction runs under the rules of execution with checks, and a request whose
+        /// answer needs the relaxed rules (inputs that fail the signing checks, a failure
+        /// DevInspect<true> would not raise) is UNIMPLEMENTED.
+        guarded,
+        /// `dev-inspect-disabled: false` (sui-node's default): executed as DevInspect<true>.
+        enabled,
+    };
+    /// The state without `--dev-inspect-disabled` and without the fullnode.yaml key.
+    pub const default_dev_inspect: DevInspect = .guarded;
 
     pub const ProposerSelector = struct {
         ctx: *anyopaque,
@@ -449,8 +466,8 @@ const Pre = struct {
     const vtable: ptb.PreState.VTable = .{ .shared_latest = sharedLatest, .child_at_most = childAtMost, .address_balance = addressBalance };
 };
 
-/// Failures DevInspect<true> does not raise (arbitrary calls and values, no conservation checks):
-/// that execution goes on where normal execution stopped.
+/// `Engine.DevInspect.guarded`: failures DevInspect<true> does not raise (arbitrary calls and
+/// values, no conservation checks). Its execution goes on where execution with checks stopped.
 fn relaxedFailure(eff: *const types.TransactionEffects) ?[]const u8 {
     const status = switch (eff.*) {
         .V2 => |v| v.status,
@@ -486,8 +503,11 @@ fn loadedOf(arena: Allocator, kind: checks.InputKind, raw: []const u8) !Loaded {
     return .{ .kind = kind, .raw = raw, .view = v, .owner = try ownerOf(arena, raw, &v) };
 }
 
-/// `dev_inspect` is checks disabled: `check_dev_inspect_input` and DevInspect<true>, whose relaxed
-/// checks only turn failures into successes, so a valid transaction has the same effects.
+/// `dev_inspect` is checks disabled: `check_dev_inspect_input` in place of
+/// `check_transaction_input` (no ownership, replay protection or receiving checks; the gas checks
+/// without the ownership pass) and execution as DevInspect<true> (`ptb.Inputs.skip_all_checks`),
+/// when `Engine.dev_inspect` is `enabled`. `refused` answers sui-node's refusal; `guarded` never
+/// runs DevInspect<true> (see `Engine.DevInspect`).
 /// The simulation core (`transaction_simulation::simulate_transaction`): the gRPC handler above
 /// and the native engine (`src/exec/simulate`) both run transactions through it.
 pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: State, tx_raw: []const u8, td_in: types.TransactionDataV1, allow_mock: bool, dev_inspect: bool) !RunResult {
@@ -495,6 +515,9 @@ pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: Stat
     var td = td_in;
     // AuthorityState::simulate_transaction
     if (checks.isSystemKind(&td.kind)) return .{ .fail = try checks.unsupportedFeature(arena, "simulate does not support system transactions", .{}) };
+    // `checks.disabled() && self.config.dev_inspect_disabled`
+    if (dev_inspect and e.dev_inspect == .refused) return .{ .fail = try checks.unsupportedFeature(arena, "simulate with checks disabled is not allowed on this node", .{}) };
+    const relaxed = dev_inspect and e.dev_inspect == .enabled;
 
     // coin reservations in gas payment
     if (!protocol.derived.enableCoinReservationObjRefs(cfg)) {
@@ -607,12 +630,14 @@ pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: Stat
     // ---- check_transaction_input
     if (dev_inspect) {
         if (try checks.devInspectInput(arena, cfg, env.rgp, &td, loaded)) |f| return .{ .fail = f };
-        // ownership, replay and receiving checks are skipped there; execution assumes them
-        if (try checks.objectsInput(arena, cfg, &td, loaded, recv.items, recv_objs)) |_|
+        // guarded: the ownership, replay and receiving checks are skipped there, and execution
+        // with checks assumes them
+        if (!relaxed) if (try checks.objectsInput(arena, cfg, &td, loaded, recv.items, recv_objs)) |_|
             return .{ .unimplemented = "checks disabled: inputs that fail the signing checks are not supported" };
     } else if (try checks.transactionInput(arena, cfg, env.rgp, &td, loaded, recv.items, recv_objs)) |f| return .{ .fail = f };
 
-    // ---- execution (DevInspect<false>: the effects of normal execution)
+    // ---- execution (`dev_inspect_transaction(.., skip_all_checks = dev_inspect)`: DevInspect<false>
+    // has the effects of normal execution, DevInspect<true> its relaxed rules)
     var lookup: Lookup = .{ .state = state, .mock = mock };
     var pre: Pre = .{ .state = state, .arena = arena };
     const res = ptb.execute(arena, .{
@@ -631,6 +656,7 @@ pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: Stat
         .state = .{ .ctx = &pre, .vtable = &Pre.vtable },
         .reservation_types = withdraw_types,
         .track_results = e.track_results,
+        .skip_all_checks = relaxed,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .unimplemented = try std.fmt.allocPrint(arena, "execution: {s}", .{@errorName(err)}) },
@@ -641,7 +667,7 @@ pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: Stat
         .unsupported => |why| return .{ .unimplemented = why },
     };
     const eff = try bcs.decode(types.TransactionEffects, arena, o.effects);
-    if (dev_inspect) if (relaxedFailure(&eff)) |why| return .{ .unimplemented = why };
+    if (dev_inspect and !relaxed) if (relaxedFailure(&eff)) |why| return .{ .unimplemented = why };
 
     // ---- unchanged_loaded_runtime_objects: runtime loads (packages excluded), one per id (the
     // highest version wins, as in an ObjectSet walk), minus every changed object.
@@ -926,11 +952,13 @@ fn gaslessCandidate(arena: Allocator, cfg: *const protocol.ProtocolConfig, state
         else => if (!u) return false,
     };
     if (unused_pure > max_unused) return false;
-    // input_objects (duplicates fail) and check_gasless_object_inputs
+    // input_objects (duplicates fail) and check_gasless_object_inputs. A coin reservation (an
+    // ImmOrOwnedObject ref whose digest is a reservation) is a withdrawal, not an input object
+    // (`CallArg::input_objects`): no object is loaded for it and it is no duplicate of anything.
     for (pt.inputs, 0..) |*a, i| {
         const id: Id = switch (a.*) {
             .Object => |o| switch (o) {
-                .ImmOrOwnedObject => |r| r[0].@"0".@"0",
+                .ImmOrOwnedObject => |r| if (checks.isCoinReservation(&r[2].@"0".@"0")) continue else r[0].@"0".@"0",
                 .SharedObject => |sh| sh.id.@"0".@"0",
                 .Receiving => return false,
             },
@@ -938,7 +966,7 @@ fn gaslessCandidate(arena: Allocator, cfg: *const protocol.ProtocolConfig, state
         };
         for (pt.inputs[0..i]) |*b| switch (b.*) {
             .Object => |o| switch (o) {
-                .ImmOrOwnedObject => |r| if (std.mem.eql(u8, &r[0].@"0".@"0", &id)) return false,
+                .ImmOrOwnedObject => |r| if (!checks.isCoinReservation(&r[2].@"0".@"0") and std.mem.eql(u8, &r[0].@"0".@"0", &id)) return false,
                 .SharedObject => |sh| if (std.mem.eql(u8, &sh.id.@"0".@"0", &id)) return false,
                 .Receiving => {},
             },
@@ -1287,6 +1315,473 @@ test "command outputs carry json rendered from the value's type layout" {
     // json switched off: the plain encoding
     const off: serve.render_object.Ctx = .{ .resolver = res, .json_on = false };
     try std.testing.expectEqualSlices(u8, try encodeCommandOutputs(arena, &results), try encodeCommandOutputsCtx(arena, &results, &off));
+}
+
+// ---- checks disabled (DevInspect<true>) through the handler -------------------------------------
+// The system packages come from the corpus (`ptb.devinspect_test.Fixture`): skipped without it.
+
+/// A `SimulateTransactionRequest`: `transaction.bcs.value`, the read mask and `checks`.
+fn testRequest(arena: Allocator, tx_raw: []const u8, mask: []const []const u8, checks_disabled: bool) ![]const u8 {
+    var bcs_msg: std.ArrayList(u8) = .empty;
+    try pbBytes(arena, &bcs_msg, 2, tx_raw);
+    var tx: std.ArrayList(u8) = .empty;
+    try pbBytes(arena, &tx, 1, bcs_msg.items);
+    var fm: std.ArrayList(u8) = .empty;
+    for (mask) |path| try pbBytes(arena, &fm, 1, path);
+    var req: std.ArrayList(u8) = .empty;
+    try pbBytes(arena, &req, 1, tx.items);
+    try pbBytes(arena, &req, 2, fm.items);
+    if (checks_disabled) try pbVarint(arena, &req, 3, 1); // TransactionChecks::DISABLED
+    return req.items;
+}
+
+fn testEnv(f: *const ptb.devinspect_test.Fixture) EpochEnv {
+    return .{ .chain_id = @splat(0), .epoch = f.epoch, .pv = f.pv, .cfg = f.cfg, .rgp = f.rgp, .epoch_start_ms = f.start_ms, .committee_size = 100 };
+}
+
+fn testState(arena: Allocator, f: *const ptb.devinspect_test.Fixture) !*state_mod.MapState {
+    const ms = try arena.create(state_mod.MapState);
+    ms.* = .{};
+    var it = f.objs.iterator();
+    while (it.next()) |kv| try ms.put(arena, kv.key_ptr.*, (try ObjectView.parse(kv.value_ptr.*)).version, kv.value_ptr.*);
+    return ms;
+}
+
+/// One `CommandResult` holding one return value: `CommandOutput { value: Bcs { name, value },
+/// json: Value { string_value } }`.
+fn testReturnOutput(arena: Allocator, type_name: []const u8, value: []const u8, json_string: []const u8) ![]const u8 {
+    var b: std.ArrayList(u8) = .empty;
+    try pbBytes(arena, &b, 1, type_name);
+    try pbBytes(arena, &b, 2, value);
+    var j: std.ArrayList(u8) = .empty;
+    try pbBytes(arena, &j, 3, json_string);
+    var o: std.ArrayList(u8) = .empty;
+    try pbBytes(arena, &o, 2, b.items);
+    try pbBytes(arena, &o, 3, j.items);
+    var cr: std.ArrayList(u8) = .empty;
+    try pbBytes(arena, &cr, 1, o.items);
+    var out: std.ArrayList(u8) = .empty;
+    try pbBytes(arena, &out, 2, cr.items);
+    return out.items;
+}
+
+// sui-core `simulate_transaction`: `check_dev_inspect_input` in place of `check_transaction_input`
+// when checks are disabled (no `check_objects` ownership pass, `check_gas` with
+// `gas_ownership_checks = false`), then `dev_inspect_transaction(.., skip_all_checks = true)`;
+// sui-rpc-api renders `execution_result` as `command_outputs` with each value's `json`.
+test "checks disabled: an object and a gas coin of another address execute; command outputs carry json" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const dt = ptb.devinspect_test;
+    var f: dt.Fixture = undefined;
+    try f.init(arena, std.testing.io);
+    defer f.deinit();
+    const other: types.Owner = .{ .AddressOwner = .{ .@"0" = dt.idOf(0x77) } };
+    const coin = try dt.coinObject(arena, dt.idOf(0x71), 5, 5000, other);
+    const gas = try dt.coinObject(arena, dt.idOf(0x72), 9, dt.gas_balance, other);
+    try f.add(coin);
+    try f.add(gas);
+    var td = try f.data(.{
+        .inputs = &.{ .{ .Pure = &.{ 2, 'h', 'i' } }, .{ .Object = .{ .ImmOrOwnedObject = try dt.refOf(coin) } } },
+        .commands = &.{
+            dt.moveCall(1, "string", "utf8", &.{}, &.{.{ .Input = 0 }}),
+            dt.moveCall(2, "coin", "value", &.{dt.suiInput()}, &.{.{ .Input = 1 }}),
+        },
+    });
+    const engine: Engine = .{ .gpa = std.heap.page_allocator, .pkgs = &f.pkgs, .dev_inspect = .enabled };
+    const env = testEnv(&f);
+    const ms = try testState(arena, &f);
+    const mask: []const []const u8 = &.{"command_outputs"};
+
+    var want: std.ArrayList(u8) = .empty;
+    try want.appendSlice(arena, try testReturnOutput(arena, "0x0000000000000000000000000000000000000000000000000000000000000001::string::String", &.{ 2, 'h', 'i' }, "hi"));
+    try want.appendSlice(arena, try testReturnOutput(arena, "u64", try dt.u64Bytes(arena, 5000), "5000"));
+
+    // the sender's own gas coin, another address's object; then another address's gas coin too
+    for (0..2) |round| {
+        if (round == 1) {
+            const pay = try arena.alloc(@typeInfo(@TypeOf(td.V1.gas_data.payment)).pointer.child, 1);
+            const r = try dt.refOf(gas);
+            pay[0] = .{ r[0], r[1], r[2] };
+            td.V1.gas_data.payment = pay;
+        }
+        const tx_raw = try bcs.encodeAlloc(types.TransactionData, arena, &td);
+        // checks on: check_one_object refuses an object of another address
+        switch (try engine.simulate(arena, &env, ms.state(), try testRequest(arena, tx_raw, mask, false))) {
+            .ok => return error.TestUnexpectedResult,
+            .err => |e| {
+                try std.testing.expectEqual(@as(u8, code_invalid_argument), e.code);
+                try std.testing.expect(std.mem.indexOf(u8, e.message, "is owned by account address") != null);
+            },
+        }
+        // checks off: it runs
+        switch (try engine.simulate(arena, &env, ms.state(), try testRequest(arena, tx_raw, mask, true))) {
+            .ok => |resp| try std.testing.expectEqualSlices(u8, want.items, resp),
+            .err => |e| {
+                std.debug.print("checks disabled: code {d}: {s}\n", .{ e.code, e.message });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
+// `check_dev_inspect_input` still runs `check_gas` (SuiGasStatus::new and check_gas_balance): the
+// gas price and budget rules hold with checks disabled.
+test "checks disabled: the gas price and budget rules still hold" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const dt = ptb.devinspect_test;
+    var f: dt.Fixture = undefined;
+    try f.init(arena, std.testing.io);
+    defer f.deinit();
+    const engine: Engine = .{ .gpa = std.heap.page_allocator, .pkgs = &f.pkgs, .dev_inspect = .enabled };
+    const env = testEnv(&f);
+    const ms = try testState(arena, &f);
+    const pt: types.ProgrammableTransaction = .{
+        .inputs = &.{.{ .Pure = try dt.u64Bytes(arena, 7) }},
+        .commands = &.{dt.moveCall(1, "u64", "max", &.{}, &.{ .{ .Input = 0 }, .{ .Input = 0 } })},
+    };
+    const Case = struct { price: u64, budget: u64, message: []const u8 };
+    const cases = [_]Case{
+        .{ .price = f.rgp - 1, .budget = dt.budget, .message = "Error checking transaction input objects: Gas price 99 under reference gas price (RGP) 100" },
+        .{ .price = f.rgp, .budget = dt.gas_balance + 1, .message = "Error checking transaction input objects: Balance of gas object 1000000000000 is lower than the needed amount: 1000000000001" },
+    };
+    for (cases) |c| {
+        var td = try f.data(pt);
+        td.V1.gas_data.price = c.price;
+        td.V1.gas_data.budget = c.budget;
+        const tx_raw = try bcs.encodeAlloc(types.TransactionData, arena, &td);
+        switch (try engine.simulate(arena, &env, ms.state(), try testRequest(arena, tx_raw, &.{"command_outputs"}, true))) {
+            .ok => return error.TestUnexpectedResult,
+            .err => |e| {
+                try std.testing.expectEqual(@as(u8, code_invalid_argument), e.code);
+                try std.testing.expectEqualStrings(c.message, e.message);
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 100), f.rgp);
+}
+
+// sui-node's own answers (`zui-truth-rpc-exec synth`: Mysten's SimulateTransaction handler over
+// transaction_simulation, checks disabled, a mock gas coin) for natives whose result is not of
+// its declared type, in every position sui-node consumes such a value, next to the same calls
+// with a type that fits. 18 transactions, each with and without `command_outputs` in the mask:
+// - `funds_accumulator::withdraw_from_accumulator_address<T>` (a struct of one u64 whatever `T`
+//   is) from the PTB, through `withdraw_impl` and through `redeem`; `T` = u256, u64, ID,
+//   vector<u64> (InvariantViolation in command 0) and Balance<SUI>, Supply<SUI> (success)
+// - `config::read_setting_impl` with a `Value` that is not the stored one: a vector<u64> as
+//   Option<u8>, Option<String>, also when it is empty (InvariantViolation: a vector of a
+//   primitive keeps its element kind), an empty vector<ID> as Option<u8> (success: a generic
+//   vector is checked element by element), a vector<ID> as Option<u64> and Option<address>
+// The record has the rpc-simulate format (tools/truth/rpc-exec/README.md).
+test "checks disabled: a native result that is not of its declared type answers as sui-node (Rust-made vectors)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const dt = ptb.devinspect_test;
+    const conformance = @import("conformance.zig");
+    var f: dt.Fixture = undefined;
+    try f.init(arena, std.testing.io);
+    defer f.deinit();
+    const data = try @import("harness").decompressZstd(arena, @embedFile("testdata/devinspect_ill_typed.rec.zst"), 1 << 24);
+    const blocks = try conformance.parseRecord(arena, data);
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    const b = &blocks[0];
+    // the fixture's system packages are the record's epoch
+    try std.testing.expectEqual(f.epoch, b.epoch);
+    try std.testing.expectEqual(f.pv, b.pv);
+    try std.testing.expectEqual(@as(usize, 36), b.cases.len);
+    const ms = try conformance.mapState(arena, b.objects);
+    const env = try conformance.envOf(serve.b58.decode32(conformance.mainnet_chain_id_b58).?, b);
+    const engine: Engine = .{ .gpa = std.heap.page_allocator, .pkgs = &f.pkgs, .dev_inspect = .enabled };
+    var failures: usize = 0;
+    for (b.cases) |*k| {
+        switch (try engine.simulate(arena, &env, ms.state(), k.request)) {
+            .ok => |resp| {
+                if (k.code != 0 or !std.mem.eql(u8, resp, k.response)) {
+                    std.debug.print("case {d}: zui answered OK with {d} bytes; sui-node code {d}, {d} bytes\n", .{ k.case, resp.len, k.code, k.response.len });
+                    return error.TestUnexpectedResult;
+                }
+                // TransactionEffects.status.error (ExecutionError.kind = INVARIANT_VIOLATION is 20)
+                if (std.mem.indexOf(u8, resp, "InvariantViolation in command 0") != null) failures += 1;
+            },
+            .err => |e| {
+                std.debug.print("case {d}: zui code {d} \"{s}\"; sui-node code {d} \"{s}\"\n", .{ k.case, e.code, e.message, k.code, k.message });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+    // 12 of the 18 transactions fail that way, under both masks
+    try std.testing.expectEqual(@as(usize, 24), failures);
+}
+
+// ---- gasless simulation with a coin reservation input --------------------------------------------
+
+// sui-rpc-api simulate/mod.rs `is_gasless_candidate` loads `transaction.input_objects()`, and
+// sui-types `CallArg::input_objects` yields nothing for an ImmOrOwnedObject ref whose digest is a
+// coin reservation: the ref names the sender's balance, not an object, so no object is looked up
+// for it. Every other object input must still be in the store.
+test "gasless candidate: a coin reservation input is not an input object to load" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const dt = ptb.devinspect_test;
+    const cfg = try protocol.get(141, .mainnet);
+    var usdc_addr: Id = undefined;
+    _ = try std.fmt.hexToBytes(&usdc_addr, "dba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7");
+    const usdc: types.TypeInput = .{ .@"struct" = .{ .address = .{ .@"0" = usdc_addr }, .module = .{ .@"0" = "usdc" }, .name = .{ .@"0" = "USDC" }, .type_args = &.{} } };
+    // a reservation digest: the amount, then 20 bytes of 0xac at the end
+    var res_digest: Id = @splat(0);
+    std.mem.writeInt(u64, res_digest[0..8], 1_000_000, .little);
+    @memset(res_digest[12..32], 0xac);
+    const ObjRef = @FieldType(types.ObjectArg, "ImmOrOwnedObject");
+    const reservation: ObjRef = .{ .{ .@"0" = .{ .@"0" = dt.idOf(0x0d) } }, .{ .@"0" = 7 }, .{ .@"0" = .{ .@"0" = res_digest } } };
+    const object: ObjRef = .{ .{ .@"0" = .{ .@"0" = dt.idOf(0x0d) } }, .{ .@"0" = 7 }, .{ .@"0" = .{ .@"0" = dt.idOf(0x33) } } };
+    const empty: state_mod.MapState = .{};
+    const req: resolve.Request = .{};
+    const send = dt.moveCall(2, "coin", "send_funds", &.{usdc}, &.{ .{ .Input = 0 }, .{ .Input = 1 } });
+    const send_second = dt.moveCall(2, "coin", "send_funds", &.{usdc}, &.{ .{ .Input = 2 }, .{ .Input = 1 } });
+    const recipient: types.CallArg = .{ .Pure = &dt.idOf(0x44) };
+    const data = struct {
+        fn of(inputs: []const types.CallArg, commands: []const types.Command) types.TransactionDataV1 {
+            return .{
+                .kind = .{ .ProgrammableTransaction = .{ .inputs = inputs, .commands = commands } },
+                .sender = .{ .@"0" = dt.sender },
+                .gas_data = .{ .payment = &.{}, .owner = .{ .@"0" = dt.sender }, .price = 0, .budget = 0 },
+                .expiration = .None,
+            };
+        }
+    }.of;
+
+    // the reservation names no object in the store: still a candidate
+    const one = data(&.{ .{ .Object = .{ .ImmOrOwnedObject = reservation } }, recipient }, &.{send});
+    try std.testing.expect(try gaslessCandidate(arena, cfg, empty.state(), &req, false, &one));
+    // the same reservation twice is no duplicate object input either
+    const two = data(&.{ .{ .Object = .{ .ImmOrOwnedObject = reservation } }, recipient, .{ .Object = .{ .ImmOrOwnedObject = reservation } } }, &.{ send, send_second });
+    try std.testing.expect(try gaslessCandidate(arena, cfg, empty.state(), &req, false, &two));
+    // an object ref under the same id is an input object: missing from the store, no candidate
+    const missing = data(&.{ .{ .Object = .{ .ImmOrOwnedObject = object } }, recipient }, &.{send});
+    try std.testing.expect(!try gaslessCandidate(arena, cfg, empty.state(), &req, false, &missing));
+    // and next to a reservation the missing object still decides
+    const mixed = data(&.{ .{ .Object = .{ .ImmOrOwnedObject = reservation } }, recipient, .{ .Object = .{ .ImmOrOwnedObject = object } } }, &.{ send, send_second });
+    try std.testing.expect(!try gaslessCandidate(arena, cfg, empty.state(), &req, false, &mixed));
+    // a transaction given as bcs, or with a gas price, is never one
+    try std.testing.expect(!try gaslessCandidate(arena, cfg, empty.state(), &req, true, &one));
+    const priced: resolve.Request = .{ .gas = .{ .price = 100 } };
+    try std.testing.expect(!try gaslessCandidate(arena, cfg, empty.state(), &priced, false, &one));
+}
+
+// Mainnet checkpoint 342452733, transaction 11, answered by sui-node 1.83.1 (rpc-simulate record
+// format, tools/truth/rpc-exec/README.md): `0x2::coin::send_funds<USDC>` of a coin reservation
+// of the sender's USDC balance. Cases: 1 the signed bytes (gas from the address balance), 5 gas
+// selection over the bytes, 6 gas selection with a budget the sender's SUI does not cover
+// (INVALID_ARGUMENT), 7 the unresolved transaction with gas selection, which sui-node simulates
+// gasless and keeps (all gas costs 0). The pre-state is the record's without the system state
+// object, plus the USDC package.
+test "gasless simulation of a coin reservation transfer answers as sui-node (mainnet 342452733/11)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const dt = ptb.devinspect_test;
+    const conformance = @import("conformance.zig");
+    var f: dt.Fixture = undefined;
+    try f.init(arena, std.testing.io);
+    defer f.deinit();
+    const data = try @import("harness").decompressZstd(arena, @embedFile("testdata/gasless_coin_reservation.rec.zst"), 1 << 24);
+    const blocks = try conformance.parseRecord(arena, data);
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    const b = &blocks[0];
+    // the fixture's system packages are the record's epoch
+    try std.testing.expectEqual(f.epoch, b.epoch);
+    try std.testing.expectEqual(f.pv, b.pv);
+    try std.testing.expectEqual(@as(usize, 4), b.cases.len);
+    for (b.objects) |raw| {
+        const v = try ObjectView.parse(raw);
+        if (v.is_package) try f.pkgs.user.put(arena, v.id, raw);
+    }
+    const ms = try conformance.mapState(arena, b.objects);
+    const env = try conformance.envOf(serve.b58.decode32(conformance.mainnet_chain_id_b58).?, b);
+    const engine: Engine = .{ .gpa = std.heap.page_allocator, .pkgs = &f.pkgs };
+    for (b.cases) |*k| {
+        switch (try engine.simulate(arena, &env, ms.state(), k.request)) {
+            .ok => |resp| if (k.code != 0 or !std.mem.eql(u8, resp, k.response)) {
+                std.debug.print("case {d}: zui answered OK with {d} bytes; sui-node code {d}, {d} bytes\n", .{ k.case, resp.len, k.code, k.response.len });
+                return error.TestUnexpectedResult;
+            },
+            .err => |e| if (k.code != e.code or !std.mem.eql(u8, e.message, k.message)) {
+                std.debug.print("case {d}: zui code {d} \"{s}\"; sui-node code {d} \"{s}\"\n", .{ k.case, e.code, e.message, k.code, k.message });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
+// The executor gets the transaction with the reservation rewritten to a sender FundsWithdrawal
+// (sui-core `rewrite_transaction_for_coin_reservations`), so the reservation is one of
+// `compute_input_reservations` (temporary_store.rs) and `check_gasless_execution_requirements`
+// holds it to the remainder rule: what the transaction leaves of the reserved amount is 0 or at
+// least the token's minimum (USDC: 10000). A gasless simulation that breaks the rule ends in
+// InsufficientGas, which simulate/mod.rs `is_gasless_post_execution_failure` answers with the
+// priced flow. The pre-state is the record's above; the expectations follow the Rust source (the
+// record has the whole reservation sent, a remainder of 0).
+test "gasless simulation: a coin reservation's unused remainder is held to the token minimum" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const dt = ptb.devinspect_test;
+    const conformance = @import("conformance.zig");
+    var f: dt.Fixture = undefined;
+    try f.init(arena, std.testing.io);
+    defer f.deinit();
+    const data = try @import("harness").decompressZstd(arena, @embedFile("testdata/gasless_coin_reservation.rec.zst"), 1 << 24);
+    const b = &(try conformance.parseRecord(arena, data))[0];
+    for (b.objects) |raw| {
+        const v = try ObjectView.parse(raw);
+        if (v.is_package) try f.pkgs.user.put(arena, v.id, raw);
+    }
+    const ms = try conformance.mapState(arena, b.objects);
+    const env = try conformance.envOf(serve.b58.decode32(conformance.mainnet_chain_id_b58).?, b);
+    const engine: Engine = .{ .gpa = std.heap.page_allocator, .pkgs = &f.pkgs };
+
+    // the transaction's sender, reservation ref (21.34 USDC of the sender's balance) and recipient
+    var tx_sender: Id = undefined;
+    _ = try std.fmt.hexToBytes(&tx_sender, "1daff9e3ade7510db6e7152e8fa21495b70a33da4d09164b0ad4c3c93660a662");
+    var res_id: Id = undefined;
+    _ = try std.fmt.hexToBytes(&res_id, "0de54d7329b9cd224a03ab634967f964fe93d90bad11ad18567c32e6f460ad50");
+    var recipient: Id = undefined;
+    _ = try std.fmt.hexToBytes(&recipient, "149b3e2272d5eb0fc6218ae73a9c6342131955844dbaf17a067b55a0569ebaa4");
+    var usdc_addr: Id = undefined;
+    _ = try std.fmt.hexToBytes(&usdc_addr, "dba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7");
+    const usdc: types.TypeInput = .{ .@"struct" = .{ .address = .{ .@"0" = usdc_addr }, .module = .{ .@"0" = "usdc" }, .name = .{ .@"0" = "USDC" }, .type_args = &.{} } };
+    const res_digest = serve.b58.decode32("7WAzsXjhkSvrSjLzQcXAAyeTFsLWuyAJagCnsXkHPQMR").?;
+    try std.testing.expect(checks.isCoinReservation(&res_digest));
+    const reserved: u64 = std.mem.readInt(u64, res_digest[0..8], .little);
+    try std.testing.expectEqual(@as(u64, 21_340_000), reserved);
+    const req: resolve.Request = .{};
+
+    // the amount sent back to the sender is what stays of the reservation
+    const Run = struct { back: u64, gasless: bool };
+    for ([_]Run{ .{ .back = 1, .gasless = false }, .{ .back = 9_999, .gasless = false }, .{ .back = 10_000, .gasless = true } }) |r| {
+        var td: types.TransactionDataV1 = .{
+            .kind = .{ .ProgrammableTransaction = .{
+                .inputs = &.{
+                    .{ .Object = .{ .ImmOrOwnedObject = .{ .{ .@"0" = .{ .@"0" = res_id } }, .{ .@"0" = 912306153 }, .{ .@"0" = .{ .@"0" = res_digest } } } } },
+                    .{ .Pure = &recipient },
+                    .{ .Pure = &tx_sender },
+                    .{ .Pure = try dt.u64Bytes(arena, r.back) },
+                },
+                .commands = &.{
+                    .{ .SplitCoins = .{ .{ .Input = 0 }, &.{.{ .Input = 3 }} } },
+                    dt.moveCall(2, "coin", "send_funds", &.{usdc}, &.{ .{ .NestedResult = .{ 0, 0 } }, .{ .Input = 2 } }),
+                    dt.moveCall(2, "coin", "send_funds", &.{usdc}, &.{ .{ .Input = 0 }, .{ .Input = 1 } }),
+                },
+            } },
+            .sender = .{ .@"0" = tx_sender },
+            .gas_data = .{ .payment = &.{}, .owner = .{ .@"0" = tx_sender }, .price = env.rgp, .budget = 50_000_000 },
+            .expiration = .None,
+        };
+        try std.testing.expect(try gaslessCandidate(arena, env.cfg, ms.state(), &req, false, &td));
+        const outcome = try gasSelection(&engine, arena, &env, ms.state(), &req, false, &td);
+        if (r.gasless) {
+            // kept: gas selection is over, the transaction is the gasless one
+            try std.testing.expect(outcome == .ok);
+            try std.testing.expectEqual(@as(u64, 0), td.gas_data.price);
+            try std.testing.expectEqual(@as(u64, 0), td.gas_data.budget);
+        } else {
+            // not kept: the priced flow goes on with the reference gas price
+            try std.testing.expectEqual(env.rgp, td.gas_data.price);
+        }
+    }
+}
+
+// sui-core authority.rs `simulate_transaction`: `checks.disabled() && config.dev_inspect_disabled`
+// is `UnsupportedFeatureError { "simulate with checks disabled is not allowed on this node" }`,
+// which sui-rpc-api's `simulation_error_to_rpc_error` answers as INVALID_ARGUMENT with the
+// error's Display ("Use of disabled feature: ..").
+test "dev-inspect-disabled: a checks-disabled request gets sui-node's refusal, a checks-enabled one is unaffected" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const dt = ptb.devinspect_test;
+    var f: dt.Fixture = undefined;
+    try f.init(arena, std.testing.io);
+    defer f.deinit();
+    const env = testEnv(&f);
+    const ms = try testState(arena, &f);
+    const td = try f.data(.{
+        .inputs = &.{.{ .Pure = try dt.u64Bytes(arena, 7) }},
+        .commands = &.{dt.moveCall(1, "u64", "max", &.{}, &.{ .{ .Input = 0 }, .{ .Input = 0 } })},
+    });
+    const tx_raw = try bcs.encodeAlloc(types.TransactionData, arena, &td);
+    const mask: []const []const u8 = &.{"command_outputs"};
+    const want_ok = try testReturnOutput(arena, "u64", try dt.u64Bytes(arena, 7), "7");
+    const refusal = "Use of disabled feature: simulate with checks disabled is not allowed on this node";
+
+    for ([_]Engine.DevInspect{ .refused, .guarded, .enabled }) |mode| {
+        const engine: Engine = .{ .gpa = std.heap.page_allocator, .pkgs = &f.pkgs, .dev_inspect = mode };
+        // checks enabled: the same answer whatever the switch says
+        switch (try engine.simulate(arena, &env, ms.state(), try testRequest(arena, tx_raw, mask, false))) {
+            .ok => |resp| try std.testing.expectEqualSlices(u8, want_ok, resp),
+            .err => return error.TestUnexpectedResult,
+        }
+        switch (try engine.simulate(arena, &env, ms.state(), try testRequest(arena, tx_raw, mask, true))) {
+            .ok => |resp| {
+                try std.testing.expect(mode != .refused);
+                try std.testing.expectEqualSlices(u8, want_ok, resp);
+            },
+            .err => |e| {
+                try std.testing.expect(mode == .refused);
+                try std.testing.expectEqual(@as(u8, code_invalid_argument), e.code);
+                try std.testing.expectEqualStrings(refusal, e.message);
+                try std.testing.expectEqualSlices(u8, try serve.status.plain(arena, code_invalid_argument, refusal), e.details);
+            },
+        }
+    }
+    // without the switch the engine is in its default state
+    const plain: Engine = .{ .gpa = std.heap.page_allocator, .pkgs = &f.pkgs };
+    try std.testing.expectEqual(Engine.default_dev_inspect, plain.dev_inspect);
+}
+
+// `guarded`: DevInspect<true> never runs. A request that needs its rules is UNIMPLEMENTED: a
+// friend function call fails as NonEntryFunctionInvoked under the rules with checks, and an
+// object of another address fails the signing checks.
+test "dev inspect guarded: a request that needs DevInspect<true> is UNIMPLEMENTED" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const dt = ptb.devinspect_test;
+    var f: dt.Fixture = undefined;
+    try f.init(arena, std.testing.io);
+    defer f.deinit();
+    const coin = try dt.coinObject(arena, dt.idOf(0x71), 5, 5000, .{ .AddressOwner = .{ .@"0" = dt.idOf(0x77) } });
+    try f.add(coin);
+    const env = testEnv(&f);
+    const ms = try testState(arena, &f);
+    const engine: Engine = .{ .gpa = std.heap.page_allocator, .pkgs = &f.pkgs, .dev_inspect = .guarded };
+    const Case = struct { pt: types.ProgrammableTransaction, message: []const u8 };
+    const cases = [_]Case{
+        .{ .pt = .{
+            .inputs = &.{ .{ .Pure = try arena.dupe(u8, &dt.idOf(0x11)) }, .{ .Pure = try dt.u64Bytes(arena, 7) } },
+            .commands = &.{dt.moveCall(2, "dynamic_field", "hash_type_and_key", &.{.u64}, &.{ .{ .Input = 0 }, .{ .Input = 1 } })},
+        }, .message = "checks disabled: execution past a check DevInspect<true> skips is not supported" },
+        .{ .pt = .{
+            .inputs = &.{.{ .Object = .{ .ImmOrOwnedObject = try dt.refOf(coin) } }},
+            .commands = &.{dt.moveCall(2, "coin", "value", &.{dt.suiInput()}, &.{.{ .Input = 0 }})},
+        }, .message = "checks disabled: inputs that fail the signing checks are not supported" },
+    };
+    for (cases) |c| {
+        const td = try f.data(c.pt);
+        const tx_raw = try bcs.encodeAlloc(types.TransactionData, arena, &td);
+        switch (try engine.simulate(arena, &env, ms.state(), try testRequest(arena, tx_raw, &.{"command_outputs"}, true))) {
+            .ok => return error.TestUnexpectedResult,
+            .err => |e| {
+                try std.testing.expectEqual(@as(u8, code_unimplemented), e.code);
+                try std.testing.expectEqualStrings(c.message, e.message);
+            },
+        }
+    }
 }
 
 /// sui-rpc-api `simulation_failure_error`: the failure's message, and details carrying the

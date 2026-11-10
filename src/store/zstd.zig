@@ -181,9 +181,55 @@ const Seq = struct { lit_len: u32, match_len: u32, offset: u32 };
 
 // ---------------------------------------------------------------- match finder
 
+/// Inputs up to this many bytes use the sparse bucket table (`Heads`).
+pub const sparse_max = 4096;
+
+/// The match finder's bucket heads: for each 16-bit hash, the newest position with it plus one
+/// (0: none). The dense form has a slot per hash value: 256 KiB, cleared for every frame, which
+/// for a gRPC reply of a few hundred bytes cost more than the rest of the call. The sparse form
+/// holds the same map for an input of at most `sparse_max` bytes in an open-addressed table with
+/// at least twice as many slots as the input has positions (a slot is hash << 16 | value, 0 when
+/// empty). Every lookup answers the same in both, so the frame's bytes are the same.
+const Heads = struct {
+    slots: []u32,
+    sparse: bool,
+
+    fn slotsFor(src_len: usize, dense: bool) usize {
+        if (dense or src_len > sparse_max) return 1 << hash_log;
+        return @max(64, std.math.ceilPowerOfTwoAssert(usize, 2 * src_len));
+    }
+
+    inline fn get(hd: Heads, h: u32) u32 {
+        if (!hd.sparse) return hd.slots[h];
+        const mask = hd.slots.len - 1;
+        var i: usize = h & mask;
+        while (true) : (i = (i + 1) & mask) {
+            const s = hd.slots[i];
+            if (s == 0) return 0;
+            if (s >> 16 == h) return s & 0xffff;
+        }
+    }
+
+    inline fn set(hd: Heads, h: u32, v: u32) void {
+        if (!hd.sparse) {
+            hd.slots[h] = v;
+            return;
+        }
+        const mask = hd.slots.len - 1;
+        var i: usize = h & mask;
+        while (true) : (i = (i + 1) & mask) {
+            const s = hd.slots[i];
+            if (s == 0 or s >> 16 == h) {
+                hd.slots[i] = (h << 16) | v;
+                return;
+            }
+        }
+    }
+};
+
 const Matcher = struct {
     src: []const u8,
-    head: []u32,
+    head: Heads,
     chain: []u32,
 
     fn hash(p: []const u8) u32 {
@@ -194,8 +240,8 @@ const Matcher = struct {
     fn insert(m: *Matcher, pos: usize) void {
         if (pos + 4 > m.src.len) return;
         const h = hash(m.src[pos..]);
-        m.chain[pos] = m.head[h];
-        m.head[h] = @intCast(pos + 1);
+        m.chain[pos] = m.head.get(h);
+        m.head.set(h, @intCast(pos + 1));
     }
 
     /// Longest match for `pos` ending at or before `limit`.
@@ -204,7 +250,7 @@ const Matcher = struct {
         const src = m.src;
         var best_len: usize = 0;
         var best_off: usize = 0;
-        var cand = m.head[hash(src[pos..])];
+        var cand = m.head.get(hash(src[pos..]));
         var depth: u32 = 0;
         const max_l = limit - pos;
         while (cand != 0 and depth < chain_depth) : (depth += 1) {
@@ -233,6 +279,9 @@ const Matcher = struct {
 
 pub const Options = struct {
     huffman: bool = false,
+    /// Always the dense bucket table, whatever the input size (tests: the sparse table must give
+    /// the same bytes).
+    dense_heads: bool = false,
 };
 
 /// A zstd frame holding `src` (caller frees).
@@ -250,12 +299,12 @@ pub fn compressWith(gpa: Allocator, src: []const u8, opts: Options) ![]u8 {
         try out.appendSlice(gpa, &.{ 1, 0, 0 });
         return out.toOwnedSlice(gpa);
     }
-    const head = try gpa.alloc(u32, 1 << hash_log);
+    const head = try gpa.alloc(u32, Heads.slotsFor(src.len, opts.dense_heads));
     defer gpa.free(head);
     @memset(head, 0);
     const chain = try gpa.alloc(u32, src.len);
     defer gpa.free(chain);
-    var m: Matcher = .{ .src = src, .head = head, .chain = chain };
+    var m: Matcher = .{ .src = src, .head = .{ .slots = head, .sparse = head.len != 1 << hash_log }, .chain = chain };
 
     var lits: std.ArrayList(u8) = .empty;
     defer lits.deinit(gpa);

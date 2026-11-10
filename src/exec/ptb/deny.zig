@@ -4,15 +4,18 @@
 //!
 //! The owners that receive a non-SUI coin (a written `Coin<T>` with an address, object or
 //! consensus-address owner, or a `Balance<T>` accumulator event) are grouped by the coin type's
-//! canonical string (`to_canonical_string(false)`). For each type, in string order, the per-type
-//! config is the dynamic object field of 0x403 under `Wrapper<ConfigKey { 0, type bytes }>`; its
-//! value, read as `Config { id }`, names the config. Then the global pause setting
+//! canonical string (`to_canonical_string(false)`). First, for every type, in string order, the
+//! per-type config is read: the dynamic object field of 0x403 under
+//! `Wrapper<ConfigKey { 0, type bytes }>`; its value, read as `Config { id }`, names the config.
+//! Then, for each type that has one, in the same order, the global pause setting
 //! (`GlobalPauseKey`) and each owner's setting (`AddressKey`, owners in byte order) are the
-//! config's dynamic fields `Setting<bool>`, read with `read_value(Some(epoch))`. Any read or
-//! decode failure counts as not set, as in Rust (`.ok()?`, `unwrap_or(false)`).
+//! config's dynamic fields `Setting<bool>`, read with `read_value(Some(epoch))`; the first one
+//! that reads true is the result and ends the reads. Any read or decode failure counts as not
+//! set, as in Rust (`.ok()?`, `unwrap_or(false)`).
 //!
 //! The reads go to the store's latest object (`ObjectStore::get_object`), outside the
-//! transaction's inputs: `Store.get`.
+//! transaction's inputs: `Store.get`, one call per read, in Rust's order (`check`). The callers
+//! run the check before they charge for it (`charge_coin_transfers`), as `context::finish` does.
 const std = @import("std");
 const types = @import("types");
 const hash = @import("hash");
@@ -219,18 +222,31 @@ fn setting(store: Store, config: *const Id, key_name: []const u8, key: []const u
 }
 
 /// The deny-list result for `pairs` (deduplicated); sorts `pairs`. null: no denial.
+///
+/// The store reads are in Rust's order (`check_coin_deny_list_v2_during_execution`): first the
+/// per-type config field of every coin type, in type string order (the `filter_map` over the
+/// types is collected into `regulated_coin_owners` before anything else runs); then, for the
+/// types that have a config, in the same order, the global pause setting and each owner's
+/// setting in address order (`check_new_regulated_coin_owners`), which stops at the first
+/// setting that reads true. So a denial of one type leaves the settings of the later types
+/// unread, and their config fields read.
 pub fn check(arena: Allocator, store: Store, epoch: u64, pairs: []Pair) !?Denied {
     std.mem.sort(Pair, pairs, {}, lessPair);
+    const Regulated = struct { first: usize, end: usize, cfg: Id };
+    var regulated: std.ArrayList(Regulated) = .empty;
     var i: usize = 0;
     while (i < pairs.len) {
         const ty = pairs[i].ty;
         var j = i;
         while (j < pairs.len and std.mem.eql(u8, pairs[j].ty, ty)) j += 1;
-        defer i = j;
-        const cfg = (try configOf(arena, store, ty)) orelse continue;
-        if (setting(store, &cfg, "GlobalPauseKey", &.{0}, epoch)) return .{ .pause = ty };
-        for (pairs[i..j]) |p| {
-            if (setting(store, &cfg, "AddressKey", &p.owner, epoch))
+        if (try configOf(arena, store, ty)) |cfg| try regulated.append(arena, .{ .first = i, .end = j, .cfg = cfg });
+        i = j;
+    }
+    for (regulated.items) |*g| {
+        const ty = pairs[g.first].ty;
+        if (setting(store, &g.cfg, "GlobalPauseKey", &.{0}, epoch)) return .{ .pause = ty };
+        for (pairs[g.first..g.end]) |p| {
+            if (setting(store, &g.cfg, "AddressKey", &p.owner, epoch))
                 return .{ .address = .{ .address = p.owner, .coin_type = ty } };
         }
     }
@@ -292,6 +308,19 @@ test "setting read_value by epoch" {
     try std.testing.expect(setting(store, &cfg, "AddressKey", &owner, 11));
     const other: Id = @splat(0xac);
     try std.testing.expect(!setting(store, &cfg, "AddressKey", &other, 11));
+}
+
+// The store reads of the check against Mysten's executor (`deny_order_vectors.zig`): the
+// vectors that are charged in full (two coin types, no config object, the global pause, the
+// sender against the recipient, settings by epoch). Effects byte for byte, reads in call order.
+test "deny list reads follow Rust's order: every type's config, then the settings (coin executor)" {
+    const vectors = @import("deny_order_vectors.zig");
+    try std.testing.expectEqual(@as(usize, 24), try vectors.run(std.testing.allocator, std.testing.io, .charged, .coin));
+}
+
+test "deny list reads follow Rust's order: every type's config, then the settings (Move-call executor)" {
+    const vectors = @import("deny_order_vectors.zig");
+    try std.testing.expectEqual(@as(usize, 24), try vectors.run(std.testing.allocator, std.testing.io, .charged, .move));
 }
 
 /// Replay's deny-list state (`$ZUI_CORPUS/deny/objects.bin.zst`, `zui-truth-exec

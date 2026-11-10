@@ -59,6 +59,34 @@ v1 accumulation makes lookups, for each answer source and each protocol version,
   `plain` at the epoch's version: `acc` is null (30 lines).
 - 180 lines; deepwave finishes each lookup with `state_hash.applyHistory` using the same answers.
 
+## deny-order (`src/exec/testdata/deny_order.jsonl`, in the repository)
+
+`$T deny-order $ZUI_CORPUS <out.jsonl>`: coin deny list v2 vectors that carry the executor's
+store reads in call order. Every object is synthetic (a sender, its gas coin, `Coin<T>` objects
+whose `T` is a struct of a system package, the 0x403 per-type config fields and their
+`Setting<bool>` fields); the corpus gives only the system packages of the newest epoch in
+`epochs.jsonl`. Each line is one coin-only programmable transaction run by
+`sui_execution::executor`:
+
+```
+{"name","pv","epoch","rgp","start_ms","tx":hex,"objects":[hex Object],"system":[{"seq","epoch"}],
+ "latest":[hex Object],"reads":[{"id":hex,"hit":bool,"what":label}],"status":Debug,"effects":hex,
+ "written":[hex Object]}
+```
+
+- `reads` is every `ObjectStore::get_object` call on the backing store, in call order, with
+  whether the store held the object: the reads of `check_coin_deny_list_v2_during_execution`
+  (the tool fails on any other call).
+- `latest` is the deny-list state the store held; `system` names the corpus checkpoints that
+  wrote the system packages the executor loaded.
+- Cases: two coin types (the first denied or paused, the second, both), a type without a config
+  object, the global pause and the sender against the recipient by epoch (in force, from the
+  next epoch, lifted from the next epoch), and a budget that runs out at `charge_coin_transfers`
+  (the smallest budget that reaches the check) or one gas unit earlier.
+
+deepwave's unit tests replay the file through the coin executor and the Move-call executor
+(`src/exec/ptb/deny_order_vectors.zig`).
+
 ## bench
 
 `bench state-hash`: `accumulate_effects` per checkpoint on decoded effects with a prebuilt store

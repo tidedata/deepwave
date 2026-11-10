@@ -11,6 +11,12 @@
 //! caller (`put`) checks the same TransactionData bytes and the same signatures as a multiset, so
 //! the envelope has the stored length and every digest still holds.
 //!
+//! The store keeps a second table of the same kind, `Store.list_fix`: a transaction's loaded
+//! runtime object list served in place of the stored aux record (node/history.zig
+//! `loadedListNear`), installed by the node when a checkpoint it built itself turns out to list
+//! other objects than sui-node does (node/reconcile.zig). Same readers, same reclamation, same
+//! `changedSince` for the GetCheckpoint response cache; its bytes are a list, not an envelope.
+//!
 //! About half of the multi-signer transactions of a catch-up range need a fix, so the table holds
 //! tens of thousands. Layout: an immutable base sorted by digest plus an append-only delta of at
 //! most about 2 sqrt(N) slots (`deltaCap`); a full delta is merged into a new base. A put costs
@@ -38,7 +44,9 @@ pub const Fix = struct {
     seq: u64,
     /// Table generation that installed it (`Table.changedSince`).
     gen: u64,
-    tx: []const u8,
+    /// The bytes served, in an 8-aligned copy: the store's second table (`Store.list_fix`) holds
+    /// lists of 8-aligned entries that readers use in place.
+    tx: []align(8) const u8,
 };
 
 /// A fix to install (`putMany`, `load`): `tx` is copied.
@@ -398,7 +406,9 @@ pub const Table = struct {
         const gpa = t.gpa.?;
         const f = try gpa.create(Fix);
         errdefer gpa.destroy(f);
-        f.* = .{ .digest = e.digest, .seq = e.seq, .gen = g, .tx = try gpa.dupe(u8, e.tx) };
+        const copy = try gpa.alignedAlloc(u8, .@"8", e.tx.len);
+        @memcpy(copy, e.tx);
+        f.* = .{ .digest = e.digest, .seq = e.seq, .gen = g, .tx = copy };
         _ = t.bytes.fetchAdd(@sizeOf(Fix) + e.tx.len, .monotonic);
         return f;
     }
@@ -583,6 +593,31 @@ fn testTable(rd: *Readers) Table {
     return .{ .gpa = testing.allocator, .readers = rd };
 }
 
+test "txfix: the served bytes are 8-aligned copies, an empty one included" {
+    // The loaded-list table (`Store.list_fix`) is read in place as a list of 8-aligned entries;
+    // an empty list is a fix too (it replaces a stored list that had entries).
+    var rd: Readers = .{};
+    var t = testTable(&rd);
+    defer t.deinit();
+    var src: [41]u8 = undefined;
+    for (&src, 0..) |*b, i| b.* = @intCast(i);
+    var d: [32]u8 = @splat(0);
+    // Odd lengths from odd source offsets: the copy's alignment does not follow the source's.
+    for ([_]usize{ 40, 39, 1, 7, 33 }, 0..) |len, i| {
+        d[0] = @intCast(i + 1);
+        try testing.expect(try t.put(5, &d, src[1..][0..len]));
+        const f = t.find(&d).?;
+        try testing.expectEqual(@as(usize, 0), @intFromPtr(f.tx.ptr) % 8);
+        try testing.expectEqualSlices(u8, src[1..][0..len], f.tx);
+    }
+    d[0] = 9;
+    try testing.expect(try t.put(5, &d, src[0..40]));
+    try testing.expect(try t.put(5, &d, &.{}));
+    try testing.expectEqual(@as(usize, 0), t.find(&d).?.tx.len);
+    try testing.expect(!try t.put(5, &d, &.{}));
+    try testing.expect(t.changedSince(5, 0));
+}
+
 test "txfix: find, replace, generations and per-checkpoint staleness" {
     var rd: Readers = .{};
     var t = testTable(&rd);
@@ -634,13 +669,13 @@ fn testTx(buf: *[96]u8, i: u64, ver: u8) []const u8 {
     return buf;
 }
 
-/// Counts live and peak bytes (the writer's allocations).
-const Counting = struct {
+/// Counts live and peak bytes (the writer's allocations). For tests, here and of the log reload.
+pub const Counting = struct {
     child: Allocator,
     live: Atomic(usize) = .init(0),
     peak: Atomic(usize) = .init(0),
 
-    fn allocator(c: *Counting) Allocator {
+    pub fn allocator(c: *Counting) Allocator {
         return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = freeFn } };
     }
     fn add(c: *Counting, n: usize) void {

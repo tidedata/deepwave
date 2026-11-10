@@ -389,10 +389,13 @@ pub fn withdraw_from_accumulator_address(c: *Ctx, tys: []const TyArg, args: []Va
     const amount: u64 = @intCast(value);
     if (!typeInBounds(c, tag)) return c.abort(E_ACCUMULATOR_TYPE_TOO_LARGE);
     if (try rt(c).emitAccumulatorEvent(c.arena, c.cfg, acc, .split, owner, tag, .{ .u64 = amount })) |e| return Ctx.vmErr(e);
+    // `Value::struct_(Struct::pack(vec![Value::u64(amount)]))`, whatever `T` is
     const fields = try c.arena.alloc(Value, 1);
     fields[0] = .{ .u64 = amount };
-    return c.ok1(.{ .@"struct" = fields });
+    return c.ok1As(.{ .@"struct" = fields }, &struct_of_one_u64);
 }
+
+const struct_of_one_u64: Layout = .{ .@"struct" = &.{ .@"0" = &.{.u64} } };
 
 pub fn reserve_object_funds_for_withdrawal(c: *Ctx, tys: []const TyArg, args: []Value) Error!Outcome {
     if (!c.flag("check_object_funds_withdraw_in_execution")) return c.ok0();
@@ -415,6 +418,43 @@ pub fn reserve_object_funds_for_withdrawal(c: *Ctx, tys: []const TyArg, args: []
 
 // ---- config ---------------------------------------------------------------------------------
 
+/// move-vm `VEC_UNPACK_PARITY_MISMATCH` (sub status of VECTOR_OPERATION_ERROR).
+const VEC_UNPACK_PARITY_MISMATCH: u64 = 3;
+
+/// move-vm `check_elem_layout(ty, vector)` for a non-empty vector value decoded from a layout:
+/// a vector of bool, u8, u16, u32, u64, u128, u256 or address is its own container kind and
+/// takes exactly that type; every other element type (vectors, datatypes, signer) shares one.
+fn elemKindMatches(ty: *const TypeTag, vec: Value) bool {
+    const Kind = enum { bool, u8, u16, u32, u64, u128, u256, address, other };
+    const want: Kind = switch (ty.*) {
+        .bool => .bool,
+        .u8 => .u8,
+        .u16 => .u16,
+        .u32 => .u32,
+        .u64 => .u64,
+        .u128 => .u128,
+        .u256 => .u256,
+        .address => .address,
+        .signer, .vector, .@"struct" => .other,
+    };
+    const have: Kind = switch (vec) {
+        .bytes => .u8,
+        .vector => |items| switch (items[0]) {
+            .bool => .bool,
+            .u8 => .u8,
+            .u16 => .u16,
+            .u32 => .u32,
+            .u64 => .u64,
+            .u128 => .u128,
+            .u256 => .u256,
+            .address => .address,
+            .signer, .vector, .@"struct", .variant, .bytes => .other,
+        },
+        else => return false,
+    };
+    return want == have;
+}
+
 /// `read_setting_impl<FieldSettingValue, SettingValue, SettingDataValue, Value>(config, name, epoch)`
 pub fn read_setting_impl(c: *Ctx, tys: []const TyArg, args: []Value) Error!Outcome {
     const base = c.popt("config_read_setting_impl_cost_base") orelse return Ctx.invariant();
@@ -436,26 +476,57 @@ pub fn read_setting_impl(c: *Ctx, tys: []const TyArg, args: []Value) Error!Outco
     opt_s.* = .{ .@"0" = opt_fields };
     const opt_l: Layout = .{ .@"struct" = opt_s };
 
+    // `option_none(value_ty)`: built from the declared `Value`
     const none: Value = .{ .@"struct" = try c.arena.dupe(Value, &.{.{ .vector = &.{} }}) };
     var result = none;
+    // `newer_value` / `older_value_opt` are returned as decoded: values of the layout the
+    // caller's `FieldSettingValue` has at that position, not of `Option<Value>`
+    var result_layout: ?*const Layout = null;
     if (try rt(c).configRead(c.arena, config, name, field_layout, field_tag)) |field| {
-        // Field { id, name, value: Setting { data: Option<SettingData> } }
+        // Field { id, name, value: Setting { data: Option<SettingData> } }, as
+        // `consistent_value_before_current_epoch` walks it. The value was decoded with the
+        // layout of the caller's `FieldSettingValue`, which under DevInspect<true> is any `key`
+        // type, so every step is checked as Rust's casts check it: a value of another kind
+        // (`value_as`, INTERNAL_TYPE_ERROR) or with another field count (`unpack_struct`,
+        // UNKNOWN_INVARIANT_VIOLATION_ERROR) is an invariant error of the VM.
+        if (field != .@"struct") return Ctx.invariant();
         const f = field.@"struct";
         if (f.len != 3) return Ctx.invariant();
+        if (f[2] != .@"struct") return Ctx.invariant();
         const setting = f[2].@"struct";
         if (setting.len != 1) return Ctx.invariant();
+        if (setting[0] != .@"struct") return Ctx.invariant();
         const data_opt = setting[0].@"struct";
         if (data_opt.len != 1) return Ctx.invariant();
-        const data_vec = data_opt[0].vector;
-        if (data_vec.len != 0) {
-            const data = data_vec[0].@"struct";
+        // `unpack_option(data_opt, setting_data_value_ty)`: a vector; empty is none; otherwise
+        // `Vector::unpack(ty, 1)`: `check_elem_layout` (the vector's element kind against the
+        // caller's `SettingDataValue`), then exactly one element
+        const n: usize = switch (data_opt[0]) {
+            .vector => |x| x.len,
+            .bytes => |x| x.len,
+            else => return Ctx.invariant(),
+        };
+        if (n != 0) {
+            if (!elemKindMatches(tys[2].tag, data_opt[0])) return Ctx.invariant();
+            if (n != 1) return Ctx.err(.VECTOR_OPERATION_ERROR, VEC_UNPACK_PARITY_MISMATCH);
+            if (data_opt[0] != .vector or data_opt[0].vector[0] != .@"struct") return Ctx.invariant();
+            const data = data_opt[0].vector[0].@"struct";
             if (data.len != 3) return Ctx.invariant();
+            if (data[0] != .u64) return Ctx.invariant();
             const newer_epoch = data[0].u64;
-            result = if (current_epoch > newer_epoch) data[1] else data[2];
+            const pick: usize = if (current_epoch > newer_epoch) 1 else 2;
+            result = data[pick];
+            // the layout of that field: Field.value (2) . Setting.data (0) . Option.vec (0) .
+            // element . SettingData field. The value was decoded with it, so each step is there.
+            const setting_l = field_layout.@"struct".@"0"[2];
+            const option_l = setting_l.@"struct".@"0"[0];
+            const data_l = option_l.@"struct".@"0"[0].vector;
+            result_layout = &data_l.@"struct".@"0"[pick];
         }
     }
-    if (!c.charge(per_byte *| abi.objectRuntimeSize(c.cfg, &result, &opt_l))) return c.oog();
-    return c.ok1(result);
+    // `abstract_size(protocol_config, &read_value_opt)` sizes the value as it is
+    if (!c.charge(per_byte *| abi.objectRuntimeSize(c.cfg, &result, result_layout orelse &opt_l))) return c.oog();
+    return if (result_layout) |l| c.ok1As(result, l) else c.ok1(result);
 }
 
 // ---- package --------------------------------------------------------------------------------

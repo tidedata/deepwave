@@ -13,6 +13,9 @@ pub fn tune(fd: c.fd_t) void {
     _ = c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
     if (comptime builtin.os.tag.isDarwin()) {
         _ = c.setsockopt(fd, std.posix.SOL.SOCKET, 0x1022, std.mem.asBytes(&one), @sizeOf(c_int)); // SO_NOSIGPIPE
+        // `rawWriteSome`: the socket polls writable only with room for one whole chunk.
+        const lowat: c_int = darwin_chunk;
+        _ = c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDLOWAT, std.mem.asBytes(&lowat), @sizeOf(c_int));
     }
     const tv: c.timeval = .{ .sec = 5, .usec = 0 };
     _ = c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(c.timeval));
@@ -29,8 +32,16 @@ pub const Session = struct {
     pub const VTable = struct {
         /// Plaintext into `buf`: blocks until at least one byte (0: closed).
         read: *const fn (ctx: *anyopaque, buf: []u8) Error!usize,
-        /// Encrypts and writes all of `bytes`.
+        /// Encrypts and writes all of `bytes` (after what a `write_some` left unsent).
         write: *const fn (ctx: *anyopaque, bytes: []const u8) Error!void,
+        /// Never waits for the peer: sends what an earlier call left, then encrypts a first part
+        /// of `bytes` and sends what the socket takes now. Returns how many bytes of `bytes` it
+        /// took (they are the session's from then on, sent or not); 0 with nothing taken means
+        /// the socket is full. An empty `bytes` only sends what was left. Null: `write` is used,
+        /// which waits.
+        write_some: ?*const fn (ctx: *anyopaque, bytes: []const u8) Error!usize = null,
+        /// Bytes `write_some` took and has not sent yet.
+        unsent: ?*const fn (ctx: *anyopaque) usize = null,
         /// Plaintext (or a whole record) is buffered: a read would not block.
         buffered: *const fn (ctx: *anyopaque) bool,
         /// Frees the session (the fd is closed by `close`).
@@ -137,15 +148,51 @@ pub fn rawWriteAll(fd: c.fd_t, bytes: []const u8) Error!void {
 
 /// Writes what the socket takes now without waiting; 0 when its send buffer is full.
 pub fn writeSome(fd: c.fd_t, bytes: []const u8) Error!usize {
-    // A session takes everything: records are not split across calls.
     if (sessionOf(fd)) |s| {
+        if (s.vt.write_some) |f| return f(s.ctx, bytes);
+        // A session without a non-blocking write takes everything, waiting for the peer.
         try s.vt.write(s.ctx, bytes);
         return bytes.len;
     }
+    return rawWriteSome(fd, bytes);
+}
+
+/// Bytes a session took in `writeSome` and has not sent yet (a later `writeSome`, also an empty
+/// one, sends them).
+pub fn unsent(fd: c.fd_t) usize {
+    const s = sessionOf(fd) orelse return 0;
+    const f = s.vt.unsent orelse return 0;
+    return f(s.ctx);
+}
+
+/// Largest single send of `rawWriteSome` on Darwin, and the socket's send low-water mark there
+/// (`tune`).
+const darwin_chunk = 32 << 10;
+
+/// `writeSome` without a session.
+pub fn rawWriteSome(fd: c.fd_t, bytes: []const u8) Error!usize {
+    if (bytes.len == 0) return 0;
     const nosig: u32 = if (comptime builtin.os.tag == .linux) 0x4000 else 0; // MSG_NOSIGNAL
     const flags: u32 = nosig | @as(u32, std.posix.MSG.DONTWAIT);
+    var len = bytes.len;
+    if (comptime builtin.os.tag.isDarwin()) {
+        // Darwin's MSG_DONTWAIT only refuses a send that finds no room at all: one that fits in
+        // part sends that part and then waits for the rest, up to the send timeout (measured: a
+        // 256 KiB send into a nearly full buffer returned after the 5 s SO_SNDTIMEO). So send
+        // only what is known to fit: the socket polls writable once it has room for its
+        // low-water mark, which `tune` set to one chunk (2,048 bytes on a socket it never saw).
+        var p = [_]c.pollfd{.{ .fd = fd, .events = c.POLL.OUT, .revents = 0 }};
+        const pr = c.poll(&p, 1, 0);
+        if (pr < 0) return if (c.errno(pr) == .INTR) 0 else error.Closed;
+        if (pr == 0) return 0;
+        if (p[0].revents & c.POLL.OUT == 0) return if (p[0].revents & (c.POLL.ERR | c.POLL.HUP | c.POLL.NVAL) != 0) error.Closed else 0;
+        var lowat: c_int = 0;
+        var sz: c.socklen_t = @sizeOf(c_int);
+        if (c.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDLOWAT, std.mem.asBytes(&lowat), &sz) != 0 or lowat <= 0) lowat = 2048;
+        len = @min(len, @as(usize, @intCast(lowat)));
+    }
     while (true) {
-        const r = c.send(fd, bytes.ptr, bytes.len, flags);
+        const r = c.send(fd, bytes.ptr, len, flags);
         if (r < 0) switch (c.errno(r)) {
             .INTR => continue,
             .AGAIN => return 0,
@@ -228,10 +275,13 @@ pub const Wake = struct {
 
 pub const Ready = struct { readable: bool = false, writable: bool = false, woken: bool = false };
 
-/// Waits until `fd` is readable (or hung up), writable when `want_out`, or `wake` fires.
-pub fn waitConn(fd: c.fd_t, want_out: bool, wake: ?Wake, timeout_ms: i32) Error!Ready {
-    if (buffered(fd)) return .{ .readable = true };
-    const ev: i16 = if (want_out) c.POLL.IN | c.POLL.OUT else c.POLL.IN;
+/// Waits until `fd` is readable when `want_in` (a hang-up or an error always reports readable),
+/// writable when `want_out`, or `wake` fires.
+pub fn waitConn(fd: c.fd_t, want_in: bool, want_out: bool, wake: ?Wake, timeout_ms: i32) Error!Ready {
+    if (want_in and buffered(fd)) return .{ .readable = true };
+    var ev: i16 = 0;
+    if (want_in) ev |= c.POLL.IN;
+    if (want_out) ev |= c.POLL.OUT;
     var p = [_]c.pollfd{
         .{ .fd = fd, .events = ev, .revents = 0 },
         .{ .fd = if (wake) |k| k.r else -1, .events = c.POLL.IN, .revents = 0 },

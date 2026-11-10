@@ -180,6 +180,11 @@ pub const Ptb = struct {
     tx_ctx_ty: Ty = undefined,
     /// Typing context: the command being typed.
     current: u16 = 0,
+    /// `execution_mode::DevInspect<true>` (`Inputs.skip_all_checks`): `allow_arbitrary_values`
+    /// and `allow_arbitrary_function_calls` answer true, so the checks they gate are skipped
+    /// (object input owners, pure input types and bytes, reference returns, visibility, unused
+    /// values without drop, hot arguments to private entry functions). Off for every other mode.
+    skip_checks: bool = false,
 
     fn rt(p: *Ptb) *move_vm.Runtime {
         return p.linker.cache.rt;
@@ -539,16 +544,21 @@ pub fn load(p: *Ptb, srcs: []const ?ObjSource) Error!void {
                     const tag = objectTag(p.arena, src.raw) catch return p.diag.unsupported("accumulator object input");
                     const ty = try fromStruct(p, &tag);
                     const owner = @import("bcs").decode(types.Owner, p.arena, src.raw[view.owner_at..view.prev_tx_at]) catch return p.diag.unsupported("owner does not decode");
+                    // loading/translate.rs `input`: an owner the argument kind does not expect is
+                    // `assert_invariant!(Mode::allow_arbitrary_values(), ..)`, and then used with
+                    // every permission (a Party owner's permissions are not modeled).
                     const perm: Perm = if (src.shared_mutable) |m| blk: {
                         if (!m) break :blk .immutable;
                         break :blk switch (owner) {
                             .Shared => .legacy_shared,
                             .ConsensusAddressOwner => .all,
+                            .AddressOwner, .ObjectOwner, .Immutable => if (p.skip_checks) .all else return p.diag.unsupported("shared input owner"),
                             else => return p.diag.unsupported("shared input owner"),
                         };
                     } else switch (owner) {
                         .AddressOwner => .all,
                         .Immutable => .immutable,
+                        .ObjectOwner, .Shared, .ConsensusAddressOwner => if (p.skip_checks) .all else return p.diag.unsupported("owned input owner"),
                         else => return p.diag.unsupported("owned input owner"),
                     };
                     p.kinds[i] = .{ .object = @intCast(p.objects.items.len) };
@@ -1772,14 +1782,16 @@ pub fn validate(b: []const u8, at: *usize, l: *const Prim, depth: u32) bool {
 }
 
 fn inputArguments(p: *Ptb) Error!void {
-    for (p.pure.items) |pl| {
+    // `check_pure_bytes`: `if Mode::allow_arbitrary_values() { return Ok(()) }` (any type, any
+    // bytes; the value is deserialized when a command first uses it)
+    if (!p.skip_checks) for (p.pure.items) |pl| {
         const bytes = p.pureBytes(pl.input);
         const lay = (try primLayout(p.arena, pl.ty)) orelse
             return p.diag.failWith(.{ .CommandArgumentError = .{ .arg_idx = pl.arg, .kind = .InvalidUsageOfPureArg } }, pl.cmd);
         var at: usize = 0;
         if (!validate(bytes, &at, lay, 0) or at != bytes.len)
             return p.diag.failWith(.{ .CommandArgumentError = .{ .arg_idx = pl.arg, .kind = .InvalidBCSBytes } }, pl.cmd);
-    }
+    };
     for (p.receiving.items) |rl| {
         const ok = qualified(rl.ty, 2, "transfer", "Receiving", 1) and abilities(rl.ty.datatype.args[0]).hasKey();
         if (!ok) return p.diag.failWith(.{ .CommandArgumentError = .{ .arg_idx = rl.arg, .kind = .TypeMismatch } }, rl.cmd);
@@ -1808,7 +1820,8 @@ pub fn isSendFunds(call: *const Call) bool {
 }
 
 fn moveFunction(p: *Ptb, call: *const Call) Error!void {
-    if (!p.cfg.feature_flags.allow_references_in_ptbs) {
+    // `check_signature`: a reference return type passes under `Mode::allow_arbitrary_values()`
+    if (!p.cfg.feature_flags.allow_references_in_ptbs and !p.skip_checks) {
         for (call.returns, 0..) |t, i| if (isRef(t)) return p.fail(.{ .InvalidPublicFunctionReturnType = .{ .idx = @intCast(i) } });
     }
     if (p.cfg.feature_flags.ptb_tx_context_restrictions) {
@@ -1833,8 +1846,10 @@ fn moveFunction(p: *Ptb, call: *const Call) Error!void {
         (s == 2 and std.mem.eql(u8, call.module, "transfer") and for ([_][]const u8{ "transfer", "freeze_object", "share_object", "receive", "party_transfer" }) |n| {
             if (std.mem.eql(u8, call.name, n)) break true;
         } else false);
+    // `check_private_generics_v2` holds in every mode; `check_visibility` lets a private or
+    // friend function that is not `entry` through under `Mode::allow_arbitrary_function_calls()`
     if (internal) return p.fail(.NonEntryFunctionInvoked);
-    if (call.visibility != .Public and !call.is_entry) return p.fail(.NonEntryFunctionInvoked);
+    if (call.visibility != .Public and !call.is_entry and !p.skip_checks) return p.fail(.NonEntryFunctionInvoked);
 }
 
 /// typing/verify/memory_safety.rs over the regex borrow graph (`borrow.zig`): every value is a
@@ -2099,6 +2114,8 @@ fn refineArg(p: *Ptb, used: *std.AutoHashMapUnmanaged(Loc, void), a: *Arg) void 
 }
 
 fn dropVerify(p: *Ptb) Error!void {
+    // `drop_value`: `!abilities.has_drop() && !Mode::allow_arbitrary_values()` is the only error
+    if (p.skip_checks) return;
     // Values moved by commands; at the end every result value left must have drop.
     var moved = std.AutoHashMapUnmanaged(Loc, void).empty;
     for (p.cmds.items) |*c| for (c.args) |a| if (a.kind != .borrow and a.move) try moved.put(p.arena, a.loc, {});
@@ -2163,7 +2180,8 @@ fn privateEntry(p: *Ptb) Error!void {
         }
         // exec-history: before `restrict_hot_or_not_entry_functions` (v3) only private counts
         const non_public = if (versions.executionVersion(p.cfg) < versions.latest and !p.cfg.feature_flags.restrict_hot_or_not_entry_functions) (if (c.call) |call| call.visibility == .Private else false) else (if (c.call) |call| call.visibility != .Public else false);
-        if (c.call) |call| if (call.is_entry and non_public) {
+        // `is_entry && is_non_public && !Mode::allow_arbitrary_values()`
+        if (c.call) |call| if (call.is_entry and non_public and !p.skip_checks) {
             for (arg_cliques.items) |ac| if (C.isHot(parent.items, temps.items, ac[1]))
                 return p.diag.failWith(.{ .CommandArgumentError = .{ .arg_idx = ac[0], .kind = .InvalidArgumentToPrivateEntryFunction } }, p.annot(ci));
         };
@@ -2308,4 +2326,133 @@ test "type input naming a module the package lacks (mainnet 1659149, 1665877, 17
     try std.testing.expectEqual(types.TypeArgumentError.TypeNotFound, call.TypeArgumentError.kind);
     try std.testing.expectEqual(@as(u16, 1), call.TypeArgumentError.argument_idx);
     try std.testing.expect(try testLoadError(arena, 9, &stubs, &no_struct, 0, .vec) == .VMVerificationOrDeserializationError);
+}
+
+// ---- DevInspect<true> (`Ptb.skip_checks`): the checks `Mode::allow_arbitrary_values()` and
+// `Mode::allow_arbitrary_function_calls()` gate, each against the same input with checks on.
+
+fn testStubPkg(al: Allocator, id: Id) !*pkgs.Pkg {
+    const p = try al.create(pkgs.Pkg);
+    p.* = .{ .raw = &.{}, .view = undefined, .version_id = id, .original_id = id, .version = 1, .linkage = &.{}, .type_origins = &.{}, .modules = &.{}, .gas_size = 0 };
+    return p;
+}
+
+fn testCall(pkg: *pkgs.Pkg, module: []const u8, name: []const u8, visibility: ff.Visibility, is_entry: bool, returns: []const Ty) Call {
+    return .{ .pkg = pkg, .module = module, .name = name, .func = undefined, .ty_args = &.{}, .params = &.{}, .returns = returns, .visibility = visibility, .is_entry = is_entry, .linkage_entries = 0, .linkage = &.{} };
+}
+
+fn testPtb(arena: Allocator, cfg: *const protocol.ProtocolConfig, diag: *pkgs.Diag, pt: *const types.ProgrammableTransaction, skip_checks: bool) Ptb {
+    return .{ .arena = arena, .cfg = cfg, .linker = undefined, .diag = diag, .meter = undefined, .pt = pt, .skip_checks = skip_checks };
+}
+
+test "skip_checks: check_visibility lets private and friend functions through, check_private_generics_v2 does not" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const cfg = try protocol.get(protocol.max_protocol_version, .mainnet);
+    const pt: types.ProgrammableTransaction = .{ .inputs = &.{}, .commands = &.{} };
+    const user = try testStubPkg(arena, @splat(0xab));
+    var two: Id = @splat(0);
+    two[31] = 2;
+    const fw = try testStubPkg(arena, two);
+    for ([_]ff.Visibility{ .Private, .Friend }) |vis| {
+        const call = testCall(user, "m", "f", vis, false, &.{});
+        var diag: pkgs.Diag = .{};
+        var checked = testPtb(arena, cfg, &diag, &pt, false);
+        try std.testing.expectError(error.Fail, moveFunction(&checked, &call));
+        try std.testing.expect(diag.fail.kind == .NonEntryFunctionInvoked);
+        var relaxed = testPtb(arena, cfg, &diag, &pt, true);
+        try moveFunction(&relaxed, &call);
+        // entry functions and public functions pass in both modes
+        try moveFunction(&checked, &testCall(user, "m", "f", vis, true, &.{}));
+    }
+    var diag: pkgs.Diag = .{};
+    var checked = testPtb(arena, cfg, &diag, &pt, false);
+    try moveFunction(&checked, &testCall(user, "m", "f", .Public, false, &.{}));
+    // `0x2::transfer::transfer` has an internal type parameter: rejected in every mode
+    const internal = testCall(fw, "transfer", "transfer", .Public, false, &.{});
+    for ([_]bool{ false, true }) |skip| {
+        var d: pkgs.Diag = .{};
+        var p = testPtb(arena, cfg, &d, &pt, skip);
+        try std.testing.expectError(error.Fail, moveFunction(&p, &internal));
+        try std.testing.expect(d.fail.kind == .NonEntryFunctionInvoked);
+    }
+}
+
+test "skip_checks: check_signature lets a reference return type through before allow_references_in_ptbs" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // the newest protocol version without `allow_references_in_ptbs`
+    var v: u64 = protocol.max_protocol_version;
+    const cfg = while (v > 0) : (v -= 1) {
+        const c = protocol.get(v, .mainnet) catch continue;
+        if (!c.feature_flags.allow_references_in_ptbs) break c;
+    } else return error.SkipZigTest;
+    const pt: types.ProgrammableTransaction = .{ .inputs = &.{}, .commands = &.{} };
+    const user = try testStubPkg(arena, @splat(0xab));
+    const ref_u64 = try mk(arena, .{ .ref = &Type.t_u64 });
+    const call = testCall(user, "m", "f", .Public, false, &.{ &Type.t_u64, ref_u64 });
+    var diag: pkgs.Diag = .{};
+    var checked = testPtb(arena, cfg, &diag, &pt, false);
+    try std.testing.expectError(error.Fail, moveFunction(&checked, &call));
+    try std.testing.expectEqual(@as(u16, 1), diag.fail.kind.InvalidPublicFunctionReturnType.idx);
+    var relaxed = testPtb(arena, cfg, &diag, &pt, true);
+    try moveFunction(&relaxed, &call);
+}
+
+test "skip_checks: check_pure_bytes accepts any type and any bytes" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const cfg = try protocol.get(protocol.max_protocol_version, .mainnet);
+    const pt: types.ProgrammableTransaction = .{ .inputs = &.{ .{ .Pure = &.{ 1, 2, 3 } }, .{ .Pure = &@as([32]u8, @splat(7)) } }, .commands = &.{} };
+    const Case = struct { loc: PureLoc, want: types.CommandArgumentError };
+    const cases = [_]Case{
+        // three bytes are not a u64
+        .{ .loc = .{ .input = 0, .ty = &Type.t_u64, .cmd = 4, .arg = 2 }, .want = .InvalidBCSBytes },
+        // a signer is not a primitive argument type
+        .{ .loc = .{ .input = 1, .ty = &Type.t_signer, .cmd = 5, .arg = 3 }, .want = .InvalidUsageOfPureArg },
+    };
+    for (cases) |c| {
+        var diag: pkgs.Diag = .{};
+        var checked = testPtb(arena, cfg, &diag, &pt, false);
+        try checked.pure.append(arena, c.loc);
+        try std.testing.expectError(error.Fail, inputArguments(&checked));
+        try std.testing.expectEqual(std.meta.activeTag(c.want), std.meta.activeTag(diag.fail.kind.CommandArgumentError.kind));
+        try std.testing.expectEqual(c.loc.arg, diag.fail.kind.CommandArgumentError.arg_idx);
+        try std.testing.expectEqual(@as(?u64, c.loc.cmd), diag.fail.command);
+        var relaxed = testPtb(arena, cfg, &diag, &pt, true);
+        try relaxed.pure.append(arena, c.loc);
+        try inputArguments(&relaxed);
+    }
+}
+
+test "skip_checks: a hot argument to a private entry function passes" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const cfg = try protocol.get(protocol.max_protocol_version, .mainnet);
+    const pt: types.ProgrammableTransaction = .{ .inputs = &.{.{ .Pure = &@as([8]u8, @splat(0)) }}, .commands = &.{} };
+    const user = try testStubPkg(arena, @splat(0xab));
+    var call = testCall(user, "m", "f", .Private, true, &.{});
+    for ([_]bool{ false, true }) |skip| {
+        var diag: pkgs.Diag = .{};
+        var p = testPtb(arena, cfg, &diag, &pt, skip);
+        try p.pure.append(arena, .{ .input = 0, .ty = &Type.t_u64, .cmd = 0, .arg = 0 });
+        // command 0 incurs post-execution checks, which heats the clique of its argument;
+        // command 1 passes the same value to a private entry function
+        const args0 = try arena.dupe(Arg, &.{.{ .idx = 0, .kind = .use, .loc = .{ .pure = 0 }, .ty = &Type.t_u64 }});
+        const args1 = try arena.dupe(Arg, &.{.{ .idx = 0, .kind = .use, .loc = .{ .pure = 0 }, .ty = &Type.t_u64 }});
+        try p.cmds.append(arena, .{ .tag = .make_vec, .args = args0, .post_checks = true, .annot = 0 });
+        try p.cmds.append(arena, .{ .tag = .call, .call = &call, .args = args1, .annot = 1 });
+        if (skip) {
+            try privateEntry(&p);
+        } else {
+            try std.testing.expectError(error.Fail, privateEntry(&p));
+            try std.testing.expect(diag.fail.kind.CommandArgumentError.kind == .InvalidArgumentToPrivateEntryFunction);
+            try std.testing.expectEqual(@as(u16, 0), diag.fail.kind.CommandArgumentError.arg_idx);
+            try std.testing.expectEqual(@as(?u64, 1), diag.fail.command);
+        }
+    }
 }

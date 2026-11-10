@@ -14,6 +14,7 @@ pub const stream = @import("stream.zig");
 pub const sigorder = @import("sigorder.zig");
 pub const p2p = @import("p2p.zig");
 pub const p2p_exec = @import("p2p_exec.zig");
+pub const reconcile = @import("reconcile.zig");
 pub const p2p_only = @import("p2p_only.zig");
 pub const p2p_serve = @import("p2p_serve.zig");
 pub const p2p_probe = @import("p2p_probe.zig");

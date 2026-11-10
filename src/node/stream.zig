@@ -25,6 +25,7 @@ const std = @import("std");
 const Io = std.Io;
 const source = @import("source.zig");
 const netguard = @import("netguard.zig");
+const reconcile = @import("reconcile.zig");
 const Atomic = std.atomic.Value;
 
 pub const default_url = "https://fullnode.mainnet.sui.io";
@@ -346,6 +347,8 @@ pub const Stream = struct {
     io: Io,
     base: []const u8 = default_url,
     fetcher: *source.Fetcher,
+    /// Takes the duplicates of checkpoints p2p delivered first (reconcile.zig); null: dropped.
+    reconcile: ?*reconcile.Reconciler = null,
     stats: Stats = .{},
     stopping: Atomic(bool) = .init(false),
     thread: ?std.Thread = null,
@@ -514,7 +517,21 @@ pub const Stream = struct {
         }
     }
 
-    fn handle(s: *Stream, m: Msg, sc: *source.Scratch, blob: *std.ArrayList(u8)) void {
+    /// A checkpoint another source delivered first. When that source was p2p the read sets in
+    /// the store are deepwave's own: this copy carries sui-node's, which reconcile.zig compares.
+    fn duplicate(s: *Stream, seq: u64, m: Msg, sc: *source.Scratch, blob: *std.ArrayList(u8)) void {
+        const r = s.reconcile orelse return;
+        if (!r.wantsCopy(seq)) return;
+        _ = sc.arena.reset(.retain_capacity);
+        source.decodeProto(s.gpa, sc, m.checkpoint, seq, blob) catch {
+            _ = s.stats.bad.fetchAdd(1, .monotonic);
+            return;
+        };
+        r.offer(seq, sc.aux.items, .stream);
+    }
+
+    /// One stream message: spooled when the stream has it first, else a duplicate.
+    pub fn handle(s: *Stream, m: Msg, sc: *source.Scratch, blob: *std.ArrayList(u8)) void {
         const f = s.fetcher;
         _ = s.stats.messages.fetchAdd(1, .monotonic);
         _ = s.stats.bytes.fetchAdd(m.checkpoint.len, .monotonic);
@@ -525,11 +542,17 @@ pub const Stream = struct {
         f.noteSeen(seq, .stream);
         if (!f.wants(seq)) {
             const lo = f.applied_next.load(.acquire);
-            _ = (if (seq >= lo + f.window) &s.stats.skipped else &s.stats.dups).fetchAdd(1, .monotonic);
+            if (seq >= lo + f.window) {
+                _ = s.stats.skipped.fetchAdd(1, .monotonic);
+            } else {
+                _ = s.stats.dups.fetchAdd(1, .monotonic);
+                s.duplicate(seq, m, sc, blob);
+            }
             return;
         }
         if (!f.markDone(seq)) {
             _ = s.stats.dups.fetchAdd(1, .monotonic);
+            s.duplicate(seq, m, sc, blob);
             return;
         }
         f.noteArrival(seq);

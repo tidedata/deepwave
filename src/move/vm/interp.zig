@@ -13,6 +13,7 @@ const types = @import("types.zig");
 const gas = @import("gas.zig");
 const trace = @import("trace.zig");
 const profile = @import("profile.zig");
+const loopaccel = @import("loopaccel.zig"); // loop accelerator hook, see stepRun
 
 const Allocator = std.mem.Allocator;
 const ff = move_format.file_format;
@@ -403,6 +404,13 @@ pub const Session = struct {
     tracer: ?*trace.Tracer = null,
     /// exec-history-vm: the pending error leaves without the v0..v3 core-dump remap.
     raw_err: bool = false,
+    /// DevInspect<true> only (set by the native host under `Host.arbitrary_calls`): a value on
+    /// the operand stack or in a local is not of its declared type. Rust's VM carries such a
+    /// value through every instruction that only moves values; the handlers here trust the
+    /// declared types, so from this point `taintedLoop` runs and lets nothing else execute.
+    tainted: bool = false,
+    /// `taintedLoop` stopped at an instruction that is not a move: not modeled.
+    taint_stopped: bool = false,
     /// exec-history-vm: set by the host while a child object is mutably borrowed under the
     /// v0..v2 / pre-`minimize_child_object_mutations` rule; told the address every write
     /// instruction writes through (a Value slot or a container header), with `ext`.
@@ -447,7 +455,10 @@ pub const Session = struct {
 
     // ---- operand stack -------------------------------------------------------------------
 
-    pub const Fail = error{Vm};
+    /// `Tainted`: a native call just pushed a value that is not of its declared type
+    /// (`tainted`); raised by `callNative` after the call completed, so that whatever tier ran
+    /// the calling frame hands over to `taintedLoop`.
+    pub const Fail = error{ Vm, Tainted };
 
     fn fail(s: *Session, major: StatusCode, sub: ?u64) Fail {
         s.pending = .{ .major = major, .sub = sub };
@@ -749,6 +760,8 @@ pub const Session = struct {
                 s.pending.off = at.off;
                 return .{ .err = s.finalize(s.pending) };
             },
+            // only `callNative` (a native called by bytecode) raises it
+            error.Tainted => unreachable,
             else => |x| return x,
         };
         return .{ .ok = s.stack[0..s.sp] };
@@ -758,6 +771,36 @@ pub const Session = struct {
         while (true) {
             const r = (if (traced) s.step(true) else s.stepRun()) catch |e| switch (e) {
                 error.Vm => return .{ .err = s.finalize(s.pending) },
+                error.Tainted => return s.taintedLoop(traced),
+                else => |x| return x,
+            };
+            if (r) return .{ .ok = s.stack[0..s.sp] };
+        }
+    }
+
+    /// The rest of a run once a value that is not of its declared type is live (`tainted`). Rust's
+    /// interpreter keeps running: its values carry their own kind, an instruction that only
+    /// moves a value never looks at it, and the charges of those instructions come from the
+    /// value as it is. The same instructions here read only the value's own tag (`Ret`, `Pop`,
+    /// `StLoc`, `MoveLoc`, `CopyLoc`, `Branch`, `Nop`), so they run through `step` unchanged,
+    /// with their charges. Anything else may read the value by its declared type: the run stops
+    /// (`taint_stopped`, `error.NativeUnsupported`). The framework's callers of the natives that
+    /// can return such a value return it straight to their own caller.
+    fn taintedLoop(s: *Session, comptime traced: bool) Error!Outcome {
+        while (true) {
+            const f = &s.frames.items[s.frames.items.len - 1];
+            const moves_only = f.pc < f.func.code.len and switch (f.func.code[f.pc].op) {
+                .Ret, .Pop, .StLoc, .MoveLoc, .CopyLoc, .Branch, .Nop => true,
+                else => false,
+            };
+            if (!moves_only) {
+                s.taint_stopped = true;
+                return error.NativeUnsupported;
+            }
+            const r = s.step(traced) catch |e| switch (e) {
+                error.Vm => return .{ .err = s.finalize(s.pending) },
+                // no instruction of the set calls a native
+                error.Tainted => continue,
                 else => |x| return x,
             };
             if (r) return .{ .ok = s.stack[0..s.sp] };
@@ -783,6 +826,9 @@ pub const Session = struct {
         const f = &s.frames.items[s.frames.items.len - 1];
         // aot tier: compiled code for this function runs the same instructions (see aot.zig)
         if (f.func.aot) |a| return @as(AotFn, @ptrCast(@alignCast(a)))(s, f);
+        // loop accelerator hook: a function with a loop accelerator attached runs through loopaccel.run
+        // (off unless loopaccel.enable() or ZUI_VM_LOOPACCEL=1; nothing else in this file knows about it)
+        if (f.func.accel != null and loopaccel.live()) return loopaccel.run(s, f);
         const code = f.func.code;
         const meter = s.meter;
         // the pc lives in a register here; the frame gets it before every instruction (stores
@@ -1201,6 +1247,8 @@ pub const Session = struct {
         };
         if (traced) try s.tracer.?.exitFrame(s, target, null);
         caller.pc += 1;
+        // the call is complete (values pushed, charged, the caller past it): hand over
+        if (s.tainted) return error.Tainted;
     }
 
     fn nativeCall(s: *Session, nf: Native, target: *const Function, ty_args: []const *const Type) (Fail || Error)!void {

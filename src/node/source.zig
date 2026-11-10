@@ -721,6 +721,20 @@ pub const Fetcher = struct {
         return true;
     }
 
+    /// `writeSpool` for a checkpoint built here (p2p_exec.zig): `<seq>.p2p`, an empty file
+    /// written before the blob, tells history.zig that the read sets are deepwave's own, so the
+    /// checkpoint is marked for reconcile (reconcile.zig). A file of its own: the blob and aux
+    /// formats stay what every reader (and an older binary on a kept spool) knows.
+    pub fn writeSpoolBuilt(f: *Fetcher, seq: u64, bytes: []const u8, aux: []const u8) !void {
+        var nb: [48]u8 = undefined;
+        const name = std.fmt.bufPrint(&nb, "{d}.p2p", .{seq}) catch unreachable;
+        try f.spool.writeFile(f.io, .{ .sub_path = name, .data = "" });
+        f.writeSpool(seq, bytes, aux) catch |e| {
+            f.spool.deleteFile(f.io, name) catch {};
+            return e;
+        };
+    }
+
     /// `<seq>.aux` first, then `<seq>.chk` (each written to a temporary name and renamed), so a
     /// reader that sees the `.chk` also sees its `.aux`.
     pub fn writeSpool(f: *Fetcher, seq: u64, bytes: []const u8, aux: []const u8) !void {
@@ -745,6 +759,8 @@ pub const Fetcher = struct {
             f.spool.deleteFile(f.io, name) catch {};
             const ax = std.fmt.bufPrint(&nb, "{d}.aux", .{seq}) catch unreachable;
             f.spool.deleteFile(f.io, ax) catch {};
+            const pp = std.fmt.bufPrint(&nb, "{d}.p2p", .{seq}) catch unreachable;
+            f.spool.deleteFile(f.io, pp) catch {};
         }
     }
 
@@ -754,7 +770,7 @@ pub const Fetcher = struct {
         var s = from;
         var nb: [48]u8 = undefined;
         while (s < below) : (s += 1) {
-            inline for (.{ "{d}.chk", "{d}.aux" }) |fmt| {
+            inline for (.{ "{d}.chk", "{d}.aux", "{d}.p2p" }) |fmt| {
                 const name = std.fmt.bufPrint(&nb, fmt, .{s}) catch unreachable;
                 f.spool.deleteFile(f.io, name) catch {};
             }

@@ -59,7 +59,8 @@ fn setup(ctx: *harness.Ctx, arena: Allocator) !*Shared {
     pkgs.* = try exec.packages.load(ctx, arena, last);
     const sh = try arena.create(Shared);
     sh.* = .{
-        .engine = .{ .core = .{ .gpa = std.heap.smp_allocator, .pkgs = pkgs } },
+        // checks-disabled records are sui-node's default config: DevInspect<true>
+        .engine = .{ .core = .{ .gpa = std.heap.smp_allocator, .pkgs = pkgs, .dev_inspect = .enabled } },
         .chain_id = serve.b58.decode32(rconf.mainnet_chain_id_b58) orelse return error.InvalidChainId,
     };
     return sh;

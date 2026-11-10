@@ -37,6 +37,7 @@ const Allocator = std.mem.Allocator;
 const store = @import("store");
 const sorted = @import("sorted.zig");
 const root = @import("root.zig");
+const bulk = @import("bulk.zig");
 
 pub const Op = enum(u8) { put = 1, del = 2, delta = 3 };
 pub const max_val = 32;
@@ -101,18 +102,18 @@ pub const Files = struct {
     /// RealIo's file table is not thread safe: opens, closes and removes take this.
     mu: SpinLock = .{},
 
-    fn open(f: *Files, name: []const u8, create: bool) !store.io.Fd {
+    pub fn open(f: *Files, name: []const u8, create: bool) !store.io.Fd {
         f.mu.lock();
         defer f.mu.unlock();
         if (create) try f.rio.remove(name);
         return f.rio.openFile(name, create);
     }
-    fn close(f: *Files, fd: store.io.Fd) void {
+    pub fn close(f: *Files, fd: store.io.Fd) void {
         f.mu.lock();
         defer f.mu.unlock();
         f.rio.closeFile(fd);
     }
-    fn remove(f: *Files, name: []const u8) void {
+    pub fn remove(f: *Files, name: []const u8) void {
         f.mu.lock();
         defer f.mu.unlock();
         f.rio.remove(name) catch {};
@@ -129,7 +130,7 @@ pub const SpinLock = struct {
     }
 };
 
-fn tableName(buf: []u8, gen: u64) []const u8 {
+pub fn tableName(buf: []u8, gen: u64) []const u8 {
     return std.fmt.bufPrint(buf, "index/{d}.tbl", .{gen}) catch unreachable;
 }
 fn tempName(buf: []u8, part: u64, k: u64) []const u8 {
@@ -890,6 +891,13 @@ pub const Options = struct {
     build_threads: usize = 0,
     build_chunk_bytes: usize = 96 << 20,
     build_groups: u32 = 4,
+    /// Bulk build by key-range partitions (bulk.zig): one pass over the live set, rows spilled
+    /// to one file per partition, each partition sorted in memory and written straight into the
+    /// base run's tables. False: the sort-and-merge build below (`Builder.runFromMerge`).
+    bulk: bool = true,
+    /// Memory the partitioned build may allocate (lane buffers while rows arrive, then the
+    /// partitions being sorted). `build_chunk_bytes` caps one lane's buffer.
+    build_mem_bytes: usize = 2 << 30,
     sync: store.SyncMode = .data,
 };
 
@@ -1063,7 +1071,7 @@ pub const Db = struct {
         try db.gc();
     }
 
-    fn writeManifest(db: *Db) !void {
+    pub fn writeManifest(db: *Db) !void {
         const files = db.files.?;
         db.man.counter += 1;
         const buf = try db.gpa.create([slot_len]u8);
@@ -1074,15 +1082,23 @@ pub const Db = struct {
     }
 
     /// Removes files no manifest state refers to (a crash mid-flush, mid-compaction or mid-build).
-    fn gc(db: *Db) !void {
+    pub fn gc(db: *Db) !void {
         const files = db.files.?;
         const names = files.rio.listDir(db.gpa, "index") catch return;
         defer {
             for (names) |n| db.gpa.free(n);
             db.gpa.free(names);
         }
+        // A pending partitioned build (bulk.zig) keeps its state file, its partition files and
+        // the tables of its finished ranges.
+        const load: ?*bulk.State = if (db.man.build) |b| (if (b.tip == pending_tip) bulk.State.read(db.gpa, files) else null) else null;
+        defer if (load) |l| db.gpa.destroy(l);
         for (names) |n| {
             var keep = false;
+            if (load) |l| if (l.keeps(n)) {
+                keep = true;
+            };
+            if (keep) continue;
             if (std.mem.endsWith(u8, n, ".tbl")) {
                 if (std.fmt.parseInt(u64, n[0 .. n.len - 4], 10)) |g| {
                     for (db.runs.items) |r| for (r.tables) |t| {
@@ -1473,7 +1489,24 @@ pub const Builder = struct {
     temps: std.ArrayList(*Table) = .empty,
     base: [n_ranges]?*Table = @splat(null),
 
-    pub const Report = struct { objects: u64, entries: u64, bytes: u64, ms: u64, resumed_parts: u32 };
+    pub const Report = struct {
+        objects: u64,
+        entries: u64,
+        bytes: u64,
+        ms: u64,
+        resumed_parts: u32,
+        /// Ranges a resumed partitioned build found finished.
+        resumed_ranges: u32 = 0,
+        /// The two stages: until every row is on disk (the partitioned build: rows appended to
+        /// partition files; the sort-and-merge build: walks and sorted spills), then until the
+        /// tables are written (partitions sorted; temp tables merged).
+        rows_ms: u64 = 0,
+        sort_ms: u64 = 0,
+        /// Partitioned build: bytes of the partition files.
+        temp_bytes: u64 = 0,
+        /// Sorted chunks written for partitions larger than a worker's share of the budget.
+        sort_chunks: u32 = 0,
+    };
 
     /// Builds the base run from the snapshot's live set (resuming a build of the same tip) and
     /// installs it with the snapshot's checkpoint as the watermark. Index lock must be held
@@ -1489,6 +1522,14 @@ pub const Builder = struct {
     /// lock or no reader or other writer touches `db` until it returns (fast start: readers are
     /// held off by the index's `ready` flag, and the commit feed starts after the catch-up).
     pub fn runFrom(db: *Db, src: Source, rows: *const fn (Allocator, []const u8, i2, Emit) anyerror!void) !Report {
+        if (db.opts.bulk) return bulk.Loader.runFrom(db, src, rows);
+        return runFromMerge(db, src, rows);
+    }
+
+    /// The sort-and-merge build (`Options.bulk` false): per key-range group, every thread walks
+    /// parts of the live set and spills sorted temp tables, then the group's ranges are merged
+    /// from all of them. `build_groups` passes over the live set.
+    pub fn runFromMerge(db: *Db, src: Source, rows: *const fn (Allocator, []const u8, i2, Emit) anyerror!void) !Report {
         const t0 = nowMs();
         const tip = src.at;
         var resumed: u32 = 0;
@@ -1516,11 +1557,17 @@ pub const Builder = struct {
             }
         }
         const groups = db.man.build.?.groups;
+        var sort_ms: u64 = 0;
+        var merge_ms: u64 = 0;
         while (db.man.build.?.group < groups) {
             const g = db.man.build.?.group;
             std.log.info("state index: build group {d}/{d} (tip {d}, {d} parts done)", .{ g + 1, groups, tip, @popCount(db.man.build.?.done) });
+            const ta = nowMs();
             try b.phaseSort(g);
+            const tb = nowMs();
             try b.phaseMerge(g);
+            sort_ms += tb - ta;
+            merge_ms += nowMs() - tb;
             if (builtin.is_test) if (test_fail_after_group) |fg| if (fg == g) return error.TestCrash;
         }
         // install: the base run is the only run, the watermark is the tip
@@ -1530,7 +1577,8 @@ pub const Builder = struct {
         try db.writeManifest();
         try db.gc();
         const entries: u64 = if (db.runs.items.len > 0) db.runs.items[0].entries() else 0;
-        return .{ .objects = objs, .entries = entries, .bytes = db.diskBytes(), .ms = nowMs() - t0, .resumed_parts = resumed };
+        std.log.info("state index: sort-and-merge build: walks and sorted spills {d} s, merges {d} s ({d} groups, {d} threads)", .{ sort_ms / 1000, merge_ms / 1000, groups, b.threads });
+        return .{ .objects = objs, .entries = entries, .bytes = db.diskBytes(), .ms = nowMs() - t0, .resumed_parts = resumed, .rows_ms = sort_ms, .sort_ms = merge_ms };
     }
 
     fn deinitTemps(b: *Builder) void {
@@ -1812,8 +1860,10 @@ pub const Stream = struct {
     chunk: usize,
     lanes: []Lane,
     objects: std.atomic.Value(u64) = .init(0),
-    /// Temp tables written so far (progress).
+    /// Temp tables written so far (progress; the partitioned build counts its frames).
     spills: std.atomic.Value(u64) = .init(0),
+    /// The partitioned build behind this stream (`Options.bulk`): `lanes` is then empty.
+    loader: ?*bulk.Loader = null,
 
     pub const Lane = struct {
         lock: SpinLock = .{},
@@ -1823,11 +1873,16 @@ pub const Stream = struct {
         bad: ?anyerror = null,
     };
 
-    const pending_tip = std.math.maxInt(u64);
-
     /// Drops whatever the index holds and starts an empty one-group build. `chunk` is each lane's
     /// sort buffer (0: the db's build_chunk_bytes).
     pub fn begin(db: *Db, rows: *const fn (Allocator, []const u8, i2, Emit) anyerror!void, chunk: usize) !*Stream {
+        if (db.opts.bulk) {
+            const s = try db.gpa.create(Stream);
+            errdefer db.gpa.destroy(s);
+            const l = try bulk.Loader.begin(db, rows, chunk);
+            s.* = .{ .db = db, .rows = rows, .chunk = l.staging, .lanes = &.{}, .loader = l };
+            return s;
+        }
         try db.reset();
         db.man.build = .{ .tip = pending_tip, .groups = 1 };
         try db.writeManifest();
@@ -1843,6 +1898,11 @@ pub const Stream = struct {
     /// Frees the lanes (temp tables of an unfinished stream stay until the next build's reset).
     pub fn destroy(s: *Stream) void {
         const gpa = s.db.gpa;
+        if (s.loader) |l| {
+            l.destroy();
+            gpa.destroy(s);
+            return;
+        }
         for (s.lanes) |*l| {
             l.buf.deinit();
             l.arena.deinit();
@@ -1854,6 +1914,12 @@ pub const Stream = struct {
     /// The rows of one live object (BCS Object) into lane `lane`; spills the lane when its buffer
     /// is full.
     pub fn put(s: *Stream, lane: usize, raw: []const u8) !void {
+        if (s.loader) |ld| {
+            try ld.put(lane, raw);
+            _ = s.objects.fetchAdd(1, .monotonic);
+            s.spills.store(ld.frames.load(.monotonic), .monotonic);
+            return;
+        }
         const l = &s.lanes[lane % build_parts];
         l.lock.lock();
         defer l.lock.unlock();
@@ -1881,6 +1947,16 @@ pub const Stream = struct {
     pub fn finish(s: *Stream, tip: u64, stop: ?*const std.atomic.Value(bool)) !Builder.Report {
         const db = s.db;
         const t0 = nowMs();
+        if (s.loader) |ld| {
+            const saved = db.build_stop;
+            if (stop) |x| db.build_stop = x;
+            defer db.build_stop = saved;
+            var rep = try ld.finish(tip);
+            s.spills.store(ld.frames.load(.monotonic), .monotonic);
+            rep.objects = s.objects.load(.monotonic);
+            rep.ms = nowMs() - t0;
+            return rep;
+        }
         // spill the lanes in parallel (each a sort of up to `chunk` bytes)
         const Spill = struct {
             s: *Stream,
@@ -1918,7 +1994,7 @@ pub const Stream = struct {
         const saved = db.build_stop;
         if (stop) |x| db.build_stop = x;
         defer db.build_stop = saved;
-        var rep = try Builder.runFrom(db, .{ .ctx = s, .at = tip, .walk = noWalk }, s.rows);
+        var rep = try Builder.runFromMerge(db, .{ .ctx = s, .at = tip, .walk = noWalk }, s.rows);
         rep.objects = s.objects.load(.monotonic);
         rep.ms = nowMs() - t0;
         return rep;
@@ -1929,7 +2005,37 @@ pub const Stream = struct {
     }
 };
 
-fn raiseFdLimit() void {
+/// A pending build with this tip has no live-set checkpoint yet (a stream before `finish`) or is
+/// a partitioned build, whose own state file holds the tip (bulk.zig). The sort-and-merge build
+/// never matches it, so it resets such a build.
+pub const pending_tip = std.math.maxInt(u64);
+
+/// Merges whole temp tables (equal keys: deltas add up, index 0 wins otherwise; deletes and zero
+/// sums are dropped) into `w` in key order. `stop` is checked every 64k rows.
+pub fn mergeTablesInto(gpa: Allocator, files: *Files, tables: []const *Table, w: *TableWriter, stop: ?*const std.atomic.Value(bool)) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = tables.len;
+    const srcs = try a.alloc(Src, n);
+    const runs = try a.alloc(Run, n);
+    const one = try a.alloc([1]*Table, n);
+    for (tables, 0..) |t, i| {
+        one[i] = .{t};
+        runs[i] = .{ .tables = &one[i] };
+        srcs[i] = .{ .kind = .{ .run = RunIter.init(a, files, &runs[i]) } };
+    }
+    var m: MergeIter = .{ .a = a, .srcs = srcs, .heap = try a.alloc(u32, n) };
+    try m.seek("");
+    var k: u64 = 0;
+    while (try m.next()) |e| {
+        try w.add(e.key, e.val);
+        k += 1;
+        if (k % 65536 == 0) if (stop) |x| if (x.load(.acquire)) return error.Stopped;
+    }
+}
+
+pub fn raiseFdLimit() void {
     if (builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) return;
     var lim = std.posix.getrlimit(.NOFILE) catch return;
     const want: @TypeOf(lim.cur) = if (builtin.os.tag.isDarwin()) @min(lim.max, 10240) else lim.max;
@@ -1938,7 +2044,7 @@ fn raiseFdLimit() void {
     std.posix.setrlimit(.NOFILE, lim) catch {};
 }
 
-fn nowMs() u64 {
+pub fn nowMs() u64 {
     var ts: std.posix.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;

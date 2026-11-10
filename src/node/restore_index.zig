@@ -7,13 +7,16 @@
 //!
 //! - **State index rows on the fetch threads.** Each verified partition's objects go through
 //!   `index.rowsOf` on the fetch thread that checked it (`snapshot.RestoreOptions.on_partition`),
-//!   into that thread's lane of an `index.lsm.Stream`: a sort buffer spilled as a sorted temp table
-//!   whenever it fills. Partitions arrive in any order; rows are keyed, so order does not matter.
+//!   into that thread's lane of an `index.lsm.Stream`: a buffer whose rows are appended, grouped
+//!   by key range, to the index build's partition files whenever it fills (index/bulk.zig; with
+//!   ZUI_INDEX_BULK=0 a sort buffer spilled as a sorted temp table). Partitions arrive in any
+//!   order; rows are keyed, so order does not matter.
 //! - **Package floors** (rpc index `onRestoredObject`) on the same threads, under one lock (a few
 //!   hundred thousand packages among 773M objects).
-//! - **Merge beside the live-table build.** Once every partition is in and the root matched
-//!   (`after_objects`), a thread spills the lanes and merges the temp tables into the base run
-//!   (`Stream.finish`, one merge thread per key range) while the restore builds the live table.
+//! - **Tables beside the live-table build.** Once every partition is in and the root matched
+//!   (`after_objects`), a thread flushes the lanes and writes the base run (`Stream.finish`: each
+//!   key range's partitions sorted in memory and written as its table, one worker per range)
+//!   while the restore builds the live table.
 //!   `finish` joins it after the table is persisted, then makes the rpc index durable at the
 //!   restored checkpoint. Both indexes are level with the store before the `done` marker, so the
 //!   first start serves everything at once.
@@ -21,6 +24,18 @@
 //! Failure here never costs the restore: `finish` reports it and the caller falls back to the
 //! post-restore image walk (`Node.restoreIndexes`), or, failing that, to node start's builds.
 //! `ZUI_RESTORE_STREAM=0` turns the stream off (image walk after the restore, as before).
+//!
+//! **A stop or a kill while the index tables are written costs no download** (`finishRestore`).
+//! The `done` marker means the store holds the restored live set, nothing more: it is written
+//! once the live table is durable, before the indexes are waited for. Whether an index is
+//! usable is read from the index itself at node start (the state index's pending build and
+//! watermark, the rpc index's watermark: `Feed.buildReason`, `Node.startIndexes`, the rpc
+//! seed), which keeps StateService UNAVAILABLE and /health 503 until the build, resumed from
+//! `index/load.state`, is level with the store. No reader of the marker takes `done` for
+//! "indexes ready": Node.init (wipe or keep the store), `restored_epoch` (lowest available
+//! checkpoint), `completeFrom`, `restoreImage`, deepwave-tool and deploy/shadow-install.sh all mean
+//! "the store is restored", and a store copied without its index directories already started
+//! that way.
 const std = @import("std");
 const store = @import("store");
 const serve = @import("serve");
@@ -48,11 +63,49 @@ pub const Options = struct {
     rpc_dir: ?[]const u8,
     committees: ?serve.rpcindex.CommitteeSource = null,
     lsm: index.lsm.Options = .{},
-    /// Sort buffer per fetch thread (0: 64 MiB; ZUI_RESTORE_INDEX_CHUNK_MB).
+    /// Row buffer per fetch thread (0: 64 MiB; ZUI_RESTORE_INDEX_CHUNK_MB). The partitioned
+    /// build caps it at 32 MiB and at its memory budget's share (index/bulk.zig `stagingFor`).
     chunk: usize = 0,
+    /// Fetch threads of the restore (0: unknown). Above 16 the row buffers shrink so that all of
+    /// them stay inside the index build's memory budget (`lsm.build_mem_bytes`).
+    threads: usize = 0,
     /// The node's signal flag: the merge stops when it is set (the restore is retried).
     signal: *const Atomic(bool),
 };
+
+/// The row buffer of one of `threads` fetch threads: `chunk`, cut to a fifth of `budget` between
+/// them (a lane holds its rows, the same rows grouped, and at worst one frame of all of them).
+/// The partitioned build applies the same rule for 16 lanes on its own.
+pub fn laneBytes(chunk: usize, threads: usize, budget: usize) usize {
+    if (threads <= 16) return chunk;
+    return @min(chunk, @max(budget / (5 * threads), 1 << 20));
+}
+
+/// The end of a restore, after `snapshot.restore` returned (objects, live table and the
+/// end-of-epoch checkpoint are committed): the live table durable in its file, then the `done`
+/// marker, then the indexes of the download. True: both indexes are level with the store.
+/// False: they are not built (no stream, or it failed and its index was reset); the caller
+/// builds them from the restore image, now or at the next start. error.Stopped: a signal
+/// arrived while the index tables were written; the store is complete and marked, and the
+/// next start resumes the index build where it stopped instead of restoring again.
+pub fn finishRestore(io: std.Io, node_dir: std.Io.Dir, st: *store.Store, epoch: u64, rib: ?*Build) !bool {
+    // The table durable in its file before `done` (shadow-install finding 2: an exit before
+    // the first follow flush replayed the whole restored segment, ~23 min, on every start).
+    const t_p = nowMs();
+    try st.persistLive();
+    std.log.info("snapshot: live table persisted in {d} ms", .{nowMs() - t_p});
+    try snapshot.writeMarker(io, node_dir, .done, epoch);
+    const b = rib orelse return false;
+    b.finish() catch |e| {
+        if (e == error.Stopped or b.opts.signal.load(.acquire)) {
+            std.log.info("snapshot: stopped while the indexes were built; the store is restored, the index build resumes at the next start", .{});
+            return error.Stopped;
+        }
+        std.log.warn("snapshot: indexes from the download: {s}; walking the restore image instead", .{@errorName(e)});
+        return false;
+    };
+    return true;
+}
 
 pub const Build = struct {
     gpa: std.mem.Allocator,
@@ -89,6 +142,7 @@ pub const Build = struct {
                 chunk = 64 << 20;
                 if (std.c.getenv("ZUI_RESTORE_INDEX_CHUNK_MB")) |v| chunk = (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 64) << 20;
             }
+            if (opts.lsm.bulk) chunk = laneBytes(chunk, opts.threads, opts.lsm.build_mem_bytes);
             b.stream = try index.lsm.Stream.begin(&b.ix.?.db, index.rowsOf, chunk);
             b.ix.?.ready.store(false, .release);
         }
@@ -156,7 +210,7 @@ pub const Build = struct {
         }
         b.merge_start_ms = nowMs();
         const objs = b.stream.?.objects.load(.monotonic);
-        std.log.info("snapshot: state index rows of {d} objects in {d} temp tables; merging beside the live-table build", .{ objs, b.stream.?.spills.load(.monotonic) });
+        std.log.info("snapshot: state index rows of {d} objects in {d} temp pieces; building its tables beside the live-table build", .{ objs, b.stream.?.spills.load(.monotonic) });
         b.thread = std.Thread.spawn(.{ .stack_size = 16 << 20 }, mergeMain, .{b}) catch |e| {
             // no thread: merge in `finish` instead
             std.log.warn("snapshot: index merge thread: {s}; merging after the table", .{@errorName(e)});

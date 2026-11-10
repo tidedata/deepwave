@@ -27,6 +27,7 @@ pub const commit_finalizer = @import("commit_finalizer.zig");
 pub const ancestor = @import("ancestor.zig");
 pub const core = @import("core.zig");
 pub const test_dag = @import("test_dag.zig");
+pub const gen_dag = @import("gen_dag.zig");
 pub const sim = @import("sim.zig");
 pub const conformance = @import("conformance.zig");
 
@@ -42,7 +43,7 @@ pub const Core = core.Core;
 
 test {
     // Unit tests of every file (a file's `test` blocks run only when the file is referenced here).
-    inline for (.{ "types", "committee", "config", "iface", "digest", "verifier", "store", "rand", "leader_scoring", "dag_state", "block_manager", "threshold_clock", "leader_schedule", "committer", "linearizer", "transaction_vote_tracker", "commit_finalizer", "ancestor", "core", "test_dag", "sim", "conformance" }) |name| {
+    inline for (.{ "types", "committee", "config", "iface", "digest", "verifier", "store", "rand", "leader_scoring", "dag_state", "block_manager", "threshold_clock", "leader_schedule", "committer", "linearizer", "transaction_vote_tracker", "commit_finalizer", "ancestor", "core", "test_dag", "gen_dag", "sim", "conformance" }) |name| {
         _ = @field(@This(), name);
         std.testing.refAllDecls(@field(@This(), name));
     }

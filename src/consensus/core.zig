@@ -329,6 +329,16 @@ pub const Core = struct {
         return total;
     }
 
+    /// Hands the finalized commits to the driver's list. Each owns memory (an arena, and a hold
+    /// on every block it shares with the DAG window) that the driver frees through that list: if
+    /// the list cannot take them, they are freed here, since nobody else knows them.
+    fn appendCommitted(arena: Allocator, out: *Output, fin: []commit_finalizer.Finalized) err.Error!void {
+        out.committed.appendSlice(arena, fin) catch {
+            for (fin) |*f| f.deinit();
+            return error.OutOfMemory;
+        };
+    }
+
     fn acceptCommittedBlocks(self: *Core, arena: Allocator, blocks: []const types.VerifiedBlock, out: *Output) err.Error!void {
         const acc = try self.block_manager.tryAcceptCommittedBlocks(arena, blocks);
         try appendAccepted(arena, out, acc);
@@ -344,7 +354,7 @@ pub const Core = struct {
             if (expected) |e| try checkCertifiedRef(e, s.commit_ref);
             s.decided_with_local_blocks = local;
             const fin = try self.finalizer.process(arena, s);
-            out.committed.appendSlice(arena, fin) catch return error.OutOfMemory;
+            try appendCommitted(arena, out, fin);
         }
         for (subs) |*s| try self.dag.addScoringSubdag(s);
         return subs.len;
@@ -373,7 +383,7 @@ pub const Core = struct {
                 try self.tracker.recoverAndVoteOnBlocks(arena, sub.blocks);
             }
             const fin = try self.finalizer.process(arena, &sub);
-            out.committed.appendSlice(arena, fin) catch return error.OutOfMemory;
+            try appendCommitted(arena, out, fin);
         }
     }
 

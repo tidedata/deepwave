@@ -4,9 +4,10 @@
 //! Single-threaded: only the core thread touches it (Rust wraps it in a RwLock; deepwave publishes
 //! read-only snapshots for the network tiles, docs/VALIDATOR-DESIGN.md 7).
 //!
-//! Memory: every cached block lives in its own arena (a copy of the serialized bytes, decoded).
-//! Pointers returned by the getters stay valid until the block is evicted by `flush` (after it
-//! is older than both the GC round and `dag_state_cached_rounds`). V3 consensus is not implemented:
+//! Memory: every cached block lives in its own box (`BlockInfo`: an arena with a copy of the
+//! serialized bytes, decoded). Pointers returned by the getters stay valid until the block is
+//! evicted by `flush` (after it is older than both the GC round and `dag_state_cached_rounds`);
+//! a holder that took the box with `shareBlock` keeps it alive past that until it lets go. V3 consensus is not implemented:
 //! `init` refuses `enable_v3`.
 const std = @import("std");
 const bcs = @import("bcs");
@@ -27,6 +28,23 @@ pub const BlockInfo = struct {
     committed: bool = false,
     /// Hard linked into one of our own proposals (`link_causal_history`).
     included: bool = false,
+    /// Holders of the box: the DAG window, plus every finalizer commit that shares the block
+    /// instead of copying it (`CommitFinalizer` switch `share_blocks`). `block` never changes
+    /// after the box is made; the box is freed when its last holder lets go, on whichever thread
+    /// that is (the allocator is the DagState's, which the finalizer's consumers already free on).
+    holders: std.atomic.Value(u32) = .init(1),
+
+    pub fn retain(self: *BlockInfo) void {
+        _ = self.holders.fetchAdd(1, .monotonic);
+    }
+
+    pub fn release(self: *BlockInfo) void {
+        if (self.holders.fetchSub(1, .acq_rel) != 1) return;
+        const gpa = self.arena.child_allocator;
+        var arena = self.arena;
+        arena.deinit();
+        gpa.destroy(self);
+    }
 };
 
 fn refCmp(ctx: types.BlockRef, item: types.BlockRef) std.math.Order {
@@ -50,6 +68,8 @@ pub const DagState = struct {
 
     /// Recent blocks by ref and the sorted order of the same refs (BTreeMap range queries).
     recent: std.HashMapUnmanaged(types.BlockRef, *BlockInfo, RefContext, 80) = .empty,
+    /// Removals from `recent` since its last rehash (store.zig `Churn`).
+    recent_churn: store_mod.Churn = .{},
     order: std.ArrayList(types.BlockRef) = .empty,
     refs_by_author: []std.ArrayList(types.BlockRef),
     evicted_rounds: []types.Round,
@@ -101,10 +121,7 @@ pub const DagState = struct {
     pub fn deinit(self: *DagState) void {
         const gpa = self.gpa;
         var it = self.recent.valueIterator();
-        while (it.next()) |p| {
-            p.*.arena.deinit();
-            gpa.destroy(p.*);
-        }
+        while (it.next()) |p| p.*.release();
         self.recent.deinit(gpa);
         self.order.deinit(gpa);
         for (self.refs_by_author) |*l| l.deinit(gpa);
@@ -245,6 +262,14 @@ pub const DagState = struct {
         }
         if (self.recent.get(ref)) |info| return &info.block;
         return null;
+    }
+
+    /// The cached block's box with one more holder, or null when the block is not in the window.
+    /// The caller owns that hold and gives it back with `BlockInfo.release`.
+    pub fn shareBlock(self: *DagState, ref: types.BlockRef) ?*BlockInfo {
+        const info = self.recent.get(ref) orelse return null;
+        info.retain();
+        return info;
     }
 
     /// Like `getBlock`, falling back to the store (the result is then valid for the store's life).
@@ -580,8 +605,7 @@ pub const DagState = struct {
             var cut: usize = 0;
             while (cut < list.items.len and list.items[cut].round <= ev) : (cut += 1) {
                 if (self.recent.fetchRemove(list.items[cut])) |kv| {
-                    kv.value.arena.deinit();
-                    self.gpa.destroy(kv.value);
+                    kv.value.release();
                     removed += 1;
                 }
                 max_cut_round = @max(max_cut_round, list.items[cut].round);
@@ -595,6 +619,7 @@ pub const DagState = struct {
         // `order` is sorted by round first and every evicted ref has a round <= max_cut_round, so
         // only that prefix can hold dropped refs; nothing evicted, nothing to compact.
         if (removed == 0) return;
+        self.recent_churn.after(&self.recent, RefContext{}, removed);
         var end: usize = 0;
         while (end < self.order.items.len and self.order.items[end].round <= max_cut_round) : (end += 1) {}
         var w: usize = 0;

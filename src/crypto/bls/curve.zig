@@ -256,6 +256,109 @@ pub fn sigma(p: G1.Point) G1.Point {
     return .{ .x = p.x, .y = p.y, .z = p.z.mul(beta) };
 }
 
+/// `sigma` on an affine point: (beta x, y) (Z beta in Jacobian form divides x by beta^2 = 1 / beta).
+pub fn sigmaAffine(a: G1.Affine) G1.Affine {
+    return .{ .x = a.x.mul(beta), .y = a.y };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scalar multiplication on G1 with the endomorphism, for public scalars (batch verification)
+//
+// On G1, sigma(P) = [lambda]P with lambda = z^2 - 1 (lambda^2 + lambda + 1 = 0 mod r; test
+// below). A pair of 64-bit halves (a, b) stands for the scalar a + b lambda mod r, and
+// [a]P + [b]sigma(P) costs one chain of 64 doublings instead of 128.
+//
+// Distinct pairs are distinct scalars: if a + b lambda = a' + b' lambda mod r then
+// (x, y) = (a - a', b - b') is in the lattice of (x, y) with x + y lambda = 0 mod r, which has
+// the basis (-(z^2 - 1), 1), (1, z^2) (determinant -(z^4 - z^2 + 1) = -r). In that basis
+// (x, y) = c1 (-(z^2 - 1), 1) + c2 (1, z^2) with c1 = -(z^2 x - y) / r and
+// c2 = (x + (z^2 - 1) y) / r; for |x|, |y| < 2^64 both numerators are below 2^192 < r in size,
+// so c1 = c2 = 0. Uniform (a, b) therefore give a scalar uniform over 2^128 values.
+
+/// Width-4 NAF of k: k = sum d[i] 2^i, every d[i] zero or odd with |d[i]| <= 7, at most one
+/// nonzero digit in any four in a row. Returns the digit count (at most 65); digits at and
+/// above it are not written.
+pub fn wnaf4(k: u64, d: *[65]i8) usize {
+    var x: u128 = k;
+    var n: usize = 0;
+    while (x != 0) : (n += 1) {
+        if (x & 1 == 1) {
+            const low: i8 = @intCast(x & 15);
+            const digit: i8 = if (low >= 8) low - 16 else low;
+            d[n] = digit;
+            x = if (digit < 0) x + @as(u128, @intCast(-digit)) else x - @as(u128, @intCast(digit));
+        } else d[n] = 0;
+        x >>= 1;
+    }
+    return n;
+}
+
+/// out[j] = (2j + 1) p.
+pub fn oddMultiples(p: G1.Point, out: *[4]G1.Point) void {
+    const d = p.dbl();
+    out[0] = p;
+    out[1] = d.add(p);
+    out[2] = out[1].add(d);
+    out[3] = out[2].add(d);
+}
+
+inline fn tblPick(tbl: *const [4]G1.Affine, d: i8) G1.Affine {
+    const e = tbl[(@abs(d) - 1) / 2];
+    return if (d < 0) e.neg() else e;
+}
+
+/// [a]P + [b]sigma(P) = [a + b lambda]P for P in G1, from the affine odd multiples of P
+/// (`tbl[j] = (2j + 1) P`). Variable time: public scalars only.
+pub fn mulGlv(tbl: *const [4]G1.Affine, a: u64, b: u64) G1.Point {
+    var da: [65]i8 = @splat(0);
+    var db: [65]i8 = @splat(0);
+    var i = @max(wnaf4(a, &da), wnaf4(b, &db));
+    var acc = G1.Point.infinity;
+    while (i > 0) {
+        i -= 1;
+        acc = acc.dbl();
+        if (da[i] != 0) acc = acc.addAffine(tblPick(tbl, da[i]));
+        if (db[i] != 0) acc = acc.addAffine(sigmaAffine(tblPick(tbl, db[i])));
+    }
+    return acc;
+}
+
+/// Points per shared chain of doublings in `msmGlv` (digit arrays on the stack).
+pub const msm_chunk = 32;
+
+/// sum over i in `idx` of [a_i]P_i + [b_i]sigma(P_i), every P_i in G1: `tbls[4 i ..][0..4]`
+/// are the affine odd multiples of P_i and `scalars[i]` is a_i then b_i, 8 little-endian bytes
+/// each. Straus: one chain of doublings shared by up to `msm_chunk` points. Variable time.
+pub fn msmGlv(tbls: []const G1.Affine, scalars: []const [16]u8, idx: []const u32) G1.Point {
+    var total = G1.Point.infinity;
+    var k: usize = 0;
+    while (k < idx.len) : (k += msm_chunk) {
+        const part = idx[k..@min(idx.len, k + msm_chunk)];
+        var digits: [msm_chunk][2][65]i8 = undefined;
+        var top: usize = 0;
+        for (part, 0..) |i, j| {
+            digits[j] = @splat(@splat(0));
+            top = @max(top, wnaf4(std.mem.readInt(u64, scalars[i][0..8], .little), &digits[j][0]));
+            top = @max(top, wnaf4(std.mem.readInt(u64, scalars[i][8..16], .little), &digits[j][1]));
+        }
+        var acc = G1.Point.infinity;
+        var bit = top;
+        while (bit > 0) {
+            bit -= 1;
+            acc = acc.dbl();
+            for (part, 0..) |i, j| {
+                const t: *const [4]G1.Affine = tbls[4 * i ..][0..4];
+                const da = digits[j][0][bit];
+                if (da != 0) acc = acc.addAffine(tblPick(t, da));
+                const db = digits[j][1][bit];
+                if (db != 0) acc = acc.addAffine(sigmaAffine(tblPick(t, db)));
+            }
+        }
+        total = total.add(acc);
+    }
+    return total;
+}
+
 /// psi = untwist-Frobenius-twist endomorphism on G2 (blst e2.c `psi`).
 pub fn psi(p: G2.Point) G2.Point {
     return .{ .x = p.x.conj().mul(psi_x), .y = p.y.conj().mul(psi_y), .z = p.z.conj() };
@@ -355,4 +458,93 @@ test "generators, subgroup checks, endomorphisms" {
     var scr: [4]Fp = undefined;
     batchToAffine(G1, &pts, &aff, &scr);
     for (pts, aff) |pp, a| try std.testing.expect(pp.toAffine().eql(a));
+}
+
+test "wnaf4: digits rebuild the scalar and keep the window rule" {
+    var prng = std.Random.DefaultPrng.init(0x4af);
+    const rnd = prng.random();
+    const edge = [_]u64{ 0, 1, 2, 7, 8, 9, 15, 16, 0x8000000000000000, std.math.maxInt(u64), std.math.maxInt(u64) - 1, 0x7777777777777777, 0x8888888888888888, 0xffffffff00000000 };
+    for (0..5000) |k| {
+        const v: u64 = if (k < edge.len) edge[k] else rnd.int(u64) >> rnd.uintLessThan(u6, 63);
+        var d: [65]i8 = undefined;
+        const n = wnaf4(v, &d);
+        try std.testing.expect(n <= 65);
+        var sum: i128 = 0;
+        var last: ?usize = null;
+        for (0..n) |i| {
+            sum += @as(i128, d[i]) << @intCast(i);
+            if (d[i] == 0) continue;
+            try std.testing.expect(@abs(d[i]) <= 7 and @abs(d[i]) % 2 == 1);
+            if (last) |l| try std.testing.expect(i - l >= 4);
+            last = i;
+        }
+        try std.testing.expectEqual(@as(i128, v), sum);
+        if (v != 0) try std.testing.expect(d[n - 1] != 0);
+    }
+}
+
+fn testOddTable(p: G1.Point) [4]G1.Affine {
+    var jac: [4]G1.Point = undefined;
+    oddMultiples(p, &jac);
+    var aff: [4]G1.Affine = undefined;
+    var scr: [4]Fp = undefined;
+    batchToAffine(G1, &jac, &aff, &scr);
+    return aff;
+}
+
+test "mulGlv and msmGlv equal double-and-add" {
+    var prng = std.Random.DefaultPrng.init(0x61f);
+    const rnd = prng.random();
+    const g1 = g1_generator.toJacobian();
+    // sigma is [lambda] on G1, lambda = z^2 - 1
+    const lambda: u256 = @as(u256, z_abs) * z_abs - 1;
+    var lb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &lb, lambda, .little);
+    try std.testing.expect(sigma(g1).eql(g1.mulVartime(&lb, 128)));
+    try std.testing.expectEqual(@as(u256, 0), (lambda * lambda + lambda + 1) % consts.r);
+    try std.testing.expect(sigmaAffine(g1_generator).eql(sigma(g1).toAffine()));
+    try std.testing.expect(sigmaAffine(G1.Affine.infinity).isInfinity());
+
+    const edge = [_]u64{ 0, 1, 2, 3, 15, 16, std.math.maxInt(u64), std.math.maxInt(u64) - 1, 0x8000000000000000, 0x7777777777777777 };
+    const n = 70; // more than two chunks of the shared chain
+    var tbls: [4 * n]G1.Affine = undefined;
+    var scalars: [n][16]u8 = undefined;
+    var each: [n]G1.Point = undefined;
+    var kb: [32]u8 = undefined;
+    for (0..n) |i| {
+        // a point of G1: a random multiple of the generator; item 5 is the identity
+        rnd.bytes(&kb);
+        kb[31] &= 0x3f;
+        const p = if (i == 5) G1.Point.infinity else g1.mulVartime(&kb, 256);
+        const tbl = testOddTable(p);
+        for (tbl, 0..) |t, j| {
+            const m: [1]u8 = .{@intCast(2 * j + 1)};
+            try std.testing.expect(t.eql(p.mulVartime(&m, 8).toAffine()));
+        }
+        @memcpy(tbls[4 * i ..][0..4], &tbl);
+        const a: u64 = if (i < edge.len) edge[i] else rnd.int(u64);
+        const b: u64 = if (i < 2 * edge.len) edge[(i * 7 + 3) % edge.len] else rnd.int(u64);
+        std.mem.writeInt(u64, scalars[i][0..8], a, .little);
+        std.mem.writeInt(u64, scalars[i][8..16], b, .little);
+        // [a]P + [b]sigma(P), and [a + b lambda mod r]P
+        const want = p.mulVartime(scalars[i][0..8], 64).add(sigma(p).mulVartime(scalars[i][8..16], 64));
+        const got = mulGlv(&tbl, a, b);
+        try std.testing.expect(got.eql(want));
+        const full: u256 = @intCast((@as(u512, a) + @as(u512, b) * lambda) % consts.r);
+        std.mem.writeInt(u256, &kb, full, .little);
+        try std.testing.expect(got.eql(p.mulVartime(&kb, 256)));
+        each[i] = want;
+    }
+    // any subset, in any order, with repeats
+    var idx: [n + 3]u32 = undefined;
+    for (0..n) |i| idx[i] = @intCast(i);
+    rnd.shuffle(u32, idx[0..n]);
+    idx[n] = idx[0];
+    idx[n + 1] = idx[1];
+    idx[n + 2] = idx[0];
+    for ([_]usize{ 0, 1, 2, 31, 32, 33, 64, 65, n, n + 3 }) |m| {
+        var want = G1.Point.infinity;
+        for (idx[0..m]) |i| want = want.add(each[i]);
+        try std.testing.expect(msmGlv(&tbls, &scalars, idx[0..m]).eql(want));
+    }
 }

@@ -31,6 +31,15 @@
 //!     runtime (core/cpu.zig): a baseline x86-64 binary runs this file compiled for AVX2 + BMI2
 //!     + ADX, or for AVX-512 IFMA, when the CPU has them.
 //!
+//! Switched paths, all off by default (`Opts`; the paths above are what runs until one is on):
+//!   - vec4 (core/cpu.zig `edVec4`, ZUI_ED25519_VEC4): the single chain and the batch chain run
+//!     on the four-way point kernel of ed25519_avx2.zig. The AVX2 tier's default chains are scalar.
+//!   - batch key cache and batch key merge (`setBatchKeys`, ZUI_ED25519_BATCH_KEYS): the batch
+//!     takes decoded keys from sig/fast.zig's cache, and items of one chunk that share a key share
+//!     one table and one summed scalar.
+//!   Every switched path gives the verdict of the default path on every input
+//!   (ed25519_exact.zig checks each one item by item against the reference rule).
+//!
 //! Verification works on public data and is variable time. Signing is constant time.
 const std = @import("std");
 const hash = @import("hash");
@@ -40,6 +49,8 @@ const Verdict = verdict.Verdict;
 const fe25519 = @import("fe25519.zig");
 const fe25519x4 = @import("fe25519x4.zig");
 const ifma = @import("ed25519_ifma.zig");
+const x4 = @import("ed25519_avx2.zig");
+const fast = @import("fast.zig");
 const cpu = @import("core").cpu;
 
 pub const Fe = fe25519.Fe;
@@ -52,6 +63,51 @@ pub const l_bytes: [32]u8 = .{
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
 };
 pub const l_int: u256 = scalar.field_order;
+
+/// Per-call switches of the verifier. The public wrappers read them in the caller's compilation
+/// and pass them to the kernel entries: a kernel object (src/cpu_kernels.zig) has its own copy
+/// of every global, so an entry cannot read a switch itself. All false: the default paths.
+pub const Opts = packed struct(u32) {
+    /// The chains run on the four-way point kernel (ed25519_avx2.zig). Where the AVX-512 IFMA
+    /// kernel is compiled in it keeps the single chain; the batch chain follows this switch.
+    vec4: bool = false,
+    /// Batch: items of a chunk that share a key share one table and one summed scalar.
+    merge_keys: bool = false,
+    _: u30 = 0,
+};
+
+/// Batch switches, both off by default. `cache`: the batch takes decoded keys from the
+/// decoded-key cache of sig/fast.zig and stores the ones it decodes there (only while that cache
+/// is on, `fast.Config.pk_cache`). `merge`: see `Opts.merge_keys`.
+/// ZUI_ED25519_BATCH_KEYS=cache,merge (or all, or off) sets them from the environment: exact
+/// comma-separated names, and a token that is not a name leaves both off with a warning. The
+/// state and the parser are in core/cpu.zig (`EdBatchKeys`), next to the vec4 switch;
+/// `setBatchKeys` overrides the environment.
+pub const BatchKeys = cpu.EdBatchKeys;
+
+/// The switches a ZUI_ED25519_BATCH_KEYS value names (both off when a token is not a name).
+pub fn parseBatchKeys(s: []const u8) BatchKeys {
+    return cpu.parseEdBatchKeys(s).keys;
+}
+
+/// What ZUI_ED25519_BATCH_KEYS asks for (both off when unset).
+pub fn batchKeysFromEnv() BatchKeys {
+    return cpu.edBatchKeysFromEnv();
+}
+
+pub fn batchKeys() BatchKeys {
+    return cpu.edBatchKeys();
+}
+
+pub fn setBatchKeys(k: BatchKeys) void {
+    cpu.setEdBatchKeys(k);
+}
+
+/// The switches in force now. At comptime everything is off (the switches are runtime state).
+fn liveOpts() Opts {
+    if (@inComptime()) return .{};
+    return .{ .vec4 = cpu.edVec4Live(), .merge_keys = batchKeys().merge };
+}
 
 // ---------------------------------------------------------------------------------------------
 // Point arithmetic (extended twisted Edwards, a = -1), the dalek formula set.
@@ -859,7 +915,7 @@ fn hashK(r_bytes: *const [32]u8, a_bytes: *const [32]u8, msg: []const u8) [32]u8
 }
 
 /// The cofactored half-size check: [8]([c0]A + [c1]R - [c1*s]B) = 0. `s` must be canonical.
-fn checkHalf(a: Point, r: Point, s: *const [32]u8, k: *const [32]u8) bool {
+fn checkHalf(a: Point, r: Point, s: *const [32]u8, k: *const [32]u8, o: Opts) bool {
     const hs = halfSize(std.mem.readInt(u256, k, .little));
     var c1b: [32]u8 = @splat(0);
     std.mem.writeInt(u128, c1b[0..16], hs.c1, .little);
@@ -869,6 +925,7 @@ fn checkHalf(a: Point, r: Point, s: *const [32]u8, k: *const [32]u8) bool {
     const nb0 = wnaf(qn, @as(u128, @truncate(t)), 8, true);
     const nb1 = wnaf(qn, t >> 128, 8, true);
     if (comptime ifma.enabled) return isSmallOrder(ifma.quadMul(a, &na, r, &nr, &nb0, &nb1));
+    if (o.vec4) return isSmallOrder(x4.quadMul(a, &na, r, &nr, &nb0, &nb1));
     const tabs = naf5Tables2(a, r);
     return isSmallOrder(quadMul(&tabs[0], &na, &tabs[1], &nr, &nb0, &nb1));
 }
@@ -885,14 +942,14 @@ pub const PublicKey = struct {
 
     /// ed25519-consensus VerificationKey::verify_prehashed. Variable time (public inputs).
     pub fn verifyPrehashed(pk: *const PublicKey, sig: *const [64]u8, k: *const [32]u8) bool {
-        return cpu.call("ed25519_verify_prehashed", verifyPrehashedImpl, .{ pk, sig, k });
+        return cpu.call("ed25519_verify_prehashed", verifyPrehashedImpl, .{ pk, sig, k, liveOpts() });
     }
 
-    pub fn verifyPrehashedImpl(pk: *const PublicKey, sig: *const [64]u8, k: *const [32]u8) bool {
+    pub fn verifyPrehashedImpl(pk: *const PublicKey, sig: *const [64]u8, k: *const [32]u8, o: Opts) bool {
         const s = sig[32..64];
         if (!isCanonicalScalar(s)) return false;
         const r = decompress(sig[0..32]) orelse return false;
-        return checkHalf(pk.a, r, s, k);
+        return checkHalf(pk.a, r, s, k, o);
     }
 
     pub fn verify(pk: *const PublicKey, msg: []const u8, sig: *const [64]u8) bool {
@@ -904,32 +961,32 @@ pub const PublicKey = struct {
 /// fastcrypto Ed25519PublicKey::from_bytes + Ed25519Signature::from_bytes + verify.
 /// Verdicts: pk:InvalidInput (A does not decode), verify:InvalidSignature.
 pub fn verify(pk: *const [32]u8, msg: []const u8, sig: *const [64]u8) Verdict {
-    return cpu.call("ed25519_verify", verifyImpl, .{ pk, msg, sig });
+    return cpu.call("ed25519_verify", verifyImpl, .{ pk, msg, sig, liveOpts() });
 }
 
-pub fn verifyImpl(pk: *const [32]u8, msg: []const u8, sig: *const [64]u8) Verdict {
+pub fn verifyImpl(pk: *const [32]u8, msg: []const u8, sig: *const [64]u8, o: Opts) Verdict {
     const pts = decompress2(pk, sig[0..32]);
     const a = pts[0] orelse return .{ .invalid = .pk_invalid_input };
     const s = sig[32..64];
     if (!isCanonicalScalar(s)) return .{ .invalid = .verify_invalid_signature };
     const r = pts[1] orelse return .{ .invalid = .verify_invalid_signature };
     const k = hashK(sig[0..32], pk, msg);
-    if (!checkHalf(a, r, s, &k)) return .{ .invalid = .verify_invalid_signature };
+    if (!checkHalf(a, r, s, &k, o)) return .{ .invalid = .verify_invalid_signature };
     return .valid;
 }
 
 /// The verify step for an A already decoded (with `decompress2`, together with R): R that did
 /// not decode, a non-canonical s or a failed equation are all false.
 pub fn verifyDecoded(a: Point, r: ?Point, pk: *const [32]u8, msg: []const u8, sig: *const [64]u8) bool {
-    return cpu.call("ed25519_verify_decoded", verifyDecodedImpl, .{ a, r, pk, msg, sig });
+    return cpu.call("ed25519_verify_decoded", verifyDecodedImpl, .{ a, r, pk, msg, sig, liveOpts() });
 }
 
-pub fn verifyDecodedImpl(a: Point, r: ?Point, pk: *const [32]u8, msg: []const u8, sig: *const [64]u8) bool {
+pub fn verifyDecodedImpl(a: Point, r: ?Point, pk: *const [32]u8, msg: []const u8, sig: *const [64]u8, o: Opts) bool {
     const s = sig[32..64];
     if (!isCanonicalScalar(s)) return false;
     const rp = r orelse return false;
     const k = hashK(sig[0..32], pk, msg);
-    return checkHalf(a, rp, s, &k);
+    return checkHalf(a, rp, s, &k, o);
 }
 
 /// Same as `verify` over slices: a signature that is not 64 bytes is sig:InvalidInput and a key
@@ -982,17 +1039,64 @@ const nil: u32 = std.math.maxInt(u32);
 /// (fastcrypto `verify_batch_empty_fail`), verify:InvalidSignature on any failure. Coefficients are 128-bit values derived from
 /// a Blake2b hash of the whole batch, so the result is deterministic. Variable time.
 pub fn verifyBatch(items: []const BatchItem, scratch: []u8) Verdict {
-    return cpu.call("ed25519_verify_batch", verifyBatchImpl, .{ items, scratch });
+    const kc: ?*const KeyCache = if (!@inComptime() and batchKeys().cache and fast.pkCacheOn()) &fast_key_cache else null;
+    const o = liveOpts();
+    if (!@inComptime() and items.len > 2 and batchCapacity(scratch.len) > 0) {
+        _ = batch_equations.fetchAdd(1, .monotonic);
+        _ = batch_equation_items.fetchAdd(items.len, .monotonic);
+        if (o.vec4 or o.merge_keys or kc != null) _ = batch_switched.fetchAdd(1, .monotonic);
+    }
+    return cpu.call("ed25519_verify_batch", verifyBatchImpl, .{ items, scratch, o, kc });
 }
 
-pub fn verifyBatchImpl(items: []const BatchItem, scratch: []u8) Verdict {
+/// What `verifyBatch` was asked to do so far in this process: the calls that ran the batch
+/// equation (more than two items and scratch for a chunk; the others are single checks), the
+/// items in those calls, and how many of the calls ran a switched path (four-way chain, key
+/// cache or key merge: `batchChunkKeyed`). Counted here, in the caller's compilation, so the
+/// numbers hold whatever kernel tier ran the batch. The conformance runner prints them per suite
+/// and fails a run whose batch switch never reached a batch (sig/conformance.zig).
+pub const BatchCalls = struct { equations: u64, items: u64, switched: u64 };
+
+var batch_equations: std.atomic.Value(u64) = .init(0);
+var batch_equation_items: std.atomic.Value(u64) = .init(0);
+var batch_switched: std.atomic.Value(u64) = .init(0);
+
+pub fn batchCalls() BatchCalls {
+    return .{ .equations = batch_equations.load(.monotonic), .items = batch_equation_items.load(.monotonic), .switched = batch_switched.load(.monotonic) };
+}
+
+/// The decoded-key cache as the batch sees it. The cache itself (sig/fast.zig) lives in the
+/// caller's compilation, so it reaches a kernel entry as two C-ABI function pointers.
+pub const KeyCache = struct {
+    /// 0: not cached. 1: cached, `out` written. 2: cached as a key that does not decode.
+    get: *const fn (pk: *const [32]u8, out: *Point) callconv(.c) u8,
+    /// `p` null: the key does not decode.
+    put: *const fn (pk: *const [32]u8, p: ?*const Point) callconv(.c) void,
+};
+
+fn fastKeyGet(pk: *const [32]u8, out: *Point) callconv(.c) u8 {
+    const v = fast.edGetKey(pk) orelse return 0;
+    out.* = v orelse return 2;
+    return 1;
+}
+
+fn fastKeyPut(pk: *const [32]u8, p: ?*const Point) callconv(.c) void {
+    fast.edPutKey(pk, if (p) |x| x.* else null);
+}
+
+const fast_key_cache: KeyCache = .{ .get = &fastKeyGet, .put = &fastKeyPut };
+
+pub fn verifyBatchImpl(items: []const BatchItem, scratch: []u8, o: Opts, kc: ?*const KeyCache) Verdict {
     if (items.len == 0) return .{ .invalid = .verify_invalid_input };
     // Tiny batches: the half-size single check is cheaper than a 253-step shared chain, and it
     // gives the same verdict (a batch is valid iff every item is).
     if (items.len <= 2) {
-        for (items) |it| if (verify(it.pk, it.msg, it.sig) != .valid) return .{ .invalid = .verify_invalid_signature };
+        for (items) |it| if (verifyImpl(it.pk, it.msg, it.sig, o) != .valid) return .{ .invalid = .verify_invalid_signature };
         return .valid;
     }
+    // A switched path (four-way chain, key cache, key merge) runs `batchChunkKeyed`; with every
+    // switch off the chunks run `batchChunk`, the path as it was.
+    const keyed = o.vec4 or o.merge_keys or kc != null;
     const fit = batchCapacity(scratch.len);
     // Chunks above ~256 items get slower per item (the tables fall out of cache): on a test machine,
     // 64..256 items 16.8 us/sig, 1024 18.2, 4096 22.7 to 24.3, 30k 30.3 (slower than single
@@ -1019,15 +1123,21 @@ pub fn verifyBatchImpl(items: []const BatchItem, scratch: []u8) Verdict {
         if (fit == 0) {
             // no room for tables: verify one by one
             for (items[start..end]) |it| {
-                if (verify(it.pk, it.msg, it.sig) != .valid) return .{ .invalid = .verify_invalid_signature };
+                if (verifyImpl(it.pk, it.msg, it.sig, o) != .valid) return .{ .invalid = .verify_invalid_signature };
             }
         } else {
             const sa = alignedScratch(scratch);
             const entries: [*]BatchEntry = @ptrCast(@alignCast(sa.ptr));
             const ops: [*]BatchOp = @ptrCast(@alignCast(sa.ptr + cap * @sizeOf(BatchEntry)));
-            if (!batchChunk(items[start..end], entries[0 .. end - start], ops[0 .. (end - start) * max_ops_per_item], &seed, chunk_no)) {
-                return .{ .invalid = .verify_invalid_signature };
-            }
+            const ce = entries[0 .. end - start];
+            const co = ops[0 .. (end - start) * max_ops_per_item];
+            const ok = if (!keyed)
+                batchChunk(items[start..end], ce, co, &seed, chunk_no)
+            else if (o.vec4)
+                batchChunkKeyed(true, items[start..end], ce, co, &seed, chunk_no, kc, o.merge_keys)
+            else
+                batchChunkKeyed(false, items[start..end], ce, co, &seed, chunk_no, kc, o.merge_keys);
+            if (!ok) return .{ .invalid = .verify_invalid_signature };
         }
         start = end;
     }
@@ -1103,7 +1213,228 @@ const Chain = struct {
         }
         return acc.toExtended();
     }
+
+    /// `run` on the four-way point kernel: the same ops and digits, the entries' tables cached
+    /// points of ed25519_avx2.zig.
+    fn runX4(c: *const Chain, entries: []const BatchEntryOf(true), bn: *const [256]i8) Point {
+        x4.countChain();
+        var i: usize = 255;
+        while (i > c.top and bn[i] == 0) i -= 1;
+        var acc = x4.identity;
+        while (true) {
+            acc = x4.dbl(acc);
+            var o = c.head[i];
+            while (o != nil) {
+                const op = c.ops[o];
+                const e = &entries[op.entry];
+                const tbl = if (op.tbl == 0) &e.ta else &e.tr;
+                acc = x4.step(acc, op.digit, &tbl.t);
+                o = op.next;
+            }
+            acc = x4.step(acc, bn[i], &x4.base_c);
+            if (i == 0) break;
+            i -= 1;
+        }
+        return x4.toPoint(acc);
+    }
 };
+
+/// A batch entry for the scalar chain (`BatchEntry`) or the four-way one. Both are the same
+/// size and neither needs more than the scratch's alignment, so a chunk's scratch holds either.
+fn BatchEntryOf(comptime vec: bool) type {
+    if (!vec) return BatchEntry;
+    return struct { ta: x4.Table, tr: x4.Table };
+}
+
+comptime {
+    std.debug.assert(@sizeOf(BatchEntryOf(true)) == @sizeOf(BatchEntry));
+    std.debug.assert(@alignOf(BatchEntryOf(true)) <= @alignOf(BatchEntry));
+}
+
+/// Up to eight encodings waiting to be decoded together (the hybrid vector + scalar
+/// exponentiation of `decompressN`), each with the table its point goes into.
+fn DecodeQueue(comptime vec: bool) type {
+    const T = if (vec) x4.Table else Naf5Table;
+    return struct {
+        const Self = @This();
+        src: [8]*const [32]u8 = undefined,
+        dst: [8]*T = undefined,
+        is_key: [8]bool = undefined,
+        n: usize = 0,
+        kc: ?*const KeyCache,
+        /// Scalar tables are built two at a time (their additions interleave): the point
+        /// waiting for a partner.
+        pend: ?struct { p: Point, dst: *T } = null,
+
+        /// False: a point of a flushed group did not decode.
+        fn push(q: *Self, src: *const [32]u8, dst: *T, is_key: bool) bool {
+            q.src[q.n] = src;
+            q.dst[q.n] = dst;
+            q.is_key[q.n] = is_key;
+            q.n += 1;
+            return if (q.n == 8) q.flush() else true;
+        }
+
+        fn flush(q: *Self) bool {
+            const n = q.n;
+            q.n = 0;
+            var pts: [8]?Point = undefined;
+            if (n == 8) {
+                pts = decompressN(8, q.src);
+            } else {
+                var done: usize = 0;
+                if (n >= 4) {
+                    pts[0..4].* = decompressN(4, q.src[0..4].*);
+                    done = 4;
+                }
+                if (n - done >= 2) {
+                    pts[done..][0..2].* = decompress2(q.src[done], q.src[done + 1]);
+                    done += 2;
+                }
+                if (n - done == 1) pts[done] = decompress(q.src[done]);
+            }
+            if (q.kc) |c| for (0..n) |i| {
+                if (q.is_key[i]) c.put(q.src[i], if (pts[i]) |*p| p else null);
+            };
+            for (0..n) |i| {
+                const p = pts[i] orelse return false;
+                q.table(p, q.dst[i]);
+            }
+            return true;
+        }
+
+        fn table(q: *Self, p: Point, dst: *T) void {
+            if (vec) {
+                dst.init(p);
+                return;
+            }
+            if (q.pend) |w| {
+                naf5Tables2Into(w.p, p, w.dst, dst);
+                q.pend = null;
+            } else q.pend = .{ .p = p, .dst = dst };
+        }
+
+        /// Decodes what is left and builds the last table.
+        fn finish(q: *Self) bool {
+            if (!q.flush()) return false;
+            if (!vec) if (q.pend) |w| {
+                w.dst.* = Naf5Table.init(w.p);
+                q.pend = null;
+            };
+            return true;
+        }
+    };
+}
+
+/// `batchChunk` for the switched paths: the same batch equation with the same coefficients
+/// z_i (so with no key merged it is term for term the equation `batchChunk` evaluates), and
+///   - keys come from the decoded-key cache when `kc` is given (a cached point is the point the
+///     decoder returns for those bytes; a key cached as not decoding fails the chunk, as decoding
+///     it would), and the keys decoded here go into it;
+///   - with `merge`, the items of the chunk with the same key bytes share one table and one scalar
+///     sum of z_i k_i mod l. The sum differs from the separate terms by a multiple of l times A,
+///     a small-order point, which the final multiplication by the cofactor removes: the same
+///     argument as the reduction of each z_i k_i mod l. The verdict is unchanged, exactly;
+///   - with `vec`, the tables and the chain are on the four-way point kernel.
+/// A chunk has at most `batch_chunk_best` items (`verifyBatchImpl` caps it).
+/// Test builds count what the switched batch path did (chunks, keys merged into an earlier item's
+/// table, keys taken from the cache), so a test can tell each switch took effect.
+pub var test_keyed: struct {
+    chunks: std.atomic.Value(usize) = .init(0),
+    merged: std.atomic.Value(usize) = .init(0),
+    cached: std.atomic.Value(usize) = .init(0),
+} = .{};
+
+inline fn testCount(c: *std.atomic.Value(usize)) void {
+    if (@import("builtin").is_test) _ = c.fetchAdd(1, .monotonic);
+}
+
+fn batchChunkKeyed(comptime vec: bool, items: []const BatchItem, scratch_entries: []BatchEntry, ops: []BatchOp, seed: *const [32]u8, chunk_no: u64, kc: ?*const KeyCache, merge: bool) bool {
+    const n = items.len;
+    testCount(&test_keyed.chunks);
+    std.debug.assert(n <= batch_chunk_best and n <= scratch_entries.len);
+    const entries: []BatchEntryOf(vec) = @as([*]BatchEntryOf(vec), @ptrCast(scratch_entries.ptr))[0..n];
+    // owner[i]: the first item of the chunk with the same key bytes (i itself without `merge`).
+    var owner: [batch_chunk_best]u16 = undefined;
+    if (merge) {
+        // open addressing over twice the chunk size; the hash is keyed by the batch seed, so the
+        // probe lengths are not the sender's to choose
+        var slots: [2 * batch_chunk_best]u16 = @splat(0xffff);
+        const hseed = std.mem.readInt(u64, seed[0..8], .little);
+        for (items, 0..) |it, i| {
+            var h: usize = @intCast(std.hash.Wyhash.hash(hseed, it.pk) & (slots.len - 1));
+            while (true) : (h = (h + 1) & (slots.len - 1)) {
+                const s = slots[h];
+                if (s == 0xffff) {
+                    slots[h] = @intCast(i);
+                    owner[i] = @intCast(i);
+                    break;
+                }
+                if (std.mem.eql(u8, items[s].pk, it.pk)) {
+                    owner[i] = s;
+                    testCount(&test_keyed.merged);
+                    break;
+                }
+            }
+        }
+    } else {
+        for (0..n) |i| owner[i] = @intCast(i);
+    }
+    // Points and tables: R of every item, A of every owner (from the cache when it is there).
+    var q: DecodeQueue(vec) = .{ .kc = kc };
+    for (items, 0..) |it, i| {
+        if (owner[i] == i) {
+            var cached: Point = undefined;
+            const st: u8 = if (kc) |c| c.get(it.pk, &cached) else 0;
+            if (st == 2) return false;
+            if (st == 1) {
+                testCount(&test_keyed.cached);
+                q.table(cached, &entries[i].ta);
+            } else if (!q.push(it.pk, &entries[i].ta, true)) return false;
+        }
+        if (!q.push(it.sig[0..32], &entries[i].tr, false)) return false;
+    }
+    if (!q.finish()) return false;
+    // Scalars: z_i for R_i, the sum of z_i k_i per owner for A, the sum of z_i s_i for B.
+    var acc: [batch_chunk_best][32]u8 = undefined;
+    for (0..n) |i| {
+        if (owner[i] == i) acc[i] = @splat(0);
+    }
+    var chain: Chain = .{ .ops = ops };
+    var bsum: u512 = 0;
+    var zpair: [32]u8 = undefined;
+    for (items, 0..) |it, i| {
+        if (i % 2 == 0) {
+            // two 128-bit coefficients per Blake2b of (seed, chunk, pair), as `batchChunk`
+            var h = hash.Blake2b256.init();
+            h.update(seed);
+            var nb: [16]u8 = undefined;
+            std.mem.writeInt(u64, nb[0..8], chunk_no, .little);
+            std.mem.writeInt(u64, nb[8..16], i / 2, .little);
+            h.update(&nb);
+            h.final(&zpair);
+        }
+        const s = it.sig[32..64];
+        if (!isCanonicalScalar(s)) return false;
+        const k = hashK(it.sig[0..32], it.pk, it.msg);
+        var z: [32]u8 = @splat(0);
+        @memcpy(z[0..16], zpair[16 * (i % 2) ..][0..16]);
+        const zi = std.mem.readInt(u128, z[0..16], .little);
+        bsum += @as(u512, zi) * std.mem.readInt(u256, s, .little);
+        const ow = owner[i];
+        acc[ow] = scalar.add(acc[ow], scalar.mul(z, k));
+        chain.push(zi, @intCast(i), 1);
+    }
+    for (0..n) |i| {
+        if (owner[i] == i) chain.push(std.mem.readInt(u256, &acc[i], .little), @intCast(i), 0);
+    }
+    var bb: [64]u8 = undefined;
+    std.mem.writeInt(u512, &bb, bsum, .little);
+    const b_coeff = scalar.neg(scalar.reduce64(bb));
+    const bn = naf(&b_coeff, 8);
+    const r = if (vec) chain.runX4(entries, &bn) else chain.run(entries, &bn);
+    return r.mulByCofactor().isIdentity();
+}
 
 /// The batch equation [8](sum z_i R_i + sum (z_i k_i) A_i - (sum z_i s_i) B) = 0 for one chunk,
 /// by Straus with one shared doubling chain (ed25519-consensus evaluates the same equation).
@@ -1478,6 +1809,103 @@ test "batch: chunking, odd sizes and one bad item agree with single verification
             try std.testing.expect(verifyBatch(&items, buf[0..len]) == .invalid);
         sigs[bad][40] ^= 1;
     }
+}
+
+test "batch calls: equations, their items and the switched ones are counted" {
+    const N = 6;
+    var kps: [N]KeyPair = undefined;
+    var msgs: [N][8]u8 = undefined;
+    var sigs: [N][64]u8 = undefined;
+    var items: [N]BatchItem = undefined;
+    for (0..N) |i| {
+        kps[i] = KeyPair.fromSeed(&@as([32]u8, @splat(@intCast(i + 40))));
+        msgs[i] = @splat(@intCast(i));
+        sigs[i] = kps[i].sign(&msgs[i]);
+        items[i] = .{ .pk = &kps[i].pk, .msg = &msgs[i], .sig = &sigs[i] };
+    }
+    var buf: [N * batch_scratch_per_item + 64]u8 = undefined;
+    const keys_before = batchKeys();
+    defer setBatchKeys(keys_before);
+    const vec_before = cpu.edVec4();
+    defer cpu.setEdVec4(vec_before);
+    setBatchKeys(.{});
+    cpu.setEdVec4(.off);
+    // every switch off: equations are counted, none of them switched
+    var c0 = batchCalls();
+    try std.testing.expect(verifyBatch(&items, &buf) == .valid);
+    try std.testing.expect(verifyBatch(items[0..3], &buf) == .valid);
+    var c1 = batchCalls();
+    try std.testing.expectEqual(c0.equations + 2, c1.equations);
+    try std.testing.expectEqual(c0.items + N + 3, c1.items);
+    try std.testing.expectEqual(c0.switched, c1.switched);
+    // not the batch equation: one or two items (single checks), no scratch, an empty batch
+    try std.testing.expect(verifyBatch(items[0..2], &buf) == .valid);
+    try std.testing.expect(verifyBatch(items[0..1], &buf) == .valid);
+    try std.testing.expect(verifyBatch(&items, buf[0..0]) == .valid);
+    try std.testing.expect(verifyBatch(items[0..0], &buf) == .invalid);
+    try std.testing.expect(std.meta.eql(c1, batchCalls()));
+    // the key merge and the four-way chain are switched paths
+    setBatchKeys(.{ .merge = true });
+    c0 = batchCalls();
+    try std.testing.expect(verifyBatch(&items, &buf) == .valid);
+    c1 = batchCalls();
+    try std.testing.expectEqual(c0.equations + 1, c1.equations);
+    try std.testing.expectEqual(c0.switched + 1, c1.switched);
+    setBatchKeys(.{});
+    cpu.setEdVec4(.force);
+    try std.testing.expect(verifyBatch(&items, &buf) == .valid);
+    try std.testing.expectEqual(c1.switched + 1, batchCalls().switched);
+    // the key cache switch without sig.fast's cache changes nothing, and is not counted
+    cpu.setEdVec4(.off);
+    setBatchKeys(.{ .cache = true });
+    const fast_before = fast.config();
+    defer fast.configure(fast_before);
+    fast.configure(.{});
+    c0 = batchCalls();
+    try std.testing.expect(verifyBatch(&items, &buf) == .valid);
+    try std.testing.expectEqual(c0.switched, batchCalls().switched);
+    fast.configure(.{ .pk_cache = true });
+    defer fast.clearCaches();
+    try std.testing.expect(verifyBatch(&items, &buf) == .valid);
+    try std.testing.expectEqual(c0.switched + 1, batchCalls().switched);
+}
+
+test "batch switches: names, set and read back, the environment read" {
+    try std.testing.expect(std.meta.eql(parseBatchKeys("cache,merge"), BatchKeys{ .cache = true, .merge = true }));
+    try std.testing.expect(std.meta.eql(parseBatchKeys("all"), BatchKeys{ .cache = true, .merge = true }));
+    try std.testing.expect(std.meta.eql(parseBatchKeys("merge"), BatchKeys{ .merge = true }));
+    try std.testing.expect(std.meta.eql(parseBatchKeys("cache"), BatchKeys{ .cache = true }));
+    try std.testing.expect(std.meta.eql(parseBatchKeys("off"), BatchKeys{}));
+    // exact tokens: a name inside a longer word switches nothing on
+    try std.testing.expect(std.meta.eql(parseBatchKeys("nomerge"), BatchKeys{}));
+    try std.testing.expect(std.meta.eql(parseBatchKeys("nocache,merge"), BatchKeys{}));
+    try std.testing.expect(std.meta.eql(parseBatchKeys("cache,nomerge"), BatchKeys{}));
+    // run the tests with ZUI_ED25519_BATCH_KEYS set to check the environment read end to end
+    const want: BatchKeys = blk: {
+        const v = std.testing.environ.getAlloc(std.testing.allocator, "ZUI_ED25519_BATCH_KEYS") catch break :blk .{};
+        defer std.testing.allocator.free(v);
+        break :blk parseBatchKeys(v);
+    };
+    if (comptime @import("builtin").link_libc) try std.testing.expect(std.meta.eql(want, batchKeysFromEnv()));
+    // set and read back (whatever the environment asked for is put back at the end)
+    const before = batchKeys();
+    defer setBatchKeys(before);
+    const vec_before = cpu.edVec4();
+    defer cpu.setEdVec4(vec_before);
+    cpu.setEdVec4(.off);
+    setBatchKeys(.{ .merge = true });
+    try std.testing.expect(std.meta.eql(batchKeys(), BatchKeys{ .merge = true }));
+    try std.testing.expect(liveOpts().merge_keys);
+    setBatchKeys(.{});
+    try std.testing.expect(std.meta.eql(batchKeys(), BatchKeys{}));
+    try std.testing.expect(!liveOpts().merge_keys and !liveOpts().vec4);
+    cpu.setEdVec4(.force);
+    try std.testing.expect(liveOpts().vec4);
+}
+
+test {
+    _ = @import("ed25519_exact.zig");
+    _ = @import("ed25519_avx2.zig");
 }
 
 /// ZUI_DUDECT=1 prints the t statistics (the build runner fails a test that writes to stderr).

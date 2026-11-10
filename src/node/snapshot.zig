@@ -22,9 +22,12 @@
 //!
 //! Crash safety. `node/snapshot.json` says `loading` while objects go into the store (commit groups
 //! numbered 0, 1, 2, ... below the end-of-epoch checkpoint). The last group stores the
-//! end-of-epoch checkpoint itself (summary, contents and transaction records) and only then is
-//! the marker set to `done`. A node that finds `loading` wipes the store and starts the restore
-//! again; afterwards it resumes from the stored end-of-epoch checkpoint like any restart.
+//! end-of-epoch checkpoint itself (summary, contents and transaction records) and only then,
+//! with the live table durable, is the marker set to `done`. A node that finds `loading` wipes
+//! the store and starts the restore again; afterwards it resumes from the stored end-of-epoch
+//! checkpoint like any restart. `done` says the store is restored; it says nothing of the
+//! derived indexes, which a node start reads from the indexes themselves
+//! (restore_index.finishRestore).
 const std = @import("std");
 const Io = std.Io;
 const bcs = @import("bcs");

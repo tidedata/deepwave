@@ -813,9 +813,95 @@ pub fn MontField(comptime N: usize, comptime modulus: @Int(.unsigned, 64 * N)) t
             return addLimbs(a.l, b.l)[0];
         }
 
-        /// a^-1 by a binary extended Euclid in variable time: for public values only.
-        /// 0 maps to 0.
+        /// `add`, `sub` and the wide add and subtract modulo m R with the limb carries written
+        /// per limb (`big` false) or as one big-integer operation (`big` true): the two forms
+        /// `big_carry` picks between, side by side for the microbench that decides it on a
+        /// target (bls/microbench.zig). Results equal the functions in use (test below).
+        pub fn CarryForm(comptime big: bool) type {
+            return struct {
+                inline fn subL(comptime K: usize, a: [K]u64, b: [K]u64) struct { [K]u64, u64 } {
+                    if (big) {
+                        const I = @Int(.unsigned, 64 * K);
+                        const d = @subWithOverflow(@as(I, @bitCast(a)), @as(I, @bitCast(b)));
+                        return .{ @bitCast(d[0]), d[1] };
+                    }
+                    var r: [K]u64 = undefined;
+                    var borrow: u64 = 0;
+                    inline for (0..K) |i| {
+                        const d1 = @subWithOverflow(a[i], b[i]);
+                        const d2 = @subWithOverflow(d1[0], borrow);
+                        r[i] = d2[0];
+                        borrow = d1[1] | d2[1];
+                    }
+                    return .{ r, borrow };
+                }
+
+                inline fn addL(comptime K: usize, a: [K]u64, b: [K]u64) struct { [K]u64, u64 } {
+                    if (big) {
+                        const I = @Int(.unsigned, 64 * K);
+                        const r = @addWithOverflow(@as(I, @bitCast(a)), @as(I, @bitCast(b)));
+                        return .{ @bitCast(r[0]), r[1] };
+                    }
+                    var r: [K]u64 = undefined;
+                    var carry: u64 = 0;
+                    inline for (0..K) |i| {
+                        const s1 = @addWithOverflow(a[i], b[i]);
+                        const s2 = @addWithOverflow(s1[0], carry);
+                        r[i] = s2[0];
+                        carry = s1[1] | s2[1];
+                    }
+                    return .{ r, carry };
+                }
+
+                pub inline fn add(a: Self, b: Self) Self {
+                    const t = addL(N, a.l, b.l)[0];
+                    const d = subL(N, t, P);
+                    const mask = 0 -% d[1];
+                    var r: Limbs = undefined;
+                    inline for (0..N) |i| r[i] = (t[i] & mask) | (d[0][i] & ~mask);
+                    return .{ .l = r };
+                }
+
+                pub inline fn sub(a: Self, b: Self) Self {
+                    const d = subL(N, a.l, b.l);
+                    const mask = 0 -% d[1];
+                    var pm: Limbs = undefined;
+                    inline for (0..N) |i| pm[i] = P[i] & mask;
+                    return .{ .l = addL(N, d[0], pm)[0] };
+                }
+
+                pub inline fn addWideModMR(a: WideLimbs, b: WideLimbs) WideLimbs {
+                    const r = addL(2 * N, a, b)[0];
+                    const d = subL(2 * N, r, MR);
+                    return wSelect(0 -% d[1], r, d[0]);
+                }
+
+                pub inline fn subWideModMR(a: WideLimbs, b: WideLimbs) WideLimbs {
+                    const d = subL(2 * N, a, b);
+                    return addL(2 * N, d[0], wMask(0 -% d[1], MR))[0];
+                }
+            };
+        }
+
+        /// a^-1 in variable time: for public values only. 0 maps to 0.
+        ///
+        /// The divsteps inverse below, with its result checked: a nonzero element has one
+        /// inverse, so a value that multiplies back to one is, limb for limb, what the binary
+        /// Euclid (`invEuclid`, the only path before) returns. Anything else falls through to
+        /// `invEuclid`, so no bug in the fast path can change a result.
         pub fn invVartime(a: Self) Self {
+            if (a.isZero()) return zero;
+            if (comptime !is_wasm) if (!@inComptime()) {
+                if (invDivsteps(a)) |r| {
+                    if (a.mul(r).eql(one)) return r;
+                }
+            };
+            return invEuclid(a);
+        }
+
+        /// a^-1 by a binary extended Euclid, one bit at a time (the reference for `invVartime`,
+        /// its fallback, and the wasm and comptime path). 0 maps to 0.
+        pub fn invEuclid(a: Self) Self {
             if (a.isZero()) return zero;
             // Work on the Montgomery representative x = aR: compute x^-1 mod m, then
             // a^-1 R = (x^-1) * R^2 needs two R factors: mulRaw(x^-1, R3) = x^-1 R^3 / R = a^-1 R.
@@ -844,6 +930,233 @@ pub fn MontField(comptime N: usize, comptime modulus: @Int(.unsigned, 64 * N)) t
             }
             const r: Int = if (u == 1) x1 else x2; // (aR)^-1 mod m
             return mulRaw(toLimbs(r), R3);
+        }
+
+        // ---------------------------------------------------------------------------------
+        // Variable-time inverse by divsteps (Bernstein and Yang, "Fast constant-time gcd
+        // computation and modular inversion", in the variable-time form of libsecp256k1's
+        // modinv64_var): f = m, g = x, and d, e with d x = f, e x = g (mod m). 62 divsteps are
+        // decided on the low 64 bits of f and g alone, which gives a 2x2 integer matrix t with
+        // [f'; g'] = t [f; g] / 2^62; the same matrix is applied to the full f, g and, modulo
+        // m, to d, e. When g reaches 0, f is 1 or -1 and d is that sign times x^-1.
+        //
+        // Values are signed, in limbs of 62 bits: limbs below the top one in [0, 2^62), the
+        // top one signed. |f| and |g| never exceed m; d and e stay in (-2m, m).
+
+        /// 62-bit limbs for values in (-2m, 2m).
+        const L62 = 64 * N / 62 + 1;
+        const M62: u64 = (1 << 62) - 1;
+        const m62: [L62]i64 = to62(P);
+        /// m^-1 mod 2^62.
+        const m_inv62: u64 = (0 -% INV) & M62;
+        /// Rounds of 62 divsteps that always suffice: g = 0 after at most (49 b + 57) / 17
+        /// divsteps for inputs of b bits (Bernstein and Yang, theorem 11.2), here b = 64N.
+        const max_rounds62 = (49 * 64 * N + 57) / 17 / 62 + 2;
+
+        fn to62(x: Limbs) [L62]i64 {
+            var out: [L62]i64 = undefined;
+            inline for (0..L62) |i| {
+                const w = 62 * i / 64;
+                const sh = 62 * i % 64;
+                var v: u64 = if (w < N) x[w] >> sh else 0;
+                if (sh > 2 and w + 1 < N) v |= x[w + 1] << (64 - sh);
+                out[i] = @intCast(v & M62);
+            }
+            return out;
+        }
+
+        /// Limbs all in [0, 2^62), value below 2^(64N).
+        fn from62(v: [L62]i64) Limbs {
+            var out: Limbs = @splat(0);
+            inline for (0..L62) |i| {
+                const w = 62 * i / 64;
+                const sh = 62 * i % 64;
+                const x: u64 = @bitCast(v[i]);
+                if (w < N) out[w] |= x << sh;
+                if (sh > 2 and w + 1 < N) out[w + 1] |= x >> (64 - sh);
+            }
+            return out;
+        }
+
+        const Trans = struct { u: i64, v: i64, q: i64, r: i64 };
+
+        inline fn lo64(x: i128) u64 {
+            return @truncate(@as(u128, @bitCast(x)));
+        }
+
+        /// 62 divsteps from (eta, f, g), given the low 64 bits of f (odd) and g; returns the
+        /// new eta (eta = -delta of the paper). One divstep is
+        ///   g even:           (eta - 1, f, g / 2)
+        ///   g odd, eta >= 0:  (eta - 1, f, (g + f) / 2)
+        ///   g odd, eta < 0:   (-eta - 1, g, (g - f) / 2)
+        /// `t`, scaled by 2^62, maps the old (f, g) to the new: |u| + |v| <= 2^62 and
+        /// |q| + |r| <= 2^62.
+        fn divsteps62(eta_in: i64, f0: u64, g0: u64, t: *Trans) i64 {
+            const all: u64 = std.math.maxInt(u64);
+            var u: u64 = 1;
+            var v: u64 = 0;
+            var q: u64 = 0;
+            var r: u64 = 1;
+            var f = f0;
+            var g = g0;
+            var eta = eta_in;
+            var i: u32 = 62; // divsteps left
+            while (true) {
+                // every zero low bit of g is one divstep that halves g (counted up to i)
+                const zeros: u32 = @ctz(g | (all << @intCast(i)));
+                g >>= @intCast(zeros);
+                u <<= @intCast(zeros);
+                v <<= @intCast(zeros);
+                eta -= zeros;
+                i -= zeros;
+                if (i == 0) break;
+                // g is odd
+                if (eta < 0) {
+                    // (f, g) <- (g, -f): with the addition below this is the third divstep
+                    eta = -eta;
+                    const tf = f;
+                    f = g;
+                    g = 0 -% tf;
+                    const tu = u;
+                    u = q;
+                    q = 0 -% tu;
+                    const tv = v;
+                    v = r;
+                    r = 0 -% tv;
+                }
+                // eta >= 0 now, and stays so for the next eta + 1 divsteps: each of them adds f
+                // to g when g is odd and halves it. Together they add w f, with w the multiple
+                // that clears the low bits of g: w = -g / f mod 2^limit. Up to 6 bits at once
+                // (1 / f = f (2 - f^2) mod 2^6); the halvings are the zeros of the next pass.
+                const limit: u32 = @intCast(@min(eta + 1, @as(i64, i)));
+                const mask = (all >> @intCast(64 - limit)) & 63;
+                const w = (f *% g *% (f *% f -% 2)) & mask;
+                g +%= f *% w;
+                q +%= u *% w;
+                r +%= v *% w;
+            }
+            t.* = .{ .u = @bitCast(u), .v = @bitCast(v), .q = @bitCast(q), .r = @bitCast(r) };
+            return eta;
+        }
+
+        /// (d, e) <- t (d, e) / 2^62 mod m, for d, e in (-2m, m); the results are again.
+        fn updateDe62(d: *[L62]i64, e: *[L62]i64, t: Trans) void {
+            const u: i128 = t.u;
+            const v: i128 = t.v;
+            const q: i128 = t.q;
+            const r: i128 = t.r;
+            // the multiple of m that makes a negative d or e count as d + m, e + m
+            const sd = d[L62 - 1] >> 63;
+            const se = e[L62 - 1] >> 63;
+            var md: i64 = (t.u & sd) + (t.v & se);
+            var me: i64 = (t.q & sd) + (t.r & se);
+            var cd: i128 = u * d[0] + v * e[0];
+            var ce: i128 = q * d[0] + r * e[0];
+            // and the multiple that makes the low 62 bits zero
+            md -= @intCast((m_inv62 *% lo64(cd) +% @as(u64, @bitCast(md))) & M62);
+            me -= @intCast((m_inv62 *% lo64(ce) +% @as(u64, @bitCast(me))) & M62);
+            cd += @as(i128, m62[0]) * md;
+            ce += @as(i128, m62[0]) * me;
+            cd >>= 62;
+            ce >>= 62;
+            inline for (1..L62) |i| {
+                cd += u * d[i] + v * e[i] + @as(i128, m62[i]) * md;
+                ce += q * d[i] + r * e[i] + @as(i128, m62[i]) * me;
+                d[i - 1] = @intCast(lo64(cd) & M62);
+                e[i - 1] = @intCast(lo64(ce) & M62);
+                cd >>= 62;
+                ce >>= 62;
+            }
+            d[L62 - 1] = @truncate(cd);
+            e[L62 - 1] = @truncate(ce);
+        }
+
+        /// (f, g) <- t (f, g) / 2^62 (exact) on the low `len` limbs.
+        fn updateFg62(len: usize, f: *[L62]i64, g: *[L62]i64, t: Trans) void {
+            const u: i128 = t.u;
+            const v: i128 = t.v;
+            const q: i128 = t.q;
+            const r: i128 = t.r;
+            var cf: i128 = u * f[0] + v * g[0];
+            var cg: i128 = q * f[0] + r * g[0];
+            cf >>= 62;
+            cg >>= 62;
+            for (1..len) |i| {
+                cf += u * f[i] + v * g[i];
+                cg += q * f[i] + r * g[i];
+                f[i - 1] = @intCast(lo64(cf) & M62);
+                g[i - 1] = @intCast(lo64(cg) & M62);
+                cf >>= 62;
+                cg >>= 62;
+            }
+            f[len - 1] = @truncate(cf);
+            g[len - 1] = @truncate(cg);
+        }
+
+        /// x^-1 mod m as raw limbs, for raw 0 < x < m; null if g did not reach 0 in
+        /// `max_rounds62` rounds (it always does for a prime m). Unchecked: `invVartime`
+        /// multiplies the result back.
+        fn invRaw62(x: Limbs) ?Limbs {
+            var f = m62;
+            var g = to62(x);
+            var d: [L62]i64 = @splat(0);
+            var e: [L62]i64 = @splat(0);
+            e[0] = 1;
+            var eta: i64 = -1;
+            var len: usize = L62;
+            var rounds: usize = 0;
+            while (true) {
+                var t: Trans = undefined;
+                eta = divsteps62(eta, @bitCast(f[0]), @bitCast(g[0]), &t);
+                updateDe62(&d, &e, t);
+                updateFg62(len, &f, &g, t);
+                if (g[0] == 0) {
+                    var rest: i64 = 0;
+                    for (g[1..len]) |gl| rest |= gl;
+                    if (rest == 0) break;
+                }
+                rounds += 1;
+                if (rounds >= max_rounds62) return null;
+                // a top limb that is only the sign of both f and g folds into the limb below
+                const ft = f[len - 1];
+                const gt = g[len - 1];
+                if (len >= 2 and (ft == 0 or ft == -1) and (gt == 0 or gt == -1)) {
+                    f[len - 2] |= @bitCast(@as(u64, @bitCast(ft)) << 62);
+                    g[len - 2] |= @bitCast(@as(u64, @bitCast(gt)) << 62);
+                    len -= 1;
+                }
+            }
+            // f is 1 or -1, d is f / x in (-2m, m): to [0, m), with the sign of f taken out
+            const m62s: i64 = @intCast(M62);
+            if (d[L62 - 1] < 0) {
+                inline for (0..L62) |i| d[i] += m62[i];
+            }
+            if (f[len - 1] < 0) {
+                inline for (0..L62) |i| d[i] = -d[i];
+            }
+            inline for (0..L62 - 1) |i| {
+                d[i + 1] += d[i] >> 62;
+                d[i] &= m62s;
+            }
+            if (d[L62 - 1] < 0) {
+                inline for (0..L62) |i| d[i] += m62[i];
+                inline for (0..L62 - 1) |i| {
+                    d[i + 1] += d[i] >> 62;
+                    d[i] &= m62s;
+                }
+            }
+            if (d[L62 - 1] < 0) return null;
+            const y = from62(d);
+            if (subLimbs(y, P)[1] == 0) return null; // not below m
+            return y;
+        }
+
+        /// The divsteps inverse without the check `invVartime` makes (tests compare it with
+        /// `invEuclid` and `inv`); null if it gave up. 0 maps to 0.
+        pub fn invDivsteps(a: Self) ?Self {
+            if (a.isZero()) return zero;
+            const y = invRaw62(a.l) orelse return null; // (aR)^-1
+            return mulRaw(y, R3); // y < m: (aR)^-1 R^3 / R = a^-1 R, fully reduced
         }
 
         const R3: Limbs = toLimbs(@intCast((@as(@Int(.unsigned, 192 * N + 1), 1) << (192 * N)) % modulus));
@@ -1157,6 +1470,127 @@ test "fp basics" {
         try std.testing.expectEqual(@as(u384, @intCast(sq)), x.sqr().toInt());
         if (!x.isZero()) try std.testing.expect(x.mul(x.inv()).eql(F.one));
         try std.testing.expect(F.fromBytesBE(&x.toBytesBE()).?.eql(x));
+    }
+}
+
+test "invVartime: the divsteps inverse equals the binary Euclid and Fermat on random and edge inputs" {
+    var prng = std.Random.DefaultPrng.init(0x1f1d);
+    const rnd = prng.random();
+    inline for (.{ Fp, Fr }) |F| {
+        const N = F.P.len;
+        var edge: std.ArrayList(F) = .empty;
+        defer edge.deinit(std.testing.allocator);
+        const a = std.testing.allocator;
+        // 1, 2, 3, -1, -2, (m - 1) / 2, (m + 1) / 2, R, R^2, and around them
+        var x = F.one;
+        for (0..6) |_| {
+            try edge.append(a, x);
+            try edge.append(a, x.neg());
+            x = x.add(F.one);
+        }
+        const two_inv = F.one.dbl().inv();
+        try edge.append(a, two_inv);
+        try edge.append(a, two_inv.neg());
+        try edge.append(a, two_inv.sub(F.one));
+        // raw limb patterns below m, read as Montgomery representatives: the inverse works
+        // on the representative, so these are its own edge inputs (powers of two and their
+        // neighbours, long runs of zeros and ones, m - 1, m - 2, 1, 2)
+        for (0..64 * N - 2) |k| {
+            var raw: F.Limbs = @splat(0);
+            raw[k / 64] = @as(u64, 1) << @intCast(k % 64);
+            const pw: F = .{ .l = raw };
+            if (!below(F, raw)) continue;
+            try edge.append(a, pw);
+            if (k > 0) {
+                // 2^k - 1 and 2^k + 1
+                var lo: F.Limbs = @splat(0);
+                for (0..k) |b| lo[b / 64] |= @as(u64, 1) << @intCast(b % 64);
+                try edge.append(a, .{ .l = lo });
+                var hi = raw;
+                hi[0] |= 1;
+                try edge.append(a, .{ .l = hi });
+            }
+        }
+        var pm = F.P;
+        pm[0] -= 1;
+        try edge.append(a, .{ .l = pm });
+        pm[0] -= 1;
+        try edge.append(a, .{ .l = pm });
+        for (edge.items) |v| try expectInv(F, v, true);
+        // zero
+        try std.testing.expect(F.zero.invVartime().isZero());
+        try std.testing.expect(F.invDivsteps(F.zero).?.isZero());
+        // random, and random with long runs of equal bits
+        const rounds: usize = if (builtin.mode == .debug) 3000 else 200_000;
+        for (0..rounds) |k| {
+            var raw: F.Limbs = undefined;
+            for (&raw) |*l| l.* = rnd.int(u64);
+            if (k % 4 == 1) for (&raw) |*l| {
+                if (rnd.boolean()) l.* = if (rnd.boolean()) 0 else std.math.maxInt(u64);
+            };
+            if (k % 4 == 2) {
+                // few bits set
+                raw = @splat(0);
+                for (0..1 + rnd.uintLessThan(usize, 4)) |_| {
+                    const b = rnd.uintLessThan(usize, 64 * N - 3);
+                    raw[b / 64] |= @as(u64, 1) << @intCast(b % 64);
+                }
+            }
+            raw[N - 1] &= (@as(u64, 1) << @intCast(63 - @clz(F.P[N - 1]))) - 1; // below m
+            try expectInv(F, .{ .l = raw }, k % 16 == 0);
+        }
+    }
+}
+
+fn below(comptime F: type, raw: F.Limbs) bool {
+    var i: usize = raw.len;
+    while (i > 0) {
+        i -= 1;
+        if (raw[i] != F.P[i]) return raw[i] < F.P[i];
+    }
+    return false;
+}
+
+fn expectInv(comptime F: type, v: F, fermat: bool) !void {
+    const want = v.invEuclid();
+    const fast = F.invDivsteps(v) orelse return error.DivstepsGaveUp;
+    try std.testing.expectEqual(want.l, fast.l);
+    try std.testing.expectEqual(want.l, v.invVartime().l);
+    if (!v.isZero()) {
+        try std.testing.expect(v.mul(want).eql(F.one));
+        if (fermat) try std.testing.expectEqual(want.l, v.inv().l);
+    }
+}
+
+test "both carry forms equal the add and subtract in use" {
+    var prng = std.Random.DefaultPrng.init(0xca44);
+    const rnd = prng.random();
+    inline for (.{ Fp, Fr }) |F| {
+        const edge = [_]F{ F.zero, F.one, F.one.neg(), F.zero.sub(F.one.dbl()) };
+        for (0..5000) |k| {
+            var a: F = undefined;
+            var b: F = undefined;
+            if (k < edge.len * edge.len) {
+                a = edge[k % edge.len];
+                b = edge[k / edge.len];
+            } else {
+                var raw: F.Limbs = undefined;
+                for (&raw) |*l| l.* = rnd.int(u64);
+                a = F.mulPortable(.{ .l = raw }, F.one);
+                for (&raw) |*l| l.* = if (k % 3 == 0) std.math.maxInt(u64) else rnd.int(u64);
+                b = F.mulPortable(.{ .l = raw }, F.one);
+            }
+            const wa = F.mulWidePortable(a.l, b.l);
+            const wb = F.mulWidePortable(b.l, b.l);
+            inline for (.{ false, true }) |big| {
+                const C = F.CarryForm(big);
+                try std.testing.expectEqual(a.add(b).l, C.add(a, b).l);
+                try std.testing.expectEqual(a.sub(b).l, C.sub(a, b).l);
+                try std.testing.expectEqual(F.addWideModMR(wa, wb), C.addWideModMR(wa, wb));
+                try std.testing.expectEqual(F.subWideModMR(wa, wb), C.subWideModMR(wa, wb));
+                try std.testing.expectEqual(F.subWideModMR(wb, wa), C.subWideModMR(wb, wa));
+            }
+        }
     }
 }
 

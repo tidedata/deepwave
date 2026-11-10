@@ -200,3 +200,83 @@ test "percent encoding matches tonic and text chunks decode" {
     defer gpa.free(d);
     try std.testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x00\x80\x00\x00\x00\x0fgrpc-status:0\r\n", d);
 }
+
+test "zstd: a small reply is compressed in a few KiB, not with a 256 KiB table" {
+    // A GetObject-sized reply: everything `compress` allocates for it fits in 64 KiB. The match
+    // finder's bucket table alone used to be 256 KiB, allocated and cleared per message.
+    var payload: [300]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = if (i % 40 < 32) @truncate(i / 40 *% 37 +% i % 40) else @truncate(i);
+    var buf: [64 << 10]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const z = try compress(fba.allocator(), .zstd, &payload);
+    var in: std.Io.Reader = .fixed(z);
+    var dbuf: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
+    var dz: std.compress.zstd.Decompress = .init(&in, &dbuf, .{});
+    const got = try dz.reader.allocRemaining(std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualSlices(u8, &payload, got);
+}
+
+test "zstd: the frame of a small reply is byte for byte the one the dense table makes" {
+    // The sparse bucket table (store/zstd.zig `Heads`) must not change one compressed byte:
+    // every size up to 300 and sizes around the switch-over, over inputs with few matches, many
+    // matches, long hash chains and protobuf-like repeats.
+    const gpa = std.testing.allocator;
+    const z = @import("store").zstd;
+    var rng = std.Random.DefaultPrng.init(0x7a737464);
+    const r = rng.random();
+    var ids: [8][32]u8 = undefined;
+    for (&ids) |*id| r.bytes(id);
+    const src = try gpa.alloc(u8, z.sparse_max + 64);
+    defer gpa.free(src);
+    var sizes: std.ArrayList(usize) = .empty;
+    defer sizes.deinit(gpa);
+    for (0..301) |n| try sizes.append(gpa, n);
+    var n: usize = 317;
+    while (n < z.sparse_max) : (n += 1 + n / 7) try sizes.append(gpa, n);
+    for ([_]usize{ z.sparse_max - 1, z.sparse_max, z.sparse_max + 1, z.sparse_max + 64 }) |m| try sizes.append(gpa, m);
+    var checked: usize = 0;
+    for (0..5) |kind| for (sizes.items) |len| {
+        const s = src[0..len];
+        switch (kind) {
+            0 => r.bytes(s), // noise: almost every position its own bucket
+            1 => for (s) |*b| {
+                b.* = "ab"[r.uintLessThan(usize, 2)]; // two symbols: long chains, long matches
+            },
+            2 => for (s, 0..) |*b, i| {
+                b.* = @truncate(i % 97 *% 13); // one period
+            },
+            3 => {
+                // protobuf-like: tags, varints and ids drawn from a small pool
+                var i: usize = 0;
+                while (i < len) {
+                    const id = &ids[r.uintLessThan(usize, ids.len)];
+                    const hdr = [_]u8{ 0x0a, 0x20 };
+                    for (hdr) |h| if (i < len) {
+                        s[i] = h;
+                        i += 1;
+                    };
+                    const k = @min(32, len - i);
+                    @memcpy(s[i..][0..k], id[0..k]);
+                    i += k;
+                    if (i < len) {
+                        s[i] = r.int(u8) & 0x7f;
+                        i += 1;
+                    }
+                }
+            },
+            else => for (s, 0..) |*b, i| {
+                b.* = if (r.uintLessThan(u8, 8) == 0) r.int(u8) else @truncate(i >> 3); // runs with noise
+            },
+        }
+        inline for (.{ false, true }) |huffman| {
+            const sparse = try z.compressWith(gpa, s, .{ .huffman = huffman });
+            defer gpa.free(sparse);
+            const dense = try z.compressWith(gpa, s, .{ .huffman = huffman, .dense_heads = true });
+            defer gpa.free(dense);
+            try std.testing.expectEqualSlices(u8, dense, sparse);
+        }
+        checked += 1;
+    };
+    try std.testing.expect(checked > 1500);
+}

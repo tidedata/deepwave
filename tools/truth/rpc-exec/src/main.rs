@@ -1191,14 +1191,197 @@ fn cmd_bench(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------------------------------------
+// `synth`: synthetic DevInspect<true> transactions (checks disabled, mock gas coin) whose native
+// result is not of its declared type, in each position sui-node can consume it.
+
+/// Case ids of `synth` (base; + 50 with `command_outputs` in the mask).
+const SYNTH_CASES: &[(u8, &str)] = &[
+    (30, "withdraw_from_accumulator_address<u256> called from the PTB (the struct of one u64 as a u256)"),
+    (31, "funds_accumulator::withdraw_impl<u256>: the native's value returned by its Move caller"),
+    (32, "funds_accumulator::redeem<u256>: returned through two Move frames"),
+    (33, "withdraw_from_accumulator_address<Balance<SUI>>: the declared type has the value's shape"),
+    (34, "withdraw_from_accumulator_address<u64>"),
+    (35, "withdraw_from_accumulator_address<0x2::object::ID>: a struct of one address"),
+    (36, "withdraw_from_accumulator_address<0x2::balance::Supply<SUI>>: another struct of one u64"),
+    (37, "withdraw_from_accumulator_address<vector<u64>>"),
+    (38, "read_setting_impl over Field<u64, Setting<u64>>, Value = u64, epoch after the setting: some(42)"),
+    (39, "read_setting_impl, Value = u8: a vector<u64> of one element as Option<u8>"),
+    (40, "read_setting_impl, Value = u8, epoch before the setting: an empty vector<u64> as Option<u8>"),
+    (41, "read_setting_impl, Value = 0x1::string::String, epoch before: an empty vector<u64> as Option<String>"),
+    (42, "read_setting_impl over Field<u64, Setting<ID>>, Value = u8, epoch before: an empty vector<ID> as Option<u8>"),
+    (43, "read_setting_impl, Value = 0x1::string::String, epoch after: a vector<u64> of one element as Option<String>"),
+    (44, "read_setting_impl over Field<u64, Setting<ID>>, Value = u64, epoch after: a vector<ID> of one element as Option<u64>"),
+    (45, "read_setting_impl over Field<u64, Setting<ID>>, Value = address, epoch after: an ID as an address"),
+    (46, "read_setting_impl over Field<u64, Setting<ID>>, Value = ID, epoch after: some(ID)"),
+    (47, "funds_accumulator::redeem<Balance<SUI>>: the well typed value through two Move frames"),
+];
+
+fn cmd_synth(corpus: &Path, out: &Path, seq: u64) -> Result<()> {
+    use move_core_types::identifier::Identifier;
+    use move_core_types::language_storage::{StructTag, TypeTag};
+    use std::str::FromStr;
+    use sui_types::base_types::MoveObjectType;
+    use sui_types::object::MoveObject;
+    use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+    use sui_types::transaction::Argument;
+
+    let env = Arc::new(load_env(corpus)?);
+    let data = decode_chk(&corpus.join(format!("chk/{seq}.chk")))?;
+    let epoch = data.checkpoint_summary.epoch;
+    let ep = env.epochs[epoch as usize];
+    let cfg = ProtocolConfig::get_for_version(ProtocolVersion::new(ep.pv), Chain::Mainnet);
+    let exs = Executors::new();
+    let executor = exs.get(&cfg)?;
+    let committee_size = env.sysstate.get(&epoch).map(|x| x.1).unwrap_or(0);
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+
+    let addr = |b: u8| ObjectID::from_bytes([b; 32]).unwrap();
+    let sender = SuiAddress::from(addr(0x55));
+    let config = addr(0xc0);
+    let setting_u64 = addr(0xc1);
+    let setting_id = addr(0xc2);
+    let ty = |s: &str| TypeTag::from_str(s).unwrap();
+
+    // Field<u64, Setting<V>> { id, name: 5, value: Setting { data: some(SettingData {
+    //   newer_value_epoch: 3, newer_value: some(v), older_value_opt: none }) } } under `config`
+    let field = |id: ObjectID, v_ty: &str, v: &[u8]| -> Result<Object> {
+        let mut c = id.to_vec();
+        c.extend_from_slice(&5u64.to_le_bytes());
+        c.push(1);
+        c.extend_from_slice(&3u64.to_le_bytes());
+        c.push(1);
+        c.extend_from_slice(v);
+        c.push(0);
+        let st = StructTag::from_str(&format!("0x2::dynamic_field::Field<u64, 0x2::config::Setting<{v_ty}>>"))?;
+        let mo = unsafe { MoveObject::new_from_execution_with_limit(MoveObjectType::from(st), false, SequenceNumber::from_u64(7), c, 250_000) }
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok(Object::new_move(mo, Owner::ObjectOwner(config.into()), TransactionDigest::genesis_marker()))
+    };
+    // the handler reads the system state (the epoch's 0x5 and its inner field); the transactions
+    // read only the two settings, and only those go into the record
+    let mut objs: Vec<Object> = env.sysstate.get(&epoch).map(|x| x.0.clone()).unwrap_or_default();
+    let recorded = objs.len();
+    objs.push(field(setting_u64, "u64", &42u64.to_le_bytes())?);
+    objs.push(field(setting_id, "0x2::object::ID", &[0x77; 32])?);
+
+    let two = ObjectID::from_hex_literal("0x2")?;
+    let one_call = |module: &str, function: &str, tys: Vec<TypeTag>, pures: Vec<Vec<u8>>| -> Result<Vec<u8>> {
+        let mut b = ProgrammableTransactionBuilder::new();
+        let args: Vec<Argument> = pures.into_iter().map(|p| b.pure_bytes(p, true)).collect();
+        b.programmable_move_call(two, Identifier::new(module)?, Identifier::new(function)?, tys, args);
+        let td = TransactionData::new_programmable(sender, vec![], b.finish(), 50_000_000, ep.rgp);
+        Ok(bcs::to_bytes(&td)?)
+    };
+    let mut five = [0u8; 32];
+    five[0] = 5;
+    let withdraw = |t: &str| one_call("funds_accumulator", "withdraw_from_accumulator_address", vec![ty(t)], vec![addr(0xa1).to_vec(), addr(0x55).to_vec(), five.to_vec()]);
+    let read = |setting: ObjectID, stored: &str, value: &str, at_epoch: u64| {
+        one_call(
+            "config",
+            "read_setting_impl",
+            vec![
+                ty(&format!("0x2::dynamic_field::Field<u64, 0x2::config::Setting<{stored}>>")),
+                ty(&format!("0x2::config::Setting<{stored}>")),
+                ty(&format!("0x2::config::SettingData<{stored}>")),
+                ty(value),
+            ],
+            vec![config.to_vec(), setting.to_vec(), at_epoch.to_le_bytes().to_vec()],
+        )
+    };
+    let txs: Vec<(u8, Vec<u8>)> = vec![
+        (30, withdraw("u256")?),
+        (31, one_call("funds_accumulator", "withdraw_impl", vec![ty("u256")], vec![addr(0x55).to_vec(), five.to_vec()])?),
+        // Withdrawal<u256> { owner, limit: 5 }, Permit<u256> (an empty struct: one dummy bool)
+        (32, one_call("funds_accumulator", "redeem", vec![ty("u256")], vec![[addr(0x55).to_vec(), five.to_vec()].concat(), vec![0]])?),
+        (33, withdraw("0x2::balance::Balance<0x2::sui::SUI>")?),
+        (34, withdraw("u64")?),
+        (35, withdraw("0x2::object::ID")?),
+        (36, withdraw("0x2::balance::Supply<0x2::sui::SUI>")?),
+        (37, withdraw("vector<u64>")?),
+        (38, read(setting_u64, "u64", "u64", 9)?),
+        (39, read(setting_u64, "u64", "u8", 9)?),
+        (40, read(setting_u64, "u64", "u8", 0)?),
+        (41, read(setting_u64, "u64", "0x1::string::String", 0)?),
+        (42, read(setting_id, "0x2::object::ID", "u8", 0)?),
+        (43, read(setting_u64, "u64", "0x1::string::String", 9)?),
+        (44, read(setting_id, "0x2::object::ID", "u64", 9)?),
+        (45, read(setting_id, "0x2::object::ID", "address", 9)?),
+        (46, read(setting_id, "0x2::object::ID", "0x2::object::ID", 9)?),
+        (47, one_call("funds_accumulator", "redeem", vec![ty("0x2::balance::Balance<0x2::sui::SUI>")], vec![[addr(0x55).to_vec(), five.to_vec()].concat(), vec![0]])?),
+    ];
+    assert_eq!(txs.len(), SYNTH_CASES.len());
+
+    let pre = Arc::new(Pre {
+        env: env.clone(),
+        epoch,
+        objs: objs.iter().map(|o| (o.id(), o.clone())).collect(),
+        latest: Some(VerifiedCheckpoint::new_unchecked(data.checkpoint_summary.clone())),
+        layouts: Some((cfg.clone(), executor.clone())),
+    });
+    let sim = Arc::new(Sim {
+        pre: pre.clone(),
+        cfg: cfg.clone(),
+        rgp: ep.rgp,
+        start_ms: ep.start_ms,
+        committee_size,
+        executor: executor.clone(),
+        verifier_metrics: exs.verifier_metrics.clone(),
+        exec_metrics: exs.exec_metrics.clone(),
+    });
+    let mut svc = sui_rpc_api::RpcService::new(pre.clone());
+    svc.with_executor(sim.clone());
+
+    let mut rec = Vec::new();
+    put_u32(&mut rec, 0);
+    put_u64(&mut rec, epoch);
+    put_u64(&mut rec, ep.pv);
+    put_u64(&mut rec, ep.rgp);
+    put_u64(&mut rec, ep.start_ms);
+    put_u32(&mut rec, committee_size);
+    put_u32(&mut rec, (objs.len() - recorded) as u32);
+    for o in &objs[recorded..] {
+        put_bytes(&mut rec, &bcs::to_bytes(o)?);
+    }
+    rec.push((txs.len() * 2) as u8);
+    let mask_outputs = format!("{MASK_FULL}{MASK_OUTPUTS_EXTRA}");
+    for (extra, mask) in [(0u8, MASK_FULL), (50u8, mask_outputs.as_str())] {
+        for (case, tx_bcs) in &txs {
+            let req = request(tx_bcs.clone(), Some(mask), Some(ProtoChecks::Disabled));
+            let req_bytes = prost::Message::encode_to_vec(&req);
+            let (code, msg, det, resp) = call(&rt, &svc, req);
+            let status = <sui_rpc::proto::sui::rpc::v2::SimulateTransactionResponse as prost::Message>::decode(&resp[..])
+                .ok()
+                .and_then(|r| r.transaction)
+                .and_then(|t| t.effects)
+                .and_then(|e| e.bcs)
+                .and_then(|b| b.value)
+                .and_then(|b| bcs::from_bytes::<TransactionEffects>(&b).ok())
+                .map(|fx| format!("{:?} gas {:?}", fx.status(), fx.gas_cost_summary()));
+            let what = SYNTH_CASES.iter().find(|(c, _)| c == case).map(|(_, d)| *d).unwrap_or("");
+            eprintln!("case {}: {what}\n    code {code} {msg:?} {}", case + extra, status.unwrap_or_default());
+            rec.push(case + extra);
+            put_bytes(&mut rec, &req_bytes);
+            rec.push(code);
+            put_bytes(&mut rec, msg.as_bytes());
+            put_bytes(&mut rec, &det);
+            put_bytes(&mut rec, &resp);
+            rec.push(0);
+        }
+    }
+    std::fs::write(out, zstd::encode_all(&rec[..], 19)?)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("synth") if args.len() >= 4 => cmd_synth(Path::new(&args[1]), Path::new(&args[2]), args[3].parse()?),
         Some("gen") if args.len() >= 3 => cmd_gen(Path::new(&args[1]), Path::new(&args[2]), args.get(3).map(|s| s.parse()).transpose()?),
         Some("bench") => cmd_bench(&args[1..]),
         Some("fetch-packages") if args.len() >= 4 => cmd_fetch_packages(Path::new(&args[1]), &args[2], Path::new(&args[3])),
         _ => {
-            eprintln!("usage: zui-truth-rpc-exec gen <corpus> <out dir> [seq] | fetch-packages <corpus> <grpc url> <ids file> | bench simulate --iters N --list <file>");
+            eprintln!("usage: zui-truth-rpc-exec gen <corpus> <out dir> [seq] | synth <corpus> <out file> <seq> | fetch-packages <corpus> <grpc url> <ids file> | bench simulate --iters N --list <file>");
             std::process::exit(2)
         }
     }

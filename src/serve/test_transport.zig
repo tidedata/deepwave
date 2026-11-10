@@ -854,10 +854,19 @@ fn stressMs() u64 {
 
 /// One client: connections one after the other until `until_ns`, each with up to 150 streams.
 fn racyClient(until_ns: u64, streams_done: *std.atomic.Value(u32), failed: *std.atomic.Value(u32)) void {
-    racyClientInner(until_ns, streams_done) catch {
+    racyClientInner(until_ns, streams_done) catch |err| {
+        std.debug.print("listpump stress client: {s}\n", .{@errorName(err)});
         _ = failed.fetchAdd(1, .acq_rel);
     };
 }
+
+/// The stress client opens and resets streams far faster than any real peer. On a loaded box the
+/// connection thread reads them in large batches, and more than `max_pending_resets` (20) resets
+/// of streams opened in one `feed` pass close the connection with GOAWAY(ENHANCE_YOUR_CALM), the
+/// rapid reset guard: the client's next write fails (WriteFailed, as many as `reset_closes`;
+/// 2026-11-10 on a test machine: 1 to 6 per run, every run, from 4721b4de on). This test is about late
+/// pump wakes, not that guard (h2/test_limits.zig covers it), so its server takes every reset.
+const racy_opts: h2.server.Options = .{ .h2 = .{ .max_pending_resets = std.math.maxInt(u32) } };
 
 fn racyClientInner(until_ns: u64, streams_done: *std.atomic.Value(u32)) !void {
     const gpa = std.heap.smp_allocator;
@@ -872,7 +881,7 @@ fn racyClientInner(until_ns: u64, streams_done: *std.atomic.Value(u32)) !void {
         const t = try std.Thread.spawn(.{}, struct {
             fn run(s: *std.Io.net.Server) void {
                 const st = s.accept(testing.io) catch return;
-                h2.server.serveStreamOpts(std.heap.smp_allocator, testing.io, st, .{}, Racy.handler);
+                h2.server.serveStreamOpts(std.heap.smp_allocator, testing.io, st, racy_opts, Racy.handler);
             }
         }.run, .{&server});
         defer t.join();

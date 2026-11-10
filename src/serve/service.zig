@@ -59,6 +59,14 @@ pub const Service = struct {
     pkg_cache: PkgCache = .{},
     /// Pre-encoded GetCheckpoint responses by (checkpoint, read_mask) (cpcache.zig); budget 0: off.
     cp_cache: cpcache.Cache = .{},
+    /// GetCheckpoint calls answered from `cp_cache` before any store read (`getCheckpointCached`).
+    cp_fast_hits: std.atomic.Value(u64) = .init(0),
+    /// How long a cached GetCheckpoint response is served without its checkpoint's record being
+    /// read again (`getCheckpointCached`). After that the next call for it takes the store path,
+    /// which reads and checks the record: a record that went bad on disk answers NotFound and
+    /// counts in the store's `corrupt_reads` from then on, as it did before the cache was
+    /// looked up first.
+    cp_recheck_ns: u64 = 60 * std.time.ns_per_s,
     /// x-sui-* header values (router.zig).
     info_cache: router.InfoCache = .{},
     /// StateService (DROP-IN G4), served by the `index` module when the node has built its indexes.
@@ -341,6 +349,11 @@ pub fn call(ctx: *anyopaque, req: *const h2.Request, rs: *h2.ResponseStream) h2.
         rs.setMessage(text);
         return .internal; // tonic: Status::internal(DecodeError), no details
     };
+    // A repeated GetCheckpoint is answered from the response cache before the snapshot.
+    if (std.mem.eql(u8, method, "GetCheckpoint")) {
+        const sent = getCheckpointCached(self, arena, req.body, rs) catch |e| return fail(arena, rs, e);
+        if (sent) return .ok;
+    }
     var snap = self.store.snapshot();
     defer snap.release();
     var cctx: clever.Ctx = .{ .svc = self, .snap = &snap, .arena = arena };
@@ -694,24 +707,92 @@ fn renderCheckpoint(c: CpCtx, w: *proto.Writer) !void {
     try ledger.getCheckpoint(c.arena, w, c.m, c.d.cert, c.d.contents, c.d.objects, c.d.txs);
 }
 
-fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: []const u8, rs: *h2.ResponseStream) !void {
+const CheckpointRequest = struct { seq: ?u64 = null, digest: ?[]const u8 = null, mask_field: MaskField = .{} };
+
+/// The fields of a GetCheckpointRequest.
+fn scanCheckpointRequest(arena: Allocator, body: []const u8) Err!CheckpointRequest {
     // checkpoint_id is a oneof { sequence_number = 1, digest = 2 }: the last one seen wins
-    var seq: ?u64 = null;
-    var digest: ?[]const u8 = null;
-    var mask_field: MaskField = .{};
+    var q: CheckpointRequest = .{};
     var r = proto.Reader.init(body);
     while (r.next() catch return error.Malformed) |f| switch (f.number) {
         1 => {
-            seq = proto.Reader.varintOf(f) catch return error.Malformed;
-            digest = null;
+            q.seq = proto.Reader.varintOf(f) catch return error.Malformed;
+            q.digest = null;
         },
         2 => {
-            digest = proto.Reader.stringOf(f) catch return error.Malformed;
-            seq = null;
+            q.digest = proto.Reader.stringOf(f) catch return error.Malformed;
+            q.seq = null;
         },
-        3 => try mask_field.add(arena, proto.Reader.bytesOf(f) catch return error.Malformed),
+        3 => try q.mask_field.add(arena, proto.Reader.bytesOf(f) catch return error.Malformed),
         else => {},
     };
+    return q;
+}
+
+/// GetCheckpoint by sequence number (or latest) from the response cache alone: no mask parse, no
+/// record read, and no snapshot unless a fix was installed since the entry was rendered
+/// (`fixedSince`). True when the reply was sent; false leaves everything to `getCheckpoint`,
+/// which has had no effect of this call to undo.
+///
+/// The reply is the one `getCheckpoint` sends for the same request at the same moment. That
+/// function serves the cached entry when (1) the request parses and names no digest, (2) the
+/// mask is valid and does not select `display`, (3) the sequence number is within
+/// lowest..=latest, (4) the checkpoint's record is readable, (5) an entry for (sequence number,
+/// raw mask bytes) is cached and (6) no transaction fix touched the checkpoint since. Here:
+/// - (1) is the same scan; anything else, and every error reply, goes to `getCheckpoint`.
+/// - (2) follows from (5): an entry is only ever inserted under a key whose mask passed both
+///   tests, and both depend on the raw mask bytes alone.
+/// - (3) reads the same values: the store's committed tip (what a snapshot taken now holds),
+///   bounded by the live index, and the lowest available checkpoint.
+/// - (4): a committed record at or above the store's floors is never removed, so it is readable
+///   exactly while its sequence number is at or above the checkpoint floor and its segment's
+///   epoch is in the history window. Both are checked here on the store's own atomics (they move
+///   before the node refreshes `lowest`), the epoch being the one recorded with the entry.
+///   What those cannot show is a record that fails its checks (damage on disk): `getCheckpoint`
+///   answers NotFound for it and the store counts it (`stats.corrupt_reads`). So an entry is
+///   served here only for `cp_recheck_ns` after its record was last read: the next call then
+///   goes through `getCheckpoint`, which reads the record and, if it is good, serves the entry
+///   and renews it. A damaged record is therefore answered from memory for at most that long,
+///   then NotFound on every call, and counted.
+/// - (5) and (6) are the same lookup and the same test.
+fn getCheckpointCached(svc: *Service, arena: Allocator, body: []const u8, rs: *h2.ResponseStream) !bool {
+    if (!svc.cp_cache.enabled()) return false;
+    const q = scanCheckpointRequest(arena, body) catch return false;
+    if (q.digest != null) return false;
+    const latest = boundByIndex(svc, svc.store.committed() orelse return false) orelse return false;
+    const want_seq = q.seq orelse latest;
+    if (want_seq < lowestOf(svc) or want_seq > latest) return false;
+    if (want_seq < svc.store.cp_floor.load(.acquire)) return false;
+    const key = cpcache.maskKey(arena, q.mask_field.parts.items) catch return false;
+    const e = svc.cp_cache.peek(want_seq, key) orelse return false;
+    defer cpcache.release(svc.gpa, e);
+    const epoch = e.epoch orelse return false;
+    if (epoch < svc.store.oldest_epoch.load(.acquire)) return false;
+    if (h2.meta.monoNs() -| e.checked_ns.load(.monotonic) >= svc.cp_recheck_ns) return false;
+    if (fixedSince(svc.store, want_seq, e)) return false;
+    _ = svc.cp_cache.stats.hits.fetchAdd(1, .monotonic);
+    _ = svc.cp_fast_hits.fetchAdd(1, .monotonic);
+    try sendCached(svc, rs, e);
+    return true;
+}
+
+/// Whether a transaction fix or a loaded-list fix installed after `e` was rendered touches its
+/// checkpoint (`changedSince` on both of the store's fix tables), for a caller that holds no
+/// snapshot. The tables free a merged-away index once no snapshot from before the merge is
+/// live, so the index is read under a snapshot. With no fix installed since the render (the
+/// common case) there is nothing to read: two atomic loads, no snapshot.
+fn fixedSince(st: *store.Store, seq: u64, e: *const cpcache.Entry) bool {
+    if (st.tx_fix.generation() <= e.gen and st.list_fix.generation() <= e.gen_lists) return false;
+    var snap = st.snapshot();
+    defer snap.release();
+    return st.tx_fix.changedSince(seq, e.gen) or st.list_fix.changedSince(seq, e.gen_lists);
+}
+
+fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: []const u8, rs: *h2.ResponseStream) !void {
+    const q = try scanCheckpointRequest(arena, body);
+    var seq = q.seq;
+    const digest = q.digest;
+    var mask_field = q.mask_field;
     var mk = try parseMask(arena, rs, &mask_field, "sequence_number,digest", comptime schema.index("Checkpoint"));
     const m = mk.m();
     const want_txs = m.subtree("transactions") != null;
@@ -742,11 +823,18 @@ fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: [
     // A transaction of this checkpoint whose submitted signature order was learned after the
     // response was cached (store txfix.zig) makes the cached bytes stale. The generation is read
     // before the transactions are, so a fix landing during the render only marks this entry stale.
+    // The same holds for a loaded runtime object list replaced since (store `list_fix`).
     const fixes = &snap.store.tx_fix;
     const fix_gen = fixes.generation();
+    const lists = &snap.store.list_fix;
+    const list_gen = lists.generation();
     if (key) |k| if (svc.cp_cache.get(want_seq, k)) |e| {
         defer cpcache.release(svc.gpa, e);
-        if (!fixes.changedSince(want_seq, e.gen)) return sendCached(svc, rs, e);
+        if (!fixes.changedSince(want_seq, e.gen) and !lists.changedSince(want_seq, e.gen_lists)) {
+            // the record was read just above: the entry may be served ahead of it again
+            e.checked_ns.store(h2.meta.monoNs(), .monotonic);
+            return sendCached(svc, rs, e);
+        }
         svc.cp_cache.drop(svc.gpa, want_seq, k);
     };
     const d = try loadCheckpointData(svc, arena, snap, found, want_txs, want_objects);
@@ -760,7 +848,7 @@ fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: [
         for (d.txs) |*t| t.render = rctx;
     }
     const bytes = try renderBytes(arena, 4096 + found.contents.len * 2, CpCtx{ .arena = arena, .m = m, .d = d, .budget = budget }, renderCheckpoint);
-    if (key) |k| svc.cp_cache.putGen(svc.gpa, want_seq, k, bytes, fix_gen);
+    if (key) |k| svc.cp_cache.putAt(svc.gpa, want_seq, found.epoch, h2.meta.monoNs(), k, bytes, fix_gen, list_gen);
     return rs.message(bytes);
 }
 
@@ -1504,4 +1592,580 @@ fn callNames(self: *Service, arena: Allocator, req: *const h2.Request, rs: *h2.R
 
 fn badFieldReason(arena: Allocator, rs: *h2.ResponseStream, field: []const u8, description: []const u8, reason: status.Reason) void {
     _ = badField(arena, rs, field, description, reason) catch {};
+}
+
+test "GetCheckpoint: a cached reply is sent before any store read, and every boundary answers as the store path does" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const loopback = @import("loopback.zig");
+    var cfg: store.Config = .{ .max_live_objects = 1 << 10, .max_object_versions = 1 << 12, .max_transactions = 1 << 10, .max_checkpoints = 1 << 10, .max_batch_bytes = 4 << 20, .max_batch_objects = 64, .max_segments = 16, .segment_reserve = 8 << 20, .seed = 3 };
+    const sim = try store.SimIo.init(gpa, 7, .{}, 64 << 20);
+    defer sim.deinit();
+    const st = try store.Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer st.deinit();
+    const T = struct {
+        fn commit(s: *store.Store, a: Allocator, seq: u64, epoch: u64) !void {
+            const summary: types.CheckpointSummary = .{
+                .epoch = epoch,
+                .sequence_number = seq,
+                .network_total_transactions = seq,
+                .content_digest = .{ .@"0" = .{ .@"0" = @splat(0) } },
+                .previous_digest = null,
+                .epoch_rolling_gas_cost_summary = .{ .computationCost = 0, .storageCost = 0, .storageRebate = 0, .nonRefundableStorageFee = 0 },
+                .timestamp_ms = 1_700_000_000_000 + seq,
+                .checkpoint_commitments = &.{},
+                .end_of_epoch_data = null,
+                .version_specific_data = &.{},
+            };
+            const empty_bitmap = [_]u8{ 0x3a, 0x30, 0, 0, 0, 0, 0, 0 };
+            const sig: types.AuthorityQuorumSignInfo = .{ .epoch = epoch, .signature = @splat(0), .signers_map = .{ .@"0" = &empty_bitmap } };
+            const x = try bcs.encodeAlloc(types.CheckpointSummary, a, &summary);
+            const y = try bcs.encodeAlloc(types.AuthorityQuorumSignInfo, a, &sig);
+            const b = try s.begin(seq, epoch);
+            try b.checkpoint(try std.mem.concat(a, u8, &.{ x, y }), &.{ 0, 0, 0 });
+            try s.commit(b);
+        }
+        /// GetCheckpointRequest: `seq` (absent: latest) and a read mask.
+        fn request(a: Allocator, seq: ?u64, paths: []const []const u8) ![]const u8 {
+            const buf = try a.alloc(u8, 256);
+            var w = proto.Writer.init(buf);
+            if (seq) |n| try w.uint(1, n);
+            const m = try w.begin(3, 64);
+            for (paths) |p| try w.string(1, p);
+            try w.end(m);
+            return w.bytesWritten();
+        }
+        var live: StateHook.Live = .{ .ready = false, .checkpoint = null };
+        fn liveFn(_: *anyopaque) StateHook.Live {
+            return live;
+        }
+        fn stateCall(_: *anyopaque, _: *Service, _: Allocator, _: []const u8, _: []const u8, _: *h2.ResponseStream) h2.Status {
+            return .unimplemented;
+        }
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // epoch 0: checkpoints 0..5, epoch 1: 6..11, epoch 2: 12..14
+    for (0..15) |i| try T.commit(st, a, i, if (i < 6) 0 else if (i < 12) 1 else 2);
+
+    // `svc` has the response cache; `ref` never caches, so every one of its replies is rendered
+    // from the store: the reference for each case below.
+    var svc: Service = .{ .gpa = gpa, .store = st, .chain_id = @splat(0) };
+    defer svc.deinit();
+    var ref: Service = .{ .gpa = gpa, .store = st, .chain_id = @splat(0), .cp_cache = .{ .budget = 0 } };
+    defer ref.deinit();
+    var dummy: u8 = 0;
+    T.live = .{ .ready = false, .checkpoint = null };
+    svc.state = .{ .ctx = &dummy, .call = T.stateCall, .live = T.liveFn };
+    ref.state = svc.state;
+    const path = "/sui.rpc.v2.LedgerService/GetCheckpoint";
+    const mask_paths = [_][]const u8{ "sequence_number", "digest", "summary", "signature", "contents" };
+    const Same = struct {
+        /// Asks both services; the replies must be equal. Returns the gRPC status.
+        fn ask(al: Allocator, s: *Service, r: *Service, body: []const u8) !u8 {
+            const got = try loopback.unary(al, s.handler(), path, body);
+            const want = try loopback.unary(al, r.handler(), path, body);
+            try testing.expectEqual(want.status, got.status);
+            try testing.expectEqualSlices(u8, want.message, got.message);
+            try testing.expectEqualStrings(want.grpc_message, got.grpc_message);
+            try testing.expectEqualSlices(u8, want.details, got.details);
+            return got.status;
+        }
+    };
+    const fast = &svc.cp_fast_hits;
+    // First asks render and cache (by number, and "latest"); the same asks again never reach the store.
+    for ([_]?u64{ 2, 5, 7, 9, 13, 14, null }) |seq| try testing.expectEqual(@as(u8, 0), try Same.ask(a, &svc, &ref, try T.request(a, seq, &mask_paths)));
+    try testing.expectEqual(@as(u64, 1), fast.load(.monotonic)); // "latest" is 14, cached by the ask before it
+    for ([_]?u64{ 2, 5, 7, 9, 13, 14, null }) |seq| try testing.expectEqual(@as(u8, 0), try Same.ask(a, &svc, &ref, try T.request(a, seq, &mask_paths)));
+    try testing.expectEqual(@as(u64, 8), fast.load(.monotonic));
+    try testing.expectEqual(@as(u64, 8), svc.cp_cache.stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(u64, 6), svc.cp_cache.stats.misses.load(.monotonic));
+    // Another mask, the same paths in another order, a digest: not the cached key, the store path.
+    try testing.expectEqual(@as(u8, 0), try Same.ask(a, &svc, &ref, try T.request(a, 9, &.{ "digest", "sequence_number" })));
+    try testing.expectEqual(@as(u64, 8), fast.load(.monotonic));
+    // An invalid mask is the same INVALID_ARGUMENT whether or not the checkpoint is cached.
+    try testing.expectEqual(@as(u8, 3), try Same.ask(a, &svc, &ref, try T.request(a, 9, &.{"nope"})));
+    // Not yet available: NOT_FOUND; once committed it is served (failures are never cached).
+    try testing.expectEqual(@as(u8, 5), try Same.ask(a, &svc, &ref, try T.request(a, 15, &mask_paths)));
+    try T.commit(st, a, 15, 2);
+    try testing.expectEqual(@as(u8, 0), try Same.ask(a, &svc, &ref, try T.request(a, 15, &mask_paths)));
+    // "latest" follows the tip: 15 now (cached by the ask just above), not the 14 cached for it before.
+    const f0 = fast.load(.monotonic);
+    try testing.expectEqual(@as(u8, 0), try Same.ask(a, &svc, &ref, try T.request(a, null, &mask_paths)));
+    try testing.expectEqual(f0 + 1, fast.load(.monotonic));
+
+    // The live index bounds the tip at 13: 14 and 15 are cached and no longer served.
+    T.live = .{ .ready = true, .checkpoint = 13 };
+    const f1 = fast.load(.monotonic);
+    try testing.expectEqual(@as(u8, 5), try Same.ask(a, &svc, &ref, try T.request(a, 14, &mask_paths)));
+    try testing.expectEqual(@as(u8, 5), try Same.ask(a, &svc, &ref, try T.request(a, 15, &mask_paths)));
+    try testing.expectEqual(f1, fast.load(.monotonic));
+    try testing.expectEqual(@as(u8, 0), try Same.ask(a, &svc, &ref, try T.request(a, null, &mask_paths))); // latest is 13, cached
+    try testing.expectEqual(f1 + 1, fast.load(.monotonic));
+    T.live = .{ .ready = false, .checkpoint = null };
+
+    // Pruned by the checkpoint floor, before the node has refreshed `lowest`: 2 is cached, and gone.
+    _ = try st.setFloors(.{ .cp_pruned = 3 });
+    const f2 = fast.load(.monotonic);
+    try testing.expectEqual(@as(u8, 5), try Same.ask(a, &svc, &ref, try T.request(a, 2, &mask_paths)));
+    try testing.expectEqual(f2, fast.load(.monotonic));
+    try testing.expectEqual(@as(u8, 0), try Same.ask(a, &svc, &ref, try T.request(a, 5, &mask_paths)));
+    try testing.expectEqual(f2 + 1, fast.load(.monotonic));
+    // Aged out by epoch (segment 0 leaves the window): 5 is above the checkpoint floor, cached, and gone.
+    _ = try st.ageOut(1);
+    try testing.expectEqual(@as(u8, 5), try Same.ask(a, &svc, &ref, try T.request(a, 5, &mask_paths)));
+    try testing.expectEqual(f2 + 1, fast.load(.monotonic));
+    try testing.expectEqual(@as(u8, 0), try Same.ask(a, &svc, &ref, try T.request(a, 7, &mask_paths)));
+    try testing.expectEqual(f2 + 2, fast.load(.monotonic));
+    // The lowest available checkpoint moves above 7: cached, readable in the store, not served.
+    svc.lowest_checkpoint = 8;
+    ref.lowest_checkpoint = 8;
+    try testing.expectEqual(@as(u8, 5), try Same.ask(a, &svc, &ref, try T.request(a, 7, &mask_paths)));
+    try testing.expectEqual(f2 + 2, fast.load(.monotonic));
+    try testing.expectEqual(@as(u8, 0), try Same.ask(a, &svc, &ref, try T.request(a, 9, &mask_paths)));
+    try testing.expectEqual(f2 + 3, fast.load(.monotonic));
+    // A transaction fix for checkpoint 9 makes its entry stale: rendered again, then cached again.
+    const d9: [32]u8 = @splat(9);
+    _ = try st.tx_fix.put(9, &d9, "fix");
+    try testing.expectEqual(@as(u8, 0), try Same.ask(a, &svc, &ref, try T.request(a, 9, &mask_paths)));
+    try testing.expectEqual(f2 + 3, fast.load(.monotonic));
+    try testing.expectEqual(@as(u8, 0), try Same.ask(a, &svc, &ref, try T.request(a, 9, &mask_paths)));
+    try testing.expectEqual(f2 + 4, fast.load(.monotonic));
+    // An entry put without its epoch (`put`) is never served ahead of the record read.
+    const raw_key = try cpcache.maskKey(a, &.{"x"});
+    svc.cp_cache.put(gpa, 13, raw_key, "not a response");
+    const Noop = struct {
+        fn write(_: *anyopaque, _: *const [5]u8, _: []const u8) anyerror!void {}
+        fn cancelled(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var dummy_rs: h2.ResponseStream = .{ .gpa = gpa, .impl = &dummy, .vt = &.{ .write = Noop.write, .cancelled = Noop.cancelled } };
+    var raw_req: [16]u8 = undefined;
+    var rw = proto.Writer.init(&raw_req);
+    try rw.uint(1, 13);
+    try rw.bytes(3, "x");
+    try testing.expect(!(try getCheckpointCached(&svc, a, rw.bytesWritten(), &dummy_rs)));
+}
+
+/// A small chain in a simulated store, for tests of the GetCheckpoint paths.
+const CpTest = struct {
+    fn commit(s: *store.Store, a: Allocator, seq: u64, epoch: u64) !void {
+        const summary: types.CheckpointSummary = .{
+            .epoch = epoch,
+            .sequence_number = seq,
+            .network_total_transactions = seq,
+            .content_digest = .{ .@"0" = .{ .@"0" = @splat(0) } },
+            .previous_digest = null,
+            .epoch_rolling_gas_cost_summary = .{ .computationCost = 0, .storageCost = 0, .storageRebate = 0, .nonRefundableStorageFee = 0 },
+            .timestamp_ms = 1_700_000_000_000 + seq,
+            .checkpoint_commitments = &.{},
+            .end_of_epoch_data = null,
+            .version_specific_data = &.{},
+        };
+        const empty_bitmap = [_]u8{ 0x3a, 0x30, 0, 0, 0, 0, 0, 0 };
+        const sig: types.AuthorityQuorumSignInfo = .{ .epoch = epoch, .signature = @splat(0), .signers_map = .{ .@"0" = &empty_bitmap } };
+        const x = try bcs.encodeAlloc(types.CheckpointSummary, a, &summary);
+        const y = try bcs.encodeAlloc(types.AuthorityQuorumSignInfo, a, &sig);
+        const b = try s.begin(seq, epoch);
+        try b.checkpoint(try std.mem.concat(a, u8, &.{ x, y }), &.{ 0, 0, 0 });
+        try s.commit(b);
+    }
+    /// GetCheckpointRequest: `seq` (absent: latest) and a read mask.
+    fn request(a: Allocator, seq: ?u64, paths: []const []const u8) ![]const u8 {
+        const buf = try a.alloc(u8, 256);
+        var w = proto.Writer.init(buf);
+        if (seq) |n| try w.uint(1, n);
+        const m = try w.begin(3, 64);
+        for (paths) |p| try w.string(1, p);
+        try w.end(m);
+        return w.bytesWritten();
+    }
+    const path = "/sui.rpc.v2.LedgerService/GetCheckpoint";
+    const masks = [_][]const []const u8{
+        &.{ "sequence_number", "digest", "summary", "signature", "contents" },
+        &.{ "sequence_number", "summary" },
+    };
+};
+
+test "GetCheckpoint over sockets: cached replies (borrowed, zstd, gRPC-web text) stay whole under eviction, re-render and clients that leave" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const loopback = @import("loopback.zig");
+    var cfg: store.Config = .{ .max_live_objects = 1 << 10, .max_object_versions = 1 << 12, .max_transactions = 1 << 10, .max_checkpoints = 1 << 10, .max_batch_bytes = 4 << 20, .max_batch_objects = 64, .max_segments = 16, .segment_reserve = 8 << 20, .seed = 3 };
+    const sim = try store.SimIo.init(gpa, 7, .{}, 64 << 20);
+    defer sim.deinit();
+    const st = try store.Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer st.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const nseq = 24;
+    for (0..nseq) |i| try CpTest.commit(st, a, i, 0);
+
+    // What every reply must be: rendered by a service that never caches.
+    var ref: Service = .{ .gpa = gpa, .store = st, .chain_id = @splat(0), .cp_cache = .{ .budget = 0 } };
+    defer ref.deinit();
+    var want: [nseq][CpTest.masks.len][]const u8 = undefined;
+    var largest: usize = 0;
+    for (0..nseq) |i| for (CpTest.masks, 0..) |m, j| {
+        const r = try loopback.unary(a, ref.handler(), CpTest.path, try CpTest.request(a, i, m));
+        try testing.expectEqual(@as(u8, 0), r.status);
+        want[i][j] = r.message;
+        largest = @max(largest, r.message.len);
+    };
+    // A cache that holds about five responses per shard: derived frames (zstd, base64) push
+    // entries out all the time, also while a worker still holds one for the transport.
+    var svc: Service = .{ .gpa = gpa, .store = st, .chain_id = @splat(0), .cp_cache = .{ .budget = cpcache.nshards * 5 * (largest + 64 + @sizeOf(cpcache.Entry)) } };
+    defer svc.deinit();
+
+    const Srv = struct {
+        io: std.Io,
+        handler: h2.Handler,
+        server: std.Io.net.Server,
+        stopping: std.atomic.Value(bool) = .init(false),
+        live: std.atomic.Value(u32) = .init(0),
+        fn loop(s: *@This()) void {
+            while (!s.stopping.load(.acquire)) {
+                const c = s.server.accept(s.io) catch return;
+                if (s.stopping.load(.acquire)) return c.close(s.io);
+                _ = s.live.fetchAdd(1, .acq_rel);
+                const t = std.Thread.spawn(.{}, conn, .{ s, c }) catch {
+                    _ = s.live.fetchSub(1, .acq_rel);
+                    c.close(s.io);
+                    continue;
+                };
+                t.detach();
+            }
+        }
+        fn conn(s: *@This(), c: std.Io.net.Stream) void {
+            h2.server.serveStreamOpts(testing.allocator, s.io, c, .{}, s.handler);
+            _ = s.live.fetchSub(1, .acq_rel);
+        }
+    };
+    var addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var srv: Srv = .{ .io = io, .handler = svc.handler(), .server = try addr.listen(io, .{ .reuse_address = true }) };
+    const port = srv.server.socket.address.getPort();
+    const accept_thread = try std.Thread.spawn(.{}, Srv.loop, .{&srv});
+
+    const Shared = struct {
+        port: u16,
+        io: std.Io,
+        want: *const [nseq][CpTest.masks.len][]const u8,
+        st: *store.Store,
+        stop: std.atomic.Value(bool) = .init(false),
+        calls: std.atomic.Value(u32) = .init(0),
+        left: std.atomic.Value(u32) = .init(0),
+        bad: std.atomic.Value(u32) = .init(0),
+        fn fail(sh: *@This(), comptime fmt: []const u8, args: anytype) void {
+            if (sh.bad.fetchAdd(1, .monotonic) < 8) std.debug.print("cp socket stress: " ++ fmt ++ "\n", args);
+        }
+        fn unzstd(al: Allocator, z: []const u8) ![]u8 {
+            var in: std.Io.Reader = .fixed(z);
+            const dbuf = try al.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+            var dz: std.compress.zstd.Decompress = .init(&in, dbuf, .{});
+            return dz.reader.allocRemaining(al, .unlimited);
+        }
+        fn client(sh: *@This(), idx: usize) void {
+            var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer ar.deinit();
+            var rng = std.Random.DefaultPrng.init(0xc11e + idx);
+            const r = rng.random();
+            const bin = [_][2][]const u8{ .{ "content-type", "application/grpc" }, .{ "te", "trailers" } };
+            const bin_z = [_][2][]const u8{ .{ "content-type", "application/grpc" }, .{ "te", "trailers" }, .{ "grpc-accept-encoding", "zstd" } };
+            const text = [_][2][]const u8{ .{ "content-type", "application/grpc-web-text" }, .{ "accept", "application/grpc-web-text" } };
+            const text_z = [_][2][]const u8{ .{ "content-type", "application/grpc-web-text" }, .{ "accept", "application/grpc-web-text" }, .{ "grpc-accept-encoding", "zstd" } };
+            while (!sh.stop.load(.acquire)) {
+                _ = ar.reset(.retain_capacity);
+                const al = ar.allocator();
+                const seq = r.uintLessThan(usize, nseq);
+                const mi = r.uintLessThan(usize, CpTest.masks.len);
+                const mode = r.uintLessThan(u8, 4);
+                const leave = r.uintLessThan(u8, 8) == 0;
+                const req = CpTest.request(al, seq, CpTest.masks[mi]) catch return;
+                const hdrs: []const [2][]const u8 = switch (mode) {
+                    0 => &bin,
+                    1 => &bin_z,
+                    2 => &text,
+                    else => &text_z,
+                };
+                // a client that leaves closes at the first DATA frame, the rest of the reply unread
+                const rep = loopback.call(al, sh.io, sh.port, CpTest.path, hdrs, &.{req}, .{ .text_body = mode >= 2, .max_messages = if (leave) 0 else null }) catch |e| {
+                    sh.fail("call: {s}", .{@errorName(e)});
+                    continue;
+                };
+                if (leave) {
+                    _ = sh.left.fetchAdd(1, .monotonic);
+                    continue;
+                }
+                _ = sh.calls.fetchAdd(1, .monotonic);
+                const expected = sh.want[seq][mi];
+                var flag: u8 = 0;
+                var body: []const u8 = "";
+                if (mode < 2) {
+                    if (rep.messages.items.len != 1) {
+                        sh.fail("seq {d} mode {d}: {d} messages", .{ seq, mode, rep.messages.items.len });
+                        continue;
+                    }
+                    flag = @intFromBool(rep.messages.items[0].compressed);
+                    body = rep.messages.items[0].payload;
+                } else {
+                    const raw = h2.codec.base64DecodeChunks(al, rep.data.items) catch {
+                        sh.fail("seq {d} mode {d}: reply is not base64", .{ seq, mode });
+                        continue;
+                    };
+                    if (raw.len < 5 or raw.len - 5 < std.mem.readInt(u32, raw[1..5], .big)) {
+                        sh.fail("seq {d} mode {d}: short text reply ({d} bytes)", .{ seq, mode, raw.len });
+                        continue;
+                    }
+                    flag = raw[0];
+                    body = raw[5..][0..std.mem.readInt(u32, raw[1..5], .big)];
+                }
+                const got = if (flag & 1 != 0) unzstd(al, body) catch {
+                    sh.fail("seq {d} mode {d}: reply does not zstd-decode", .{ seq, mode });
+                    continue;
+                } else body;
+                if (!std.mem.eql(u8, expected, got)) sh.fail("seq {d} mask {d} mode {d}: reply differs ({d} bytes, want {d})", .{ seq, mi, mode, got.len, expected.len });
+            }
+        }
+        /// Transaction fixes for random checkpoints: their cached responses turn stale, are
+        /// dropped and rendered again (to the same bytes: no transaction has these digests).
+        fn fixer(sh: *@This()) void {
+            var n: u64 = 0;
+            while (!sh.stop.load(.acquire)) : (n += 1) {
+                var d: [32]u8 = @splat(0xf1);
+                std.mem.writeInt(u64, d[0..8], n, .little);
+                _ = sh.st.tx_fix.put(n % nseq, &d, "x") catch {};
+                h2.sock.sleepMs(2);
+            }
+        }
+    };
+    var sh: Shared = .{ .port = port, .io = io, .want = &want, .st = st };
+    var clients: [4]std.Thread = undefined;
+    for (&clients, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Shared.client, .{ &sh, i });
+    const fix_thread = try std.Thread.spawn(.{}, Shared.fixer, .{&sh});
+    h2.sock.sleepMs(1500);
+    sh.stop.store(true, .release);
+    for (clients) |t| t.join();
+    fix_thread.join();
+    srv.stopping.store(true, .release);
+    {
+        // wake the accept loop
+        var wake = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+        if (wake.connect(io, .{ .mode = .stream })) |c| c.close(io) else |_| {}
+    }
+    accept_thread.join();
+    while (srv.live.load(.acquire) != 0) h2.sock.sleepMs(1);
+    srv.server.deinit(io);
+    try testing.expect(h2.server.waitDrained(5 * std.time.ns_per_s));
+
+    try testing.expectEqual(@as(u32, 0), sh.bad.load(.monotonic));
+    try testing.expect(sh.calls.load(.monotonic) > 100);
+    try testing.expect(sh.left.load(.monotonic) > 5);
+    const cs = &svc.cp_cache.stats;
+    try testing.expect(cs.hits.load(.monotonic) > 0);
+    try testing.expect(cs.evictions.load(.monotonic) > 0);
+    // `svc.deinit` (deferred) frees every entry: a reference never given back, or given back
+    // twice, is the test allocator's leak or double free.
+}
+
+test "GetCheckpoint: a record damaged on disk under a cached reply is read again within the recheck time, then NotFound and counted" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const loopback = @import("loopback.zig");
+    var cfg: store.Config = .{ .max_live_objects = 1 << 10, .max_object_versions = 1 << 12, .max_transactions = 1 << 10, .max_checkpoints = 1 << 10, .max_batch_bytes = 4 << 20, .max_batch_objects = 64, .max_segments = 16, .segment_reserve = 8 << 20, .seed = 3, .compress = false };
+    // (uncompressed segments: a read goes to the file's bytes, not to a decoded chunk kept in memory)
+    const sim = try store.SimIo.init(gpa, 7, .{}, 64 << 20);
+    defer sim.deinit();
+    const st = try store.Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer st.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // epoch 0: checkpoints 0..3 (the segment that will be damaged), epoch 1: 4..7
+    for (0..8) |i| try CpTest.commit(st, a, i, if (i < 4) 0 else 1);
+    var svc: Service = .{ .gpa = gpa, .store = st, .chain_id = @splat(0) };
+    defer svc.deinit();
+    const req2 = try CpTest.request(a, 2, CpTest.masks[0]);
+    const req6 = try CpTest.request(a, 6, CpTest.masks[0]);
+    const first = try loopback.unary(a, svc.handler(), CpTest.path, req2);
+    try testing.expectEqual(@as(u8, 0), first.status);
+    try testing.expectEqual(@as(u8, 0), (try loopback.unary(a, svc.handler(), CpTest.path, req6)).status);
+    // Served from the cache, no store read (the default recheck time is a minute).
+    try testing.expectEqual(@as(u8, 0), (try loopback.unary(a, svc.handler(), CpTest.path, req2)).status);
+    try testing.expectEqual(@as(u64, 1), svc.cp_fast_hits.load(.monotonic));
+
+    // The recheck: once the time is up a hit takes the store path, reads the record, serves the
+    // entry and renews it, so the call after that is fast again.
+    svc.cp_recheck_ns = 0;
+    const slow = try loopback.unary(a, svc.handler(), CpTest.path, req2);
+    try testing.expectEqualSlices(u8, first.message, slow.message);
+    try testing.expectEqual(@as(u64, 1), svc.cp_fast_hits.load(.monotonic));
+    svc.cp_recheck_ns = 60 * std.time.ns_per_s;
+    try testing.expectEqual(@as(u8, 0), (try loopback.unary(a, svc.handler(), CpTest.path, req2)).status);
+    try testing.expectEqual(@as(u64, 2), svc.cp_fast_hits.load(.monotonic));
+
+    // Damage on disk: the records of segment 0 read back as zeros.
+    var nb: [96]u8 = undefined;
+    const name = store.io.segName(&nb, 0);
+    const fd = try sim.openFile(name, false);
+    const size = try sim.size(fd);
+    sim.closeFile(fd);
+    try testing.expect(size > 0);
+    try testing.expect(sim.zeroAt(name, 0, size));
+    const corrupt0 = st.stats.corrupt_reads.load(.monotonic);
+    // Within the recheck time the cached reply still goes out, with no store read.
+    const during = try loopback.unary(a, svc.handler(), CpTest.path, req2);
+    try testing.expectEqual(@as(u8, 0), during.status);
+    try testing.expectEqualSlices(u8, first.message, during.message);
+    try testing.expectEqual(@as(u64, 3), svc.cp_fast_hits.load(.monotonic));
+    try testing.expectEqual(corrupt0, st.stats.corrupt_reads.load(.monotonic));
+    // Once the recheck time has passed (here: set to nothing) the call reads the record:
+    // NotFound, and the store counts the damaged read. The entry is never renewed, so every
+    // later call does the same, as every call did before the cache was looked up first.
+    svc.cp_recheck_ns = 0;
+    for (0..3) |i| {
+        const after = try loopback.unary(a, svc.handler(), CpTest.path, req2);
+        try testing.expectEqual(@as(u8, 5), after.status);
+        try testing.expectEqualStrings("Checkpoint 2 not found", after.grpc_message);
+        try testing.expect(st.stats.corrupt_reads.load(.monotonic) >= corrupt0 + 1 + i);
+    }
+    try testing.expectEqual(@as(u64, 3), svc.cp_fast_hits.load(.monotonic));
+    // A checkpoint of the undamaged segment is unaffected.
+    try testing.expectEqual(@as(u8, 0), (try loopback.unary(a, svc.handler(), CpTest.path, req6)).status);
+}
+
+test "GetCheckpoint: a signature-order fix or a loaded-list fix of the checkpoint keeps its cached reply off the lookup before the store read; a fix of another checkpoint does not" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const loopback = @import("loopback.zig");
+    var cfg: store.Config = .{ .max_live_objects = 1 << 10, .max_object_versions = 1 << 12, .max_transactions = 1 << 10, .max_checkpoints = 1 << 10, .max_batch_bytes = 4 << 20, .max_batch_objects = 64, .max_segments = 16, .segment_reserve = 8 << 20, .seed = 3 };
+    const sim = try store.SimIo.init(gpa, 7, .{}, 64 << 20);
+    defer sim.deinit();
+    const st = try store.Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer st.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for (0..8) |i| try CpTest.commit(st, a, i, 0);
+    var svc: Service = .{ .gpa = gpa, .store = st, .chain_id = @splat(0) };
+    defer svc.deinit();
+    // Every call below is within the recheck time, however slow the machine.
+    svc.cp_recheck_ns = std.time.ns_per_hour;
+    const req2 = try CpTest.request(a, 2, CpTest.masks[0]);
+    const req5 = try CpTest.request(a, 5, CpTest.masks[0]);
+    const fast = &svc.cp_fast_hits;
+    const inserts = &svc.cp_cache.stats.inserts;
+    const want2 = (try loopback.unary(a, svc.handler(), CpTest.path, req2)).message;
+    const want5 = (try loopback.unary(a, svc.handler(), CpTest.path, req5)).message;
+    try testing.expectEqual(@as(u64, 2), inserts.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), fast.load(.monotonic));
+    var f: u64 = 0; // the fast hits so far
+    var n: u64 = 2; // the inserts so far
+    // Both of the store's fix tables, in turn: a fix of checkpoint 5 alone (no transaction has
+    // the digest, so the reply's bytes stay).
+    for ([_]*store.txfix.Table{ &st.tx_fix, &st.list_fix }, 0..) |table, k| {
+        var d: [32]u8 = @splat(0xd0);
+        d[0] = @intCast(k);
+        try testing.expect(try table.put(5, &d, "x"));
+        // Checkpoint 2 was not touched: still answered before any store read, the entry kept.
+        try testing.expectEqualSlices(u8, want2, (try loopback.unary(a, svc.handler(), CpTest.path, req2)).message);
+        f += 1;
+        try testing.expectEqual(f, fast.load(.monotonic));
+        try testing.expectEqual(n, inserts.load(.monotonic));
+        // Checkpoint 5 is stale: not answered ahead of the store; dropped, rendered and cached again.
+        try testing.expectEqualSlices(u8, want5, (try loopback.unary(a, svc.handler(), CpTest.path, req5)).message);
+        n += 1;
+        try testing.expectEqual(f, fast.load(.monotonic));
+        try testing.expectEqual(n, inserts.load(.monotonic));
+        try testing.expectEqual(@as(u64, 2), svc.cp_cache.entries());
+        // The new entry carries the new generation: answered before the store read again.
+        try testing.expectEqualSlices(u8, want5, (try loopback.unary(a, svc.handler(), CpTest.path, req5)).message);
+        f += 1;
+        try testing.expectEqual(f, fast.load(.monotonic));
+        try testing.expectEqual(n, inserts.load(.monotonic));
+    }
+}
+
+test "GetCheckpoint: the lookup before the store read reads the fix tables under a snapshot, and takes none while no fix was installed since the render" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const loopback = @import("loopback.zig");
+    var cfg: store.Config = .{ .max_live_objects = 1 << 10, .max_object_versions = 1 << 12, .max_transactions = 1 << 10, .max_checkpoints = 1 << 10, .max_batch_bytes = 4 << 20, .max_batch_objects = 64, .max_segments = 16, .segment_reserve = 8 << 20, .seed = 3 };
+    const sim = try store.SimIo.init(gpa, 7, .{}, 64 << 20);
+    defer sim.deinit();
+    const st = try store.Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer st.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for (0..8) |i| try CpTest.commit(st, a, i, 0);
+    var svc: Service = .{ .gpa = gpa, .store = st, .chain_id = @splat(0) };
+    defer svc.deinit();
+    svc.cp_recheck_ns = std.time.ns_per_hour;
+
+    const Shared = struct {
+        svc: *Service,
+        req: []const u8 = "",
+        calls: std.atomic.Value(u64) = .init(0),
+        refused: std.atomic.Value(u64) = .init(0),
+        fn write(_: *anyopaque, _: *const [5]u8, _: []const u8) anyerror!void {}
+        fn cancelled(_: *anyopaque) bool {
+            return false;
+        }
+        /// One call of the lookup; a call that does not send the cached reply is counted.
+        fn ask(sh: *@This()) void {
+            var buf: [2048]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&buf);
+            var dummy: u8 = 0;
+            var rs: h2.ResponseStream = .{ .gpa = testing.allocator, .impl = &dummy, .vt = &.{ .write = write, .cancelled = cancelled } };
+            const sent = getCheckpointCached(sh.svc, fba.allocator(), sh.req, &rs) catch false;
+            if (!sent) _ = sh.refused.fetchAdd(1, .monotonic);
+            _ = sh.calls.fetchAdd(1, .release);
+        }
+        /// Whether `n` calls have finished, waiting up to `ms`.
+        fn waitCalls(sh: *@This(), n: u64, ms: u32) bool {
+            var waited: u32 = 0;
+            while (sh.calls.load(.acquire) < n and waited < ms) : (waited += 1) h2.sock.sleepMs(1);
+            return sh.calls.load(.acquire) >= n;
+        }
+    };
+    var sh: Shared = .{ .svc = &svc };
+    var calls: u64 = 0;
+    // Each of the store's two fix tables in turn, on an entry rendered after every earlier fix.
+    // Snapshots register under `creaders.lock`: while the test holds it, a call that takes a
+    // snapshot cannot finish.
+    for ([_]*store.txfix.Table{ &st.tx_fix, &st.list_fix }, 0..) |table, k| {
+        sh.req = try CpTest.request(a, 2 + k, CpTest.masks[0]);
+        try testing.expectEqual(@as(u8, 0), (try loopback.unary(a, svc.handler(), CpTest.path, sh.req)).status);
+        // No fix was installed since the render: the call takes no snapshot, and finishes.
+        {
+            st.creaders.lock.lock();
+            const t = try std.Thread.spawn(.{}, Shared.ask, .{&sh});
+            const finished = sh.waitCalls(calls + 1, 10_000);
+            st.creaders.lock.unlock();
+            t.join();
+            calls += 1;
+            try testing.expect(finished);
+        }
+        // A fix of another checkpoint: the table's index has to be read, which a merge may free
+        // as soon as no snapshot from before it is live. The call waits for the lock, so it is
+        // registered as a snapshot before it reads the index; then the entry is still served.
+        const d: [32]u8 = @splat(0xf1);
+        try testing.expect(try table.put(7, &d, "x"));
+        {
+            st.creaders.lock.lock();
+            const t = try std.Thread.spawn(.{}, Shared.ask, .{&sh});
+            const finished = sh.waitCalls(calls + 1, 100);
+            st.creaders.lock.unlock();
+            t.join();
+            calls += 1;
+            try testing.expect(!finished);
+        }
+        try testing.expectEqual(calls, sh.calls.load(.acquire));
+        try testing.expectEqual(@as(u64, 0), sh.refused.load(.monotonic));
+    }
+    try testing.expectEqual(@as(u64, 4), svc.cp_fast_hits.load(.monotonic));
 }

@@ -311,7 +311,9 @@ pub const Conn = struct {
         if (!(rd.option() catch return error.BadResponse)) return null;
         const body = rd.bytes() catch return error.BadResponse;
         rd.done() catch return error.BadResponse;
-        if (r.flags & proto.resp_zstd == 0) return @constCast(body);
+        // With flag_zstd_ok the body is a dict.zig frame. The header carries no ZSTD flag for it
+        // (spec 2.2: the feed is self-framed); cores before that set it, which changes nothing here.
+        if (!zstd_ok) return @constCast(body);
         return dict.decompress(a, want, body) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.TooLarge => return error.TooLarge,

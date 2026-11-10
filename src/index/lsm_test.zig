@@ -187,7 +187,8 @@ test "lsm: bulk build from the live set equals inserts, and a crashed build resu
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ix", .{tmp.sub_path});
-    const opts: lsm.Options = .{ .build_chunk_bytes = 16 << 10, .build_groups = 4, .build_threads = 3, .sync = .none };
+    // the sort-and-merge build (the partitioned one is in bulk_test.zig)
+    const opts: lsm.Options = .{ .build_chunk_bytes = 16 << 10, .build_groups = 4, .build_threads = 3, .bulk = false, .sync = .none };
     // first attempt dies after group 1 of 4
     {
         const ix = try index.Index.open(gpa, testing.io, dir, opts);
@@ -259,7 +260,7 @@ test "lsm: a build streamed by several producer threads equals inserts, survives
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ix", .{tmp.sub_path});
-    const opts: lsm.Options = .{ .build_chunk_bytes = 16 << 10, .build_groups = 4, .build_threads = 3, .sync = .none };
+    const opts: lsm.Options = .{ .build_chunk_bytes = 16 << 10, .build_groups = 4, .build_threads = 3, .bulk = false, .sync = .none };
     // a stream that dies before finish (a restore that failed): the next open sees a pending
     // build no tip matches, and the next stream starts over
     {

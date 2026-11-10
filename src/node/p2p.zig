@@ -1445,7 +1445,7 @@ pub const P2p = struct {
                     _ = p.stats.lost_race.fetchAdd(1, .monotonic);
                     return;
                 }
-                p.fetcher.writeSpool(seq, o.blob, o.aux) catch {
+                p.fetcher.writeSpoolBuilt(seq, o.blob, o.aux) catch {
                     p.fetcher.unmarkDone(seq);
                     slot.outcome = .fallback;
                     return p.fallback("spool write");

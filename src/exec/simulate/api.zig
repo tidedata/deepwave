@@ -467,19 +467,36 @@ pub fn grpcResponse(e: *const Engine, arena: Allocator, env: *const EpochEnv, x:
 /// Splits the package-cache budget (`--exec-cache-mb`) over every thread that holds package
 /// caches (simulation workers plus, in execute mode, the executor's threads), two epochs' caches
 /// per thread, as execute mode does: a thread's cache is dropped and rebuilt when it outgrows its
-/// share (exec `pkgs.max_cache_bytes`).
+/// share (exec `pkgs.max_cache_bytes`). The process-wide parsed-package table, when on, is one
+/// table for all of them: its part comes out of the budget once (exec `pkgs.setBudget`).
 pub fn setCacheBudget(cache_mb: u32, threads: usize) void {
     const total: usize = @as(usize, cache_mb) << 20;
-    exec.ptb.pkgs.max_cache_bytes = @max(@as(usize, 32) << 20, total / (@max(threads, 1) * 2));
+    exec.ptb.pkgs.setBudget(total, @max(threads, 1) * 2);
 }
 
 test "the cache budget is shared by every caching thread" {
-    const saved = exec.ptb.pkgs.max_cache_bytes;
-    defer exec.ptb.pkgs.max_cache_bytes = saved;
+    const pkgs = exec.ptb.pkgs;
+    pkgs.readEnv();
+    const saved = .{ pkgs.max_cache_bytes, pkgs.shared_enabled, pkgs.shared.max_bytes, pkgs.shared_budget };
+    defer {
+        pkgs.max_cache_bytes = saved[0];
+        pkgs.shared_enabled = saved[1];
+        pkgs.shared.max_bytes = saved[2];
+        pkgs.shared_budget = saved[3];
+    }
+    pkgs.shared_enabled = false;
     setCacheBudget(3072, 12);
-    try std.testing.expectEqual(@as(usize, 128) << 20, exec.ptb.pkgs.max_cache_bytes);
+    try std.testing.expectEqual(@as(usize, 128) << 20, pkgs.max_cache_bytes);
     setCacheBudget(64, 16);
-    try std.testing.expectEqual(@as(usize, 32) << 20, exec.ptb.pkgs.max_cache_bytes);
+    try std.testing.expectEqual(@as(usize, 32) << 20, pkgs.max_cache_bytes);
+    // With the parsed-package table on, its part (512 MiB here) is counted once and the
+    // thread caches share the rest: 24 caches of 2560 MiB.
+    pkgs.shared_enabled = true;
+    pkgs.shared_budget = 512 << 20;
+    setCacheBudget(3072, 12);
+    try std.testing.expectEqual(@as(usize, 512) << 20, pkgs.shared.max_bytes);
+    try std.testing.expectEqual((@as(usize, 2560) << 20) / 24, pkgs.max_cache_bytes);
+    try std.testing.expect(pkgs.shared.max_bytes + 24 * pkgs.max_cache_bytes <= @as(usize, 3072) << 20);
 }
 
 /// Frees this thread's package caches and VM runtimes (call as a worker exits).

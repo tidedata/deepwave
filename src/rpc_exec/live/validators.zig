@@ -175,10 +175,16 @@ pub const Pool = struct {
     conns: []?*grpc.Conn,
     /// `RECONNECT_COOLDOWN`.
     reconnect_cooldown: u64 = 2 * std.time.ns_per_s,
-    /// deepwave: a member whose connections keep failing before they are ready (down, firewalled:
-    /// about 20 of 111 testnet validators from the Mac) waits twice as long after each failure,
-    /// up to `max_reconnect_cooldown`, so drives do not keep spawning connects to it.
+    /// deepwave: a member whose connections keep failing waits twice as long after each failure, up
+    /// to `max_reconnect_cooldown`, so drives do not keep spawning connects to it. A failure is
+    /// a connection that never got ready (down, firewalled: about 20 of 111 testnet validators
+    /// from the Mac) or one that got ready and did not hold for `stable_ns` (a validator that
+    /// accepts, then drops or stalls: it used to be retried every `reconnect_cooldown` forever).
     max_reconnect_cooldown: u64 = 60 * std.time.ns_per_s,
+    /// A connection that stayed ready this long ends the failure streak: the next one opens
+    /// after the plain `reconnect_cooldown`.
+    stable_ns: u64 = 60 * std.time.ns_per_s,
+    /// The failure streak per member.
     connect_fails: []u8 = &.{},
     /// `ValidatorClientMonitor` (validator_client_monitor/stats.rs), per member.
     stats: []Stats,
@@ -311,7 +317,8 @@ pub const Pool = struct {
     /// The live connection to member `i`, retained for the caller (drop it with `unref`); null
     /// when its address does not parse. A dead connection is handed out (it fails calls at once)
     /// until the reconnect cooldown has passed; then the pool drops its own reference and opens a
-    /// new one, while callers still holding the old one keep it alive until they unref it.
+    /// new one, while callers still holding the old one keep it alive until they unref it. A
+    /// connection the peer is closing with GOAWAY is not handed out: the next one opens at once.
     ///
     /// The pool lock is never held while a connection lock is taken or waited for (a writer stuck
     /// on one validator's socket holds that connection's lock): the liveness questions are
@@ -319,16 +326,26 @@ pub const Pool = struct {
     /// connection lock.
     pub fn get(p: *Pool, i: u32) ?*grpc.Conn {
         var stale: ?*grpc.Conn = null;
-        defer if (stale) |c| c.release();
+        defer if (stale) |c| c.retire();
         p.mu.lockUncancelable(p.io);
         defer p.mu.unlock(p.io);
         if (p.conns[i]) |c| {
-            const cooldown = @min(p.reconnect_cooldown << @intCast(@min(p.connect_fails[i], 8)), @max(p.max_reconnect_cooldown, p.reconnect_cooldown));
-            if (!c.isDead() or monotonicNs(p.io) -| c.diedAt() < cooldown) {
+            const dead = c.isDead();
+            if (!dead and !c.isDraining()) {
                 c.retain();
                 return c;
             }
-            p.connect_fails[i] = if (c.wasReady()) 0 else p.connect_fails[i] +| 1;
+            // A connection that died waits out its cooldown. One the peer closed or is closing
+            // with GOAWAY is replaced at once (its open calls finish on it, `retire`): the wait
+            // only starts with a failure streak, so a member that sends GOAWAY to every new
+            // connection is not redialled for every call.
+            const fails = p.connect_fails[i];
+            const wait = if (!c.isDraining()) p.cooldown(i, fails, c.closedAt()) else if (fails == 0) 0 else p.cooldown(i, fails - 1, c.closedAt());
+            if (monotonicNs(p.io) -| c.closedAt() < wait) {
+                c.retain();
+                return c;
+            }
+            p.connect_fails[i] = p.streakAfter(fails, c.wasReady(), c.heldFor());
             stale = c;
             p.conns[i] = null;
         }
@@ -338,6 +355,24 @@ pub const Pool = struct {
         p.conns[i] = c;
         c.retain();
         return c;
+    }
+
+    /// How long after member `i`'s connection ended (at `ended_at`) the next one may be opened,
+    /// `fails` failures in a row before it: `reconnect_cooldown` doubled per failure, capped at
+    /// `max_reconnect_cooldown`, and from the first failure on spread over the last quarter
+    /// (75% to 100%), so the members of a committee that dropped together (a network cut) are
+    /// not all redialled in the same instant. The spread is a function of the member and the
+    /// time of the end: every `get` of one wait sees the same value.
+    pub fn cooldown(p: *const Pool, i: u32, fails: u8, ended_at: u64) u64 {
+        const full = @min(p.reconnect_cooldown << @intCast(@min(fails, 8)), @max(p.max_reconnect_cooldown, p.reconnect_cooldown));
+        if (fails == 0 or full < 4) return full;
+        const spread = full / 4;
+        return full - spread + std.hash.Wyhash.hash(i, std.mem.asBytes(&ended_at)) % (spread + 1);
+    }
+
+    /// The failure streak after a connection ended: over once a connection held for `stable_ns`.
+    pub fn streakAfter(p: *const Pool, fails: u8, was_ready: bool, held_ns: u64) u8 {
+        return if (was_ready and held_ns >= p.stable_ns) 0 else fails +| 1;
     }
 
     /// Opens every connection now (sui-node keeps them open).
@@ -423,6 +458,7 @@ pub const Session = struct {
 
     fn start(ctx: *anyopaque, call: drv.CallId, validator: u32, method: drv.Method, body: []const u8) void {
         const s: *Session = @ptrCast(@alignCast(ctx));
+        s.reserve();
         const rec = s.gpa.create(CallRec) catch return s.push(call, false, 8, "out of memory", "");
         rec.* = .{ .conn = s.pool.get(validator), .validator = validator, .started = monotonicNs(s.io), .method = method };
         s.trace("start v{d} {s}", .{ validator, @tagName(method) });
@@ -455,17 +491,40 @@ pub const Session = struct {
         }
     }
 
-    fn push(s: *Session, call: drv.CallId, ok: bool, code: u8, a: []const u8, b: []const u8) void {
-        const ac = s.gpa.dupe(u8, a) catch return;
-        const bc = s.gpa.dupe(u8, b) catch {
-            s.gpa.free(ac);
-            return;
-        };
+    /// Room in the inbox for the answer of one more call, taken when the call starts: `push`
+    /// then needs no memory for the list (every open call puts at most one answer there).
+    fn reserve(s: *Session) void {
         s.mu.lockUncancelable(s.io);
         defer s.mu.unlock(s.io);
-        s.inbox.append(s.gpa, .{ .call = call, .ok = ok, .code = code, .a = ac, .b = bc, .at = monotonicNs(s.io) }) catch {
-            s.gpa.free(ac);
-            s.gpa.free(bc);
+        s.inbox.ensureTotalCapacity(s.gpa, s.inbox.items.len + s.calls.count() + 1) catch {};
+    }
+
+    /// Hands a call's answer to the driver's thread, copied. Without memory for the copy the
+    /// call is still answered, RESOURCE_EXHAUSTED with no text: dropping the answer left the
+    /// driver waiting for that call until its deadline.
+    fn push(s: *Session, call: drv.CallId, ok: bool, code: u8, a: []const u8, b: []const u8) void {
+        var none: [0]u8 = .{};
+        var item: Item = .{ .call = call, .ok = ok, .code = code, .a = &none, .b = &none, .at = 0 };
+        if (s.gpa.dupe(u8, a)) |ac| {
+            if (s.gpa.dupe(u8, b)) |bc| {
+                item.a = ac;
+                item.b = bc;
+            } else |_| {
+                s.gpa.free(ac);
+                item.ok = false;
+                item.code = 8;
+            }
+        } else |_| {
+            item.ok = false;
+            item.code = 8;
+        }
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        item.at = monotonicNs(s.io);
+        s.inbox.append(s.gpa, item) catch {
+            // no room was reserved either (`reserve` had no memory): nothing can carry it
+            s.gpa.free(item.a);
+            s.gpa.free(item.b);
             return;
         };
         s.cond.signal(s.io);
@@ -1828,6 +1887,29 @@ test "a call cancelled unanswered at its deadline counts as a validator failure"
     t2.vtable.cancel(t2.ctx, 0);
     try testing.expectEqual(@as(u64, 0), pool2.stats[0].failures.load(.monotonic));
     try waitReaderDone(pool2.conns[0].?);
+}
+
+test "a call's answer reaches the driver even when there is no memory to copy it" {
+    const gpa = std.heap.smp_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const committee = try deadCommittee(a, 1);
+    var pool = try Pool.init(gpa, testing.io, &committee);
+    defer pool.deinit();
+    // allocation 0 is the inbox's room (taken when a call starts), allocation 1 the copy of
+    // the answer: that one and all later ones fail
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 1 });
+    var sess = Session.init(failing.allocator(), testing.io, &pool, a);
+    defer sess.deinit();
+    sess.reserve();
+    sess.push(7, true, 0, "the validator's answer", "");
+    try testing.expectEqual(@as(usize, 1), sess.inbox.items.len);
+    const x = sess.inbox.items[0];
+    try testing.expectEqual(@as(drv.CallId, 7), x.call);
+    try testing.expect(!x.ok);
+    try testing.expectEqual(@as(u8, 8), x.code);
+    try testing.expectEqual(@as(usize, 0), x.a.len);
 }
 
 test "zui: the monitor ranks by finality and moves unreliable members back" {

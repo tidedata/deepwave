@@ -565,6 +565,11 @@ pub fn translateValue(arena: std.mem.Allocator, root: Value, opts: Options) !Tra
             try policy.policyKeys(&t, v);
         } else if (std.mem.eql(u8, k, "transaction-driver-config")) {
             try policy.driverKeys(&t, v);
+        } else if (std.mem.eql(u8, k, "dev-inspect-disabled")) {
+            // sui-config `dev_inspect_disabled` (default false). Both values are passed on: a
+            // file that says false asks for sui-node's dev-inspect, which deepwave runs only
+            // when told to (`--dev-inspect-disabled false`).
+            if (try t.boolean(k, v)) |b| try t.flag("--dev-inspect-disabled", if (b) "true" else "false");
         } else if (findIn(no_effect, k)) |why| {
             try t.note(.info, "{s}: {s}; ignored", .{ k, why });
         } else if (findIn(unsupported, k)) |why| {
@@ -1224,6 +1229,24 @@ test "fullnode.yaml: transaction-driver-config enable-early-validation maps to -
     const on = try translate(a, "json-rpc-address: 127.0.0.1:9000\ntransaction-driver-config:\n  enable-early-validation: true\n", .{});
     try std.testing.expectEqualStrings("--serve 127.0.0.1:9000", try argsJoined(a, on));
     try std.testing.expectEqual(@as(usize, 0), on.notes.len);
+}
+
+test "fullnode.yaml: dev-inspect-disabled maps to --dev-inspect-disabled with its value" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const off = try translate(a, "json-rpc-address: 127.0.0.1:9000\ndev-inspect-disabled: true\n", .{});
+    try std.testing.expectEqualStrings("--serve 127.0.0.1:9000 --dev-inspect-disabled true", try argsJoined(a, off));
+    try std.testing.expectEqual(@as(usize, 0), off.notes.len);
+    // an explicit false is passed on too: it turns dev-inspect on
+    const on = try translate(a, "json-rpc-address: 127.0.0.1:9000\ndev-inspect-disabled: false\n", .{});
+    try std.testing.expectEqualStrings("--serve 127.0.0.1:9000 --dev-inspect-disabled false", try argsJoined(a, on));
+    // a file without the key leaves deepwave's default
+    const none = try translate(a, "json-rpc-address: 127.0.0.1:9000\n", .{});
+    try std.testing.expectEqualStrings("--serve 127.0.0.1:9000", try argsJoined(a, none));
+    const bad = try translate(a, "json-rpc-address: 127.0.0.1:9000\ndev-inspect-disabled: maybe\n", .{});
+    try std.testing.expectEqualStrings("--serve 127.0.0.1:9000", try argsJoined(a, bad));
+    try std.testing.expect(hasNote(bad, .warn, "dev-inspect-disabled"));
 }
 
 test "fullnode.yaml: zui section sets the rpc index and ledger-history paths" {

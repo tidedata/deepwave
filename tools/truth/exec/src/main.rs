@@ -28,6 +28,7 @@ use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::object::Object;
 use sui_types::storage::ObjectStore;
 
+mod deny_order;
 mod synth;
 
 struct CheckpointStore {
@@ -298,6 +299,9 @@ pub(crate) struct ExecStore<'a> {
     pub epoch: u64,
     /// Latest objects outside the inputs (`get_object`): the deny list v2 state (synth).
     pub latest: Option<&'a HashMap<ObjectID, Object>>,
+    /// Every `ObjectStore::get_object` call the executor makes, in call order, with whether the
+    /// store held the object (`deny-order`).
+    pub reads: Option<&'a Mutex<Vec<(ObjectID, bool)>>>,
 }
 
 impl ExecStore<'_> {
@@ -355,6 +359,9 @@ impl sui_types::storage::ParentSync for ExecStore<'_> {
 impl ObjectStore for ExecStore<'_> {
     fn get_object(&self, id: &ObjectID) -> Option<Object> {
         let r = self.inputs.get(id).cloned().or_else(|| self.latest.and_then(|l| l.get(id).cloned())).or_else(|| self.package(id));
+        if let Some(log) = self.reads {
+            log.lock().unwrap().push((*id, r.is_some()));
+        }
         if r.is_none() {
             log_miss("object", id, None, None);
         }
@@ -576,7 +583,7 @@ fn bench_exec(files: &[PathBuf], iters: usize, move_calls: bool) -> Result<()> {
     }
     let run = |it: &ExecItem, reads: Vec<sui_types::transaction::ObjectReadResult>| -> TransactionEffects {
         let (cfg, ex) = &execs[&it.pv];
-        let store = ExecStore { inputs: &it.inputs, packages: &packages, system: &system, epoch: it.epoch, latest: deny_by_epoch.get(&it.epoch) };
+        let store = ExecStore { inputs: &it.inputs, packages: &packages, system: &system, epoch: it.epoch, latest: deny_by_epoch.get(&it.epoch), reads: None };
         let gas_status = if it.data.kind().is_system_tx() {
             sui_types::gas::SuiGasStatus::new_unmetered(cfg)
         } else {
@@ -1317,6 +1324,7 @@ fn main() -> Result<()> {
         Some("synth") => synth::cmd_synth(Path::new(&args[1]), Path::new(&args[2])),
         Some("scan-refs") => synth::cmd_scan_refs(Path::new(&args[1])),
         Some("deny-snapshot") => cmd_deny_snapshot(Path::new(&args[1]), &args[2], &args[3]),
+        Some("deny-order") => deny_order::cmd_deny_order(Path::new(&args[1]), Path::new(&args[2])),
         _ => bail!("usage: zui-truth-exec state-hash <corpus> <out.jsonl.zst> | bench <name> --iters N --list <file>"),
     }
 }
