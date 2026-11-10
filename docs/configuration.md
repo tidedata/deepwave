@@ -169,6 +169,5 @@ note, never a failure. Only YAML Deepwave cannot parse fails the load. Run
 | `zui.rpc-index-path`, `zui.ledger-history-path` | `--rpc-index-dir`, `--ledger-history-dir` |
 
 Validator-only keys, RocksDB tuning, JSON-RPC indexing keys and `grpc-load-shed` /
-`grpc-concurrency-limit` (validator server only) are noted and ignored. Keys whose behaviour
-Deepwave does not have (for example `fullnode-sync-mode: ConsensusObserver`, submission validator
-allow and block lists) are `warn` notes. See [compatibility.md](compatibility.md).
+`grpc-concurrency-limit` (validator server only) are noted and ignored. Other keys are `warn`
+notes. See [compatibility.md](compatibility.md).

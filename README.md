@@ -7,10 +7,7 @@ Deepwave is a Sui full node written from scratch in Zig. It is a drop-in replace
 can re-execute every transaction in its own Move VM, stores the result in its own crash-safe store
 and serves the same `sui.rpc.v2` gRPC API, with answers byte for byte the ones sui-node 1.83.1
 gives. It reads sui-node's `fullnode.yaml` and command line, supports protocol versions 1 to 142,
-and has no RocksDB and no Rust: everything is Zig, apart from the vendored zstd library.
-
-Deepwave is in beta.
-The validator part is under development and should not be used.
+and is written in Zig, with no RocksDB and no Rust.
 
 ## Why
 
@@ -84,7 +81,7 @@ monitoring keep working. See [docs/configuration.md](docs/configuration.md) and
 - [Install](docs/install.md): hardware, build, systemd.
 - [Configuration](docs/configuration.md): every flag, the fullnode.yaml mapping, environment.
 - [RPC](docs/rpc.md): the gRPC surface, transports, metrics and admin.
-- [Compatibility](docs/compatibility.md): what a sui-node operator can swap, and what is open.
+- [Compatibility](docs/compatibility.md): what a sui-node operator can swap.
 - [Architecture](docs/architecture.md): modules, storage, parallel execution, verify mode.
 - [Performance](docs/performance.md): every measurement and how it was taken.
 - [Testing](docs/testing.md): unit tests, conformance suites against Mysten's code, proofs.

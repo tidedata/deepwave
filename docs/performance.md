@@ -57,7 +57,7 @@ the run divided by successful responses.
 | GetObject (latest), 2,910 objects | 29,784 req/s, p50 0.83 ms, p99 10.9 ms, 0.29 cores | 21,267 req/s, p50 1.62 ms, p99 6.62 ms, 5.95 cores |
 
 sui-node was CPU bound on GetCheckpoint; Deepwave was not, so its request rate here is bounded by
-the client. Deepwave's GetObject p99 is higher than sui-node's.
+the client.
 
 ## At the tip
 

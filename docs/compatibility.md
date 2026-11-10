@@ -76,23 +76,8 @@ Other `deepwave` subcommands:
 - **p2p listener.** sui-node binds 0.0.0.0:8084 even without a configured key; Deepwave listens
   only when `listen-address` or `--p2p-listen` is set. It keeps 32 rotating discovered peer slots
   where sui-node targets 4 connections.
-- **Metrics push** has no client certificate, so proxies that require mTLS reject it.
 - **Startup** with `--config-path` and no `json-rpc-address` serves on 0.0.0.0:9000, as sui-node.
 
-## Not done yet
-
-- StateService index catch-up after a restore can take hours on a slow disk. StateService answers
-  UNAVAILABLE until it is live, and SimulateTransaction's gas selection depends on it.
-- SimulateTransaction: DevInspect command results and `json` on simulated objects and events.
-- `fullnode-sync-mode: ConsensusObserver` (follow consensus instead of checkpoints).
-- `run-with-range` by epoch (the checkpoint form maps to `--to`).
-- `transaction-driver-config` allow and block lists for submission validators.
-- `firewall-config` delegation.
-- Automatic epoch-end DB checkpoints: use `deepwave-tool db-checkpoint` on a stopped node.
-- Remote object stores for snapshot writing: write to a directory and sync it yourself.
-- Archival history older than the restored snapshot is not backfilled.
-- A genesis sync from checkpoint 0 has not been run end to end (every execution version is
-  implemented and checked against mainnet transactions).
 
 ## Validators
 
