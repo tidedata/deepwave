@@ -20,7 +20,8 @@ same mainnet inputs. Details in [docs/performance.md](docs/performance.md).
 - **5x faster Move VM**: 15.8 ns per instruction against 78 ns.
 - **4.9x faster catch-up**, both executing every transaction: 11,871 tx/s against 2,427 tx/s, at
   3.6x less CPU per transaction.
-- **13x less RAM** in verify mode: 961 MB against 12,781 MB while catching up.
+- **13x less RAM to follow mainnet with every checkpoint verified**: 961 MB in verify mode, which checks
+  signatures and certificates without re-executing, against 12,781 MB for sui-node, which always executes.
 - **About half the disk**: 183 GB at the tip after a fresh mainnet restore, against 346 GB.
 - **28x less CPU per RPC read**: 238 us per GetCheckpoint against 6,817 us.
 - **Byte-identical gRPC**: 4,722,443 of 4,722,443 responses equal to sui-node's, and 988,204
