@@ -726,6 +726,11 @@ pub const Sweep = struct {
         // Collected, then installed in one bulk build (one sort, one published set).
         var loaded: std.ArrayList(store.txfix.Entry) = .empty;
         defer loaded.deinit(gpa);
+        // A snapshot keeps every chunk it decoded alive until it is released, so one snapshot
+        // held across tens of thousands of fixes (each in another checkpoint) pinned over 12 GB
+        // on a production node at 65k fixes. Take a fresh one every `snap_every` lookups.
+        const snap_every = 1024;
+        var lookups: usize = 0;
         while (data.len - at >= rec_head) {
             const r = data[at..];
             const len = std.mem.readInt(u32, r[8..12], .little);
@@ -735,7 +740,14 @@ pub const Sweep = struct {
             const seq = std.mem.readInt(u64, rec[12..20], .little);
             const digest: *const [32]u8 = rec[20..52];
             switch (rec[4]) {
-                kind_fix => if (snap.transaction(digest)) |t| {
+                kind_fix => if (blk: {
+                    lookups += 1;
+                    if (lookups % snap_every == 0) {
+                        snap.release();
+                        snap = st.snapshot();
+                    }
+                    break :blk snap.transaction(digest);
+                }) |t| {
                     _ = arena.reset(.retain_capacity);
                     if (t.checkpoint == seq and validFix(arena.allocator(), t.tx, rec[rec_head..]))
                         try loaded.append(gpa, .{ .seq = seq, .digest = digest.*, .tx = rec[rec_head..] });

@@ -28,8 +28,7 @@ Memory figures from [performance.md](performance.md):
 
 The store is memory mapped, so resident memory grows with the page cache on a box with spare RAM;
 that memory is reclaimable. Plan disk for the retention you choose: about 183 GB right after a
-restore, and roughly 300 GB projected at sui-node's default retention with the StateService and
-RPC indexes on. A formal snapshot restore downloads about 167 GB from Mysten's public endpoint.
+restore. A formal snapshot restore downloads about 167 GB from Mysten's public endpoint.
 
 ## Build
 
