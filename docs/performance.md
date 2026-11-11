@@ -20,7 +20,7 @@ effects. Each row says which mode was measured.
 | Catch-up, both executing every transaction | 11,871 tx/s | 2,427 tx/s | 4.9x faster |
 | CPU per GetCheckpoint | 238 us | 6,817 us | 28x less |
 | RAM during catch-up (Deepwave in verify mode, sui-node executing) | 961 MB | 12,781 MB | 13x less |
-| Disk at the tip after a fresh mainnet restore | 183 GB | 346 GB | 47% less |
+| Disk at sui-node's retention (Deepwave projected, sui-node measured) | about 300 GB | 335 GB | about 10% less |
 | gRPC responses compared with sui-node | 4,722,443 | | 0 differences |
 
 ## Whole node
@@ -37,7 +37,7 @@ requests in flight per node. Each process sampled from /proc every second.
 | Private memory, execute-mode catch-up with the full live set, 8 threads | about 2.1 GB | 12.8 GB RSS | |
 | CPU per GetCheckpoint | 238 us | 6,817 us | 28x less |
 | CPU per GetObject | 10.1 us | 289 us | 28x less |
-| Disk at the tip, fresh mainnet restore (sui-node: a live node at the same retention) | 183 GB | 346 GB | 47% less |
+| Disk at sui-node's retention (Deepwave projected from its restore size plus measured growth; sui-node measured) | about 300 GB | 335 GB | about 10% less |
 | Bytes written to disk over the 100,000 checkpoints (Deepwave in verify mode) | 38.1 GB | 63.4 GB | 1.7x less |
 | Formal snapshot restore, epoch 1303 (sui-node: `sui-tool download-formal-snapshot`) | 1,393 s | 3,588 s | 2.6x faster |
 

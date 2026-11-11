@@ -19,7 +19,8 @@ same mainnet inputs. Details in [docs/performance.md](docs/performance.md).
   3.6x less CPU per transaction.
 - **13x less RAM to follow mainnet with every checkpoint verified**: 961 MB in verify mode, which checks
   signatures and certificates without re-executing, against 12,781 MB for sui-node, which always executes.
-- **About half the disk**: 183 GB at the tip after a fresh mainnet restore, against 346 GB.
+- **Less disk at the same retention**: about 300 GB projected against 335 GB measured for sui-node, with
+  1.7x fewer bytes written. A fresh mainnet restore is about 180 GB.
 - **28x less CPU per RPC read**: 238 us per GetCheckpoint against 6,817 us.
 - **Byte-identical gRPC**: 4,722,443 of 4,722,443 responses equal to sui-node's, and 988,204
   mainnet transactions re-executed with 0 differences.
