@@ -613,6 +613,11 @@ pub const Follower = struct {
     fn ordered(f: *Follower, to: ?u64) Error!void {
         var seq = f.applied_next.load(.monotonic);
         while (to == null or seq <= to.?) : (seq += 1) {
+            // A stop ends the run after the checkpoint in hand. Checked checkpoints still waiting
+            // in the window are left for the next start: in catch-up every slot is ready, so
+            // without this the stage applied the whole window (and whatever the fetchers added
+            // to it meanwhile) before it looked at the flag, each commit at the store's pace.
+            if (f.stopping.load(.acquire)) return if (to == null) {} else error.Stopped;
             const slot = &f.slots[seq % f.slots.len];
             const ts = now();
             while (slot.ready.load(.acquire) != seq + 1) {
@@ -903,6 +908,66 @@ test "follower: on_idle runs once a checkpoint is committed and applied, never b
         try testing.expectEqual(seq + 1, rec.applied[i]);
         try testing.expectEqual(seq, rec.tip[i]);
     }
+}
+
+test "follower: a stop in catch-up ends the run after the checkpoint in hand; checked checkpoints waiting in the window are not applied" {
+    var tb: TestBed = undefined;
+    try tb.init(test_epoch);
+    defer tb.deinit();
+    const Rec = struct {
+        f: *Follower = undefined,
+        stop_at: u64,
+        /// Checked checkpoints waiting behind `stop_at` when the stop was sent.
+        waiting: u64 = 0,
+        applied: u64 = 0,
+        timed_out: bool = false,
+        fn onCheckpoint(ctx: *anyopaque, seq: u64, _: *const verify.Checked, _: []const u8) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            if (seq != r.stop_at) return;
+            // Catch-up: the workers are ahead of the ordered stage. Wait until the next three
+            // checkpoints are checked and waiting, then stop with this one still in hand.
+            const t0 = now();
+            while (r.ahead(seq) < 3) {
+                if (now() - t0 > 20 * std.time.ns_per_s) {
+                    r.timed_out = true;
+                    break;
+                }
+                testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            r.waiting = r.ahead(seq);
+            r.f.stop();
+        }
+        fn ahead(r: *@This(), seq: u64) u64 {
+            var n: u64 = 0;
+            while (n < r.f.slots.len - 1) : (n += 1) {
+                const s = seq + 1 + n;
+                if (r.f.slots[s % r.f.slots.len].ready.load(.acquire) != s + 1) break;
+            }
+            return n;
+        }
+        fn onCommitted(ctx: *anyopaque, _: u64) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            r.applied += 1;
+        }
+    };
+    var rec: Rec = .{ .stop_at = test_first + 2 };
+    var f = try Follower.init(testing.allocator, testing.io, tb.store, .{ .archive = &tb.arch }, .{ .workers = 2, .window = 8 }, .{ .committee = tb.committee, .first_seq = test_first });
+    defer f.deinit();
+    rec.f = f;
+    f.observer = .{ .ctx = &rec, .on_checkpoint = Rec.onCheckpoint, .on_committed = Rec.onCommitted };
+    try f.run(null);
+    try testing.expect(!rec.timed_out);
+    try testing.expect(rec.waiting >= 3);
+    // The checkpoint in hand was committed whole; none of the waiting ones was started.
+    try testing.expectEqual(@as(u64, 3), rec.applied);
+    try testing.expectEqual(test_first + 3, f.applied_next.load(.acquire));
+    try testing.expectEqual(@as(?u64, test_first + 2), tb.store.committed());
+    // The same follower goes on from there (a second run, as after the node's refetch).
+    f.rewind();
+    rec.stop_at = std.math.maxInt(u64);
+    try f.run(test_first + 5);
+    try testing.expectEqual(@as(u64, 6), rec.applied);
+    try testing.expectEqual(@as(?u64, test_first + 5), tb.store.committed());
 }
 
 /// A live follower (no end) over an empty archive directory with a one-member committee (the

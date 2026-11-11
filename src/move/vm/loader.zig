@@ -255,6 +255,9 @@ pub const Function = struct {
     /// The loop accelerators of this function (loopaccel.Attached) when loopaccel is on and the
     /// module's bytecode matched a registered template (loopaccel.attach); null: none.
     accel: ?*const anyopaque = null,
+    /// Block gas tables of this function (interp.Blocks), built on its first run with the
+    /// interpreter's block_gas switch on; null: none built.
+    blocks: ?*const anyopaque = null,
 };
 
 pub const Module = struct {

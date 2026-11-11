@@ -57,6 +57,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("test_transport.zig");
     _ = @import("stress_uaf.zig");
+    _ = @import("test_stop_store.zig");
     std.testing.refAllDecls(lh_core);
     std.testing.refAllDecls(lh_scan);
     std.testing.refAllDecls(lh_service);

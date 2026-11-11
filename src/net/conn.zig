@@ -134,6 +134,17 @@ pub const Config = struct {
     /// data goes to a client that has not proven it holds its key, so a listener that
     /// authenticates clients must only send what any client may see (HTTP/3 SETTINGS).
     early_send: bool = false,
+    /// BBR (draft-ietf-ccwg-bbr-07, "BBRv3"; src/net/cc.zig) instead of NewReno or CUBIC. The
+    /// sender models the path, the highest delivery rate of the last two probe cycles and the
+    /// lowest round-trip time of the last ten seconds, paces at that rate times a gain and
+    /// holds two bandwidth-delay products in flight. Loss does not halve anything: a round
+    /// with loss lowers the short-term bounds by at most 0.7, and a bandwidth probe that loses
+    /// more than 2 percent sets the long-term bound on what may be in flight. So random loss
+    /// on a long path no longer caps the rate at MSS / (RTT * sqrt(loss)), and a deep queue is
+    /// not filled. It needs the pacer: this switch turns pacing on (the pacer then runs at
+    /// BBR's rate, in runs of BBR's send quantum), and it takes the place of `cubic` and
+    /// `hystart` when those are set as well.
+    bbr: bool = false,
 };
 
 /// RFC 9002 section 7.2.
@@ -210,6 +221,8 @@ const Sent = struct {
     in_flight: bool,
     nrec: u8 = 0,
     recs: [max_recs]FrameRec = undefined,
+    /// `Config.bbr`: the delivery state when the packet left (rate sampling).
+    cc: cong.Bbr.Pkt = .{},
 };
 
 const SpaceState = struct {
@@ -295,6 +308,14 @@ pub const Stream = struct {
     /// whose bytes are all sent is not finished until this is 0 (`streamSettled`): a lost packet
     /// requeues its range on the stream, so a freed stream's lost data could never be resent.
     inflight: u32 = 0,
+    /// Byte ranges of this stream the peer has acknowledged, ascending and disjoint (touching
+    /// ranges are merged, so an in-order transfer keeps one). A packet declared lost requeues
+    /// only what is not in here: its range may have been acknowledged through another copy (a
+    /// probe timeout resends the oldest ranges while their first packets are still in flight).
+    /// Advisory: when a range cannot be recorded the data is at worst sent once more.
+    acked: std.ArrayList(buf.Range) = .empty,
+    /// A STREAM frame carrying the FIN was acknowledged.
+    fin_acked: bool = false,
     // receive side
     recv: buf.RecvBuf = .{},
     recv_limit: u64 = 0,
@@ -316,7 +337,57 @@ pub const Stream = struct {
     fn deinit(s: *Stream, gpa: Allocator) void {
         s.send_buf.deinit(gpa);
         s.retx.deinit(gpa);
+        s.acked.deinit(gpa);
         s.recv.deinit(gpa);
+    }
+
+    /// Index of the first acknowledged range that ends after `off` (or `acked.items.len`).
+    fn ackedFrom(s: *const Stream, off: u64) usize {
+        var lo: usize = 0;
+        var hi: usize = s.acked.items.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (s.acked.items[mid].end <= off) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    /// Records [start, end) as acknowledged.
+    fn noteAcked(s: *Stream, gpa: Allocator, start: u64, end: u64) void {
+        if (start >= end) return;
+        const a = &s.acked;
+        // the common cases: the transfer's acknowledged prefix grows, or its newest range does
+        if (a.items.len > 0) {
+            const last = &a.items[a.items.len - 1];
+            if (start >= last.start and start <= last.end) {
+                last.end = @max(last.end, end);
+                return;
+            }
+        }
+        // first range that ends at or after `start` (it touches or overlaps, or lies beyond)
+        var lo: usize = 0;
+        var hi: usize = a.items.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (a.items[mid].end < start) lo = mid + 1 else hi = mid;
+        }
+        var ns = start;
+        var ne = end;
+        var j = lo;
+        while (j < a.items.len and a.items[j].start <= ne) : (j += 1) {
+            ns = @min(ns, a.items[j].start);
+            ne = @max(ne, a.items[j].end);
+        }
+        if (j == lo) {
+            a.insert(gpa, lo, .{ .start = ns, .end = ne }) catch {};
+            return;
+        }
+        a.items[lo] = .{ .start = ns, .end = ne };
+        if (j > lo + 1) {
+            const rest = a.items.len - j;
+            std.mem.copyForwards(buf.Range, a.items[lo + 1 ..][0..rest], a.items[j..]);
+            a.shrinkRetainingCapacity(lo + 1 + rest);
+        }
     }
 
     fn hasPending(s: *const Stream) bool {
@@ -447,6 +518,8 @@ pub const Connection = struct {
     streams_bidi_seen: u64 = 0,
 
     streams: std.AutoArrayHashMapUnmanaged(u64, *Stream) = .empty,
+    /// Index in `streams` of the stream the next packet's STREAM frames start with.
+    sched_next: usize = 0,
     next_bidi: u64 = 0,
     /// Next unidirectional stream id we open (client 2, server 3; step 4).
     next_uni: u64 = 2,
@@ -473,6 +546,8 @@ pub const Connection = struct {
     pacer: cong.Pacer = .{},
     hystart: cong.HyStart = .{},
     cubic: cong.Cubic = .{},
+    /// `Config.bbr`: the controller; it owns `cwnd` then.
+    bbr: cong.Bbr = .{},
     /// The last transmit round ended because the window was full (not because the application
     /// had nothing more): only then does CUBIC grow the window (RFC 9438 section 5.8).
     cwnd_limited: bool = false,
@@ -539,6 +614,7 @@ pub const Connection = struct {
             .x25519_secret = xsec,
             .alpn = if (cfg.alpn.len > 0) cfg.alpn[0] else "",
         });
+        if (cfg.bbr) c.bbr = cong.Bbr.init(now, c.cwnd, c.mtu, std.mem.readInt(u64, cfg.seed[32..40], .little));
         c.installInitialKeys(&odcid);
         c.tls.start(gpa) catch |e| return mapTls(e);
         try c.drainTls();
@@ -604,6 +680,7 @@ pub const Connection = struct {
             .x25519_secret = xsec,
         });
         c.srv = st;
+        if (cfg.bbr) c.bbr = cong.Bbr.init(now, c.cwnd, c.mtu, std.mem.readInt(u64, cfg.seed[32..40], .little));
         const k = qc.initialKeys(odcid);
         c.spaces[0].send = k.server;
         c.spaces[0].recv = k.client;
@@ -1476,6 +1553,7 @@ pub const Connection = struct {
         var acked_bytes: u64 = 0;
         var newest_sent: u64 = 0;
         var big_acked = false;
+        if (c.cfg.bbr) c.bbr.ackBegin();
         // Ranges arrive in descending order; keep the first `max_ranges` (later ones are acked
         // again by the peer's next ACK) and validate them all.
         const max_ranges = 64;
@@ -1519,7 +1597,7 @@ pub const Connection = struct {
                 if (s.size > max_datagram) big_acked = true;
                 for (s.recs[0..s.nrec]) |r| switch (r) {
                     .pmtu => |m| {
-                        if (c.cfg.iw_mtu and m > c.mtu and c.ssthresh == std.math.maxInt(u64))
+                        if (c.cfg.iw_mtu and m > c.mtu and c.ssthresh == std.math.maxInt(u64) and !(c.cfg.bbr and c.bbr.full_bw_reached))
                             c.cwnd += initialWindow(m) - initialWindow(c.mtu);
                         c.mtu = @max(c.mtu, m);
                         c.pmtu_inflight = false;
@@ -1527,6 +1605,8 @@ pub const Connection = struct {
                     },
                     .stream => |sr| if (c.streams.get(sr.id)) |st| {
                         st.inflight -|= 1;
+                        st.noteAcked(c.gpa, sr.off, sr.off + sr.len);
+                        if (sr.fin) st.fin_acked = true;
                         if (st.detached) c.credit_due = true;
                     },
                     else => {},
@@ -1535,6 +1615,7 @@ pub const Connection = struct {
                 if (s.in_flight) {
                     c.bytes_in_flight -|= s.size;
                     acked_bytes += s.size;
+                    if (c.cfg.bbr) c.bbr.onPacketAcked(now, s.cc, s.time, s.pn, s.size);
                 }
                 if (s.ack_eliciting and s.in_flight) sp.ack_eliciting_in_flight -|= 1;
             }
@@ -1558,11 +1639,27 @@ pub const Connection = struct {
             }
             c.updateRtt(ack_delay);
         }
-        if (newly_acked_any) {
-            c.pto_count = 0;
-            c.onAckedBytes(now, acked_bytes, .{ .space = space, .largest = largest, .rtt = if (newly_largest_eliciting_time != null) c.latest_rtt else null, .newest_sent = newest_sent });
+        if (c.cfg.bbr) {
+            // BBR takes the losses an ACK reveals before the ACK itself: its rate sample
+            // counts what was lost while the acknowledged packet was in flight (cc.zig)
+            if (newly_acked_any) c.pto_count = 0;
+            c.detectLoss(now, space);
+            if (newly_acked_any) c.bbr.onAck(.{
+                .now = now,
+                .inflight = c.bytes_in_flight,
+                .newly_acked = acked_bytes,
+                .rtt = if (newly_largest_eliciting_time != null) c.latest_rtt else null,
+                .min_rtt = c.min_rtt,
+                .srtt = if (c.rtt_initialized) c.srtt else 0,
+                .mtu = c.mtu,
+            }, &c.cwnd);
+        } else {
+            if (newly_acked_any) {
+                c.pto_count = 0;
+                c.onAckedBytes(now, acked_bytes, .{ .space = space, .largest = largest, .rtt = if (newly_largest_eliciting_time != null) c.latest_rtt else null, .newest_sent = newest_sent });
+            }
+            c.detectLoss(now, space);
         }
-        c.detectLoss(now, space);
         if (c.cfg.pmtud and space == .app) c.blackHoleCheck(now, big_acked);
         c.updateTimer(now);
     }
@@ -1615,8 +1712,7 @@ pub const Connection = struct {
             .stream => |sr| if (c.streams.get(sr.id)) |st| {
                 st.inflight -|= 1;
                 if (!st.send_reset) {
-                    st.retx.append(c.gpa, .{ .start = sr.off, .end = sr.off + sr.len }) catch c.internalError();
-                    if (sr.fin) st.fin_sent = false;
+                    _ = c.requeue(st, sr.off, sr.off + sr.len, sr.fin) catch return c.internalError();
                 }
             },
             .reset_stream => |rs| c.ctl.append(c.gpa, .{ .reset = rs }) catch c.internalError(),
@@ -1649,13 +1745,39 @@ pub const Connection = struct {
         };
         if (s.size > max_datagram) c.big_lost_pass = true;
         // congestion event
-        if (c.cfg.cubic) {
+        if (c.cfg.bbr) {
+            if (s.in_flight) c.bbr.onPacketLost(now, s.cc, s.time, s.size, &c.cwnd);
+        } else if (c.cfg.cubic) {
             _ = c.cubic.onCongestion(now, s.time, &c.cwnd, &c.ssthresh, c.mtu);
         } else if (c.recovery_start == null or s.time > c.recovery_start.?) {
             c.recovery_start = now;
             c.cwnd = @max(c.cwnd / 2, 2 * c.mtu);
             c.ssthresh = c.cwnd;
         }
+    }
+
+    /// Queues the part of [start, end) the peer has not acknowledged for retransmission, and
+    /// the FIN if the frame carried it and no acknowledged frame has. Returns whether anything
+    /// was queued. A range (or FIN) that another packet already delivered is not sent again:
+    /// after a probe timeout the probe's copy is usually acknowledged first, and the original
+    /// packet is declared lost right after.
+    fn requeue(c: *Connection, st: *Stream, start: u64, end: u64, fin: bool) Allocator.Error!bool {
+        const before = st.retx.items.len;
+        var at = start;
+        var i = st.ackedFrom(start);
+        while (at < end and i < st.acked.items.len) : (i += 1) {
+            const r = st.acked.items[i];
+            if (r.start >= end) break;
+            if (r.start > at) try st.retx.append(c.gpa, .{ .start = at, .end = r.start });
+            at = @max(at, r.end);
+        }
+        if (at < end) try st.retx.append(c.gpa, .{ .start = at, .end = end });
+        if (fin and !st.fin_acked) {
+            // a FIN whose bytes are all delivered still has to go: an empty range at the end
+            if (st.retx.items.len == before) try st.retx.append(c.gpa, .{ .start = end, .end = end });
+            st.fin_sent = false;
+        }
+        return st.retx.items.len != before;
     }
 
     fn detectLoss(c: *Connection, now: u64, space: Space) void {
@@ -1892,9 +2014,9 @@ pub const Connection = struct {
             for (pk.recs[0..pk.nrec]) |r| switch (r) {
                 .stream => |sr| if (c.streams.get(sr.id)) |st| {
                     if (st.send_reset or sr.off < st.send_base or (sr.len == 0 and !sr.fin)) continue;
-                    st.retx.append(c.gpa, .{ .start = sr.off, .end = sr.off + sr.len }) catch return c.internalError();
-                    if (sr.fin) st.fin_sent = false;
-                    any = true;
+                    // only what no other packet has delivered yet (an earlier probe's copy may
+                    // have been acknowledged while this packet is still in flight)
+                    if (c.requeue(st, sr.off, sr.off + sr.len, sr.fin) catch return c.internalError()) any = true;
                 },
                 else => {},
             };
@@ -1973,6 +2095,9 @@ pub const Connection = struct {
         if (np == 0) {
             // the round is over: the application may consume before the next one
             c.credit_due = true;
+            // BBR: window and pacer would have let a packet go and there was none to send.
+            // Rate samples of what is in flight now are the application's rate, not the path's.
+            if (c.cfg.bbr and c.pace_at == null and c.bytes_in_flight < c.cwnd and !c.sendPending()) c.bbr.markAppLimited(c.bytes_in_flight);
             return null;
         }
         // Pad datagrams carrying Initial packets to 1200 bytes (RFC 9000 section 14.1).
@@ -1992,6 +2117,13 @@ pub const Connection = struct {
         if (!c.addr_validated) c.amp_sent += pos;
         c.updateTimer(now);
         return pos;
+    }
+
+    /// Stream data is waiting to be sent or resent (it may still be held by the peer's flow
+    /// control windows, which BBR counts as the path's limit, not the application's).
+    fn sendPending(c: *const Connection) bool {
+        for (c.streams.values()) |s| if (s.hasPending() and s.stopped_by_peer == null) return true;
+        return false;
     }
 
     fn pmtuProbeDue(c: *Connection, now: u64, out_len: usize) bool {
@@ -2056,7 +2188,15 @@ pub const Connection = struct {
         if (sp.ack_needed and sp.recv_set.n > 0) ack_len = encodeAck(sp, now, f[p..lim]);
         p += ack_len;
         var can_send = c.bytes_in_flight < c.cwnd or sp.probe > 0;
-        if (c.cfg.pacing and can_send and sp.probe == 0 and plan.space == .app and c.rtt_initialized) {
+        if (c.cfg.bbr) {
+            if (can_send and sp.probe == 0 and plan.space == .app and c.rtt_initialized) {
+                // BBR's own rate, in runs of its send quantum
+                if (c.pacer.delayRate(now, c.bbr.pacing_rate, c.mtu, c.cwnd - c.bytes_in_flight, c.bbr.send_quantum)) |at| {
+                    can_send = false;
+                    c.pace_at = at;
+                }
+            }
+        } else if (c.cfg.pacing and can_send and sp.probe == 0 and plan.space == .app and c.rtt_initialized) {
             // Probes and ACKs are never paced; the handshake flights fit the first bucket.
             const slow_start = c.cwnd < c.ssthresh;
             if (c.pacer.delay(now, c.srtt, c.cwnd, c.mtu, c.cwnd - c.bytes_in_flight, if (slow_start) 2 else 5, if (slow_start) 1 else 4)) |at| {
@@ -2104,7 +2244,9 @@ pub const Connection = struct {
             if (c.state == .established or c.spaces[2].send != null) {
                 p = c.fillApp(plan, p, lim, can_send);
             }
-            if (c.cfg.cubic) {
+            if (c.cfg.bbr) {
+                if (c.bytes_in_flight >= c.cwnd) c.bbr.noteCwndLimited();
+            } else if (c.cfg.cubic) {
                 if (c.bytes_in_flight >= c.cwnd) {
                     c.cwnd_limited = true;
                 } else if (!plan.eliciting and c.pace_at == null) c.cwnd_limited = false;
@@ -2238,12 +2380,21 @@ pub const Connection = struct {
             plan.eliciting = true;
         }
         if (!can_send) return p;
-        // STREAM data
-        for (c.streams.values()) |s| {
+        // STREAM data, round-robin: each packet starts with the stream after the one served
+        // last, so a small response (a subscription's ack, a read) leaves within a packet or
+        // two of being written instead of after every byte of a bulk stream that happens to
+        // sit before it in the map. With one stream ready the packets are what they were.
+        const vals = c.streams.values();
+        const start = if (c.sched_next < vals.len) c.sched_next else 0;
+        for (0..vals.len) |k| {
             if (p + 24 >= lim) break;
+            const idx = if (start + k < vals.len) start + k else start + k - vals.len;
+            const s = vals[idx];
             if (!s.hasPending()) continue;
             if (s.stopped_by_peer != null) continue;
+            const before = p;
             p = c.fillStream(plan, p, lim, s);
+            if (p != before) c.sched_next = idx + 1;
         }
         return p;
     }
@@ -2416,11 +2567,12 @@ pub const Connection = struct {
         rec.nrec = plan.nrec;
         if (plan.nrec > 0) @memcpy(rec.recs[0..plan.nrec], plan.recs[0..plan.nrec]);
         if (plan.eliciting) {
+            if (c.cfg.bbr) rec.cc = c.bbr.onSent(now, c.bytes_in_flight, total, &c.cwnd);
             sp.sent.append(c.gpa, rec) catch c.internalError();
             sp.time_last_ack_eliciting = now;
             sp.ack_eliciting_in_flight += 1;
             c.bytes_in_flight += total;
-            if (c.cfg.pacing) c.pacer.onSend(total);
+            if (c.cfg.pacing or c.cfg.bbr) c.pacer.onSend(total);
         }
         // Initial keys are dropped as soon as the first Handshake packet is sent (client).
         if (plan.space == .handshake and c.srv == null) c.discardSpace(.initial);
@@ -2499,14 +2651,16 @@ pub const Connection = struct {
         if (c.stream_pool.pop()) |s| {
             var send_buf = s.send_buf;
             var retx = s.retx;
+            var acked = s.acked;
             var data = s.recv.data;
             s.recv.discard(c.gpa);
             var ooo = s.recv.ooo;
             send_buf.clearRetainingCapacity();
             retx.clearRetainingCapacity();
+            acked.clearRetainingCapacity();
             data.clearRetainingCapacity();
             ooo.clearRetainingCapacity();
-            s.* = .{ .id = id, .send_buf = send_buf, .retx = retx };
+            s.* = .{ .id = id, .send_buf = send_buf, .retx = retx, .acked = acked };
             s.recv.data = data;
             s.recv.ooo = ooo;
             return s;
@@ -2935,6 +3089,124 @@ test "a PTO probe retransmits the tail's stream data, not a bare PING (RFC 9002 
     try std.testing.expect(pl[p] & 0xf8 == 0x08 and pl[p] & 0x01 == 1);
     try std.testing.expect(std.mem.indexOf(u8, pl, "the last request of a burst") != null);
     try std.testing.expectEqual(@as(u64, 1), c.ptos);
+}
+
+test "a range acknowledged through a probe's copy is not sent again when its first packet is declared lost" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    c.cfg.keep_alive_ms = 0;
+    const id = try c.openBidi();
+    try c.streamWrite(id, "the last request of a burst", true);
+    var out: [max_datagram]u8 = undefined;
+    _ = c.pollTransmit(1000, &out).?; // packet 0: delayed, not lost
+    try std.testing.expect(c.pollTransmit(1000, &out) == null);
+    // the probe timeout sends the same range again as packet 1; packet 0 stays in flight
+    const t = c.nextTimeout().?;
+    c.onTimeout(t);
+    _ = c.pollTransmit(t, &out).?;
+    _ = c.pollTransmit(t, &out).?; // the second probe has no data left to carry: a PING
+    try std.testing.expect(c.pollTransmit(t, &out) == null);
+    try std.testing.expectEqual(@as(u64, 1), c.stream_retx);
+    try std.testing.expectEqual(@as(u32, 2), c.stream(id).?.inflight);
+    // the peer acknowledges packet 1 only. Packet 0 was sent more than 9/8 of a round trip
+    // before it, so this ACK also declares it lost.
+    var ack: [32]u8 = undefined;
+    sendTheirs(c, 0, ack[0..ackFrame(&ack, 1, 0)], t + 1000);
+    try std.testing.expectEqual(@as(u64, 1), c.pkts_lost);
+    const st = c.stream(id).?;
+    try std.testing.expect(st.fin_acked);
+    try std.testing.expectEqual(@as(usize, 1), st.acked.items.len);
+    // every byte and the FIN were delivered by the copy: nothing is queued, nothing is sent,
+    // and the stream is settled (before the fix the range went out a third time)
+    try std.testing.expectEqual(@as(usize, 0), st.retx.items.len);
+    try std.testing.expect(st.fin_sent);
+    try std.testing.expect(c.streamSettled(id));
+    try std.testing.expect(c.pollTransmit(t + 1000, &out) == null);
+    try std.testing.expectEqual(@as(u64, 1), c.stream_retx);
+}
+
+test "a lost packet requeues only the part of its range that no other packet delivered" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    const id = try c.openBidi();
+    const st = c.stream(id).?;
+    // acknowledged ranges merge when they touch or overlap, in any order
+    st.noteAcked(gpa, 100, 200);
+    st.noteAcked(gpa, 400, 500);
+    st.noteAcked(gpa, 300, 400);
+    st.noteAcked(gpa, 0, 50);
+    try std.testing.expectEqual(@as(usize, 3), st.acked.items.len);
+    st.noteAcked(gpa, 40, 320);
+    try std.testing.expectEqualSlices(buf.Range, &.{.{ .start = 0, .end = 500 }}, st.acked.items);
+    st.noteAcked(gpa, 700, 800);
+    st.noteAcked(gpa, 600, 650);
+    try std.testing.expectEqualSlices(buf.Range, &.{ .{ .start = 0, .end = 500 }, .{ .start = 600, .end = 650 }, .{ .start = 700, .end = 800 } }, st.acked.items);
+    // a lost frame [450, 900) with FIN: three holes are requeued, the delivered parts are not
+    try std.testing.expect(try c.requeue(st, 450, 900, true));
+    try std.testing.expectEqualSlices(buf.Range, &.{ .{ .start = 500, .end = 600 }, .{ .start = 650, .end = 700 }, .{ .start = 800, .end = 900 } }, st.retx.items);
+    try std.testing.expect(!st.fin_sent);
+    // a frame that lies inside what was delivered queues nothing
+    st.retx.clearRetainingCapacity();
+    try std.testing.expect(!try c.requeue(st, 10, 400, false));
+    try std.testing.expectEqual(@as(usize, 0), st.retx.items.len);
+    // its FIN alone still has to go (an empty range at the end), unless a FIN was acknowledged
+    try std.testing.expect(try c.requeue(st, 700, 800, true));
+    try std.testing.expectEqualSlices(buf.Range, &.{.{ .start = 800, .end = 800 }}, st.retx.items);
+    st.retx.clearRetainingCapacity();
+    st.fin_acked = true;
+    st.fin_sent = true;
+    try std.testing.expect(!try c.requeue(st, 700, 800, true));
+    try std.testing.expect(st.fin_sent);
+    // nothing acknowledged: the whole range, as before
+    const id2 = try c.openBidi();
+    const s2 = c.stream(id2).?;
+    try std.testing.expect(try c.requeue(s2, 5, 25, false));
+    try std.testing.expectEqualSlices(buf.Range, &.{.{ .start = 5, .end = 25 }}, s2.retx.items);
+}
+
+test "streams with data take turns: a small response is not held behind a bulk stream" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    c.cwnd = 1 << 20;
+    const chunk: [48 << 10]u8 = @splat(7);
+    // three bulk streams opened first, then a short answer on a fourth
+    var bulk: [3]u64 = undefined;
+    for (&bulk) |*id| {
+        id.* = try c.openBidi();
+        try c.streamWrite(id.*, &chunk, false);
+    }
+    const small = try c.openBidi();
+    try c.streamWrite(small, "subscribed", true);
+    var out: [max_datagram]u8 = undefined;
+    // one packet per stream in turn: the answer leaves in the fourth packet, whole and with
+    // its FIN (in map order it waited for all 144 KB before it)
+    for (0..3) |_| _ = c.pollTransmit(1000, &out).?;
+    try std.testing.expectEqual(@as(u64, 0), c.stream(small).?.send_off);
+    _ = c.pollTransmit(1000, &out).?;
+    try std.testing.expectEqual(@as(u64, 10), c.stream(small).?.send_off);
+    try std.testing.expect(c.stream(small).?.fin_sent);
+    // the bulk streams share what follows: after 30 more packets each has sent 10 or 11
+    // packets' worth, none is ahead by more than one
+    for (0..30) |_| _ = c.pollTransmit(1000, &out).?;
+    var lo: u64 = std.math.maxInt(u64);
+    var hi: u64 = 0;
+    for (bulk) |id| {
+        lo = @min(lo, c.stream(id).?.send_off);
+        hi = @max(hi, c.stream(id).?.send_off);
+    }
+    try std.testing.expect(lo >= 10 * 1100 and hi - lo <= 1200);
+    // a stream that is alone gets every packet
+    const d = try testEstablished(gpa);
+    defer d.deinit();
+    d.cwnd = 1 << 20;
+    const only = try d.openBidi();
+    try d.streamWrite(only, &chunk, true);
+    var n: u64 = 0;
+    while (d.pollTransmit(1000, &out)) |_| n += 1;
+    try std.testing.expect(d.stream(only).?.fin_sent and n >= 41 and n <= 43);
 }
 
 test "out of memory for a sent packet's record closes the connection instead of losing the data" {
@@ -3733,6 +4005,101 @@ test "cubic switch: a loss cuts the window to 0.7, once per round trip; off, New
         try std.testing.expectEqual(@as(u64, 5), c.pkts_lost);
         try std.testing.expectEqual(reduced, c.cwnd);
     }
+}
+
+test "bbr switch: the pacer runs at BBR's rate, a loss does not cut the window, an idle sender is marked application-limited" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    c.cfg.bbr = true;
+    c.cfg.keep_alive_ms = 0;
+    c.bbr = cong.Bbr.init(0, c.cwnd, c.mtu, 1);
+    c.rtt_initialized = true;
+    c.srtt = 40 * ms;
+    c.latest_rtt = 40 * ms;
+    c.min_rtt = 40 * ms;
+    c.rttvar = 1 * ms;
+    const id = try c.openBidi();
+    const chunk: [64 << 10]u8 = @splat(1);
+    for (0..4) |_| try c.streamWrite(id, &chunk, false);
+    var out: [max_mtu]u8 = undefined;
+    var now: u64 = 1_000_000;
+    var n: u64 = 0;
+    while (c.pollTransmit(now, &out)) |_| n += 1;
+    // the initial window, held by the window (the first bucket is larger): 10 datagrams, or
+    // 11 when they come out a few bytes under 1200
+    const n0 = n;
+    const flight0 = c.bytes_in_flight;
+    try std.testing.expect(n0 == 10 or n0 == 11);
+    try std.testing.expect(flight0 >= c.cwnd);
+    try std.testing.expectEqual(@as(?u64, null), c.pace_at);
+    try std.testing.expect(c.bbr.limited_now);
+    try std.testing.expectEqual(@as(u64, 0), c.bbr.app_limited);
+    try std.testing.expectEqual(flight0, c.spaces[2].live()[n0 - 1].cc.tx_in_flight);
+    // all of them acknowledged 40 ms later: that flight delivered in 40 ms is the first sample
+    now += 40 * ms;
+    var ack: [32]u8 = undefined;
+    sendTheirs(c, 0, ack[0..ackFrame(&ack, n0 - 1, n0 - 1)], now);
+    try std.testing.expectEqual(cong.Bbr.State.startup, c.bbr.state);
+    try std.testing.expectEqual(flight0, c.bbr.delivered);
+    try std.testing.expectEqual(flight0 * 25, c.bbr.max_bw);
+    try std.testing.expectEqual(@as(u64, 40 * ms), c.bbr.min_rtt);
+    try std.testing.expectEqual(12_000 + flight0, c.cwnd); // startup: the window grows by what was acknowledged
+    // the pacing rate: 2.77 windows per round trip once the first round-trip time is known
+    // (831,000 bytes per second), or 2.77 times 0.99 of the estimate when that is more
+    const rate = @max(831_000, flight0 * 25 * 277 * 99 / 10_000);
+    try std.testing.expectEqual(rate, c.bbr.pacing_rate);
+    try std.testing.expectEqual(@as(u64, 2400), c.bbr.send_quantum);
+    // paced now: the bucket (two quanta, four datagrams), then one quantum every 2400 / rate
+    n = 0;
+    while (c.pollTransmit(now, &out)) |_| n += 1;
+    try std.testing.expectEqual(@as(u64, 4), n);
+    const due = c.nextTimeout().?;
+    try std.testing.expect(due > now + 2500 * us and due <= now + 2400 * std.time.ns_per_s / rate + 1);
+    var total: u64 = n;
+    var runs: u64 = 1;
+    const t1 = now;
+    while (c.pace_at) |at| {
+        now = at;
+        c.onTimeout(now);
+        n = 0;
+        while (c.pollTransmit(now, &out)) |_| n += 1;
+        try std.testing.expect(n <= 3);
+        total += n;
+        runs += 1;
+    }
+    // the whole window left, in runs of a quantum, at the pacing rate
+    try std.testing.expect(c.bytes_in_flight >= c.cwnd);
+    try std.testing.expect(total >= 20 and total <= 22 and runs >= 8);
+    try std.testing.expect(now - t1 >= (c.cwnd - 4800) * std.time.ns_per_s / rate - ms);
+    // the peer has nine packets of that flight, not its first four: those are lost. The
+    // window is not cut (startup ends on loss only with six losses and more than 2 percent in
+    // a round); it grows by what was acknowledged.
+    const before = c.cwnd;
+    now += 40 * ms;
+    sendTheirs(c, 1, ack[0..ackFrame(&ack, n0 + 12, 8)], now);
+    try std.testing.expectEqual(@as(u64, 4), c.pkts_lost);
+    try std.testing.expect(c.bbr.lost > 4 * 1100 and c.bbr.lost <= 4 * 1200);
+    try std.testing.expect(c.bbr.recovery_start != null);
+    try std.testing.expectEqual(cong.Bbr.State.startup, c.bbr.state);
+    try std.testing.expect(c.cwnd > before + 9 * 1100 and c.cwnd <= before + 9 * 1200);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), c.ssthresh);
+
+    // a sender with nothing more to send is application-limited, and so are its next packets
+    const d = try testEstablished(gpa);
+    defer d.deinit();
+    d.cfg.bbr = true;
+    d.cfg.keep_alive_ms = 0;
+    d.bbr = cong.Bbr.init(0, d.cwnd, d.mtu, 1);
+    const id2 = try d.openBidi();
+    try d.streamWrite(id2, "a small request", false);
+    _ = d.pollTransmit(1000, &out).?;
+    try std.testing.expectEqual(@as(u64, 0), d.bbr.app_limited);
+    try std.testing.expect(d.pollTransmit(1000, &out) == null);
+    try std.testing.expect(d.bbr.app_limited != 0);
+    try d.streamWrite(id2, "and another", true);
+    _ = d.pollTransmit(2000, &out).?;
+    try std.testing.expect(!d.spaces[2].live()[0].cc.app_limited and d.spaces[2].live()[1].cc.app_limited);
 }
 
 test "path MTU search: a failed ceiling is followed by 1452 and halving; a black hole falls back to 1200" {

@@ -56,6 +56,7 @@ pub const aux_loaded = store_impl.aux_loaded;
 pub const aux_checkpoint_digest = store_impl.aux_checkpoint_digest;
 pub const aux_superseded = store_impl.aux_superseded;
 pub const aux_highest_pruned = store_impl.aux_highest_pruned;
+pub const certFixKey = store_impl.certFixKey;
 
 pub const Backend = io.Backend;
 pub const RealIo = io.RealIo;

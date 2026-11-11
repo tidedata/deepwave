@@ -81,6 +81,20 @@ pub const Options = struct {
     /// up, object versions in the object window unless the checkpoint that superseded them is
     /// below the object floor.
     age: bool = false,
+    /// With `age`: deferred age-out and the read-ahead (lane ager-catchup). The node's catch-up
+    /// signal flips at random and the ager follows the store's gate as the ager thread does:
+    /// no step while it waits (cleaning goes on and floors move, so segments age out and are
+    /// deleted under its cursors), steps while it runs, and a bulk catch-up without the segment
+    /// pass once the backlog passes `age_defer_bytes`, with crashes inside the steps and the
+    /// bulk runs. Every step is preceded by its read-ahead (`age` seeds without this keep the
+    /// serial path, so their runs stay the same draw for draw).
+    age_defer: bool = false,
+    /// With `age`: the segment pass with a live set (lane ager-segment-pass), with the
+    /// read-ahead it needs. The set's memory is 8 to 2048 bytes by seed, so one pass over the
+    /// aged segments takes many table passes; steps of a few KiB cut each table pass into
+    /// several, with commits, floor moves, cleaning (it deletes live-table entries, which moves
+    /// slots) and crashes between them and between the table pass and the walk that uses it.
+    age_set: bool = false,
     /// `pending` seeds: every crash garbles the target of the pending write (sim.zig
     /// `crash_garble_pending`). Checked as strictly as plain crash seeds: the garbled write was
     /// never acknowledged.
@@ -119,6 +133,20 @@ pub const Result = struct {
     age_steps: u64 = 0,
     age_dropped: u64 = 0,
     age_rewrites: u64 = 0,
+    /// Deferral seeds: checks that waited, bulk catch-ups run to the end, and those a crash cut.
+    age_waits: u64 = 0,
+    age_bulks: u64 = 0,
+    age_bulk_crashes: u64 = 0,
+    /// Live-set seeds: table passes finished, records kept without a lookup, lookups made,
+    /// object versions judged dead by a clear bit alone, passes started over or finished
+    /// inexact, and clear bits the table contradicted (a failure).
+    set_builds: u64 = 0,
+    set_kept: u64 = 0,
+    age_lookups: u64 = 0,
+    set_dead: u64 = 0,
+    set_restarts: u64 = 0,
+    set_inexact: u64 = 0,
+    set_misses: u64 = 0,
     floor_moves: u64 = 0,
     rot_prunes_refused: u64 = 0,
     /// Tail seeds: the damage mode run (0 rot + later group, 1 lost sector, 2 rot under dir
@@ -492,6 +520,11 @@ const Driver = struct {
     opts: *const Options,
     lean: ?*Lean = null,
     last_prune_epoch: ?u64 = null,
+    /// Deferral seeds: the node's catch-up signal.
+    behind: bool = true,
+    /// The store whose age counters were last added to the result, and their values then.
+    seen_store: ?*Store = null,
+    seen: [7]u64 = @splat(0),
 
     fn reopen(d: *Driver) !void {
         // Age seeds: some incarnations write raw segments (a store mixing both formats).
@@ -773,7 +806,13 @@ const Driver = struct {
         if (d.opts.age) {
             if (r.uintLessThan(u8, 3) == 0) try d.moveFloors();
             if (!d.res.ok) return;
-            if (r.uintLessThan(u8, 2) == 0) try d.ageSome();
+            // Live-set seeds: now and then the table's sequence counter moves as a deletion
+            // moves it (cleaning deletes few entries in these runs), so table passes start
+            // over and some finish inexact.
+            if (d.opts.age_set and r.uintLessThan(u8, 6) == 0) if (d.store.?.live.raw) |h| {
+                _ = h.t.seq.fetchAdd(2, .monotonic);
+            };
+            if (d.opts.age_defer) try d.ageGated() else if (r.uintLessThan(u8, 2) == 0) try d.ageSome(false);
             if (!d.res.ok) return;
         }
         // Occasional maintenance.
@@ -868,17 +907,127 @@ const Driver = struct {
         d.check(false);
     }
 
-    fn ageSome(d: *Driver) !void {
+    /// Adds what the store's age counters gained since the last call (a reopened store starts
+    /// at zero).
+    fn noteAge(d: *Driver) void {
+        const s = d.store orelse return;
+        if (d.seen_store != s) {
+            d.seen_store = s;
+            d.seen = @splat(0);
+        }
+        const st = &s.age_stats;
+        const now: [7]u64 = .{
+            st.set_builds.load(.monotonic),   st.set_kept.load(.monotonic),    st.lookups.load(.monotonic), st.set_dead.load(.monotonic),
+            st.set_restarts.load(.monotonic), st.set_inexact.load(.monotonic), st.set_misses.load(.monotonic),
+        };
+        // A reopened store can sit where the old one sat: counters that went down say so.
+        for (now, d.seen) |x, y| if (x < y) {
+            d.seen = @splat(0);
+            break;
+        };
+        inline for (.{ "set_builds", "set_kept", "age_lookups", "set_dead", "set_restarts", "set_inexact", "set_misses" }, 0..) |name, i| {
+            @field(d.res, name) += now[i] -| d.seen[i];
+        }
+        d.seen = now;
+        if (d.res.set_misses != 0) d.res.failf("live set: {d} records with a clear bit in an exact set that the table still named", .{d.res.set_misses});
+    }
+
+    /// Live-set seeds, one in four: the table's sequence counter moves before every age step, so
+    /// a table pass that takes several steps starts over three times and then finishes inexact
+    /// (clear bits go back to lookups).
+    fn moveSeq(d: *Driver) void {
+        if (!d.opts.age_set or ((d.opts.seed *% 0x9e3779b97f4a7c15) >> 50) & 3 != 0) return;
+        if (d.store.?.live.raw) |h| _ = h.t.seq.fetchAdd(2, .monotonic);
+    }
+
+    /// Deferral seeds: one visit of the ager thread's loop.
+    fn ageGated(d: *Driver) !void {
+        const r = d.rnd;
+        if (r.uintLessThan(u8, 12) == 0) d.behind = !d.behind;
+        const s = d.store.?;
+        s.age_mode = .deferred;
+        s.ageBehind(d.behind);
+        switch (s.ageGate()) {
+            .run => if (r.uintLessThan(u8, 2) == 0) try d.ageSome(false),
+            .wait => {
+                d.res.age_waits += 1;
+                // The writer's cleaner does not wait for the ager.
+                if (r.uintLessThan(u8, 6) == 0) try d.ageSome(true);
+            },
+            .bulk => try d.ageBulk(),
+        }
+    }
+
+    /// A bulk catch-up: steps without the segment pass until one is idle, a crash scheduled
+    /// inside half of them.
+    fn ageBulk(d: *Driver) !void {
+        const r = d.rnd;
+        var held: ?store_mod.Snapshot = if (r.boolean()) d.store.?.snapshot() else null;
+        if (r.boolean()) d.sim.scheduleCrash(r.uintLessThan(u64, 60));
+        var steps: u32 = 0;
+        while (true) : (steps += 1) {
+            const s = d.store.?;
+            d.moveSeq();
+            if (steps > 1 << 14) {
+                if (held) |*h| h.release();
+                return d.res.failf("a bulk catch-up did not end in {d} steps", .{steps});
+            }
+            const rep = s.ageStepOpts(r.intRangeAtMost(u64, 4096, 1 << 20), .{ .skip_seg = true }) catch |e| switch (e) {
+                error.Crashed => {
+                    if (held) |*h| h.release();
+                    d.res.age_bulk_crashes += 1;
+                    try d.crashed();
+                    d.followOldest();
+                    try d.leanRecover();
+                    d.check(false);
+                    return;
+                },
+                else => {
+                    if (held) |*h| h.release();
+                    return e;
+                },
+            };
+            d.res.age_steps += 1;
+            d.res.age_dropped += rep.records_dropped;
+            d.res.age_rewrites += rep.chunks_rewritten;
+            d.noteAge();
+            if (rep.idle) {
+                s.ageBulkDone();
+                break;
+            }
+        }
+        d.sim.scheduleCrash(null);
+        // A crash that landed in a deferred punch (reclaim cannot report it): recover now.
+        if (d.sim.crashed) {
+            if (held) |*h| h.release();
+            held = null;
+            d.res.age_bulk_crashes += 1;
+            try d.crashed();
+            d.followOldest();
+            try d.leanRecover();
+        } else d.res.age_bulks += 1;
+        d.followOldest();
+        if (held) |*h| {
+            d.checkWith(false, h);
+            h.release();
+        }
+        d.check(false);
+    }
+
+    /// `clean_only`: cleaning steps alone (the ager waits).
+    fn ageSome(d: *Driver, clean_only: bool) !void {
         const r = d.rnd;
         var held: ?store_mod.Snapshot = if (r.boolean()) d.store.?.snapshot() else null;
         if (r.uintLessThan(u8, 3) == 0) d.sim.scheduleCrash(r.uintLessThan(u64, 40));
         const n = 1 + r.uintLessThan(u8, 4);
         for (0..n) |_| {
             const s = d.store.?;
-            const res_step = if (r.uintLessThan(u8, 6) == 0) s.cleanStep(r.intRangeAtMost(u64, 4096, 1 << 18)) else if (s.ageStep(r.intRangeAtMost(u64, 4096, 1 << 20))) |rep| blk: {
+            d.moveSeq();
+            const res_step = if (clean_only or r.uintLessThan(u8, 6) == 0) s.cleanStep(r.intRangeAtMost(u64, 4096, 1 << 18)) else if (s.ageStep(r.intRangeAtMost(u64, 4096, 1 << 20))) |rep| blk: {
                 d.res.age_steps += 1;
                 d.res.age_dropped += rep.records_dropped;
                 d.res.age_rewrites += rep.chunks_rewritten;
+                d.noteAge();
                 break :blk @as(store_mod.PruneReport, .{});
             } else |e| e;
             _ = res_step catch |e| switch (e) {
@@ -1058,6 +1207,19 @@ pub fn run(parent_gpa: std.mem.Allocator, opts: Options) !Result {
         // From the seed, not `rnd`: the seed's run stays the same draw for draw.
         cfg.cache_bytes = (1 + (opts.seed >> 3) % 16) << 20;
         if (std.c.getenv("ZUI_DST_CACHE_MB")) |v| cfg.cache_bytes = (std.fmt.parseInt(u64, std.mem.span(v), 10) catch 16) << 20;
+        // The serial path unless the seed is a deferral seed: the read-ahead's reads would move
+        // every `age` seed's draws. Deferral seeds hold back 16 KiB to 1 MiB (from the seed).
+        cfg.age_serial = !(opts.age_defer or opts.age_set);
+        if (opts.age_set) {
+            cfg.age_live_set = true;
+            cfg.age_set_bytes = @as(u64, 8) << @intCast(((opts.seed *% 0x9e3779b97f4a7c15) >> 44) % 9);
+            // Half of them look every clear bit up as well: the cross-check of the set's proof.
+            cfg.age_set_verify = ((opts.seed *% 0x9e3779b97f4a7c15) >> 54) & 1 == 1;
+            // One in four (those whose sequence counter moves before every step, `moveSeq`):
+            // two table pages a step, so every table pass is cut and ends inexact.
+            if (((opts.seed *% 0x9e3779b97f4a7c15) >> 50) & 3 == 0) cfg.age_set_step_pages = 2;
+        }
+        if (opts.age_defer) cfg.age_defer_bytes = @as(u64, 16 << 10) << @intCast(((opts.seed *% 0x9e3779b97f4a7c15) >> 40) % 7);
     }
     // History dictionaries (chunk codec 3) small enough that every compressed seed cuts and
     // replaces several. From the seed, not `rnd`: every seed keeps its draws.
@@ -1413,6 +1575,50 @@ test "dst: age-out seeds (floors, holes, punches, crashes inside steps)" {
     }
     std.debug.print("age dst: {d} records dropped, {d} chunks rewritten\n", .{ dropped, rewrites });
     try std.testing.expect(dropped > 0 and rewrites > 0);
+}
+
+test "dst: deferred age-out seeds (waits, bulk catch-ups, read-ahead before every step, crashes inside)" {
+    var seed: u64 = 5000;
+    var tot: Result = .{};
+    while (seed < 5024) : (seed += 1) {
+        const r = run(std.testing.allocator, .{ .seed = seed, .checkpoints = 160, .age = true, .age_defer = true }) catch |e| {
+            std.debug.print("deferred age seed {d}: error {s}\n", .{ seed, @errorName(e) });
+            return e;
+        };
+        if (!r.ok) {
+            std.debug.print("seed {d}: {s}\n", .{ seed, r.msg() });
+            return error.TestUnexpectedResult;
+        }
+        inline for (.{ "age_dropped", "age_rewrites", "age_waits", "age_bulks", "age_bulk_crashes", "age_steps", "crashes" }) |name| @field(tot, name) += @field(r, name);
+    }
+    std.debug.print("deferred age dst: {d} waits, {d} bulk catch-ups ({d} more cut by a crash), {d} steps, {d} records dropped, {d} chunks rewritten, {d} crashes\n", .{
+        tot.age_waits, tot.age_bulks, tot.age_bulk_crashes, tot.age_steps, tot.age_dropped, tot.age_rewrites, tot.crashes,
+    });
+    try std.testing.expect(tot.age_dropped > 0 and tot.age_rewrites > 0);
+    try std.testing.expect(tot.age_waits > 0 and tot.age_bulks > 0 and tot.age_bulk_crashes > 0);
+}
+
+test "dst: live-set segment pass seeds (table passes cut by commits, cleaning and crashes; with and without deferral)" {
+    var seed: u64 = 7000;
+    var tot: Result = .{};
+    while (seed < 7024) : (seed += 1) {
+        const r = run(std.testing.allocator, .{ .seed = seed, .checkpoints = 160, .age = true, .age_set = true, .age_defer = seed % 2 == 1 }) catch |e| {
+            std.debug.print("live-set age seed {d}: error {s}\n", .{ seed, @errorName(e) });
+            return e;
+        };
+        if (!r.ok) {
+            std.debug.print("seed {d}: {s}\n", .{ seed, r.msg() });
+            return error.TestUnexpectedResult;
+        }
+        inline for (.{ "age_dropped", "age_rewrites", "age_steps", "crashes", "set_builds", "set_kept", "age_lookups", "set_dead", "set_restarts", "set_inexact", "set_misses" }) |name| @field(tot, name) += @field(r, name);
+    }
+    std.debug.print("live-set age dst: {d} table passes ({d} started over, {d} inexact), {d} records kept without a lookup, {d} judged dead without one, {d} lookups, {d} misses, {d} steps, {d} records dropped, {d} chunks rewritten, {d} crashes\n", .{
+        tot.set_builds, tot.set_restarts, tot.set_inexact, tot.set_kept, tot.set_dead, tot.age_lookups, tot.set_misses, tot.age_steps, tot.age_dropped, tot.age_rewrites, tot.crashes,
+    });
+    try std.testing.expect(tot.age_dropped > 0 and tot.age_rewrites > 0 and tot.crashes > 0);
+    try std.testing.expect(tot.set_builds > 24 and tot.set_kept > 0 and tot.set_dead > 0);
+    try std.testing.expect(tot.set_restarts > 0 and tot.set_inexact > 0);
+    try std.testing.expectEqual(@as(u64, 0), tot.set_misses);
 }
 
 test "dst: a seed replays bit for bit" {

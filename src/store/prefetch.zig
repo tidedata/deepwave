@@ -158,6 +158,28 @@ pub const Prefetcher = struct {
         _ = p.stats.ns.fetchAdd(monoNs() - start, .monotonic);
     }
 
+    /// Reads the pages `page_nos` (sorted, distinct page numbers) of the file `handle`, `qd` in
+    /// flight, and returns once all are in (the ager's read-ahead of live-table pages,
+    /// store.zig `ageWarm`): only the page cache side effect matters. Neighbours go in one read.
+    /// Returns the reads issued (0 off Linux or after a ring failure).
+    pub fn pages(p: *Prefetcher, handle: i32, page_nos: []const u64) u64 {
+        if (!is_linux or p.broken or page_nos.len == 0) return 0;
+        p.reqs.clearRetainingCapacity();
+        for (page_nos) |pg| {
+            if (p.reqs.items.len > 0) {
+                const last = &p.reqs.items[p.reqs.items.len - 1];
+                if (last.len == page and last.off + page == pg * page) {
+                    last.len = rec_bytes;
+                    continue;
+                }
+            }
+            p.reqs.append(p.gpa, .{ .fd = handle, .off = pg * page, .len = page }) catch break;
+        }
+        const n = p.drain();
+        _ = p.stats.table_reads.fetchAdd(n, .monotonic);
+        return n;
+    }
+
     /// Reads every distinct request, `qd` in flight. Returns the reads issued.
     fn drain(p: *Prefetcher) u64 {
         if (!is_linux) return 0;
@@ -227,6 +249,27 @@ pub const Prefetcher = struct {
         p.broken = true;
     }
 };
+
+test "prefetch: pages reads the given pages of a file, neighbours in one read" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pf = (try Prefetcher.init(gpa, 8)) orelse return error.SkipZigTest;
+    defer pf.deinit();
+    const f = try tmp.dir.createFile(io, "t", .{ .read = true });
+    defer f.close(io);
+    const bytes = try gpa.alloc(u8, 64 * page);
+    defer gpa.free(bytes);
+    @memset(bytes, 0x5a);
+    try f.writePositionalAll(io, bytes, 0);
+    // 3 and 4 are neighbours (one read), 5 would be a third page (its own read).
+    try std.testing.expectEqual(@as(u64, 6), pf.pages(f.handle, &.{ 0, 3, 4, 5, 9, 40, 41, 63 }));
+    try std.testing.expect(!pf.broken);
+    try std.testing.expectEqual(@as(u64, 0), pf.stats.errors.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 6), pf.stats.table_reads.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), pf.pages(f.handle, &.{}));
+}
 
 fn monoNs() u64 {
     var ts: std.posix.timespec = undefined;

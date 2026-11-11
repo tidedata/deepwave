@@ -90,6 +90,13 @@ pub const suites = [_]harness.Suite{
         },
         .inputs = .{ .dir = "vectors/move-vm-gas", .suffix = ".jsonl" },
     },
+    .{
+        .name = "move-vm-diff",
+        .lane = "move-vm",
+        .doc = "every move-vm-gas call on the untraced loop (stepRun, with block gas charging off and on) against the reference loop (step, which the traced loop also runs): same status, error location, whole meter (gas, instructions, stack height and size, tiers), operand stack and reference arguments, at the call's budget, at every remaining-gas value for short calls and one call in 32 (both ends and a sample for the rest), with counters placed below each tier start, unmetered, on older gas models and the v0..v3 rules; a sample also runs traced",
+        .run = @import("difftest.zig").runSuite,
+        .inputs = .{ .dir = "vectors/move-vm-gas", .suffix = ".jsonl" },
+    },
     // exec-history-vm (CONTRACTS 6.6b.2): the same calls run by Mysten's older cuts
     // (`tools/truth/move-vm cut`), each at a protocol version of its window with that
     // version's framework. Items are `<cut>/<id>/<module>::<fn>`.
@@ -191,7 +198,7 @@ pub const Vectors = struct {
     }
 };
 
-fn binaryConfig(pv: u64) !move_format.BinaryConfig {
+pub fn binaryConfig(pv: u64) !move_format.BinaryConfig {
     const cfg = try protocol.get(pv, .mainnet);
     const b = try protocol.derived.binaryConfig(cfg, null);
     var out: move_format.BinaryConfig = .{
@@ -472,7 +479,7 @@ pub fn runCallTraced(arena: Allocator, rt: *loader.Runtime, c: *const Call, trac
 /// The storage behind the truth tool's native extensions: an empty `InMemoryStorage` (no children,
 /// no packages, zero balances) and, for `clock::borrow` (1.84), the Clock `{ id: 0x6, timestamp_ms:
 /// 1_762_400_123_456 }` its `ImplicitSystemObjectResolver::clock` returns.
-const truth_world: natives.objrt.Resolver.VTable = .{
+pub const truth_world: natives.objrt.Resolver.VTable = .{
     .read_child = twReadChild,
     .received_at = twReceivedAt,
     .package_at = twPackageAt,
@@ -1031,7 +1038,7 @@ fn benchTrace(ctx: *harness.Ctx) !void {
 }
 
 /// The embedded framework (natives.framework, built-in = 141) loaded into a Runtime.
-fn frameworkRuntime(gpa: Allocator) !*loader.Runtime {
+pub fn frameworkRuntime(gpa: Allocator) !*loader.Runtime {
     const rt = try gpa.create(loader.Runtime);
     rt.* = loader.Runtime.init(gpa, try binaryConfig(protocol.max_protocol_version));
     const a = rt.arena_state.allocator();

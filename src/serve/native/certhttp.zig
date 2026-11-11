@@ -213,6 +213,9 @@ pub const Server = struct {
         if (dispatch.slowMethod(req.method) or dispatch.feedMethod(req.method) or req.method == .subscribe or req.method == .pair_relay)
             return httpError(fd, "403 Forbidden", cors);
         var out: std.ArrayList(u8) = .empty;
+        // this thread serves one connection: it may wait on a core (dispatch.zig `Foreign`)
+        dispatch.may_block = true;
+        defer dispatch.may_block = false;
         d.handle(a, req, null, &out);
         var hb: [256]u8 = undefined;
         const h = std.fmt.bufPrint(&hb, "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncache-control: no-store\r\n{s}content-length: {d}\r\nconnection: close\r\n\r\n", .{ cors, out.items.len }) catch return;

@@ -52,6 +52,13 @@ pub const Service = struct {
     lowest_checkpoint: u64 = 0,
     /// Live value of the same (the node refreshes it after each prune; CONTRACTS 6.8).
     lowest: ?*const std.atomic.Value(u64) = null,
+    /// An edge that passes what it does not hold to its core (src/edge/forward.zig) reports the
+    /// core's lowest available checkpoint in GetServiceInfo and `x-sui-lowest-available-*`: with
+    /// forwarding, that is what a client can ask this node for. Null: the node's own (`lowestOf`).
+    /// What the node itself serves from its store is bounded by `lowestOf` either way.
+    reported_lowest: ?*const std.atomic.Value(u64) = null,
+    /// An edge with a core upstream: the checkpoints whose certificate is not the core's yet.
+    foreign_cert: ?ForeignCert = null,
     /// Where each transaction's `unchanged_loaded_runtime_objects` come from (CONTRACTS 6.6): the
     /// store lane's per-transaction list once it exists. Null serves an empty list.
     loaded: ?LoadedSource = null,
@@ -240,6 +247,78 @@ pub const LoadedSource = struct {
 
 pub fn lowestOf(svc: *const Service) u64 {
     return if (svc.lowest) |l| l.load(.acquire) else svc.lowest_checkpoint;
+}
+
+/// The lowest available checkpoint the node tells clients about (`Service.reported_lowest`).
+pub fn reportedLowest(svc: *const Service) u64 {
+    if (svc.reported_lowest) |l| {
+        const v = l.load(.acquire);
+        // not read from the core yet: the node's own
+        if (v != std.math.maxInt(u64)) return v;
+    }
+    return lowestOf(svc);
+}
+
+/// A gap in this node's store that its core does not have, met while answering (an edge:
+/// src/edge/route.zig `Gap`, same values). Only looked for while `gap_watch` is set on the
+/// calling thread, which only an edge's forwarding handler does, around its local attempt: the
+/// call then ends with `error.LocalGap` before any response byte is written, and the handler
+/// passes the request to the core. Off (every other node, every other thread): nothing changes.
+pub const LocalGap = enum(u8) { none, item_missing, sig_order, object_missing, foreign_cert };
+pub threadlocal var gap_watch: bool = false;
+pub threadlocal var gap: LocalGap = .none;
+/// Set with `gap_watch` when the request's mask renders a checkpoint's quorum certificate
+/// (`Checkpoint.signature`): GetCheckpoint then asks `Service.foreign_cert` about the checkpoint
+/// it is about to answer, and ends with `foreign_cert` when its certificate is not the core's.
+pub threadlocal var gap_cert: bool = false;
+
+/// The quorum certificate this node holds for a checkpoint, as an edge with a core upstream
+/// may hand it out (src/edge/certs.zig, docs/EDGE.md section 13).
+pub const CertState = enum {
+    /// The core's (or the node tracks none): answered here.
+    core,
+    /// Not the core's yet, and the core can be asked: not this node's to answer.
+    withhold,
+    /// Not the core's yet, and no core can be reached: answered here with the certificate the
+    /// node holds (valid for the committee; replaced once a core is back).
+    held,
+};
+
+/// Set by an edge's forwarding handler; null on every other node, and nothing changes.
+pub const ForeignCert = struct {
+    ctx: *anyopaque,
+    state: *const fn (ctx: *anyopaque, seq: u64) CertState,
+    /// An answer is going out with a `held` certificate.
+    served_held: *const fn (ctx: *anyopaque) void,
+};
+
+pub fn certState(svc: *const Service, seq: u64) CertState {
+    const fc = svc.foreign_cert orelse return .core;
+    return fc.state(fc.ctx, seq);
+}
+
+fn servedHeld(svc: *const Service) void {
+    if (svc.foreign_cert) |fc| fc.served_held(fc.ctx);
+}
+
+pub fn foreignCert(svc: *const Service, seq: u64) bool {
+    return certState(svc, seq) == .withhold;
+}
+/// Set with `gap_watch` when the request's mask renders transaction signatures: GetCheckpoint
+/// then skips its response cache, whose entries were rendered without the signature check.
+pub threadlocal var gap_sigs: bool = false;
+
+fn gapHit(g: LocalGap) error{LocalGap}!void {
+    if (!gap_watch) return;
+    gap = g;
+    return error.LocalGap;
+}
+
+/// A transaction with two or more signatures, under a mask that renders them: the order an edge
+/// stored can differ from its core's until the signature-order sweep has passed (docs/EDGE.md
+/// 10.3), so an edge does not answer it.
+fn gapSigOrder(m: mask.Mask, signatures: usize) error{LocalGap}!void {
+    if (gap_watch and signatures > 1 and m.contains("signatures")) return gapHit(.sig_order);
 }
 
 fn loadedOf(svc: *const Service, snap: *const store.Snapshot, digest: *const [32]u8, at: u64) []const objset.Ref {
@@ -614,6 +693,7 @@ pub fn collectObjects(svc: *const Service, arena: Allocator, snap: *store.Snapsh
         prof.obj_ns += profNs() - t0;
         prof.objs += 1;
         const raw = found orelse {
+            try gapHit(.object_missing);
             var dbuf: [b58.max_len_32]u8 = undefined;
             var idbuf: [66]u8 = undefined;
             var o: typestr.Out = .{ .buf = &idbuf };
@@ -756,13 +836,16 @@ fn scanCheckpointRequest(arena: Allocator, body: []const u8) Err!CheckpointReque
 ///   then NotFound on every call, and counted.
 /// - (5) and (6) are the same lookup and the same test.
 fn getCheckpointCached(svc: *Service, arena: Allocator, body: []const u8, rs: *h2.ResponseStream) !bool {
-    if (!svc.cp_cache.enabled()) return false;
+    if (!svc.cp_cache.enabled() or gap_sigs) return false;
     const q = scanCheckpointRequest(arena, body) catch return false;
     if (q.digest != null) return false;
     const latest = boundByIndex(svc, svc.store.committed() orelse return false) orelse return false;
     const want_seq = q.seq orelse latest;
     if (want_seq < lowestOf(svc) or want_seq > latest) return false;
     if (want_seq < svc.store.cp_floor.load(.acquire)) return false;
+    // (`getCheckpoint` ends the call there: nothing of a withheld certificate is served from here)
+    const cert_state: CertState = if (gap_cert) certState(svc, want_seq) else .core;
+    if (cert_state == .withhold) return false;
     const key = cpcache.maskKey(arena, q.mask_field.parts.items) catch return false;
     const e = svc.cp_cache.peek(want_seq, key) orelse return false;
     defer cpcache.release(svc.gpa, e);
@@ -770,6 +853,7 @@ fn getCheckpointCached(svc: *Service, arena: Allocator, body: []const u8, rs: *h
     if (epoch < svc.store.oldest_epoch.load(.acquire)) return false;
     if (h2.meta.monoNs() -| e.checked_ns.load(.monotonic) >= svc.cp_recheck_ns) return false;
     if (fixedSince(svc.store, want_seq, e)) return false;
+    if (cert_state == .held) servedHeld(svc);
     _ = svc.cp_cache.stats.hits.fetchAdd(1, .monotonic);
     _ = svc.cp_fast_hits.fetchAdd(1, .monotonic);
     try sendCached(svc, rs, e);
@@ -782,10 +866,10 @@ fn getCheckpointCached(svc: *Service, arena: Allocator, body: []const u8, rs: *h
 /// live, so the index is read under a snapshot. With no fix installed since the render (the
 /// common case) there is nothing to read: two atomic loads, no snapshot.
 fn fixedSince(st: *store.Store, seq: u64, e: *const cpcache.Entry) bool {
-    if (st.tx_fix.generation() <= e.gen and st.list_fix.generation() <= e.gen_lists) return false;
+    if (st.tx_fix.generation() <= e.gen and st.list_fix.generation() <= e.gen_lists and st.cert_fix.generation() <= e.gen_certs) return false;
     var snap = st.snapshot();
     defer snap.release();
-    return st.tx_fix.changedSince(seq, e.gen) or st.list_fix.changedSince(seq, e.gen_lists);
+    return st.tx_fix.changedSince(seq, e.gen) or st.list_fix.changedSince(seq, e.gen_lists) or st.cert_fix.changedSince(seq, e.gen_certs);
 }
 
 fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: []const u8, rs: *h2.ResponseStream) !void {
@@ -809,6 +893,19 @@ fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: [
     const latest_opt = latestOf(svc, snap);
     const want_seq = seq orelse latest_opt orelse return error.NotFound;
     const latest = latest_opt orelse want_seq;
+    // An edge: this checkpoint's certificate is not its core's yet and the mask renders it.
+    // Asked before the record is read: a mark is set before its checkpoint is committed and
+    // cleared after the core's certificate is installed, so a record read after a "no" here
+    // carries the core's certificate.
+    // With no core reachable (`held`) the certificate the edge holds is the answer: it verifies.
+    if (gap_cert) switch (certState(svc, want_seq)) {
+        .core => {},
+        .withhold => try gapHit(.foreign_cert),
+        .held => servedHeld(svc),
+    };
+    // The certificate-fix generation, before the record is read (see the response cache below).
+    const certs = &snap.store.cert_fix;
+    const cert_gen = certs.generation();
     const rec = if (latest_opt != null and want_seq >= lowestOf(svc) and want_seq <= latest) snap.checkpoint(want_seq) else null;
     const found = rec orelse {
         rs.setMessage(std.fmt.allocPrint(arena, "Checkpoint {d} not found", .{want_seq}) catch "Checkpoint not found");
@@ -816,7 +913,7 @@ fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: [
     };
     // A committed checkpoint's response is fixed: serve repeated calls from the encoded bytes.
     // `display` renders from live Display objects, so masks selecting it are rendered each time.
-    const key: ?[]const u8 = if (svc.cp_cache.enabled() and !m.containsDyn("transactions.objects.objects.display"))
+    const key: ?[]const u8 = if (svc.cp_cache.enabled() and !gap_sigs and !m.containsDyn("transactions.objects.objects.display"))
         try cpcache.maskKey(arena, mask_field.parts.items)
     else
         null;
@@ -828,9 +925,12 @@ fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: [
     const fix_gen = fixes.generation();
     const lists = &snap.store.list_fix;
     const list_gen = lists.generation();
+    // And for the checkpoint's own certificate, replaced by an edge with its core's (store
+    // `cert_fix`): `cert_gen` was read before the record, so an entry rendered from the older
+    // certificate is never kept under the newer generation.
     if (key) |k| if (svc.cp_cache.get(want_seq, k)) |e| {
         defer cpcache.release(svc.gpa, e);
-        if (!fixes.changedSince(want_seq, e.gen) and !lists.changedSince(want_seq, e.gen_lists)) {
+        if (!fixes.changedSince(want_seq, e.gen) and !lists.changedSince(want_seq, e.gen_lists) and !certs.changedSince(want_seq, e.gen_certs)) {
             // the record was read just above: the entry may be served ahead of it again
             e.checked_ns.store(h2.meta.monoNs(), .monotonic);
             return sendCached(svc, rs, e);
@@ -838,6 +938,7 @@ fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: [
         svc.cp_cache.drop(svc.gpa, want_seq, k);
     };
     const d = try loadCheckpointData(svc, arena, snap, found, want_txs, want_objects);
+    if (gap_watch) if (m.subtree("transactions")) |tm| for (d.txs) |*t| try gapSigOrder(tm, t.signatures.len);
     const budget = try arena.create(usize);
     budget.* = render_json.default_response_budget;
     if (want_txs) {
@@ -848,7 +949,7 @@ fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: [
         for (d.txs) |*t| t.render = rctx;
     }
     const bytes = try renderBytes(arena, 4096 + found.contents.len * 2, CpCtx{ .arena = arena, .m = m, .d = d, .budget = budget }, renderCheckpoint);
-    if (key) |k| svc.cp_cache.putAt(svc.gpa, want_seq, found.epoch, h2.meta.monoNs(), k, bytes, fix_gen, list_gen);
+    if (key) |k| svc.cp_cache.putAll(svc.gpa, want_seq, found.epoch, h2.meta.monoNs(), k, bytes, fix_gen, list_gen, cert_gen);
     return rs.message(bytes);
 }
 
@@ -1031,6 +1132,7 @@ fn batchObjectsInto(arena: Allocator, w: *proto.Writer, m: mask.Mask, raws: []co
             try render_object.writeObjectCtx(arena, w, m, raw, rctx);
             try w.end(om);
         } else {
+            try gapHit(.item_missing);
             try w.bytes(2, try status.plain(arena, 5, objectNotFound(arena, id, q.version)));
         }
         try w.end(item);
@@ -1083,12 +1185,14 @@ fn batchTxInto(svc: *const Service, arena: Allocator, w: *proto.Writer, snap: *s
         var missing: []const u8 = "";
         txBody(svc, arena, w, snap, m, &dg, &missing) catch |e| switch (e) {
             error.NotFound => {
+                try gapHit(.item_missing);
                 w.len = start;
                 try w.bytes(2, try status.plain(arena, 5, txNotFound(arena, &dg)));
                 try w.end(item);
                 continue;
             },
             error.Internal => {
+                try gapHit(.item_missing);
                 w.len = start;
                 try w.bytes(2, try status.plain(arena, 13, if (missing.len > 0) missing else "internal error"));
                 try w.end(item);
@@ -1119,6 +1223,7 @@ fn txBodyPre(svc: *const Service, arena: Allocator, w: *proto.Writer, snap: *sto
         if (pre) |got| try objs.appendSlice(arena, got) else try collectObjects(svc, arena, snap, rec, &objs, missing);
     }
     var input = try txInput(svc, arena, snap, rec);
+    try gapSigOrder(m, input.signatures.len);
     const src = try arena.create(ObjSource);
     src.* = .{ .snap = snap, .overlay = objs.items };
     input.render = try renderCtx(svc, arena, src);
@@ -1161,6 +1266,7 @@ fn getTransaction(svc: *const Service, arena: Allocator, snap: *store.Snapshot, 
         return e;
     };
     var input = try txInput(svc, arena, snap, rec);
+    try gapSigOrder(m, input.signatures.len);
     const src = try arena.create(ObjSource);
     src.* = .{ .snap = snap, .overlay = objs.items };
     input.render = try renderCtx(svc, arena, src);
@@ -1187,7 +1293,7 @@ fn getServiceInfo(svc: *Service, arena: Allocator, snap: *store.Snapshot, rs: *h
         if (ms % 1000 != 0) try w.uint(2, (ms % 1000) * 1_000_000);
         try w.end(ts);
     }
-    const lowest = lowestOf(svc);
+    const lowest = reportedLowest(svc);
     try w.uint(6, lowest);
     // Deprecated lowest_available_checkpoint_objects: get_service_info.rs still sets it to the same value.
     try w.uint(7, lowest);
@@ -2087,6 +2193,142 @@ test "GetCheckpoint: a signature-order fix or a loaded-list fix of the checkpoin
         try testing.expectEqual(f, fast.load(.monotonic));
         try testing.expectEqual(n, inserts.load(.monotonic));
     }
+}
+
+test "GetCheckpoint: a certificate fix of the checkpoint (an edge installing its core's) is in the next reply, not the cached one; and with an edge's marks, a reply that would render a marked checkpoint's certificate ends as the foreign_cert gap before any byte" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const loopback = @import("loopback.zig");
+    var cfg: store.Config = .{ .max_live_objects = 1 << 10, .max_object_versions = 1 << 12, .max_transactions = 1 << 10, .max_checkpoints = 1 << 10, .max_batch_bytes = 4 << 20, .max_batch_objects = 64, .max_segments = 16, .segment_reserve = 8 << 20, .seed = 3 };
+    const sim = try store.SimIo.init(gpa, 7, .{}, 64 << 20);
+    defer sim.deinit();
+    const st = try store.Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer st.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for (0..8) |i| try CpTest.commit(st, a, i, 0);
+    var svc: Service = .{ .gpa = gpa, .store = st, .chain_id = @splat(0) };
+    defer svc.deinit();
+    svc.cp_recheck_ns = std.time.ns_per_hour;
+    const with_cert = CpTest.masks[0];
+    const without = CpTest.masks[1];
+    const req2 = try CpTest.request(a, 2, with_cert);
+    const req5 = try CpTest.request(a, 5, with_cert);
+    const req5_plain = try CpTest.request(a, 5, without);
+    const fast = &svc.cp_fast_hits;
+    const old2 = (try loopback.unary(a, svc.handler(), CpTest.path, req2)).message;
+    const old5 = (try loopback.unary(a, svc.handler(), CpTest.path, req5)).message;
+    const plain5 = (try loopback.unary(a, svc.handler(), CpTest.path, req5_plain)).message;
+    try testing.expectEqualSlices(u8, old5, (try loopback.unary(a, svc.handler(), CpTest.path, req5)).message);
+    try testing.expectEqual(@as(u64, 1), fast.load(.monotonic));
+
+    // Checkpoint 5 gets another certificate over the same summary (the core's, on an edge).
+    const other: []const u8 = blk: {
+        var snap = st.snapshot();
+        defer snap.release();
+        const stored = snap.checkpoint(5).?.summary_cert;
+        const cert = try render_checkpoint.Cert.parse(a, stored);
+        const bitmap = [_]u8{ 0x3a, 0x30, 0, 0, 0, 0, 0, 0 };
+        const sig: types.AuthorityQuorumSignInfo = .{ .epoch = 0, .signature = @splat(0x77), .signers_map = .{ .@"0" = &bitmap } };
+        break :blk try std.mem.concat(a, u8, &.{ cert.summary_bcs, try bcs.encodeAlloc(types.AuthorityQuorumSignInfo, a, &sig) });
+    };
+    try testing.expect(try st.cert_fix.put(5, &store.certFixKey(5), other));
+    // not the cached reply: rendered again, with the installed certificate, and cached again
+    const new5 = (try loopback.unary(a, svc.handler(), CpTest.path, req5)).message;
+    try testing.expect(!std.mem.eql(u8, old5, new5));
+    try testing.expect(std.mem.indexOf(u8, new5, &@as([48]u8, @splat(0x77))) != null);
+    try testing.expectEqual(@as(u64, 1), fast.load(.monotonic));
+    try testing.expectEqualSlices(u8, new5, (try loopback.unary(a, svc.handler(), CpTest.path, req5)).message);
+    try testing.expectEqual(@as(u64, 2), fast.load(.monotonic));
+    // a mask without the certificate renders the same bytes as before; another checkpoint's
+    // cached reply is still served ahead of the store
+    try testing.expectEqualSlices(u8, plain5, (try loopback.unary(a, svc.handler(), CpTest.path, req5_plain)).message);
+    try testing.expectEqualSlices(u8, old2, (try loopback.unary(a, svc.handler(), CpTest.path, req2)).message);
+
+    // An edge with a core upstream: checkpoints 3 and 7 (the latest) hold a certificate that is
+    // not the core's. Its forwarding handler sets the watch around the local attempt.
+    // `held`: no core is reachable (the node answers with what it holds); else `withhold`.
+    const Marks = struct {
+        var no_core: bool = false;
+        var served: u32 = 0;
+        fn state(_: *anyopaque, seq: u64) CertState {
+            if (seq != 3 and seq != 7) return .core;
+            return if (no_core) .held else .withhold;
+        }
+        fn servedHeldFn(_: *anyopaque) void {
+            served += 1;
+        }
+    };
+    Marks.no_core = false;
+    Marks.served = 0;
+    var ctx: u8 = 0;
+    svc.foreign_cert = .{ .ctx = &ctx, .state = Marks.state, .served_held = Marks.servedHeldFn };
+    defer {
+        gap_watch = false;
+        gap_cert = false;
+        gap = .none;
+    }
+    const Ask = struct {
+        fn gapOf(s: *Service, arena: Allocator, body: []const u8, cert: bool) !struct { gap: LocalGap, bytes: usize, status: u8 } {
+            gap = .none;
+            gap_watch = true;
+            gap_cert = cert;
+            defer gap_watch = false;
+            defer gap_cert = false;
+            const r = try loopback.unary(arena, s.handler(), CpTest.path, body);
+            return .{ .gap = gap, .bytes = r.message.len, .status = r.status };
+        }
+    };
+    // marked, the mask renders the certificate: the gap, nothing sent
+    inline for (.{ @as(?u64, 3), @as(?u64, 7), @as(?u64, null) }) |seq| {
+        const r = try Ask.gapOf(&svc, a, try CpTest.request(a, seq, with_cert), true);
+        try testing.expectEqual(LocalGap.foreign_cert, r.gap);
+        try testing.expectEqual(@as(usize, 0), r.bytes);
+    }
+    // the same checkpoints under a mask without it, and unmarked ones with it: answered here
+    for ([_]?u64{ 3, 7, null }) |seq| {
+        const r = try Ask.gapOf(&svc, a, try CpTest.request(a, seq, without), false);
+        try testing.expectEqual(LocalGap.none, r.gap);
+        try testing.expectEqual(@as(u8, 0), r.status);
+    }
+    for ([_]?u64{ 2, 5, 6 }) |seq| {
+        const r = try Ask.gapOf(&svc, a, try CpTest.request(a, seq, with_cert), true);
+        try testing.expectEqual(LocalGap.none, r.gap);
+        try testing.expectEqual(@as(u8, 0), r.status);
+        try testing.expect(r.bytes > 0);
+    }
+    // a reply of a marked checkpoint cached earlier (before it was marked here) is not served
+    // from the cache either
+    svc.foreign_cert = null;
+    const cached3 = (try loopback.unary(a, svc.handler(), CpTest.path, try CpTest.request(a, 3, with_cert))).message;
+    try testing.expect(cached3.len > 0);
+    svc.foreign_cert = .{ .ctx = &ctx, .state = Marks.state, .served_held = Marks.servedHeldFn };
+    const r = try Ask.gapOf(&svc, a, try CpTest.request(a, 3, with_cert), true);
+    try testing.expectEqual(LocalGap.foreign_cert, r.gap);
+    try testing.expectEqual(@as(usize, 0), r.bytes);
+    try testing.expectEqual(@as(u32, 0), Marks.served);
+    // No core reachable: the same requests are answered here with the certificate the node
+    // holds, from the cache and rendered, and each such answer is counted; one that does not
+    // render the certificate is not.
+    Marks.no_core = true;
+    inline for (.{ @as(?u64, 3), @as(?u64, 7), @as(?u64, null), @as(?u64, 3) }, 0..) |seq, i| {
+        const h = try Ask.gapOf(&svc, a, try CpTest.request(a, seq, with_cert), true);
+        try testing.expectEqual(LocalGap.none, h.gap);
+        try testing.expectEqual(@as(u8, 0), h.status);
+        try testing.expect(h.bytes > 0);
+        try testing.expectEqual(@as(u32, i + 1), Marks.served);
+    }
+    _ = try Ask.gapOf(&svc, a, try CpTest.request(a, 3, without), false);
+    _ = try Ask.gapOf(&svc, a, try CpTest.request(a, 5, with_cert), true);
+    try testing.expectEqual(@as(u32, 4), Marks.served);
+    // a core is back: withheld again, the cached reply included
+    Marks.no_core = false;
+    const back = try Ask.gapOf(&svc, a, try CpTest.request(a, 3, with_cert), true);
+    try testing.expectEqual(LocalGap.foreign_cert, back.gap);
+    try testing.expectEqual(@as(usize, 0), back.bytes);
+    // without the watch (no forwarding handler in front): the node's own answer, as ever
+    try testing.expectEqualSlices(u8, cached3, (try loopback.unary(a, svc.handler(), CpTest.path, try CpTest.request(a, 3, with_cert))).message);
 }
 
 test "GetCheckpoint: the lookup before the store read reads the fix tables under a snapshot, and takes none while no fix was installed since the render" {

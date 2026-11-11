@@ -102,6 +102,41 @@ test "commit, read, reopen, MVCC" {
     s.deinit();
 }
 
+test "stats.open_clean: true only when the open found a clean close (the live table's page check is skipped)" {
+    const gpa = std.testing.allocator;
+    const sim = try SimIo.init(gpa, 21, .{}, 8 << 20);
+    defer sim.deinit();
+    const cfg = smallCfg();
+    var s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    try std.testing.expect(!s.stats.open_clean); // a new store
+    var b = try s.begin(10, 1);
+    try b.checkpoint("summary-10", "");
+    try put(b, 1, 5, "obj1-v5");
+    try s.commit(b);
+    try s.flushIndex();
+    // the process ends without a close (a kill, the stop deadline): the next open checks the table
+    s.deinit();
+    s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    try std.testing.expect(!s.stats.open_clean);
+    try std.testing.expectEqual(@as(?u64, 10), s.committed());
+    try s.close();
+    // a clean close: nothing replayed, no page check
+    s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    try std.testing.expect(s.stats.open_clean);
+    try std.testing.expectEqual(@as(u64, 0), s.stats.replayed_groups);
+    // written to and flushed again, then ended without a close: checked again
+    b = try s.begin(11, 1);
+    try b.checkpoint("summary-11", "");
+    try put(b, 1, 6, "obj1-v6");
+    try s.commit(b);
+    try s.flushIndex();
+    s.deinit();
+    s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    try std.testing.expect(!s.stats.open_clean);
+    try std.testing.expectEqual(@as(?u64, 11), s.committed());
+    s.deinit();
+}
+
 test "epochs, pruning, carry-forward" {
     const gpa = std.testing.allocator;
     const sim = try SimIo.init(gpa, 8, .{}, 8 << 20);
@@ -847,7 +882,11 @@ test "liveness retention: compact base stays in place, sparse segments are clean
         try std.testing.expect(snap.objectAt(&idOf(1050), 3) != null);
         try expectObj(&snap, 1005, 41);
         try expectObj(&snap, 2017, 41);
-        try expectObj(&snap, 2003, 44);        try std.testing.expect(snap.objectAt(&idOf(1005), 3) == null); // left the window
+        try expectObj(&snap, 2003, 44);
+        // Nothing is asserted here about object 1005's restored version 3 (superseded in epoch
+        // 1, which aged out): its link is still in the memtable, which nothing has sealed in a
+        // store this small, and a memtable entry counts as the newest epoch's, the epoch its
+        // run will get. The two link tests seal first and check that the version is gone.
     }
     try std.testing.expectEqual(base_loc, s.liveLocation(&idOf(1050)).?);
 
@@ -1900,6 +1939,75 @@ test "real files: compressed segments under parallel readers and commits, evicte
     try std.testing.expectEqual(@as(u64, 0), s.chunkMemory().readers);
 }
 
+test "a restored version superseded after the restore is found by its link at mainnet epoch numbers, while the link is still in the memtable and after it is in a run" {
+    // The link's epoch decides the retention. For a link still in the memtable the lookup took
+    // the snapshot's reader counter (1 at a process start, a few thousand after hours) for
+    // that epoch: with epochs 0, 1, 2 any counter passes; at epoch 1305 the version read as
+    // absent until the counter had passed 1305.
+    const gpa = std.testing.allocator;
+    const sim = try SimIo.init(gpa, 33, .{}, 8 << 20);
+    defer sim.deinit();
+    var cfg = smallCfg();
+    cfg.codec = testCodec;
+    var s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer s.deinit();
+    const n: u64 = 0x2538;
+    {
+        const b = try s.begin(0, 1304);
+        try putT(b, true, n, 3, "restored");
+        for (0..8) |i| try putT(b, true, 100 + i, 3, "other-restored");
+        try s.commit(b);
+    }
+    {
+        const b = try s.begin(40, 1304);
+        try b.checkpoint("s40", "c");
+        try s.commit(b);
+    }
+    {
+        const b = try s.begin(41, 1305);
+        try b.checkpoint("s41", "c");
+        try s.commit(b);
+    }
+    // The floors after a restore: both pruners at S.
+    _ = try s.setFloors(.{ .cp_pruned = 40, .obj_pruned = 40, .cp_epoch = 1305, .obj_epoch = 1305 });
+    {
+        const b = try s.begin(42, 1305);
+        try b.checkpoint("s42", "c");
+        try putT(b, false, n, 4, "superseding");
+        try s.commit(b);
+    }
+    // Nothing has sealed the memtable: the link is in it.
+    {
+        var snap = s.snapshot();
+        defer snap.release();
+        const o = (try snap.objectAtChecked(&idOf(n), 3)) orelse return error.TestMissingObject;
+        try std.testing.expectEqual(@as(u64, 3), o.version);
+        try expectObj(&snap, n, 4);
+    }
+    // A close seals the memtable as a run of epoch 1305 (in a store this small nothing else
+    // does): the link's epoch is its run's from here, still inside the object window.
+    try s.close();
+    s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    {
+        var snap = s.snapshot();
+        defer snap.release();
+        try std.testing.expect((try snap.objectAtChecked(&idOf(n), 3)) != null);
+    }
+    // The objects pruner past epoch 1305: gone.
+    {
+        const b = try s.begin(80, 1306);
+        try b.checkpoint("s80", "c");
+        try s.commit(b);
+    }
+    _ = try s.setFloors(.{ .cp_pruned = 40, .obj_pruned = 79, .cp_epoch = 1305, .obj_epoch = 1306 });
+    {
+        var snap = s.snapshot();
+        defer snap.release();
+        try std.testing.expect((try snap.objectAtChecked(&idOf(n), 3)) == null);
+        try expectObj(&snap, n, 4);
+    }
+}
+
 test "a restored version superseded after the restore is found by its link while the link's epoch is retained (mainnet 0x2537 v1076557667)" {
     // sui-node 1.83.1 bytes (testdata/obj-2537-1076557667.bcs, GetObject bcs): object
     // 0x253766691d6c3aa07c41acfc2d9ef1bf0e0ba8a4d3fd86c42a6023247e1889dc v1076557667, written at
@@ -1956,7 +2064,11 @@ test "a restored version superseded after the restore is found by its link while
         try std.testing.expectEqualSlices(u8, bcs, o.bytes[40..]);
         try expectObj(&snap, n, v1);
     }
-    // Epoch 1 sealed into its run: still found while the objects pruner is below epoch 1's end.
+    // Epoch 1 sealed into its run (a close does that; nothing else in a store this small, and
+    // a link still in the memtable counts as the newest epoch's): still found while the
+    // objects pruner is below epoch 1's end.
+    try s.close();
+    s = try Store.open(gpa, .{ .sim = sim }, &cfg);
     {
         const b = try s.begin(80, 2);
         try b.checkpoint("s80", "c");
@@ -2236,6 +2348,8 @@ test "age-out: object versions go when their successor is below the object floor
     }
     const rep = try s.ageAll();
     try std.testing.expect(rep.records_dropped > 0 and rep.chunks_rewritten > 0);
+    // Counted by kind too (sui-node's num_pruned_objects): object 1's versions went.
+    try std.testing.expect(s.age_stats.objects_dropped.load(.monotonic) > 100);
     var b1: [4096]u8 = undefined;
     var b3: [3072]u8 = undefined;
     {
@@ -2273,6 +2387,514 @@ test "age-out: object versions go when their successor is below the object floor
     try std.testing.expectEqual(@as(u64, 0), again.chunks_rewritten);
 }
 
+/// Every file of the simulated disk, name and bytes, in name order: what a store wrote.
+fn simImage(gpa: std.mem.Allocator, sim: *SimIo) ![]u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(gpa);
+    for (sim.files) |*f| if (f.used and f.live) try names.append(gpa, f.name[0..f.name_len]);
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (names.items) |name| for (sim.files) |*f| {
+        if (!f.used or !f.live or !std.mem.eql(u8, f.name[0..f.name_len], name)) continue;
+        try out.append(gpa, f.name_len);
+        try out.appendSlice(gpa, name);
+        try out.appendSlice(gpa, std.mem.asBytes(&f.cache_len));
+        try out.appendSlice(gpa, f.cache[0..f.cache_len]);
+    };
+    return out.toOwnedSlice(gpa);
+}
+
+/// Prints where two `simImage`s first differ (file and offset in it).
+fn simImageDiff(a: []const u8, b: []const u8) void {
+    const n = @min(a.len, b.len);
+    var d: usize = 0;
+    while (d < n and a[d] == b[d]) d += 1;
+    var p: usize = 0;
+    while (p < a.len) {
+        const nl: usize = a[p];
+        const name = a[p + 1 ..][0..nl];
+        const len: usize = @intCast(std.mem.readInt(u64, a[p + 1 + nl ..][0..8], .little));
+        const data = p + 1 + nl + 8;
+        if (d < data + len) {
+            std.debug.print("images differ at byte {d} of {d}: file {s}, offset {d} of {d}{s}\n", .{ d, a.len, name, d -| data, len, if (d < data) " (name or length)" else "" });
+            return;
+        }
+        p = data + len;
+    }
+    std.debug.print("images differ in length: {d} and {d}\n", .{ a.len, b.len });
+}
+
+/// One age-out workload on a fresh simulated disk: floors inside the object window, an aged
+/// epoch (whole-segment rule), steps of several budgets, a close and a reopen. Returns the
+/// disk image and the totals. (No crash: what a simulated crash tears is drawn from the disk's
+/// random numbers, which the read-ahead's reads advance. The crash seeds are in dst.zig.)
+fn ageWorkload(gpa: std.mem.Allocator, serial: bool, totals: *[4]u64) ![]u8 {
+    const sim = try SimIo.init(gpa, 77, .{}, 64 << 20);
+    defer sim.deinit();
+    var cfg = smallCfg();
+    cfg.chunk_bytes = 8 << 10;
+    cfg.age_lag_checkpoints = 3;
+    cfg.age_whole_group_bytes = 16 << 10;
+    cfg.age_serial = serial;
+    var s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    var is_open = true;
+    errdefer if (is_open) s.deinit();
+    var seq = try ageFill(s, 0, 0, 120);
+    seq = try ageFill(s, seq, 1, 120);
+    seq = try ageFill(s, seq, 2, 20);
+    var tot: [4]u64 = @splat(0);
+    const add = struct {
+        fn f(t: *[4]u64, r: Store.AgeReport) void {
+            t[0] += r.records_dropped;
+            t[1] += r.chunks_rewritten;
+            t[2] += r.bytes_dropped;
+            t[3] += r.groups_rewritten;
+        }
+    }.f;
+    // Floors inside epoch 0: the object pass and the checkpoint pass, no segment rule.
+    _ = try s.setFloors(.{ .cp_pruned = 40, .obj_pruned = 90, .cp_epoch = 0, .obj_epoch = 0 });
+    try s.flushIndex();
+    for ([_]u64{ 4096, 64 << 10, 9000, 1 << 20, 1 << 20, 4096, 64 << 20 }) |budget| add(&tot, try s.ageStep(budget));
+    // The object window leaves epoch 0: the segment pass over it, the other passes in epoch 1.
+    _ = try s.setFloors(.{ .cp_pruned = 150, .obj_pruned = 200, .cp_epoch = 1, .obj_epoch = 1 });
+    try s.flushIndex();
+    for ([_]u64{ 4096, 20 << 10, 1 << 20, 4096, 300 << 10 }) |budget| add(&tot, try s.ageStep(budget));
+    seq = try ageFill(s, seq, 2, 10);
+    add(&tot, try s.ageAll());
+    // A close and a reopen, more history, floors into epoch 2, age-out to the end.
+    is_open = false;
+    try s.close();
+    s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    is_open = true;
+    seq = try ageFill(s, seq, 3, 12);
+    _ = try s.setFloors(.{ .cp_pruned = 255, .obj_pruned = 262, .cp_epoch = 2, .obj_epoch = 2 });
+    try s.flushIndex();
+    for ([_]u64{ 4096, 50 << 10, 1 << 20 }) |budget| add(&tot, try s.ageStep(budget));
+    add(&tot, try s.ageAll());
+    try ageExpectLive(s, seq);
+    is_open = false;
+    try s.close();
+    totals.* = tot;
+    return simImage(gpa, sim);
+}
+
+test "age-out: the serial path and the read-ahead path drop the same records and leave the same bytes in every file" {
+    const gpa = std.testing.allocator;
+    var t_old: [4]u64 = undefined;
+    var t_new: [4]u64 = undefined;
+    const old = try ageWorkload(gpa, true, &t_old);
+    defer gpa.free(old);
+    const new = try ageWorkload(gpa, false, &t_new);
+    defer gpa.free(new);
+    try std.testing.expect(t_old[0] > 200 and t_old[1] > 20);
+    try std.testing.expectEqualSlices(u64, &t_old, &t_new);
+    if (!std.mem.eql(u8, old, new)) {
+        simImageDiff(old, new);
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "age-out deferred: the ager waits while the node is behind, catches up in one run (no segment pass) once enough history lies below the checkpoint floor, and a restart does not reset that" {
+    const gpa = std.testing.allocator;
+    const sim = try SimIo.init(gpa, 41, .{}, 64 << 20);
+    defer sim.deinit();
+    var cfg = smallCfg();
+    cfg.chunk_bytes = 8 << 10;
+    cfg.age_lag_checkpoints = 0;
+    cfg.age_defer_bytes = 256 << 10;
+    var s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer s.deinit();
+    const Gate = Store.AgeGate;
+    // Not deferred: the ager always runs.
+    s.ageBehind(true);
+    try std.testing.expectEqual(Gate.run, s.ageGate());
+    s.age_mode = .deferred;
+    var seq = try ageFill(s, 0, 0, 200);
+    seq = try ageFill(s, seq, 1, 60);
+    seq = try ageFill(s, seq, 2, 10);
+    // Nothing is below the floors: nothing is held back, however much was appended.
+    try std.testing.expectEqual(Gate.wait, s.ageGate());
+    try std.testing.expectEqual(@as(u64, 0), s.age_stats.backlog.load(.monotonic));
+    // A little history below the checkpoint floor: still waiting.
+    _ = try s.setFloors(.{ .cp_pruned = 9, .obj_pruned = 9, .cp_epoch = 0, .obj_epoch = 0 });
+    try s.flushIndex();
+    try std.testing.expectEqual(Gate.wait, s.ageGate());
+    const small = s.age_stats.backlog.load(.monotonic);
+    try std.testing.expect(small > 0 and small < cfg.age_defer_bytes);
+    // More than age_defer_bytes of it: a bulk catch-up.
+    _ = try s.setFloors(.{ .cp_pruned = 150, .obj_pruned = 150, .cp_epoch = 0, .obj_epoch = 0 });
+    try s.flushIndex();
+    // A restart in between measures the same backlog from what is durable.
+    sim.scheduleCrash(0);
+    s.deinit();
+    sim.crash();
+    s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    s.age_mode = .deferred;
+    s.ageBehind(true);
+    try std.testing.expectEqual(Gate.bulk, s.ageGate());
+    try std.testing.expect(s.age_stats.backlog.load(.monotonic) >= cfg.age_defer_bytes);
+    var dropped: u64 = 0;
+    var steps: u32 = 0;
+    while (true) : (steps += 1) {
+        try std.testing.expect(steps < 2000);
+        const r = try s.ageStepOpts(64 << 10, .{ .skip_seg = true });
+        dropped += r.records_dropped;
+        if (r.idle) break;
+        try std.testing.expectEqual(Gate.bulk, s.ageGate());
+    }
+    s.ageBulkDone();
+    try std.testing.expect(steps > 4 and dropped > 100);
+    // Caught up: waiting again, nothing held back.
+    try std.testing.expectEqual(Gate.wait, s.ageGate());
+    try std.testing.expectEqual(@as(u64, 0), s.age_stats.backlog.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), s.age_stats.bulk_runs.load(.monotonic));
+    // Epoch 0 leaves both windows while the node is still behind: the rest of it and the start
+    // of epoch 1 are a new backlog. The bulk run frees it without the segment pass.
+    _ = try s.setFloors(.{ .cp_pruned = 215, .obj_pruned = 230, .cp_epoch = 1, .obj_epoch = 1 });
+    try s.flushIndex();
+    try std.testing.expectEqual(Gate.bulk, s.ageGate());
+    steps = 0;
+    while (true) : (steps += 1) {
+        try std.testing.expect(steps < 2000);
+        if ((try s.ageStepOpts(64 << 10, .{ .skip_seg = true })).idle) break;
+    }
+    s.ageBulkDone();
+    try std.testing.expectEqual(Gate.wait, s.ageGate());
+    try std.testing.expectEqual(@as(u64, 0), s.ager.seg_target);
+    // At the tip the ager runs everything, the segment pass included.
+    s.ageBehind(false);
+    try std.testing.expectEqual(Gate.run, s.ageGate());
+    _ = try s.ageAll();
+    try std.testing.expectEqual(@as(u64, 1), s.ager.seg_target);
+    try ageExpectLive(s, seq);
+    var snap = s.snapshot();
+    defer snap.release();
+    var b1: [4096]u8 = undefined;
+    for (216..270) |q| try std.testing.expectEqualSlices(u8, noise(q *% 31 + 1, b1[0..1024]), snap.checkpoint(q).?.summary_cert);
+}
+
+test "age-out read-ahead: the dry run before a step asks for the live-table page of every lookup the step makes; the serial path asks for none" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |serial| {
+        const sim = try SimIo.init(gpa, 43, .{}, 64 << 20);
+        defer sim.deinit();
+        var cfg = smallCfg();
+        cfg.chunk_bytes = 8 << 10;
+        cfg.age_lag_checkpoints = 2;
+        cfg.age_serial = serial;
+        const s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+        defer s.deinit();
+        var seq = try ageFill(s, 0, 0, 150);
+        seq = try ageFill(s, seq, 1, 20);
+        seq = try ageFill(s, seq, 2, 5);
+        // The first step only places the cursors (no read-ahead before it).
+        _ = try s.ageStep(4096);
+        // Epoch 0 leaves the object window: every pass over it looks up every object version
+        // and tombstone (the whole-segment rule), as the segment pass does over a restore image.
+        _ = try s.setFloors(.{ .cp_pruned = 149, .obj_pruned = 149, .cp_epoch = 1, .obj_epoch = 1 });
+        try s.flushIndex();
+        var dropped: u64 = 0;
+        var steps: u32 = 0;
+        var idle = false;
+        while (!idle) : (steps += 1) {
+            try std.testing.expect(steps < 4000);
+            const r = try s.ageStep(if (steps % 3 == 0) 4096 else if (steps % 3 == 1) 40 << 10 else 300 << 10);
+            dropped += r.records_dropped;
+            idle = r.idle;
+        }
+        const st = &s.age_stats;
+        const lookups = st.lookups.load(.monotonic);
+        try std.testing.expect(dropped > 100 and lookups >= 300);
+        if (serial) {
+            try std.testing.expectEqual(lookups, st.lookups_cold.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 0), st.warm_pages.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 0), st.warm_groups.load(.monotonic));
+        } else {
+            try std.testing.expectEqual(@as(u64, 0), st.lookups_cold.load(.monotonic));
+            try std.testing.expect(st.warm_pages.load(.monotonic) > 0);
+            try std.testing.expect(st.warm_groups.load(.monotonic) >= 150);
+        }
+        try ageExpectLive(s, seq);
+    }
+}
+
+const SegMode = enum { serial, set, set_verify };
+
+/// The age counters a `SegWorld` leaves behind.
+const SegStats = struct {
+    lookups: u64,
+    objects_dropped: u64,
+    chunks_rewritten: u64,
+    seg_passes: u64,
+    set_builds: u64,
+    set_kept: u64,
+    set_dead: u64,
+    set_groups_skipped: u64,
+    set_chunks_skipped: u64,
+    set_inexact: u64,
+    set_misses: u64,
+
+    fn of(s: *Store) SegStats {
+        var r: SegStats = undefined;
+        inline for (comptime std.meta.fieldNames(SegStats)) |name| @field(r, name) = @field(s.age_stats, name).load(.monotonic);
+        return r;
+    }
+};
+
+/// A store shaped like a restored one for the segment pass: epoch 0 holds `seg_objs` live
+/// objects per checkpoint and little else (an image), later epochs supersede some of them.
+const SegWorld = struct {
+    gpa: std.mem.Allocator,
+    sim: *SimIo,
+    cfg: root.Config,
+    s: *Store,
+    seq: u64 = 0,
+    /// Newest version of each image object (index = object number).
+    ver: [seg_cps * seg_objs]u64 = @splat(1),
+
+    const seg_cps = 48;
+    const seg_objs = 24;
+    const base_id = 5000;
+
+    fn open(gpa: std.mem.Allocator, mode: SegMode, whole_bytes: u64, set_bytes: u64) !SegWorld {
+        // Small files: the simulator holds two copies of every file at its cap.
+        const sim = try SimIo.init(gpa, 91, .{}, 2 << 20);
+        errdefer sim.deinit();
+        var cfg = smallCfg();
+        cfg.max_live_objects = 4096;
+        cfg.segment_reserve = 2 << 20;
+        cfg.cache_bytes = 1 << 20;
+        cfg.chunk_bytes = 4 << 10;
+        cfg.age_lag_checkpoints = 1;
+        cfg.age_whole_group_bytes = whole_bytes;
+        cfg.age_serial = mode == .serial;
+        cfg.age_live_set = mode == .set or mode == .set_verify;
+        cfg.age_set_verify = mode == .set_verify;
+        cfg.age_set_bytes = set_bytes;
+        const s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+        return .{ .gpa = gpa, .sim = sim, .cfg = cfg, .s = s };
+    }
+
+    fn close(w: *SegWorld) void {
+        w.s.deinit();
+        w.sim.deinit();
+    }
+
+    fn payloadOf(buf: *[300]u8, obj: u64, version: u64) []const u8 {
+        return noise(obj *% 131 + version *% 7 + 3, buf);
+    }
+
+    /// Epoch 0: the image.
+    fn image(w: *SegWorld) !void {
+        var buf: [300]u8 = undefined;
+        for (0..seg_cps) |c| {
+            const b = try w.s.begin(w.seq, 0);
+            try b.checkpoint("summary", "contents");
+            for (0..seg_objs) |k| {
+                const obj = c * seg_objs + k;
+                try put(b, base_id + obj, 1, payloadOf(&buf, obj, 1));
+            }
+            try w.s.commit(b);
+            w.seq += 1;
+        }
+    }
+
+    /// One checkpoint of `epoch` that writes a new version of each object in `objs`.
+    fn update(w: *SegWorld, epoch: u64, objs: []const u64) !void {
+        var buf: [300]u8 = undefined;
+        const b = try w.s.begin(w.seq, epoch);
+        try b.checkpoint("summary", "contents");
+        for (objs) |obj| {
+            w.ver[obj] += 1;
+            try put(b, base_id + obj, w.ver[obj], payloadOf(&buf, obj, w.ver[obj]));
+        }
+        try w.s.commit(b);
+        w.seq += 1;
+    }
+
+    /// Both floors just below the newest checkpoint, epochs given: durable.
+    fn floors(w: *SegWorld, epoch: u64) !void {
+        _ = try w.s.setFloors(.{ .cp_pruned = w.seq - 2, .obj_pruned = w.seq - 2, .cp_epoch = epoch, .obj_epoch = epoch });
+        try w.s.flushIndex();
+    }
+
+    /// Age-out to the end, in steps of mixed budgets.
+    fn ageToEnd(w: *SegWorld) !void {
+        var i: u32 = 0;
+        while (true) : (i += 1) {
+            try std.testing.expect(i < 20000);
+            const budget: u64 = switch (i % 4) {
+                0 => 4096,
+                1 => 24 << 10,
+                2 => 9000,
+                else => 1 << 20,
+            };
+            if ((try w.s.ageStep(budget)).idle) break;
+        }
+    }
+
+    /// Every image object reads back at its newest version.
+    fn expectLive(w: *SegWorld) !void {
+        var snap = w.s.snapshot();
+        defer snap.release();
+        var buf: [300]u8 = undefined;
+        for (0..seg_cps * seg_objs) |obj| {
+            const got = snap.liveObject(&idOf(base_id + obj)) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualSlices(u8, payloadOf(&buf, obj, w.ver[obj]), got.bytes);
+        }
+    }
+
+    fn hashes(w: *SegWorld, out: *[6]?u64) !void {
+        for (out, 0..) |*h, e| h.* = try w.s.segmentLogicalHash(e);
+    }
+
+    /// The same history in every mode: updates that leave most chunks of the image nearly all
+    /// live, a few with every record superseded, then two more epochs of the same.
+    fn run(w: *SegWorld, out: *[3][6]?u64) !void {
+        try w.image();
+        // Epoch 1: a twentieth of the image, spread; and three whole checkpoints of it.
+        var few: [seg_cps * seg_objs / 20]u64 = undefined;
+        for (&few, 0..) |*o, i| o.* = (i * 20 + 7) % (seg_cps * seg_objs);
+        try w.update(1, &few);
+        for ([_]u64{ 5, 6, 30 }) |c| {
+            var all: [seg_objs]u64 = undefined;
+            for (&all, 0..) |*o, k| o.* = c * seg_objs + k;
+            try w.update(1, &all);
+        }
+        try w.update(2, &.{0});
+        try w.update(2, &.{1});
+        try w.floors(1);
+        try w.ageToEnd();
+        try w.expectLive();
+        try w.hashes(&out[0]);
+        // Epoch 2 and 3: more of the image dies, the object window moves on.
+        for ([_]u64{ 11, 12, 40, 41 }) |c| {
+            var all: [seg_objs]u64 = undefined;
+            for (&all, 0..) |*o, k| o.* = c * seg_objs + k;
+            try w.update(2, &all);
+        }
+        try w.update(3, &few);
+        try w.update(3, &.{2});
+        try w.floors(2);
+        try w.ageToEnd();
+        try w.expectLive();
+        try w.hashes(&out[1]);
+        for ([_]u64{ 20, 21 }) |c| {
+            var all: [seg_objs]u64 = undefined;
+            for (&all, 0..) |*o, k| o.* = c * seg_objs + k;
+            try w.update(3, &all);
+        }
+        try w.update(4, &.{3});
+        try w.update(4, &.{4});
+        try w.floors(3);
+        try w.ageToEnd();
+        try w.expectLive();
+        try w.hashes(&out[2]);
+    }
+};
+
+test "age-out segment pass: with the live set the same records survive as with a lookup per record, and far fewer lookups are made" {
+    const gpa = std.testing.allocator;
+    // Groups rewritten whole with a set that covers everything in one table pass; groups
+    // rewritten chunk by chunk with a set of 64 bytes (512 cells, 32 KiB of segment) that
+    // needs many.
+    for ([_][2]u64{ .{ 64 << 10, 1 << 20 }, .{ 2 << 10, 64 } }) |v| {
+        // One store at a time (the lane's memory): each leaves its hashes and its counters.
+        var h_old: [3][6]?u64 = undefined;
+        var h_new: [3][6]?u64 = undefined;
+        var h_ver: [3][6]?u64 = undefined;
+        var stats: [3]SegStats = undefined;
+        inline for (.{ SegMode.serial, SegMode.set, SegMode.set_verify }, .{ &h_old, &h_new, &h_ver }, 0..) |mode, out, i| {
+            var w = try SegWorld.open(gpa, mode, v[0], v[1]);
+            defer w.close();
+            try w.run(out);
+            stats[i] = SegStats.of(w.s);
+        }
+        const old = &stats[0];
+        const new = &stats[1];
+        const ver = &stats[2];
+        for (0..3) |phase| for (0..6) |e| {
+            if (h_old[phase][e] != h_new[phase][e] or h_old[phase][e] != h_ver[phase][e]) {
+                std.debug.print("whole {d} set {d}: phase {d} segment {d}: serial {?x}, live set {?x}, live set with lookups {?x}\n", .{ v[0], v[1], phase, e, h_old[phase][e], h_new[phase][e], h_ver[phase][e] });
+                return error.TestUnexpectedResult;
+            }
+        };
+        inline for (.{ old, new, ver }, .{ "serial", "live set", "live set + lookups" }) |x, name| {
+            std.debug.print("segment pass ({s}; whole {d}, set {d} B): {d} lookups, {d} objects dropped, {d} chunks rewritten, {d} table passes, {d} kept by the set, {d} judged dead by it, {d} groups and {d} chunks left unexamined\n", .{
+                name, v[0], v[1], x.lookups, x.objects_dropped, x.chunks_rewritten, x.set_builds, x.set_kept, x.set_dead, x.set_groups_skipped, x.set_chunks_skipped,
+            });
+        }
+        // The set alone judged the dead; with the cross-check on, no clear bit was wrong.
+        try std.testing.expect(new.set_dead > 0);
+        try std.testing.expectEqual(@as(u64, 0), new.set_inexact);
+        try std.testing.expectEqual(@as(u64, 0), ver.set_misses);
+        try std.testing.expect(ver.lookups > new.lookups);
+        // Something was freed, and the image is still held.
+        try std.testing.expect(h_new[2][0] != null);
+        try std.testing.expect(old.chunks_rewritten > 0);
+        try std.testing.expect(new.set_builds >= 3);
+        try std.testing.expect(new.set_kept > 0);
+        try std.testing.expect(new.seg_passes >= 3);
+        try std.testing.expect(new.set_groups_skipped + new.set_chunks_skipped > 0);
+        if (v[1] == 64) try std.testing.expect(new.set_builds >= 12);
+        // Serial looks every object record of every aged segment up, each pass.
+        try std.testing.expect(old.lookups >= 3 * SegWorld.seg_cps * SegWorld.seg_objs);
+        try std.testing.expect(new.lookups * 4 < old.lookups);
+    }
+}
+
+test "age-out segment pass: a record that dies after the table pass named it is kept by that pass and goes with the next; no live record goes" {
+    const gpa = std.testing.allocator;
+    var w = try SegWorld.open(gpa, .set, 64 << 10, 1 << 20);
+    defer w.close();
+    try w.image();
+    // One dead record in each of three groups: under an eighth, so none of them is rewritten.
+    try w.update(1, &.{0});
+    try w.update(2, &.{SegWorld.seg_objs});
+    try w.update(2, &.{2 * SegWorld.seg_objs});
+    try w.floors(1);
+    // Steps until the table pass is done and the walk has begun, not ended.
+    const st = &w.s.age_stats;
+    var i: u32 = 0;
+    while (st.set_builds.load(.monotonic) == 0) : (i += 1) {
+        try std.testing.expect(i < 1000);
+        _ = try w.s.ageStep(4096);
+    }
+    try std.testing.expectEqual(@as(u64, 0), st.seg_passes.load(.monotonic));
+    // Commits race the pass: every object of checkpoints 40 to 43 (not walked yet) gets a new
+    // version. The set still names their image records.
+    const dropped0 = st.objects_dropped.load(.monotonic);
+    for ([_]u64{ 40, 41, 42, 43 }) |c| {
+        var all: [SegWorld.seg_objs]u64 = undefined;
+        for (&all, 0..) |*o, k| o.* = c * SegWorld.seg_objs + k;
+        try w.update(2, &all);
+    }
+    try w.ageToEnd();
+    try w.expectLive();
+    try std.testing.expectEqual(@as(u64, 1), st.seg_passes.load(.monotonic));
+    // Kept by this pass: the set named them when the table was read.
+    try std.testing.expectEqual(dropped0, st.objects_dropped.load(.monotonic));
+    // The next pass (the object window moves on) names them no longer: they go.
+    try w.update(3, &.{3 * SegWorld.seg_objs});
+    try w.update(3, &.{4 * SegWorld.seg_objs});
+    try w.floors(2);
+    try w.ageToEnd();
+    try w.expectLive();
+    try std.testing.expect(st.objects_dropped.load(.monotonic) >= dropped0 + 4 * SegWorld.seg_objs);
+    try std.testing.expectEqual(@as(u64, 0), st.set_misses.load(.monotonic));
+    // A crash and a reopen: the image's live objects are all there.
+    w.sim.scheduleCrash(0);
+    w.s.deinit();
+    w.sim.crash();
+    w.s = try Store.open(gpa, .{ .sim = w.sim }, &w.cfg);
+    try w.expectLive();
+}
+
 test "age-out: a snapshot held across a rewrite keeps reading the old frames; the punch waits for it" {
     const gpa = std.testing.allocator;
     const sim = try SimIo.init(gpa, 32, .{}, 64 << 20);
@@ -2301,6 +2923,49 @@ test "age-out: a snapshot held across a rewrite keeps reading the old frames; th
     var snap = s.snapshot();
     defer snap.release();
     for (31..64) |q| try std.testing.expectEqualSlices(u8, noise(q *% 31 + 1, b1[0..1024]), snap.checkpoint(q).?.summary_cert);
+}
+
+test "real files: the ager's read-ahead reads live-table pages through the reader it reports (io_uring, or madvise and a touch)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    var cfg = smallCfg();
+    cfg.dir = path_buf[0..n];
+    cfg.chunk_bytes = 16 << 10;
+    cfg.age_lag_checkpoints = 0;
+    const h = try root.openDir(gpa, io, &cfg, .{ .sync = .none });
+    defer h.io.deinit();
+    const s = h.store;
+    defer s.close() catch {};
+    var seq = try ageFill(s, 0, 0, 120);
+    seq = try ageFill(s, seq, 1, 20);
+    seq = try ageFill(s, seq, 2, 5);
+    // The first step only places the cursors; then epoch 0 leaves the object window and every
+    // object version in it is looked up. The flush makes the table's pages clean: a page the
+    // writer holds dirty is in memory and is not read ahead.
+    _ = try s.ageStep(4096);
+    _ = try s.setFloors(.{ .cp_pruned = 119, .obj_pruned = 119, .cp_epoch = 1, .obj_epoch = 1 });
+    try s.flushIndex();
+    const reader = s.ageReader();
+    const rep = try s.ageAll();
+    try std.testing.expect(rep.records_dropped > 100);
+    const st = &s.age_stats;
+    const uring = st.warm_uring_pages.load(.monotonic);
+    const fallback = st.warm_fallback_pages.load(.monotonic);
+    std.debug.print("age-out read-ahead: reader {s}, {d} pages through io_uring, {d} by the fallback, {d} errors\n", .{ @tagName(reader), uring, fallback, st.warm_errors.load(.monotonic) });
+    try std.testing.expect(st.lookups.load(.monotonic) > 100);
+    try std.testing.expectEqual(@as(u64, 0), st.warm_errors.load(.monotonic));
+    switch (reader) {
+        .uring => try std.testing.expect(uring > 0 and fallback == 0),
+        .fallback => try std.testing.expect(fallback > 0 and uring == 0),
+        .none => return error.TestUnexpectedResult,
+    }
+    // Off Linux there is no io_uring.
+    if (@import("builtin").os.tag != .linux) try std.testing.expectEqual(Store.AgeReader.fallback, reader);
+    try ageExpectLive(s, seq);
 }
 
 test "real files: age-out at retention 0 across an epoch change frees the bytes (st_blocks) and reads stay correct" {
@@ -3070,4 +3735,53 @@ test "live table: a slot whose record holds another id (a key collision) reads a
     try std.testing.expect(snap.liveObject(&idOf(2)) == null);
     try std.testing.expect((try snap.visibleLoc(&idOf(2))) == null);
     try std.testing.expect(snap.objectAt(&idOf(2), 3) == null);
+}
+
+test "certificate fixes: a checkpoint's certified summary is served from the fix once one is installed; a snapshot from before keeps valid bytes, other checkpoints keep theirs, and a reopened store serves the stored bytes again" {
+    const gpa = std.testing.allocator;
+    const sim = try SimIo.init(gpa, 31, .{}, 8 << 20);
+    defer sim.deinit();
+    const cfg = smallCfg();
+    var s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    for (10..14) |q| {
+        const b = try s.begin(q, 1);
+        try b.checkpoint(if (q == 11) "summary+bucket-cert" else "summary+core-cert", "contents");
+        try s.commit(b);
+    }
+    // no fix: the stored bytes, and nothing changed
+    try std.testing.expectEqual(@as(usize, 0), s.cert_fix.count());
+    var before = s.snapshot();
+    const old = before.checkpoint(11).?.summary_cert;
+    try std.testing.expectEqualStrings("summary+bucket-cert", old);
+    const gen0 = s.cert_fix.generation();
+    // the core's certificate for 11 (another length than the stored one)
+    try std.testing.expect(try s.cert_fix.put(11, &root.certFixKey(11), "summary+core-certificate"));
+    try std.testing.expect(!try s.cert_fix.put(11, &root.certFixKey(11), "summary+core-certificate"));
+    {
+        var snap = s.snapshot();
+        defer snap.release();
+        const c = snap.checkpoint(11).?;
+        try std.testing.expectEqualStrings("summary+core-certificate", c.summary_cert);
+        try std.testing.expectEqualStrings("contents", c.contents);
+        try std.testing.expectEqual(@as(u64, 1), c.epoch);
+        try std.testing.expectEqualStrings("summary+core-certificate", snap.checkpointHeld(11).?.summary_cert);
+        for ([_]u64{ 10, 12, 13 }) |q| try std.testing.expectEqualStrings("summary+core-cert", snap.checkpoint(q).?.summary_cert);
+        // what a response cache asks: only checkpoint 11 changed since `gen0`
+        try std.testing.expect(s.cert_fix.changedSince(11, gen0));
+        try std.testing.expect(!s.cert_fix.changedSince(12, gen0));
+        try std.testing.expect(!s.cert_fix.changedSince(11, s.cert_fix.generation()));
+    }
+    // bytes read before the fix stay readable while their snapshot lives
+    try std.testing.expectEqualStrings("summary+bucket-cert", old);
+    before.release();
+    // memory only: after a reopen the stored bytes are served until the owner reinstalls its fixes
+    sim.scheduleCrash(0);
+    s.deinit();
+    sim.crash();
+    s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer s.deinit();
+    var snap = s.snapshot();
+    defer snap.release();
+    try std.testing.expectEqual(@as(usize, 0), s.cert_fix.count());
+    try std.testing.expectEqualStrings("summary+bucket-cert", snap.checkpoint(11).?.summary_cert);
 }

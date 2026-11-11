@@ -242,6 +242,8 @@ pub const Public = struct {
 
     fn request(p: *Public, seq: u64, out: *std.ArrayList(u8), first_byte: bool) !Result {
         const r = p.requestHttp(seq, out, first_byte) catch |e| {
+            // a request the stop ended is not a reason to ask S3 (and wait for it)
+            if (p.stopping.load(.acquire)) return e;
             const b = p.fallback orelse return e;
             _ = p.stats.fallback.fetchAdd(1, .monotonic);
             std.log.warn("public bucket {d}: {s}; trying S3", .{ seq, @errorName(e) });

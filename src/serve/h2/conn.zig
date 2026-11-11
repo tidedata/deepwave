@@ -65,6 +65,25 @@ pub const Request = struct {
     /// `x-sui-client-protocol-version` (sui-rpc-api `client_protocol_version`): SimulateTransaction
     /// offers `Validity` with allowed proposers only to clients that can decode it.
     client_protocol_version: ?u64 = null,
+    /// The request's `x-api-key` metadata ("" when absent) and the peer's address as text (""
+    /// when the transport does not know it): who is asking, for an access gate and a meter
+    /// (src/edge/route.zig `Caller`). Valid during the call. Nothing reads them yet.
+    api_key: []const u8 = "",
+    peer: []const u8 = "",
+};
+
+/// A peer address as text, held inline (`Conn.peer`, copied into each `Job`).
+pub const Peer = struct {
+    buf: [54]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn text(p: *const Peer) []const u8 {
+        return p.buf[0..p.len];
+    }
+    pub fn set(p: *Peer, t: []const u8) void {
+        p.len = @intCast(@min(t.len, p.buf.len));
+        @memcpy(p.buf[0..p.len], t[0..p.len]);
+    }
 };
 
 pub const ResponseStream = struct {
@@ -320,6 +339,8 @@ pub const Job = struct {
     encoding: Encoding,
     deadline_ns: ?u64,
     client_protocol_version: ?u64 = null,
+    api_key: []u8 = &.{},
+    peer: Peer = .{},
     /// Set by the connection (under its lock) when nobody waits for the answer any more: the
     /// stream was reset or dropped, or `expireJobs` answered it at its deadline.
     cancelled: std.atomic.Value(bool) = .init(false),
@@ -337,9 +358,10 @@ pub const Job = struct {
     }
 
     pub fn request(j: *const Job) Request {
-        return .{ .path = j.path, .authority = j.authority, .body = j.body, .stream_id = j.stream_id, .accept = j.encoding, .deadline_ns = j.deadline_ns, .client_protocol_version = j.client_protocol_version };
+        return .{ .path = j.path, .authority = j.authority, .body = j.body, .stream_id = j.stream_id, .accept = j.encoding, .deadline_ns = j.deadline_ns, .client_protocol_version = j.client_protocol_version, .api_key = j.api_key, .peer = j.peer.text() };
     }
     pub fn destroy(j: *Job, gpa: Allocator) void {
+        gpa.free(j.api_key);
         gpa.free(j.path);
         gpa.free(j.authority);
         gpa.free(j.body);
@@ -364,6 +386,8 @@ pub const Stream = struct {
     accept: Encoding = .identity,
     timeout_ns: ?u64 = null,
     client_protocol_version: ?u64 = null,
+    /// `x-api-key` (`Request.api_key`); allocated only when the request carries one.
+    api_key: []u8 = &.{},
     body: std.ArrayList(u8) = .empty,
     send_window: i64,
     /// Framed gRPC bytes not yet sent as DATA.
@@ -414,16 +438,22 @@ pub const Stream = struct {
         gpa.free(s.path);
         gpa.free(s.authority);
         gpa.free(s.grpc_encoding);
+        gpa.free(s.api_key);
         s.body.deinit(gpa);
         s.out.deinit(gpa);
         if (s.trailers) |t| gpa.free(t);
     }
 };
 
+/// Longest `x-api-key` value kept (the rest is cut).
+pub const max_api_key = 256;
+
 pub const Conn = struct {
     gpa: Allocator,
     opts: Options,
     handler: Handler,
+    /// The peer's address (`Request.peer`); set by the runtime that accepted the socket.
+    peer: Peer = .{},
     in: std.ArrayList(u8) = .empty,
     out: std.ArrayList(u8) = .empty,
     out_off: usize = 0,
@@ -884,6 +914,10 @@ pub const Conn = struct {
                 self.s.timeout_ns = meta.parseTimeout(value);
             } else if (eql(u8, name, "x-sui-client-protocol-version")) {
                 self.s.client_protocol_version = meta.parseClientProtocolVersion(value);
+            } else if (eql(u8, name, "x-api-key")) {
+                gpa.free(self.s.api_key);
+                self.s.api_key = &.{};
+                self.s.api_key = try gpa.dupe(u8, value[0..@min(value.len, max_api_key)]);
             }
         }
     };
@@ -1012,7 +1046,7 @@ pub const Conn = struct {
         var sink: ConnSink = .{ .c = c, .s = s };
         var rs: ResponseStream = .{ .gpa = c.gpa, .impl = &sink, .vt = &ConnSink.vt, .encoding = s.encoding };
         defer rs.release();
-        const req: Request = .{ .path = s.path, .authority = s.authority, .body = payload, .stream_id = s.id, .accept = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version };
+        const req: Request = .{ .path = s.path, .authority = s.authority, .body = payload, .stream_id = s.id, .accept = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version, .api_key = s.api_key, .peer = c.peer.text() };
         const status = c.handler.call(c.handler.ctx, &req, &rs);
         switch (status) {
             .deferred => return,
@@ -1029,7 +1063,9 @@ pub const Conn = struct {
         const authority = try c.gpa.dupe(u8, s.authority);
         errdefer c.gpa.free(authority);
         const body = try c.gpa.dupe(u8, payload);
-        j.* = .{ .stream_id = s.id, .path = path, .authority = authority, .body = body, .encoding = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version };
+        errdefer c.gpa.free(body);
+        const api_key: []u8 = if (s.api_key.len > 0) try c.gpa.dupe(u8, s.api_key) else &.{};
+        j.* = .{ .stream_id = s.id, .path = path, .authority = authority, .body = body, .encoding = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version, .api_key = api_key, .peer = c.peer };
         return j;
     }
 
@@ -1124,7 +1160,7 @@ pub const Conn = struct {
             var sink: ConnSink = .{ .c = c, .s = s };
             var rs: ResponseStream = .{ .gpa = c.gpa, .impl = &sink, .vt = &ConnSink.vt, .encoding = s.encoding };
             defer rs.release();
-            const req: Request = .{ .path = s.path, .authority = s.authority, .body = payload, .stream_id = s.id, .accept = s.encoding, .client_protocol_version = s.client_protocol_version };
+            const req: Request = .{ .path = s.path, .authority = s.authority, .body = payload, .stream_id = s.id, .accept = s.encoding, .client_protocol_version = s.client_protocol_version, .api_key = s.api_key, .peer = c.peer.text() };
             const status = c.handler.call(c.handler.ctx, &req, &rs);
             if (status != .ok or rs.end_stream) return c.setTrailersEx(s, if (status == .deferred or status == .held) .unimplemented else status, rs.msg, rs.details_bin, false);
             try c.flush(s);

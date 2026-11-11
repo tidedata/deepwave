@@ -348,7 +348,9 @@ pub const Prober = struct {
         p.thread = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, run, .{p});
     }
 
-    /// Stops the thread (within one connect's budget).
+    /// Stops the thread. A probe in progress (a connect, a hello, a request) ends at its next
+    /// turn, a few milliseconds, whatever the core does: until the connections carried the stop
+    /// flag this waited out a probe of a silent core (`probe_timeout_ms` per core, 1.5 s).
     pub fn stop(p: *Prober) void {
         p.stopping.store(true, .release);
         if (p.thread) |th| th.join();
@@ -429,7 +431,8 @@ pub const Prober = struct {
         var fresh = false;
         if (p.conns[i] == null) {
             const by = nowNs(p.io) + @as(u64, t.probe_timeout_ms) * ms;
-            const c = client.Conn.connect(p.gpa, p.io, p.specs[i], t.probe_timeout_ms) catch return .silent;
+            // with the prober's stop flag: a probe of a silent core ends when the prober is stopped
+            const c = client.Conn.connectStop(p.gpa, p.io, p.specs[i], t.probe_timeout_ms, &p.stopping) catch return .silent;
             p.conns[i] = c;
             p.sent[i] = 0;
             c.first_byte_by = by;
@@ -649,6 +652,29 @@ test "fallback prober: a probe's reply budget is 500 ms, more on a long path, ne
     try testing.expectEqual(@as(u64, 500), Prober.replyBudgetMs(&d, 90)); // a 90 ms round trip
     try testing.expectEqual(@as(u64, 750), Prober.replyBudgetMs(&d, 250)); // a 250 ms round trip
     try testing.expectEqual(@as(u64, 1_500), Prober.replyBudgetMs(&d, 900));
+}
+
+test "fallback prober: stop ends a probe of a core that never answers at once, not at the probe timeout" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    // a bound UDP socket nobody reads: a dead box
+    var lo: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(0) };
+    const dead = try Io.net.IpAddress.bind(&lo, io, .{ .mode = .dgram });
+    defer dead.close(io);
+    const specs = [_]client.Spec{.{ .addr = .{ .ip4 = Io.net.Ip4Address.loopback(dead.address.getPort()) }, .key = @splat(7) }};
+    // on the fallback, so the prober probes; the test's bound if the stop did nothing is 4 s
+    var sw: Switch = .{ .log = false, .t = .{ .probe_ms = 20, .probe_timeout_ms = 4_000 } };
+    try testing.expect(sw.coreFailed(10 * sec, sec, .silent, 1));
+    const p = try Prober.init(gpa, io, &sw, &specs, null);
+    try p.start();
+    // inside its first connect by now
+    io.sleep(.fromMilliseconds(150), .awake) catch {};
+    try testing.expectEqual(@as(u64, 0), sw.stats.probes.load(.monotonic));
+    const t0 = nowNs(io);
+    p.deinit();
+    try testing.expect((nowNs(io) - t0) / ms < 500);
+    // the probe a stop cut short is not a verdict on the core
+    try testing.expectEqual(@as(u64, 0), sw.stats.probes.load(.monotonic));
 }
 
 test "fallback switch: position and counters" {

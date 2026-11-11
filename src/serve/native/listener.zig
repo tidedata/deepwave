@@ -20,6 +20,7 @@ const sub = @import("sub.zig");
 const cert_mod = @import("cert.zig");
 const certs_mod = @import("certs.zig");
 const jobs_mod = @import("jobs.zig");
+const fairq = @import("fairq.zig");
 
 pub const alpns = [_][]const u8{ proto.alpn, "h3" };
 
@@ -45,10 +46,14 @@ pub const Options = struct {
     sub_backlog: u64 = 512 << 10,
     /// Worker threads for dry_run and submit_transaction.
     slow_workers: usize = 4,
-    /// Worker threads and queue depth for edge feed assembly (their own pool: dry_run and
-    /// submit_transaction never wait behind feeds).
+    /// Worker threads and queue depth (queued plus running) for edge feed assembly: their own
+    /// pool, so dry_run and submit_transaction never wait behind feeds. The queue is divided
+    /// between the clients with feed requests in flight (fairq.zig, `feedClient`): each has a
+    /// share of `feed_queue` over their number, never under `feed_min_share`, and may use what
+    /// the others leave. One client alone has all of it.
     feed_workers: usize = 4,
     feed_queue: usize = 64,
+    feed_min_share: usize = 2,
     /// Run on each slow worker before it exits (the simulate engine's thread caches).
     slow_worker_exit: ?*const fn () void = null,
     /// Half-open connections above which a new client must come back with a Retry token
@@ -60,12 +65,14 @@ pub const Options = struct {
     /// Sender-side QUIC switches for every connection of this listener (zui/1 and
     /// WebTransport), all off by default: see `net.conn.Config`. Env overrides (1 or 0):
     /// ZUI_NATIVE_PACING, ZUI_NATIVE_HYSTART, ZUI_NATIVE_CUBIC, ZUI_NATIVE_PMTUD,
-    /// ZUI_NATIVE_IW_MTU.
+    /// ZUI_NATIVE_IW_MTU, ZUI_NATIVE_BBR.
     pacing: bool = false,
     hystart: bool = false,
     cubic: bool = false,
     pmtud: bool = false,
     iw_mtu: bool = false,
+    /// BBR instead of NewReno or CUBIC (it paces by itself): see `net.conn.Config.bbr`.
+    bbr: bool = false,
     /// WebTransport cold connect: the HTTP/3 control stream (SETTINGS) and the two QPACK
     /// streams are sent right behind the server's handshake flight ("0.5-RTT",
     /// `net.conn.Config.early_send`) instead of after the client's Finished has arrived. A
@@ -107,7 +114,19 @@ pub const Stats = struct {
     /// macOS, sendmmsg with UDP GSO on Linux). Their ratio is the send batching achieved.
     datagrams_out: Atomic(u64) = .init(0),
     send_calls: Atomic(u64) = .init(0),
+    /// Passes of the I/O loop, the passes that polled the socket without blocking (a timer was
+    /// due in under 1 ms, or the burst cap left datagrams unsent), and the I/O thread's CPU
+    /// time, sampled every 64 passes.
+    io_passes: Atomic(u64) = .init(0),
+    io_polls: Atomic(u64) = .init(0),
+    io_cpu_ns: Atomic(u64) = .init(0),
 };
+
+fn threadCpuNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
 
 const Kind = enum { pending, zui, h3 };
 
@@ -224,6 +243,8 @@ pub const Listener = struct {
     req_arena: std.heap.ArenaAllocator = undefined,
     jobs: ?*jobs_mod.Jobs = null,
     feed_jobs: ?*jobs_mod.Jobs = null,
+    /// The feed queue now, and what it refused (`zui_native_feed_queue_*`).
+    feed_stats: fairq.Stats = .{},
     /// I/O thread only: Retry tokens, and connections whose handshake is not finished.
     guard: net.retry.Guard = undefined,
     half_open: usize = 0,
@@ -251,9 +272,10 @@ pub const Listener = struct {
         o.cubic = envSwitch("ZUI_NATIVE_CUBIC", o.cubic);
         o.pmtud = envSwitch("ZUI_NATIVE_PMTUD", o.pmtud);
         o.iw_mtu = envSwitch("ZUI_NATIVE_IW_MTU", o.iw_mtu);
+        o.bbr = envSwitch("ZUI_NATIVE_BBR", o.bbr);
         o.early_settings = envSwitch("ZUI_NATIVE_EARLY_SETTINGS", o.early_settings);
-        if (o.pacing or o.hystart or o.cubic or o.pmtud or o.iw_mtu or o.early_settings)
-            std.log.info("native: QUIC sender switches: pacing={} hystart={} cubic={} pmtud={} iw_mtu={} early_settings={}", .{ o.pacing, o.hystart, o.cubic, o.pmtud, o.iw_mtu, o.early_settings });
+        if (o.pacing or o.hystart or o.cubic or o.pmtud or o.iw_mtu or o.bbr or o.early_settings)
+            std.log.info("native: QUIC sender switches: pacing={} hystart={} cubic={} pmtud={} iw_mtu={} bbr={} early_settings={}", .{ o.pacing, o.hystart, o.cubic, o.pmtud, o.iw_mtu, o.bbr, o.early_settings });
         l.* = .{ .gpa = gpa, .io = io, .opts = o, .disp = disp, .sock = sock, .keys = .init(gpa), .us = .init(sock.handle), .tx = tx, .rx = rx, .req_arena = .init(gpa) };
         var gk: [32]u8 = undefined;
         io.random(&gk);
@@ -365,6 +387,9 @@ pub const Listener = struct {
             if (any_sub) wait_ns = @min(wait_ns, 5 * std.time.ns_per_ms);
             const spinning = spin_ns != 0 and now -| last_busy < spin_ns;
             const block = !more and !spinning and wait_ns >= std.time.ns_per_ms;
+            const pass = l.stats.io_passes.fetchAdd(1, .monotonic);
+            if (!block) _ = l.stats.io_polls.fetchAdd(1, .monotonic);
+            if (pass % 64 == 0) l.stats.io_cpu_ns.store(threadCpuNs(), .monotonic);
             if (block) l.us.setWait(wait_ns);
             var n = l.rx.recv(&l.us, block);
             if (n > 0) last_busy = now;
@@ -403,6 +428,7 @@ pub const Listener = struct {
                 _ = l.stats.active.fetchSub(1, .monotonic);
                 if (kv.value.kind == .pending) l.half_open -|= 1;
                 for (kv.value.reqs.keys(), kv.value.reqs.values()) |id, *r| if (r.relay) |rr| l.relayDetach(k, id, rr);
+                if (l.feed_jobs) |j| j.cancel(k); // its queued feed requests give their places back
                 l.freeSlot(kv.value);
             };
             l.relaySweep();
@@ -498,6 +524,7 @@ pub const Listener = struct {
             .cubic = l.opts.cubic,
             .pmtud = l.opts.pmtud,
             .iw_mtu = l.opts.iw_mtu,
+            .bbr = l.opts.bbr,
             .early_send = l.opts.early_settings,
         }, now, dcid, scid) catch {
             if (ident) |e| l.opts.certs.?.release(e);
@@ -754,8 +781,34 @@ pub const Listener = struct {
         if (l.feed_jobs) |j| return j;
         const j = l.gpa.create(jobs_mod.Jobs) catch return null;
         j.* = .{ .gpa = l.gpa, .io = l.io, .disp = l.disp, .wake = .{ .ctx = l, .call = wakeSelf }, .workers = l.opts.feed_workers, .max_inflight = l.opts.feed_queue, .on_exit = l.opts.slow_worker_exit };
+        // the queue is divided between clients (`feedClient`)
+        j.shares = .{ .cap = l.opts.feed_queue, .workers = l.opts.feed_workers, .min_share = l.opts.feed_min_share };
+        j.share_stats = &l.feed_stats;
+        j.evict_message = feed_refused;
         l.feed_jobs = j;
         return j;
+    }
+
+    /// The message of RATE_LIMITED on a feed request (an edge halves its requests in flight).
+    const feed_refused = "too many feed requests in flight";
+
+    /// Who a feed request is accounted to in the feed queue's shares. The API key the
+    /// connection authenticated with (hello or the WebTransport session token), when it has
+    /// one. Else the peer's address without the port: the listener asks for no client
+    /// certificate and an edge sends no token, so an edge is known by its address only, and its
+    /// connections (four with the edge profile, each from its own port) are one client with
+    /// one share. IPv4 is the whole address (also IPv4-mapped on a dual-stack socket); IPv6 is
+    /// the /64, which one host holds whole.
+    pub fn feedClient(principal: ?dispatch.Principal, addr: *const Io.net.IpAddress) fairq.Key {
+        if (principal) |p| return (@as(fairq.Key, 1) << 64) | p.id;
+        switch (addr.*) {
+            .ip4 => |a| return (@as(fairq.Key, 4) << 64) | std.mem.readInt(u32, &a.bytes, .big),
+            .ip6 => |a| {
+                if (std.mem.eql(u8, a.bytes[0..12], &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff }))
+                    return (@as(fairq.Key, 4) << 64) | std.mem.readInt(u32, a.bytes[12..16], .big);
+                return (@as(fairq.Key, 6) << 64) | std.mem.readInt(u64, a.bytes[0..8], .big);
+            },
+        }
     }
 
     /// Credit varints written on a subscription's control stream after the SubscribeReq.
@@ -864,7 +917,7 @@ pub const Listener = struct {
         if (!r.fin) return;
         r.done = true;
         _ = l.stats.requests.fetchAdd(1, .monotonic);
-        if (dispatch.slowMethod(req.method)) {
+        if (dispatch.slowMethod(req.method) or l.disp.offThread(req)) {
             const j = l.slowJobs();
             if (j != null and j.?.push(s.key, id, s.principal, r.buf.items)) {
                 r.queued = true;
@@ -875,11 +928,11 @@ pub const Listener = struct {
         }
         if (dispatch.feedMethod(req.method)) {
             const j = l.feedJobs();
-            if (j != null and j.?.push(s.key, id, s.principal, r.buf.items)) {
+            if (j != null and j.?.pushFor(feedClient(s.principal, &s.addr), s.key, id, s.principal, r.buf.items)) {
                 r.queued = true;
                 return;
             }
-            proto.errorResponse(&out, a, .rate_limited, "too many feed requests in flight", &.{ 0, 0, 0, 0 }) catch return;
+            proto.errorResponse(&out, a, .rate_limited, feed_refused, &.{ 0, 0, 0, 0 }) catch return;
             return l.respond(s, id, out.items);
         }
         // a token in hello replaces the connection's principal when it is accepted (spec 6)
@@ -1182,6 +1235,12 @@ pub const Listener = struct {
             var failed: ?anyerror = null;
             while (budget > 0 and sb.cursor <= tip and c.streamUnsent(sb.data) < l.opts.sub_backlog) : (budget -= 1) {
                 if (sb.credit_on and sb.delivered >= sb.granted) break; // out of credit
+                // An edge: the frames of this checkpoint would carry a certificate that is not
+                // its core's (a Checkpoint frame, or the Proof of a verified match).
+                if ((sb.req.filter == .checkpoints or sb.req.verify) and l.disp.withholdSeq(sb.cursor)) {
+                    failed = error.ForeignCertificate;
+                    break;
+                }
                 const rec = snap.checkpoint(sb.cursor) orelse break;
                 _ = arena_state.reset(.retain_capacity);
                 out.clearRetainingCapacity();
@@ -1332,6 +1391,228 @@ test "zui/1 listener: cancelled requests give their stream back, and stop sends 
     try std.testing.expectEqual(@as(u64, @intFromEnum(proto.Code.shutdown)), cc.code);
 }
 
+/// A link for the pacing bench, applied by the client to what it receives: a rate, a tail-drop
+/// queue and a one-way delay (rate 0: plain loopback).
+const BenchLink = struct { name: []const u8, mbit: u64 = 0, delay_ms: u64 = 0, queue_ms: u64 = 50 };
+
+const BenchRun = struct { bytes: u64, wall_ns: u64, cpu_ns: u64, passes: u64, polls: u64, dropped: u64 };
+
+/// One bulk download through a real listener over loopback: `streams` requests for a 1 MiB
+/// dictionary at a time until `total` bytes have arrived. The client thread spins (its CPU is
+/// not what is measured) and plays the link. Returns the I/O thread's CPU time over the transfer.
+fn paceBench(gpa: Allocator, io: Io, disp: *dispatch.Dispatcher, cert: *const cert_mod.Cert, dict_id: u32, opts: struct { pacing: bool = false, cubic: bool = false, bbr: bool = false }, link: BenchLink, total: u64) !BenchRun {
+    const id_seed: [32]u8 = @splat(9);
+    const l = try Listener.start(gpa, io, .{ .listen = .{ .ip4 = Io.net.Ip4Address.loopback(0) }, .identity_seed = id_seed, .cert = cert, .max_streams = 64, .pacing = opts.pacing, .cubic = opts.cubic, .bbr = opts.bbr }, disp);
+    defer l.stop();
+    var lo: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(0) };
+    const sock = try Io.net.IpAddress.bind(&lo, io, .{ .mode = .dgram });
+    defer sock.close(io);
+    const bufsz: c_int = 8 << 20;
+    std.posix.setsockopt(sock.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&bufsz)) catch {};
+    const seed: [64]u8 = @splat(2);
+    const clock = struct {
+        fn now(i: Io) u64 {
+            return @intCast(Io.Clock.awake.now(i).toNanoseconds());
+        }
+    };
+    const c = try conn_mod.Connection.init(gpa, .{
+        .server_name = "zui",
+        .identity_seed = @splat(4),
+        .expected_peer = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(id_seed)).public_key.toBytes(),
+        .seed = seed,
+        .now_unix = 1_800_000_000,
+        .alpn = &.{proto.alpn},
+        .keep_alive_ms = 0,
+        .pmtu_max = 1452,
+    }, clock.now(io));
+    defer c.deinit();
+    const us: *udpio.Sock = try gpa.create(udpio.Sock);
+    defer gpa.destroy(us);
+    us.* = .init(sock.handle);
+    const tx = try gpa.create(udpio.TxBatch);
+    defer gpa.destroy(tx);
+    tx.* = .{};
+    const rx = try gpa.create(udpio.RxBatch);
+    defer gpa.destroy(rx);
+    rx.* = .{};
+    const to = l.address();
+    // the link: datagrams wait here until their delivery time
+    const Held = struct { at: u64, len: u16, data: [1500]u8 };
+    var fifo: std.ArrayList(Held) = .empty;
+    defer fifo.deinit(gpa);
+    var head: usize = 0;
+    var free_at: u64 = 0;
+    const rate: u64 = link.mbit * 125_000;
+    const queue_bytes: u64 = rate * link.queue_ms / 1000;
+    var dropped: u64 = 0;
+
+    const streams = 16;
+    var open: [streams]?u64 = @splat(null);
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(gpa);
+    try proto.encodeRequest(&req, gpa, .get_dictionary, 0, std.mem.asBytes(&std.mem.nativeToLittle(u32, dict_id)));
+    var got: u64 = 0;
+    var asked: u64 = 0;
+    var start: ?u64 = null;
+    var cpu0: u64 = 0;
+    var passes0: u64 = 0;
+    var polls0: u64 = 0;
+    const deadline = clock.now(io) + 90 * std.time.ns_per_s;
+    var res: BenchRun = undefined;
+    while (true) {
+        var now = clock.now(io);
+        if (now > deadline or c.isClosed()) return error.TestUnexpectedResult;
+        var busy = false;
+        while (true) {
+            const n = rx.recv(us, false);
+            if (n == 0) break;
+            busy = true;
+            now = clock.now(io);
+            for (0..n) |i| {
+                const d = rx.data(i);
+                if (rate == 0) {
+                    c.handleDatagram(now, d);
+                    continue;
+                }
+                const backlog = (free_at -| now) * rate / std.time.ns_per_s;
+                if (backlog + d.len > queue_bytes or d.len > 1500) {
+                    dropped += 1;
+                    continue;
+                }
+                free_at = @max(now, free_at) + d.len * std.time.ns_per_s / rate;
+                var h: Held = .{ .at = free_at + link.delay_ms * std.time.ns_per_ms, .len = @intCast(d.len), .data = undefined };
+                @memcpy(h.data[0..d.len], d);
+                try fifo.append(gpa, h);
+            }
+            if (n < udpio.max_batch) break;
+        }
+        while (head < fifo.items.len and fifo.items[head].at <= now) : (head += 1) {
+            const h = &fifo.items[head];
+            c.handleDatagram(now, h.data[0..h.len]);
+            busy = true;
+        }
+        if (head > 0 and head == fifo.items.len) {
+            fifo.clearRetainingCapacity();
+            head = 0;
+        } else if (head >= 1024) {
+            const rest = fifo.items.len - head;
+            std.mem.copyForwards(Held, fifo.items[0..rest], fifo.items[head..]);
+            fifo.shrinkRetainingCapacity(rest);
+            head = 0;
+        }
+        if (c.nextTimeout()) |t| if (now >= t) c.onTimeout(now);
+        if (c.isEstablished()) {
+            if (start == null) {
+                start = now;
+                cpu0 = l.stats.io_cpu_ns.load(.monotonic);
+                passes0 = l.stats.io_passes.load(.monotonic);
+                polls0 = l.stats.io_polls.load(.monotonic);
+            }
+            for (&open) |*slot| {
+                if (slot.*) |id| {
+                    const st = c.stream(id) orelse return error.TestUnexpectedResult;
+                    const data = st.recv.contiguous();
+                    if (data.len > 0) {
+                        got += data.len;
+                        st.recv.consume(data.len);
+                    }
+                    if (st.recv.complete()) {
+                        c.streamFree(id);
+                        slot.* = null;
+                    }
+                }
+                if (slot.* == null and asked < total) {
+                    const id = c.openBidi() catch continue;
+                    try c.streamWrite(id, req.items, true);
+                    slot.* = id;
+                    asked += 1 << 20;
+                }
+            }
+            var live = false;
+            for (open) |o| if (o != null) {
+                live = true;
+            };
+            if (!live and asked >= total) {
+                res = .{
+                    .bytes = got,
+                    .wall_ns = now - start.?,
+                    .cpu_ns = l.stats.io_cpu_ns.load(.monotonic) - cpu0,
+                    .passes = l.stats.io_passes.load(.monotonic) - passes0,
+                    .polls = l.stats.io_polls.load(.monotonic) - polls0,
+                    .dropped = dropped,
+                };
+                break;
+            }
+        }
+        while (c.pollTransmit(now, tx.slot())) |n| {
+            tx.commit(n, &to);
+            if (tx.full()) tx.flush(us);
+            busy = true;
+        }
+        tx.flush(us);
+        if (!busy) std.atomic.spinLoopHint();
+    }
+    return res;
+}
+
+test "native listener: I/O thread CPU during a bulk send, unpaced, paced and BBR (ZUI_NATIVE_PACE_BENCH=1)" {
+    if (std.c.getenv("ZUI_NATIVE_PACE_BENCH") == null) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var cfg: store.Config = .{ .max_live_objects = 1 << 10, .max_object_versions = 1 << 11, .max_transactions = 1 << 10, .max_checkpoints = 16, .max_batch_bytes = 16 << 20, .max_batch_objects = 1 << 10, .max_segments = 16, .segment_reserve = 4 << 20, .seed = 5 };
+    const sim = try store.SimIo.init(gpa, 11, .{}, 32 << 20);
+    defer sim.deinit();
+    const st = try store.Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer st.deinit();
+    var svc: @import("serve").service.Service = .{ .gpa = gpa, .store = st, .chain_id = @splat(0) };
+    defer svc.deinit();
+    // the bulk: a 1 MiB dictionary, served whole by get_dictionary
+    const dicts_mod = @import("dicts.zig");
+    var ds = dicts_mod.Dicts.init(gpa);
+    defer ds.deinit();
+    {
+        const content = try gpa.alloc(u8, 1 << 20);
+        defer gpa.free(content);
+        var prng = std.Random.DefaultPrng.init(3);
+        prng.random().bytes(content);
+        ds.owned[0] = try @TypeOf(ds.owned[0]).init(gpa, content, 3);
+        ds.built[0] = true;
+        ds.slots[0].store(&ds.owned[0], .release);
+    }
+    var disp: dispatch.Dispatcher = .{ .svc = &svc, .dicts = &ds };
+    const P256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const cert = cert_mod.generate(try P256.KeyPair.generateDeterministic(@splat(6)), @splat(1), 1_800_000_000, 14, "zui");
+    const links = [_]BenchLink{
+        .{ .name = "loopback" },
+        .{ .name = "100Mbit 20ms", .mbit = 100, .delay_ms = 20 },
+        .{ .name = "20Mbit 50ms", .mbit = 20, .delay_ms = 50 },
+    };
+    const modes = [_]struct { name: []const u8, pacing: bool = false, cubic: bool = false, bbr: bool = false }{
+        .{ .name = "default" },
+        .{ .name = "pacing", .pacing = true },
+        .{ .name = "pacing+cubic", .pacing = true, .cubic = true },
+        .{ .name = "bbr", .bbr = true },
+    };
+    std.debug.print("\npacing bench: bulk download from the native listener over loopback; CPU of its I/O thread\n{s:<14} {s:<13} {s:>6} {s:>7} {s:>8} {s:>9} {s:>7} {s:>10} {s:>10} {s:>10} {s:>7}\n", .{ "link", "sender", "MiB", "wall s", "Mbit/s", "cpu ms", "cpu %", "ms/MiB", "passes/s", "polls/s", "drops" });
+    for (links) |link| {
+        const mib: u64 = if (link.mbit == 0) 256 else if (link.mbit >= 100) 48 else 16;
+        for (modes) |m| {
+            const r = try paceBench(gpa, io, &disp, &cert, ds.owned[0].id, .{ .pacing = m.pacing, .cubic = m.cubic, .bbr = m.bbr }, link, mib << 20);
+            const wall = @as(f64, @floatFromInt(r.wall_ns)) / 1e9;
+            const cpu = @as(f64, @floatFromInt(r.cpu_ns)) / 1e6;
+            std.debug.print("{s:<14} {s:<13} {d:>6} {d:>7.2} {d:>8.1} {d:>9.1} {d:>7.1} {d:>10.2} {d:>10.0} {d:>10.0} {d:>7}\n", .{
+                link.name,                                 m.name,                                   r.bytes >> 20,
+                wall,                                      @as(f64, @floatFromInt(r.bytes)) * 8 / 1e6 / wall, cpu,
+                cpu / 10 / wall,                           cpu / @as(f64, @floatFromInt(r.bytes >> 20)), @as(f64, @floatFromInt(r.passes)) / wall,
+                @as(f64, @floatFromInt(r.polls)) / wall, r.dropped,
+            });
+            try std.testing.expect(r.bytes >= mib << 20);
+        }
+    }
+}
+
 test "native listener: the path MTU ceiling follows the address family; switches default off" {
     const v4: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(1) };
     try std.testing.expectEqual(@as(u16, 1472), pathCeiling(&v4));
@@ -1343,8 +1624,8 @@ test "native listener: the path MTU ceiling follows the address family; switches
     v6.ip6.bytes[11] = 0xff;
     try std.testing.expectEqual(@as(u16, 1472), pathCeiling(&v6));
     const o: Options = .{ .listen = v4, .identity_seed = @splat(0), .cert = undefined };
-    try std.testing.expect(!o.pacing and !o.hystart and !o.cubic and !o.pmtud and !o.iw_mtu and !o.early_settings);
+    try std.testing.expect(!o.pacing and !o.hystart and !o.cubic and !o.pmtud and !o.iw_mtu and !o.bbr and !o.early_settings);
     const d: conn_mod.Config = .{ .server_name = "", .identity_seed = @splat(0), .seed = @splat(0), .now_unix = 0 };
-    try std.testing.expect(!d.pacing and !d.hystart and !d.cubic and !d.pmtud and !d.iw_mtu and !d.early_send);
+    try std.testing.expect(!d.pacing and !d.hystart and !d.cubic and !d.pmtud and !d.iw_mtu and !d.bbr and !d.early_send);
     try std.testing.expect(!envSwitch("ZUI_NATIVE_NO_SUCH_SWITCH", false) and envSwitch("ZUI_NATIVE_NO_SUCH_SWITCH", true));
 }

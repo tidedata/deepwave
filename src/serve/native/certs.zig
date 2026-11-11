@@ -25,6 +25,10 @@
 //! 204). The files are checked at start (the chain parses and is in order, the key is the
 //! leaf's, nothing has expired) and loaded again on SIGHUP or when they change on disk; a
 //! reload that fails the same checks is refused and the certificate in use stays.
+//!
+//! The gRPC TLS port keeps `--serve-tls-cert` and `--serve-tls-key` current with the same
+//! machinery (`Certs.initLoaded`, tcptls.zig): the node reads the files at start as it always
+//! did, and from then on a SIGHUP or a change on disk loads them again under the checks above.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -183,10 +187,10 @@ pub fn check(id: *const tls_identity.Identity, now: i64) LoadError!Checked {
 }
 
 /// Size, modification time and inode of both files: a change means "load them again".
-const Stamp = struct {
+pub const Stamp = struct {
     v: [2][3]i128 = @splat(@splat(-1)),
 
-    fn of(io: Io, f: Files) Stamp {
+    pub fn of(io: Io, f: Files) Stamp {
         var s: Stamp = .{};
         for ([_][]const u8{ f.cert, f.key }, 0..) |path, i| {
             const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
@@ -239,6 +243,8 @@ pub const Stats = struct {
     /// `--native-cert`: reloads that replaced the certificate, and reloads refused.
     reloads: Atomic(u64) = .init(0),
     reload_errors: Atomic(u64) = .init(0),
+    /// Unix second of the last reload that replaced the certificate (0: none since start).
+    last_reload: Atomic(i64) = .init(0),
 };
 
 pub const Options = struct {
@@ -257,6 +263,8 @@ pub const Options = struct {
     reload: ?*Atomic(bool) = null,
     /// The files are looked at for a change once in this many ticks (250 ms each).
     poll_ticks: u32 = 20,
+    /// What the reload lines in the log start with (the listener the files belong to).
+    label: []const u8 = "zui/1",
 };
 
 pub const Certs = struct {
@@ -275,6 +283,9 @@ pub const Certs = struct {
     file_stale: bool = false,
     stop_flag: Atomic(bool) = .init(false),
     thread: ?std.Thread = null,
+    /// `initLoaded`: why a reload would refuse the chain and key taken at start (null: it
+    /// would not).
+    start_refusal: ?LoadError = null,
 
     /// The certificates of the current period (or the loaded chain), and the hash file written.
     /// Nothing rotates or reloads until `start` (or a caller's `tick`).
@@ -307,11 +318,47 @@ pub const Certs = struct {
         return cs;
     }
 
+    /// For a listener that read and parsed `opts.files` itself (the gRPC TLS port starts with
+    /// what sui-node starts with, so nothing is refused here): `id` is presented as it is, and
+    /// the files are loaded again, checked, on SIGHUP or once they differ from `stamp` (taken
+    /// before the caller read them). No hash file. Takes `id`, also when it fails.
+    pub fn initLoaded(gpa: Allocator, io: Io, opts: Options, id: tls_identity.Identity, stamp: Stamp) Allocator.Error!*Certs {
+        var chain = id;
+        errdefer chain.deinit();
+        std.debug.assert(opts.files != null and opts.hash_file == null);
+        const cs = try gpa.create(Certs);
+        errdefer gpa.destroy(cs);
+        const e = try gpa.create(Entry);
+        const now = opts.clock.now(io);
+        e.* = derive(opts.seed, periodOf(now), opts.name);
+        cs.* = .{ .gpa = gpa, .io = io, .opts = opts, .cur = e, .next = null, .stamp = stamp };
+        if (check(&chain, now)) |ok| {
+            e.sha256 = ok.sha256;
+            e.leaf_not_after = ok.not_after;
+        } else |why| {
+            cs.start_refusal = why;
+            std.crypto.hash.sha2.Sha256.hash(chain.certs[0], &e.sha256, .{});
+            if (tls_identity.parseCertificate(chain.certs[0])) |leaf| {
+                e.leaf_not_after = @intCast(leaf.validity.not_after);
+            } else |_| {}
+        }
+        e.chain = chain;
+        cs.stats.not_after.store(e.notAfter(), .release);
+        return cs;
+    }
+
+    /// Stops the rotation (or reload) thread; the certificates stay, for an owner whose
+    /// connection threads may still be in a handshake (the node's gRPC TLS port at stop).
+    pub fn halt(cs: *Certs) void {
+        cs.stop_flag.store(true, .release);
+        if (cs.thread) |t| t.join();
+        cs.thread = null;
+    }
+
     /// Stops the rotation thread and frees the certificates. The listener is stopped first (it
     /// holds references).
     pub fn deinit(cs: *Certs) void {
-        cs.stop_flag.store(true, .release);
-        if (cs.thread) |t| t.join();
+        cs.halt();
         std.debug.assert(cs.cur.refs == 0 and (cs.next == null or cs.next.?.refs == 0));
         cs.destroy(cs.cur);
         if (cs.next) |n| cs.destroy(n);
@@ -350,7 +397,8 @@ pub const Certs = struct {
     pub fn reload(cs: *Certs) LoadError!void {
         const f = cs.opts.files orelse return;
         cs.stamp = Stamp.of(cs.io, f);
-        const e = try cs.load(f, cs.opts.clock.now(cs.io));
+        const now = cs.opts.clock.now(cs.io);
+        const e = try cs.load(f, now);
         cs.mu.lockUncancelable(cs.io);
         const old = cs.cur;
         const old_hash = old.sha256;
@@ -358,8 +406,9 @@ pub const Certs = struct {
         cs.retire(old);
         cs.mu.unlock(cs.io);
         cs.stats.not_after.store(e.notAfter(), .release);
+        cs.stats.last_reload.store(now, .release);
         _ = cs.stats.reloads.fetchAdd(1, .monotonic);
-        std.log.info("zui/1: certificate loaded again from {s}: {d} certificate(s), {s} key, leaf sha256 {x} (was {x}), not after unix {d}", .{ f.cert, e.chain.?.certs.len, @tagName(e.chain.?.key), &e.sha256, &old_hash, e.notAfter() });
+        std.log.info("{s}: certificate loaded again from {s}: {d} certificate(s), {s} key, leaf sha256 {x} (was {x}), not after unix {d}", .{ cs.opts.label, f.cert, e.chain.?.certs.len, @tagName(e.chain.?.key), &e.sha256, &old_hash, e.notAfter() });
     }
 
     /// `--native-cert`: a reload when one was asked for (SIGHUP) or the files changed. True
@@ -373,7 +422,7 @@ pub const Certs = struct {
         }
         cs.reload() catch |e| {
             _ = cs.stats.reload_errors.fetchAdd(1, .monotonic);
-            std.log.warn("zui/1: certificate reload from {s} and {s} refused: {s}; the certificate in use stays", .{ f.cert, f.key, describe(e) });
+            std.log.warn("{s}: certificate reload from {s} and {s} refused: {s}; the certificate in use stays", .{ cs.opts.label, f.cert, f.key, describe(e) });
             return false;
         };
         return true;

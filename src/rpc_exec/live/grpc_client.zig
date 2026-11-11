@@ -83,6 +83,29 @@ pub const Security = union(enum) {
     pinned: [32]u8,
     /// TLS against the system CA bundle, host name checked (public fullnodes).
     ca,
+    /// TLS, the leaf certificate must hash (SHA-256 of its DER) to this value: a deepwave core's
+    /// `--serve-tls` certificate, pinned by an edge (`--core-upstream`). No name is checked.
+    pinned_cert: [32]u8,
+};
+
+/// A raw call (edge forwarding, src/edge/forward.zig): the response is not decoded. Its DATA
+/// bytes (gRPC frames, cut wherever the h2 frames cut them) go to `on_data` as they arrive, in
+/// order, under the connection lock: the receiver copies them and returns. The call ends with
+/// `Sink.done` and a `.status` result whatever the code (0 included), carrying the trailers'
+/// `grpc-message` and `grpc-status-details-bin` as received. The stream's receive window is not
+/// refilled by the reader: the receiver gives bytes back with `Conn.credit` once it has passed
+/// them on, so a slow reader downstream holds at most one window (`recv_window`) per call.
+pub const Raw = struct {
+    on_data: *const fn (ctx: *anyopaque, tag: u64, bytes: []const u8) void,
+};
+
+/// Per-call options of `Conn.startOpts`.
+pub const CallOpts = struct {
+    /// `grpc-timeout` in milliseconds (null: none).
+    timeout_ms: ?u64 = null,
+    raw: ?Raw = null,
+    /// `x-sui-client-protocol-version`, passed through for a forwarded call.
+    client_protocol_version: ?u64 = null,
 };
 
 pub const Endpoint = struct {
@@ -365,6 +388,8 @@ const Call = struct {
     grpc_details: []u8 = &.{},
     http_status: ?u16 = null,
     end_sent: bool = false,
+    /// A raw call (`Raw`): DATA goes to it instead of `data`.
+    raw: ?Raw = null,
 };
 
 pub const Conn = struct {
@@ -421,7 +446,7 @@ pub const Conn = struct {
     /// Monotonic ns of the first GOAWAY (0: none); set before `draining`.
     goaway_at: std.atomic.Value(u64) = .init(0),
 
-    const Queued = struct { id_slot: *u32, path: []u8, body: []u8, sink: Sink, tag: u64, timeout_ms: ?u64 };
+    const Queued = struct { id_slot: *u32, path: []u8, body: []u8, sink: Sink, tag: u64, opts: CallOpts };
 
     /// Starts connecting in the background.
     pub fn open(gpa: Allocator, io: Io, ep: Endpoint) !*Conn {
@@ -532,6 +557,11 @@ pub const Conn = struct {
     /// takes. Never blocks on the network beyond a socket write, and that within the send
     /// timeouts (the connection is then dead and the call answered UNAVAILABLE).
     pub fn start(c: *Conn, id_slot: *u32, path: []const u8, body: []const u8, sink: Sink, tag: u64, timeout_ms: ?u64) void {
+        return c.startOpts(id_slot, path, body, sink, tag, .{ .timeout_ms = timeout_ms });
+    }
+
+    /// `start` with per-call options (a raw call, extra request metadata).
+    pub fn startOpts(c: *Conn, id_slot: *u32, path: []const u8, body: []const u8, sink: Sink, tag: u64, opts: CallOpts) void {
         id_slot.* = 0;
         c.lockForWrite();
         defer c.mu.unlock(c.io);
@@ -542,31 +572,31 @@ pub const Conn = struct {
             .connecting => {
                 if (path.len + body.len > max_queued_bytes -| c.queued_bytes)
                     return sink.done(sink.ctx, tag, .{ .status = .{ .code = 14, .message = "transport error: connecting, too many calls waiting" } });
-                c.enqueueLocked(id_slot, path, body, sink, tag, timeout_ms);
+                c.enqueueLocked(id_slot, path, body, sink, tag, opts);
             },
             .ready => if (c.draining.load(.monotonic)) {
                 // the peer takes no new streams: the caller's next connection will
                 sink.done(sink.ctx, tag, .{ .status = .{ .code = 14, .message = goaway_reason } });
             } else if (c.queued.items.len == 0 and c.calls.count() < c.peer_max_streams) {
-                c.startLocked(id_slot, path, body, sink, tag, timeout_ms);
+                c.startLocked(id_slot, path, body, sink, tag, opts);
             } else {
                 // as many streams open as the peer allows (or calls already waiting for that):
                 // behind them, started as open ones finish (`startQueuedLocked`)
                 if (path.len + body.len > max_queued_bytes -| c.queued_bytes)
                     return sink.done(sink.ctx, tag, .{ .status = .{ .code = 14, .message = "transport error: too many calls waiting for a stream" } });
-                c.enqueueLocked(id_slot, path, body, sink, tag, timeout_ms);
+                c.enqueueLocked(id_slot, path, body, sink, tag, opts);
                 c.startQueuedLocked(); // nothing, unless room appeared since the queue formed
             },
         }
     }
 
-    fn enqueueLocked(c: *Conn, id_slot: *u32, path: []const u8, body: []const u8, sink: Sink, tag: u64, timeout_ms: ?u64) void {
+    fn enqueueLocked(c: *Conn, id_slot: *u32, path: []const u8, body: []const u8, sink: Sink, tag: u64, opts: CallOpts) void {
         const p = c.gpa.dupe(u8, path) catch return oom(sink, tag);
         const b = c.gpa.dupe(u8, body) catch {
             c.gpa.free(p);
             return oom(sink, tag);
         };
-        c.queued.append(c.gpa, .{ .id_slot = id_slot, .path = p, .body = b, .sink = sink, .tag = tag, .timeout_ms = timeout_ms }) catch {
+        c.queued.append(c.gpa, .{ .id_slot = id_slot, .path = p, .body = b, .sink = sink, .tag = tag, .opts = opts }) catch {
             c.gpa.free(p);
             c.gpa.free(b);
             return oom(sink, tag);
@@ -582,7 +612,7 @@ pub const Conn = struct {
         while (c.state == .ready and !c.draining.load(.monotonic) and c.queued.items.len > 0 and c.calls.count() < c.peer_max_streams) {
             const q = c.queued.orderedRemove(0);
             c.queued_bytes -|= q.path.len + q.body.len;
-            c.startLocked(q.id_slot, q.path, q.body, q.sink, q.tag, q.timeout_ms);
+            c.startLocked(q.id_slot, q.path, q.body, q.sink, q.tag, q.opts);
             c.gpa.free(q.path);
             c.gpa.free(q.body);
         }
@@ -619,6 +649,24 @@ pub const Conn = struct {
         }
     }
 
+    /// A raw call's receiver has passed `n` response bytes on: the stream's receive window
+    /// gets them back (WINDOW_UPDATE). Nothing for a call that is over.
+    pub fn credit(c: *Conn, id_slot: *const u32, n: usize) void {
+        if (n == 0) return;
+        c.lockForWrite();
+        defer c.mu.unlock(c.io);
+        if (id_slot.* == 0 or c.state != .ready or !c.calls.contains(id_slot.*)) return;
+        var left = n;
+        while (left > 0) {
+            const step: u32 = @intCast(@min(left, 0x7fff_ffff));
+            var wu: [4]u8 = undefined;
+            std.mem.writeInt(u32, &wu, step, .big);
+            c.writeFrame(frame_window, 0, id_slot.*, &wu) catch return c.dieLocked("write failed");
+            left -= step;
+        }
+        c.flush();
+    }
+
     /// Frees a call taken out of `calls`; its response bytes no longer count for the connection.
     fn dropCall(c: *Conn, call: *Call) void {
         c.buffered -|= call.data.items.len;
@@ -629,7 +677,8 @@ pub const Conn = struct {
         sink.done(sink.ctx, tag, .{ .status = .{ .code = 8, .message = "out of memory" } });
     }
 
-    fn startLocked(c: *Conn, id_slot: *u32, path: []const u8, body: []const u8, sink: Sink, tag: u64, timeout_ms: ?u64) void {
+    fn startLocked(c: *Conn, id_slot: *u32, path: []const u8, body: []const u8, sink: Sink, tag: u64, opts: CallOpts) void {
+        const timeout_ms = opts.timeout_ms;
         const id = c.next_stream;
         c.next_stream += 2;
         const call = c.gpa.create(Call) catch return oom(sink, tag);
@@ -640,7 +689,7 @@ pub const Conn = struct {
         out[0] = 0;
         std.mem.writeInt(u32, out[1..5], @intCast(body.len), .big);
         @memcpy(out[5..], body);
-        call.* = .{ .sink = sink, .tag = tag, .out = out, .send_window = c.peer_initial_window };
+        call.* = .{ .sink = sink, .tag = tag, .out = out, .send_window = c.peer_initial_window, .raw = opts.raw };
         c.calls.put(c.gpa, id, call) catch {
             freeCall(c.gpa, call);
             return oom(sink, tag);
@@ -663,6 +712,10 @@ pub const Conn = struct {
         if (timeout_ms) |t| {
             const v = std.fmt.bufPrint(&tbuf, "{d}m", .{t}) catch unreachable;
             hpack.encodeLiteral(&hb, c.gpa, "grpc-timeout", v) catch return c.failCallLocked(id, "out of memory");
+        }
+        if (opts.client_protocol_version) |pv| {
+            const v = std.fmt.bufPrint(&tbuf, "{d}", .{pv}) catch unreachable;
+            hpack.encodeLiteral(&hb, c.gpa, "x-sui-client-protocol-version", v) catch return c.failCallLocked(id, "out of memory");
         }
         c.writeHeaderBlock(id, hb.items) catch return c.dieLocked("write failed");
         c.pumpLocked(id, call) catch return c.dieLocked("write failed");
@@ -918,13 +971,21 @@ pub const Conn = struct {
             const now = Io.Clock.real.now(io);
             if (c.ep.security == .ca) bundle.rescan(gpa, io, now) catch return error.TlsFailed;
             tls.* = tls_client.init(&sr.interface, &sw.interface, .{
-                .host = .{ .explicit = if (c.ep.security == .ca) c.ep.host else c.ep.server_name },
+                .host = switch (c.ep.security) {
+                    .ca => .{ .explicit = c.ep.host },
+                    .pinned_cert => .no_verification,
+                    else => .{ .explicit = c.ep.server_name },
+                },
                 .ca = switch (c.ep.security) {
                     .ca => .{ .bundle = .{ .gpa = gpa, .io = io, .lock = &t.bundle_lock, .bundle = bundle } },
                     else => .no_verification,
                 },
                 .pin_ed25519 = switch (c.ep.security) {
                     .pinned => |k| k,
+                    else => null,
+                },
+                .pin_cert_sha256 = switch (c.ep.security) {
+                    .pinned_cert => |h| h,
                     else => null,
                 },
                 .read_buffer = tls_r,
@@ -1124,8 +1185,13 @@ pub const Conn = struct {
                         body = body[0 .. body.len - pad];
                     }
                     var overflow: ?[]const u8 = null;
+                    var raw_call = false;
                     if (c.calls.get(id)) |call| {
-                        if (call.data.items.len + body.len > max_response_bytes) {
+                        if (call.raw) |rw| {
+                            // not held here: the receiver owns the bytes and the window (`credit`)
+                            raw_call = true;
+                            if (body.len > 0) rw.on_data(call.sink.ctx, call.tag, body);
+                        } else if (call.data.items.len + body.len > max_response_bytes) {
                             overflow = "response message too large";
                         } else if (body.len > max_conn_response_bytes -| c.buffered) {
                             overflow = "response buffers of the connection are full";
@@ -1148,9 +1214,12 @@ pub const Conn = struct {
                     // replenish windows (per stream and connection) once half is used
                     conn_recv_used += len;
                     if (len > 0) {
-                        if (flags & flag_end_stream == 0 and c.calls.contains(id)) {
+                        // (a raw call's receiver gives the message bytes back itself; padding is
+                        // nobody's, so it is given back here)
+                        const back: u32 = if (raw_call) len - @as(u32, @intCast(body.len)) else len;
+                        if (flags & flag_end_stream == 0 and back > 0 and c.calls.contains(id)) {
                             var wu: [4]u8 = undefined;
-                            std.mem.writeInt(u32, &wu, len, .big);
+                            std.mem.writeInt(u32, &wu, back, .big);
                             try c.writeFrame(frame_window, 0, id, &wu);
                         }
                         if (conn_recv_used >= recv_window / 2) {
@@ -1196,7 +1265,7 @@ pub const Conn = struct {
                 else => 2,
             };
         };
-        if (st != 0) return sink.done(sink.ctx, call.tag, .{ .status = .{ .code = st, .message = call.grpc_message, .details = call.grpc_details } });
+        if (st != 0 or call.raw != null) return sink.done(sink.ctx, call.tag, .{ .status = .{ .code = st, .message = call.grpc_message, .details = call.grpc_details } });
         sink.done(sink.ctx, call.tag, decodeUnary(call.data.items));
     }
 

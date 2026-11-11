@@ -50,6 +50,27 @@ pub fn findImage(snap: *const store.Snapshot, epoch: u64) ?Image {
     return .{ .epoch = epoch, .at = at };
 }
 
+/// Catch-up or tip, from the age of the newest applied checkpoint (wall clock minus its
+/// timestamp): at the tip up to `tip_lag_ms`, in catch-up above `catchup_lag_ms`. The one signal
+/// background work paces itself on: this job's image walk (`rate`) and deferred age-out
+/// (`Node.noteLag`).
+pub const tip_lag_ms: u64 = 3_000;
+pub const catchup_lag_ms: u64 = 10_000;
+
+/// Whether a node that was (`was`) or was not behind is behind now, `lag_ms` behind the tip: it
+/// falls behind above `catchup_lag_ms` and is back at the tip at `tip_lag_ms` or less.
+pub fn behind(was: bool, lag_ms: u64) bool {
+    return lag_ms > if (was) tip_lag_ms else catchup_lag_ms;
+}
+
+test "catch-up signal: behind above 10 s, at the tip again at 3 s or less" {
+    try std.testing.expect(!behind(false, 0));
+    try std.testing.expect(!behind(false, 10_000));
+    try std.testing.expect(behind(false, 10_001));
+    try std.testing.expect(behind(true, 3_001));
+    try std.testing.expect(!behind(true, 3_000));
+}
+
 pub const Job = struct {
     gpa: std.mem.Allocator,
     st: *store.Store,
@@ -330,11 +351,11 @@ pub const Job = struct {
         const ts = j.tip_ts_ms.load(.monotonic);
         if (ts == 0) return j.max_bps;
         const lag = wallMs() -| ts;
-        if (lag > 10_000) return j.catchup_bps;
-        if (lag <= 3_000) return j.max_bps;
+        if (lag > catchup_lag_ms) return j.catchup_bps;
+        if (lag <= tip_lag_ms) return j.max_bps;
         // 3 to 10 s behind: from the full budget (or 1 GiB/s) down to a quarter of it
         const top = if (j.max_bps != 0) j.max_bps else 1 << 30;
-        return @max(j.catchup_bps, top - (top * 3 / 4) * (lag - 3_000) / 7_000);
+        return @max(j.catchup_bps, top - (top * 3 / 4) * (lag - tip_lag_ms) / (catchup_lag_ms - tip_lag_ms));
     }
 
     /// Called per read window of the image walk: holds the walker to the budget, and stops.

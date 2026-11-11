@@ -104,6 +104,16 @@ pub const Dicts = struct {
     /// calls this (it reads `samples` checkpoints). Error.Unavailable: the store holds too few
     /// checkpoints yet; what could be built is published, try again later.
     pub fn warm(d: *Dicts, snap: *store.Snapshot) !void {
+        return d.warmCancel(snap, null);
+    }
+
+    /// `warm` that gives up with `error.Cancelled` once `cancel` is set (the node is stopping):
+    /// looked at before every sample (each one assembles a checkpoint's feed and reads its
+    /// transactions and objects from the store, which on a cold store is most of the time a
+    /// warm takes) and before every dictionary is built. A kind is published whole or not at
+    /// all, so a cancelled warm leaves nothing half made: what was already published stays,
+    /// the rest is built by a later call.
+    pub fn warmCancel(d: *Dicts, snap: *store.Snapshot, cancel: ?*const std.atomic.Value(bool)) !void {
         if (d.ready()) return;
         while (!d.mu.tryLock()) std.atomic.spinLoopHint();
         defer d.mu.unlock();
@@ -116,6 +126,7 @@ pub const Dicts = struct {
         var seq = hi;
         var taken: u32 = 0;
         while (taken < d.samples and seq >= lo) {
+            if (cancelled(cancel)) return error.Cancelled;
             if (try sample(a, snap, seq)) |s| {
                 taken += 1;
                 for (&lists, s) |*l, x| if (x.len > 0) try l.append(a, x);
@@ -126,6 +137,7 @@ pub const Dicts = struct {
         var missing = false;
         for (&lists, 0..) |*l, k| {
             if (d.built[k]) continue;
+            if (cancelled(cancel)) return error.Cancelled;
             if (l.items.len < 2) {
                 missing = true;
                 continue;
@@ -139,6 +151,10 @@ pub const Dicts = struct {
         // A kind with no samples in a store that already spans every sampled checkpoint (no
         // object history, say) never gets one: stop asking.
         if (missing and taken < d.samples) return error.Unavailable;
+    }
+
+    fn cancelled(cancel: ?*const std.atomic.Value(bool)) bool {
+        return if (cancel) |c| c.load(.acquire) else false;
     }
 
     /// Compresses the OK response in `out` in place when the request allowed it (flag ZSTD_OK),
@@ -207,6 +223,77 @@ fn sample(a: Allocator, snap: *store.Snapshot, seq: u64) !?[kinds][]const u8 {
 
 const dispatch = @import("dispatch.zig");
 const edgefeed = @import("edgefeed.zig");
+
+test "dictionary warm: a cancel ends it at the next sample, before anything is built; nothing is published half made and a later warm starts over" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const plen = try tmp.dir.realPath(io, &pb);
+    var cfg: store.Config = .{ .max_live_objects = 1 << 12, .max_object_versions = 1 << 12, .max_transactions = 1 << 12, .max_checkpoints = 1 << 12 };
+    cfg.dir = pb[0..plen];
+    const h = try store.openDir(gpa, io, &cfg, .{ .sync = .none });
+    defer {
+        h.store.deinit();
+        h.io.deinit();
+    }
+    {
+        const b = try h.store.begin(1, 1);
+        try b.checkpoint("summary-1", "contents-1");
+        try h.store.commit(b);
+    }
+    var d = Dicts.init(gpa);
+    defer d.deinit();
+    // a warm that would sample for a long time: the one checkpoint, again and again
+    d.samples = 400_000;
+    d.stride = 0;
+    const T = struct {
+        d: *Dicts,
+        st: *store.Store,
+        cancel: std.atomic.Value(bool) = .init(false),
+        cancelled: bool = false,
+        other: bool = false,
+        done_ns: std.atomic.Value(u64) = .init(0),
+        fn now() u64 {
+            var ts: std.posix.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        }
+        fn run(t: *@This()) void {
+            var snap = t.st.snapshot();
+            defer snap.release();
+            if (t.d.warmCancel(&snap, &t.cancel)) |_| {
+                t.other = true;
+            } else |e| if (e == error.Cancelled) {
+                t.cancelled = true;
+            } else {
+                t.other = true;
+            }
+            t.done_ns.store(now(), .release);
+        }
+    };
+    var t: T = .{ .d = &d, .st = h.store };
+    const th = try std.Thread.spawn(.{}, T.run, .{&t});
+    io.sleep(.fromMilliseconds(20), .awake) catch {};
+    const t0 = T.now();
+    t.cancel.store(true, .release);
+    // bounded either way: without the cancel the warm ends by itself after its samples
+    th.join();
+    try std.testing.expect(t.cancelled and !t.other);
+    try std.testing.expect(t.done_ns.load(.acquire) -| t0 < 500 * std.time.ns_per_ms);
+    // nothing was published, whole or half
+    try std.testing.expect(!d.ready());
+    for (&d.slots) |*s| try std.testing.expect(s.load(.acquire) == null);
+    for (d.built) |b| try std.testing.expect(!b);
+    // a flag set before the call: no sample is taken at all
+    var snap = h.store.snapshot();
+    defer snap.release();
+    try std.testing.expectError(error.Cancelled, d.warmCancel(&snap, &t.cancel));
+    // and without one the same call runs: a short warm now ends by itself, not cancelled
+    d.samples = 2;
+    if (d.warm(&snap)) |_| {} else |e| try std.testing.expect(e != error.Cancelled);
+}
 
 test "compressResponse: frames OK bodies over 1 KiB, with and without a dictionary" {
     const gpa = std.testing.allocator;

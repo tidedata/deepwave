@@ -135,7 +135,7 @@ fn info(ctx: *anyopaque, out: *h2.meta.Info) void {
     out.chain_id = svc.info_cache.chainId(&svc.chain_id);
     out.chain = svc.chain_name;
     out.tip = currentTip(svc);
-    out.lowest = if (out.tip != null) service.lowestOf(svc) else null;
+    out.lowest = if (out.tip != null) service.reportedLowest(svc) else null;
     out.server = svc.server_header;
 }
 

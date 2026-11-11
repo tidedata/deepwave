@@ -17,13 +17,16 @@ pub const certhttp = @import("certhttp.zig");
 pub const tcptls = @import("tcptls.zig");
 pub const indexq = @import("indexq.zig");
 pub const jobs = @import("jobs.zig");
+pub const fairq = @import("fairq.zig");
 pub const edgefeed = @import("edgefeed.zig");
 pub const dicts = @import("dicts.zig");
 pub const agentpass = @import("agentpass.zig");
 
 test {
     _ = @import("certs_test.zig");
+    _ = @import("tcptls_reload_test.zig");
     _ = @import("hello_test.zig");
+    _ = @import("feedshare_test.zig");
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(listener.Listener);
     std.testing.refAllDecls(dispatch.Dispatcher);

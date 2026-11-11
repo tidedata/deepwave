@@ -61,6 +61,10 @@ pub const default_watermark_interval = 25;
 /// silently dead path (h2 window at zero, so TCP has nothing to time out) cannot pin a pump.
 pub const default_stall_timeout_ms = 600_000;
 
+/// The end of a local checkpoint stream whose mask renders certificates, at the first
+/// checkpoint whose certificate is not the core's (an edge with a core upstream).
+pub const foreign_cert_text = "edge holds another certificate for this checkpoint than its core; reconnect";
+
 pub const Kind = enum { checkpoints, transactions, events };
 pub const Reason = enum(u8) { client_closed, slow_consumer, source_lag, service_shutdown };
 
@@ -96,6 +100,8 @@ pub const Sub = struct {
     len: usize = 0,
     /// Set by the hub: no update follows what is queued.
     end: ?Reason = null,
+    /// With `end`: the stream ends UNAVAILABLE with this text instead of OK (`endAllUnavailable`).
+    end_unavailable: ?[]const u8 = null,
     /// Set by the consumer once its stream is over; the hub drops the subscriber.
     gone: bool = false,
     needs_start: bool,
@@ -142,6 +148,9 @@ pub const Stats = struct {
     bytes: Atomic(u64) = .init(0),
     published: Atomic(u64) = .init(0),
     terminations: [4]Atomic(u64) = @splat(.init(0)),
+    /// Local checkpoint streams ended at a checkpoint whose certificate is not the core's
+    /// (`foreign_cert_text`; an edge with a core upstream).
+    foreign_cert_ends: Atomic(u64) = .init(0),
     /// Wall clock (ms) minus the checkpoint timestamp when the hub published it, last value.
     publish_lag_ms: Atomic(u64) = .init(0),
 };
@@ -207,6 +216,28 @@ pub const Hub = struct {
             const idle = h.stats.subscribers.load(.monotonic) == 0;
             h.io.sleep(.fromMilliseconds(if (idle) 20 else 1), .awake) catch {};
         }
+    }
+
+    /// Ends every open stream with UNAVAILABLE and `text` (a static string): an edge that fell
+    /// behind its core closes its local streams so their clients reconnect and are forwarded
+    /// (src/edge/forward.zig, the freshness guard). What is already queued is dropped: it is
+    /// what the edge is behind on. Counted under `source_lag`. Returns how many it ended.
+    pub fn endAllUnavailable(h: *Hub, text: []const u8) usize {
+        h.mu.lockUncancelable(h.io);
+        defer h.mu.unlock(h.io);
+        var n: usize = 0;
+        for (h.subs.items) |s| if (s.end == null) {
+            while (s.len > 0) {
+                s.ring[s.head].free(h.gpa);
+                s.head = (s.head + 1) % queue_cap;
+                s.len -= 1;
+            }
+            s.end_unavailable = text;
+            h.endSub(s, .source_lag);
+            n += 1;
+        };
+        h.dropUncounted();
+        return n;
     }
 
     /// Under `h.mu`. A hub-side end (anything but `client_closed`) frees the slot now; the
@@ -655,7 +686,7 @@ fn pumpRun(ctx: *anyopaque, link: *stream_conn.Link) void {
         }
         if (ended) {
             // sui-node: the stream ends when the actor drops the subscriber; tonic sends OK.
-            link.finish(.ok, "");
+            if (s.end_unavailable) |text| link.finish(.unavailable, text) else link.finish(.ok, "");
             return;
         }
         if (blocked and hub_ended) {
@@ -676,6 +707,11 @@ fn pumpRun(ctx: *anyopaque, link: *stream_conn.Link) void {
         defer u.free(h.gpa);
         sendUpdate(s, link, u, &out) catch |e| switch (e) {
             error.Closed => return,
+            error.ForeignCert => {
+                _ = h.stats.foreign_cert_ends.fetchAdd(1, .monotonic);
+                link.finish(.unavailable, foreign_cert_text);
+                return;
+            },
             else => {
                 std.log.err("subscription frame for checkpoint {d}: {s}", .{ u.cp, @errorName(e) });
                 link.finish(.internal, @errorName(e));
@@ -798,6 +834,16 @@ fn renderCheckpointUpdate(s: *Sub, arena: Allocator, u: Update, out: *std.ArrayL
     switch (u.tag) {
         .tick => return renderInto(h.gpa, out, CpTick{ .cp = u.cp }, CpTick.render),
         .matched => {
+            // An edge with a core upstream: the certificate of a checkpoint it did not take
+            // from a core is not the core's (docs/EDGE.md section 13). A stream cannot be
+            // handed over, so it ends here and its client comes back through the routing.
+            // Asked before the record is read, as GetCheckpoint does.
+            // With no core reachable the certificate the edge holds goes out (it verifies).
+            if (m.contains("signature")) switch (service.certState(h.svc, u.cp)) {
+                .core => {},
+                .withhold => return error.ForeignCert,
+                .held => if (h.svc.foreign_cert) |fc| fc.served_held(fc.ctx),
+            };
             var snap = h.svc.store.snapshot();
             defer snap.release();
             const rec = snap.checkpoint(u.cp) orelse return error.CheckpointGone;
@@ -1170,6 +1216,89 @@ test "slow consumer frees its slot at once; the pump drains without a snapshot h
     try testing.expectEqual(@as(usize, 0), h.reserved.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), h.stats.subscribers.load(.monotonic));
     try testing.expectEqual(@as(u64, 1), h.stats.terminations[@backingInt(Reason.slow_consumer)].load(.monotonic));
+}
+
+test "an edge's local checkpoint stream ends UNAVAILABLE at the first checkpoint whose certificate is not its core's when its mask renders the certificate; a stream that does not render it goes on" {
+    var node: TestNode = undefined;
+    try node.init(6);
+    defer node.deinit();
+    const h = &node.hub;
+    // checkpoint 4 came from another source than the core and is not replaced yet
+    const Marks = struct {
+        var no_core: bool = false;
+        var served: u32 = 0;
+        fn state(_: *anyopaque, seq: u64) service.CertState {
+            if (seq != 4) return .core;
+            return if (no_core) .held else .withhold;
+        }
+        fn servedHeld(_: *anyopaque) void {
+            served += 1;
+        }
+    };
+    Marks.no_core = false;
+    Marks.served = 0;
+    var ctx: u8 = 0;
+    node.svc.foreign_cert = .{ .ctx = &ctx, .state = Marks.state, .served_held = Marks.servedHeld };
+    const with_cert = h.subscribe(.checkpoints).?;
+    with_cert.mask_tree = try mask.Tree.parse(with_cert.arena.allocator(), "sequence_number,signature");
+    try h.activate(with_cert);
+    const without = (try node.subscribe()).?;
+    for ([_]u64{ 3, 4, 5 }) |seq| h.publish(seq);
+    h.mu.lockUncancelable(h.io);
+    h.endSub(with_cert, .service_shutdown);
+    h.endSub(without, .service_shutdown);
+    h.dropUncounted();
+    h.mu.unlock(h.io);
+    // checkpoint 3 goes out; at 4 the stream ends, and nothing of 4 or 5 was sent
+    var fl: FakeLink = .{ .node = &node };
+    var l = fl.link();
+    pumpRun(with_cert, &l);
+    pumpDone(with_cert);
+    try testing.expectEqual(@as(u32, 1), fl.sent);
+    try testing.expectEqual(@as(?h2.Status, .unavailable), fl.finished);
+    try testing.expectEqual(@as(u64, 1), h.stats.foreign_cert_ends.load(.monotonic));
+    // the default mask renders no certificate: all three, then the hub's own end
+    var fl2: FakeLink = .{ .node = &node };
+    var l2 = fl2.link();
+    pumpRun(without, &l2);
+    pumpDone(without);
+    try testing.expectEqual(@as(u32, 3), fl2.sent);
+    try testing.expectEqual(@as(?h2.Status, .ok), fl2.finished);
+    try testing.expectEqual(@as(u64, 1), h.stats.foreign_cert_ends.load(.monotonic));
+    // no core reachable: the stream goes on, checkpoint 4 with the certificate the edge holds
+    Marks.no_core = true;
+    const held = h.subscribe(.checkpoints).?;
+    held.mask_tree = try mask.Tree.parse(held.arena.allocator(), "sequence_number,signature");
+    try h.activate(held);
+    for ([_]u64{ 3, 4, 5 }) |seq| h.publish(seq);
+    h.mu.lockUncancelable(h.io);
+    h.endSub(held, .service_shutdown);
+    h.dropUncounted();
+    h.mu.unlock(h.io);
+    var fl4: FakeLink = .{ .node = &node };
+    var l4 = fl4.link();
+    pumpRun(held, &l4);
+    pumpDone(held);
+    try testing.expectEqual(@as(u32, 3), fl4.sent);
+    try testing.expectEqual(@as(?h2.Status, .ok), fl4.finished);
+    try testing.expectEqual(@as(u32, 1), Marks.served);
+    try testing.expectEqual(@as(u64, 1), h.stats.foreign_cert_ends.load(.monotonic));
+    // no hook (every node that is not an edge with a core upstream): the stream is as before
+    node.svc.foreign_cert = null;
+    const plain = h.subscribe(.checkpoints).?;
+    plain.mask_tree = try mask.Tree.parse(plain.arena.allocator(), "sequence_number,signature");
+    try h.activate(plain);
+    for ([_]u64{ 3, 4, 5 }) |seq| h.publish(seq);
+    h.mu.lockUncancelable(h.io);
+    h.endSub(plain, .service_shutdown);
+    h.dropUncounted();
+    h.mu.unlock(h.io);
+    var fl3: FakeLink = .{ .node = &node };
+    var l3 = fl3.link();
+    pumpRun(plain, &l3);
+    pumpDone(plain);
+    try testing.expectEqual(@as(u32, 3), fl3.sent);
+    try testing.expectEqual(@as(?h2.Status, .ok), fl3.finished);
 }
 
 test "a pump whose peer never reads after the hub ended it gives up and frees the subscriber" {

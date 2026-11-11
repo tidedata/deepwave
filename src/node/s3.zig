@@ -81,6 +81,10 @@ pub const Bucket = struct {
     timeout_ms: u64 = 60_000,
     /// Requests canceled at `timeout_ms`.
     timeouts: std.atomic.Value(u64) = .init(0),
+    /// Set at shutdown: a request in flight ends within ~100 ms (`error.Stopped`) and no new
+    /// one is sent. Without it a stop waited for the GET in flight, up to `timeout_ms` (60 s)
+    /// when S3 had gone silent.
+    stopping: std.atomic.Value(bool) = .init(false),
     /// Tests: `http://host:port` instead of the bucket's https endpoint.
     endpoint: ?[]const u8 = null,
 
@@ -191,7 +195,9 @@ pub const Bucket = struct {
         const status = while (true) : (attempt += 1) {
             if (out) |_| aw.writer.end = 0;
             ab.reset();
-            break netguard.timed(b.io, b.timeout_ms, null, &ab, fetchOnce, .{ &b.client, url, hdrs[0..nh], auth, &aw.writer, &ab }) catch |e| {
+            break netguard.timed(b.io, b.timeout_ms, &b.stopping, &ab, fetchOnce, .{ &b.client, url, hdrs[0..nh], auth, &aw.writer, &ab }) catch |e| {
+                // a stop is not the bucket's failure: not retried, not counted
+                if (b.stopping.load(.acquire)) return error.Stopped;
                 if (e == error.Timeout) {
                     _ = b.timeouts.fetchAdd(1, .monotonic);
                     netguard.dropIdle(&b.client);
@@ -315,6 +321,46 @@ test "requester-pays bucket: a GET from a server that never answers fails at the
     try std.testing.expectError(error.Timeout, b.get("ingestion/1.chk", &out));
     try std.testing.expect(netguard.wallMs() - t0 < 3000);
     try std.testing.expectEqual(@as(u64, 1), b.timeouts.load(.monotonic));
+}
+
+test "requester-pays bucket: a stop ends a GET in flight at once, not at the 60 s timeout" {
+    var srv: netguard.TestServer = undefined;
+    try srv.start(std.testing.io, null); // never answers
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    var b = Bucket.init(std.testing.allocator, std.testing.io, .{ .access_key = "AKIDEXAMPLE", .secret_key = "secret" });
+    defer b.deinit();
+    b.endpoint = srv.url(&ub);
+    // the test's bound if the stop did nothing
+    b.timeout_ms = 4_000;
+    const T = struct {
+        b: *Bucket,
+        err: ?anyerror = null,
+        done_ms: std.atomic.Value(u64) = .init(0),
+        fn run(t: *@This()) void {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(std.testing.allocator);
+            if (t.b.get("ingestion/1.chk", &out)) |_| {} else |e| t.err = e;
+            t.done_ms.store(netguard.wallMs(), .release);
+        }
+    };
+    var t: T = .{ .b = &b };
+    const th = try std.Thread.spawn(.{}, T.run, .{&t});
+    std.testing.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    const t0 = netguard.wallMs();
+    b.stopping.store(true, .release);
+    th.join();
+    try std.testing.expectEqual(@as(?anyerror, error.Stopped), t.err);
+    try std.testing.expect(t.done_ms.load(.acquire) -| t0 < 1_000);
+    // not the bucket's failure
+    try std.testing.expectEqual(@as(u64, 0), b.timeouts.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), b.stats.errors.load(.monotonic));
+    // and nothing is sent after it
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const t1 = netguard.wallMs();
+    try std.testing.expectError(error.Stopped, b.get("ingestion/2.chk", &out));
+    try std.testing.expect(netguard.wallMs() - t1 < 1_000);
 }
 
 test "requester-pays bucket: a 404 and a hit" {

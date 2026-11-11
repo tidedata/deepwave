@@ -4,6 +4,7 @@
 const std = @import("std");
 
 pub const conformance = @import("conformance.zig");
+pub const difftest = @import("difftest.zig"); // stepRun against the reference loops
 pub const gas = @import("gas.zig");
 pub const value = @import("value.zig");
 pub const loader = @import("loader.zig");

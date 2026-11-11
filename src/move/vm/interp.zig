@@ -328,6 +328,26 @@ pub const Lifo = struct {
         l.off = m.off;
     }
 
+    /// `alloc(Value, n)` for the locals of a frame, with the usual case inline: room left in
+    /// the current chunk. The same bytes at the same offset as `alloc` gives (chunks are
+    /// 16-byte aligned, so aligning the offset aligns the address), so the region, and what
+    /// it takes from the backing allocator, is the same whichever of the two is called.
+    /// (No field is added for this: the Lifo itself comes from the session's arena, and the
+    /// session's arena requests are kept as they were.)
+    pub inline fn locals(l: *Lifo, n: usize) Allocator.Error![]Value {
+        if (n != 0 and l.ci < l.chunks.items.len) {
+            const c = l.chunks.items[l.ci];
+            const start = std.mem.alignForward(usize, l.off, @alignOf(Value));
+            const end = start + n * @sizeOf(Value);
+            if (end <= c.len) {
+                l.off = end;
+                const p: [*]Value = @ptrCast(@alignCast(c.ptr + start));
+                return p[0..n];
+            }
+        }
+        return l.alloc(Value, n);
+    }
+
     fn bump(l: *Lifo, n: usize, a: usize) Allocator.Error![*]u8 {
         while (true) {
             if (l.ci < l.chunks.items.len) {
@@ -379,7 +399,219 @@ pub const Lifo = struct {
     }
 };
 
+/// Block gas tables of one function (`Switches.block_gas`), built on its first run with the
+/// switch on and kept on the function (`Function.blocks`) in its Runtime's arena.
+///
+/// A block is a straight run of at least two instructions whose charges are static (the same
+/// pushes, pops and size increase at every execution, given the operand checks of their
+/// `stepRun` handlers), entered only at its first instruction: no branch lands inside it and
+/// nothing but its last instruction leaves it. The static charges are taken from the meter's
+/// own charge functions, run on a probe meter, so the tables cannot disagree with the meter.
+pub const Blocks = struct {
+    /// The gas model version the charges were probed with. Every covered version charges the
+    /// static instructions alike (test "static charges are the same on every covered gas model
+    /// version"), so one table serves every covered session: a metered one on the latest
+    /// version and an unmetered one (version 11) share it.
+    gm: u64,
+    /// Per instruction: 0, or 1 + the index in `blocks` of the block that starts there.
+    lead: []const u16,
+    /// Per instruction of a block: the size increase it was counted with (CopyLoc compares it
+    /// with the value it copies).
+    incr: []const u8,
+    blocks: []const gas.Meter.Block,
+    /// Per instruction of a block: the sums of the block's instructions before it.
+    before: []const gas.Meter.Block,
+
+    /// Block gas covers the gas model versions with the latest size and charge rules: 11 up
+    /// to the newest one the test below has compared. A later version is charged one
+    /// instruction at a time until it is added here (and the test passes with it).
+    pub const COVERED_MIN: u64 = 11;
+    pub const COVERED_MAX: u64 = 15;
+    pub fn covers(gm: u64) bool {
+        return gm >= COVERED_MIN and gm <= COVERED_MAX;
+    }
+
+    /// The tag a `CopyLoc` of a local declared `tok` copies when its size is a constant of the
+    /// declared type (an inline integer, a bool, a reference); null for every other type.
+    fn copyTag(tok: ff.Token) ?value.Tag {
+        return switch (tok[0].tag) {
+            .U8 => .u8,
+            .U16 => .u16,
+            .U32 => .u32,
+            .U64 => .u64,
+            .U128 => .u128,
+            .Bool => .bool,
+            .Reference, .MutableReference => .ref_slot,
+            else => null,
+        };
+    }
+
+    /// (pushes, pops, size increase) of instruction `ins` when its charge is static and its
+    /// handler in `stepRun` can run inside a block; null otherwise. `probe` is a fresh meter of
+    /// the session's gas model version.
+    fn staticCharge(func: *const Function, ins: ff.Instr, probe: *const gas.Meter) ?[3]u64 {
+        var copy: ?value.Tag = null;
+        if (ins.op == .CopyLoc) {
+            const params = func.params.len;
+            if (ins.idx >= params + func.locals.len) return null; // `op` reports it
+            const tok = if (ins.idx < params) func.params[ins.idx] else func.locals[ins.idx - params];
+            copy = copyTag(tok) orelse return null;
+        }
+        return staticChargeOf(ins.op, copy, probe);
+    }
+
+    /// `staticCharge` of opcode `opc` (`copy`: what a CopyLoc copies, see `copyTag`).
+    fn staticChargeOf(opc: ff.Opcode, copy: ?value.Tag, probe: *const gas.Meter) ?[3]u64 {
+        const H: u64 = 64;
+        var p = probe.*;
+        p.stack_height_current = H;
+        p.stack_height_high_water_mark = H;
+        var l = p.limits();
+        const r: gas.ChargeError!void = switch (opc) {
+            inline .LdU8, .LdU16, .LdU32, .LdU64, .LdTrue, .LdFalse, .ImmBorrowLoc, .MutBorrowLoc, .BrTrue, .BrFalse, .Branch, .Not, .Add, .Sub, .Mul, .Div, .Mod, .BitOr, .BitAnd, .Xor, .Lt, .Gt, .Le, .Ge, .ImmBorrowField, .MutBorrowField, .ImmBorrowFieldGeneric, .MutBorrowFieldGeneric, .CastU8, .CastU16, .CastU32, .CastU64, .CastU128, .Or, .And, .Shl, .Shr, .FreezeRef, .Nop => |o| p.chargeSimpleL(&l, @field(gas.Meter.Simple, @tagName(o))),
+            .CopyLoc => blk: {
+                // static when the local's declared type has a size that is a constant of the tag
+                const tag = copy orelse return null;
+                const sz = Session.cheapSize(.{ .tag = tag }, p.plain) orelse return null;
+                break :blk p.chargeCopyLocL(&l, sz);
+            },
+            .MoveLoc => if (p.moveLocNeedsSize()) return null else p.chargeMoveLocL(&l, 0),
+            .StLoc => p.chargeStoreLocL(&l),
+            .Pop => p.chargePopL(&l),
+            .VecLen => p.chargeVecLenL(&l),
+            .VecImmBorrow, .VecMutBorrow => p.chargeVecBorrowL(&l),
+            .VecPushBack => p.chargeVecPushBackL(&l),
+            .VecPopBack => p.chargeVecPopBackL(&l),
+            .VecSwap => p.chargeVecSwapL(&l),
+            else => return null,
+        };
+        r catch return null;
+        if (p.instructions_executed != probe.instructions_executed + 1) return null;
+        const pushes = p.stack_height_high_water_mark - H;
+        const incr = p.stack_size_current - probe.stack_size_current;
+        if (incr > std.math.maxInt(u8)) return null;
+        return .{ pushes, H + pushes - p.stack_height_current, incr };
+    }
+
+    pub fn build(arena: Allocator, func: *const Function, gm: u64) Allocator.Error!*const Blocks {
+        const code = func.code;
+        const n = code.len;
+        const probe = gas.Meter.init(gm, 1 << 40, 1);
+        const lead = try arena.alloc(u16, n);
+        const incr = try arena.alloc(u8, n);
+        const before = try arena.alloc(gas.Meter.Block, n);
+        @memset(lead, 0);
+        @memset(incr, 0);
+        @memset(before, gas.Meter.Block{});
+        // where a block may not continue: branch targets, and after anything that is not a
+        // straight static instruction
+        const cut = try arena.alloc(bool, n + 1);
+        defer arena.free(cut);
+        @memset(cut, false);
+        const charges = try arena.alloc(?[3]u64, n);
+        defer arena.free(charges);
+        for (code, 0..) |ins, pc| {
+            charges[pc] = staticCharge(func, ins, &probe);
+            switch (ins.op) {
+                .BrTrue, .BrFalse, .Branch => {
+                    if (ins.idx < n) cut[ins.idx] = true;
+                    cut[pc + 1] = true;
+                },
+                else => if (charges[pc] == null) {
+                    cut[pc + 1] = true;
+                },
+            }
+        }
+        for (func.jump_tables) |jt| for (jt.offsets) |o| {
+            if (o < n) cut[o] = true;
+        };
+        var list: std.ArrayList(gas.Meter.Block) = .empty;
+        var i: usize = 0;
+        while (i < n) {
+            if (charges[i] == null) {
+                i += 1;
+                continue;
+            }
+            var j = i + 1;
+            while (j < n and charges[j] != null and !cut[j]) j += 1;
+            if (j - i >= 2 and list.items.len < std.math.maxInt(u16) - 1) {
+                var b: gas.Meter.Block = .{};
+                for (i..j) |k| {
+                    const c = charges[k].?;
+                    before[k] = b;
+                    incr[k] = @intCast(c[2]);
+                    b.add(c[0], c[1], c[2]);
+                }
+                try list.append(arena, b);
+                lead[i] = @intCast(list.items.len);
+            }
+            i = j;
+        }
+        const out = try arena.create(Blocks);
+        out.* = .{ .gm = gm, .lead = lead, .incr = incr, .blocks = list.items, .before = before };
+        return out;
+    }
+
+    pub const Pos = enum { outside, first, inside };
+
+    /// Where instruction `pc` of `func` sits in its block tables (the differential tests ask
+    /// where a run stopped). `outside` also when no tables were built.
+    pub fn posOf(func: *const Function, pc: usize) Pos {
+        const t: *const Blocks = @ptrCast(@alignCast(func.blocks orelse return .outside));
+        if (pc >= t.lead.len) return .outside;
+        if (t.lead[pc] != 0) return .first;
+        return if (t.before[pc].n != 0) .inside else .outside;
+    }
+};
+
 const GenKey = struct { m: *const Module, i: u16 };
+
+/// Process-wide interpreter switches. Every `Session` copies them at `init`; a session's own
+/// fields can be set afterwards (tests do).
+///   ref_loop   run the reference loop (`step`, one instruction at a time, the same code the
+///              traced loop runs) instead of `stepRun`. Environment: ZUI_VM_REF_LOOP=1.
+///   block_gas  charge straight runs of instructions with static charges once, at their first
+///              instruction (`Blocks`, `Meter.chargeBlock`), when that equals charging them one
+///              by one; default off. Environment: ZUI_VM_BLOCK_GAS=1.
+pub const Switches = struct {
+    ref_loop: bool = false,
+    block_gas: bool = false,
+};
+
+var switches_state: std.atomic.Value(u8) = .init(SW_UNREAD);
+const SW_UNREAD: u8 = 0x80;
+const SW_REF_LOOP: u8 = 1;
+const SW_BLOCK_GAS: u8 = 2;
+
+fn envOn(name: [*:0]const u8) bool {
+    if (!@import("builtin").link_libc) return false;
+    const v = std.c.getenv(name) orelse return false;
+    const t = std.mem.span(v);
+    return t.len != 0 and !std.mem.eql(u8, t, "0");
+}
+
+/// The switches in force (the environment is read once, on first use).
+pub fn switches() Switches {
+    var v = switches_state.load(.monotonic);
+    if (v == SW_UNREAD) {
+        v = 0;
+        if (envOn("ZUI_VM_REF_LOOP")) v |= SW_REF_LOOP;
+        if (envOn("ZUI_VM_BLOCK_GAS")) v |= SW_BLOCK_GAS;
+        // A switch set from the environment says so once (stderr), so a run's log shows
+        // which loop it measured.
+        if (v != 0) std.debug.print("move-vm switches on from the environment:{s}{s}\n", .{ if (v & SW_REF_LOOP != 0) " ref_loop" else "", if (v & SW_BLOCK_GAS != 0) " block_gas" else "" });
+        switches_state.store(v, .monotonic);
+    }
+    return .{ .ref_loop = v & SW_REF_LOOP != 0, .block_gas = v & SW_BLOCK_GAS != 0 };
+}
+
+/// Sets the switches for every session created from now on (overrides the environment).
+pub fn setSwitches(sw: Switches) void {
+    var v: u8 = 0;
+    if (sw.ref_loop) v |= SW_REF_LOOP;
+    if (sw.block_gas) v |= SW_BLOCK_GAS;
+    switches_state.store(v, .monotonic);
+}
 
 pub const Session = struct {
     link: *LinkCtx,
@@ -392,6 +624,8 @@ pub const Session = struct {
     cfg: ExecConfig,
     stack: []Value,
     sp: usize = 0,
+    /// The call stack. It grows on demand (a frame may move when it does: nothing keeps a
+    /// pointer to a frame across a call).
     frames: std.ArrayList(Frame) = .empty,
     depth_cache: std.AutoHashMapUnmanaged(*const Datatype, Formula) = .empty,
     /// Instantiated type arguments of `CallGeneric` sites that do not depend on the frame
@@ -415,6 +649,20 @@ pub const Session = struct {
     /// v0..v2 / pre-`minimize_child_object_mutations` rule; told the address every write
     /// instruction writes through (a Value slot or a container header), with `ext`.
     write_hook: ?*const fn (?*anyopaque, usize) void = null,
+    /// Untraced runs use the reference loop (`step` per instruction) instead of `stepRun`
+    /// (`Switches.ref_loop`). The differential tests compare the two.
+    ref_loop: bool = false,
+    /// Block gas charging in `stepRun` (`Switches.block_gas`).
+    block_gas: bool = false,
+    /// Block gas counters (tests and reports; nothing reads them to decide anything):
+    /// blocks charged at once; blocks the meter refused to charge at once (a tier start, too
+    /// little gas or too low a stack inside: charged instruction by instruction); charged
+    /// blocks given back because an instruction inside met an operand its handler does not
+    /// take; and of those, the ones whose instruction then failed.
+    blocks_charged: u64 = 0,
+    blocks_refused: u64 = 0,
+    blocks_undone: u64 = 0,
+    blocks_faulted: u64 = 0,
 
     pub fn init(arena: Allocator, link: *LinkCtx, meter: *gas.Meter, cfg: ExecConfig) Allocator.Error!Session {
         const pool = try arena.create(value.Pool);
@@ -431,6 +679,8 @@ pub const Session = struct {
         }
         return .{
             .tracer = prof_tracer,
+            .ref_loop = switches().ref_loop,
+            .block_gas = switches().block_gas,
             .link = link,
             .arena = arena,
             .heap = .{ .arena = arena, .pool = pool },
@@ -472,6 +722,17 @@ pub const Session = struct {
     fn chargeFail(s: *Session) Fail {
         s.pending = .{ .major = s.meter.err };
         return error.Vm;
+    }
+    /// A local index at or past the frame's locals. The bounds checker refuses such code, so no
+    /// module the loader makes gets here; `op` tests it anyway, so that a frame built some other
+    /// way ends in a Move error and not in a read outside the frame. The status is Rust's:
+    /// `StackFrame::get_valid`, `get_valid_mut` and `store_loc` say INTERNAL_TYPE_ERROR; v0..v3
+    /// `Locals::copy_loc` and `swap_loc` say VERIFIER_INVARIANT_VIOLATION and `borrow_loc`
+    /// UNKNOWN_INVARIANT_VIOLATION_ERROR.
+    fn localOutOfRange(s: *Session, comptime borrow: bool) Fail {
+        @branchHint(.cold);
+        if (!s.cfg.rules.legacyVm()) return s.fail(.INTERNAL_TYPE_ERROR, null);
+        return s.fail(if (borrow) .UNKNOWN_INVARIANT_VIOLATION_ERROR else .VERIFIER_INVARIANT_VIOLATION, null);
     }
 
     inline fn push(s: *Session, v: Value) Fail!void {
@@ -733,13 +994,13 @@ pub const Session = struct {
         if (args.len != func.params.len) return .{ .err = .{ .major = .NUMBER_OF_ARGUMENTS_MISMATCH, .module = func.module } };
         if (s.tracer) |t| try t.enterInitialFrame(s, func, ty_args, args);
         const mk = s.lifo.mark();
-        const locals = try s.lifo.alloc(Value, func.n_locals);
+        const locals = try s.lifo.locals(func.n_locals);
         @memcpy(locals[0..args.len], args);
         @memset(locals[args.len..], Value.invalid);
         s.frames.clearRetainingCapacity();
         try s.frames.append(s.arena, try s.newFrame(func, locals, ty_args, mk));
         s.sp = 0;
-        return if (s.tracer != null) s.loop(true) else s.loop(false);
+        return if (s.tracer != null) s.loop(.traced) else if (s.ref_loop) s.loop(.ref) else s.loop(.fast);
     }
 
     /// A native as the outermost function (`interpreter::run` → `call_native_with_args`):
@@ -767,11 +1028,19 @@ pub const Session = struct {
         return .{ .ok = s.stack[0..s.sp] };
     }
 
-    fn loop(s: *Session, comptime traced: bool) Error!Outcome {
+    /// traced: `step` with the tracer hooks. ref: the same `step` without them (the reference
+    /// for the untraced loop). fast: `stepRun`.
+    const LoopKind = enum { traced, ref, fast };
+
+    fn loop(s: *Session, comptime kind: LoopKind) Error!Outcome {
         while (true) {
-            const r = (if (traced) s.step(true) else s.stepRun()) catch |e| switch (e) {
+            const r = (switch (kind) {
+                .traced => s.step(true),
+                .ref => s.step(false),
+                .fast => s.stepRun(),
+            }) catch |e| switch (e) {
                 error.Vm => return .{ .err = s.finalize(s.pending) },
-                error.Tainted => return s.taintedLoop(traced),
+                error.Tainted => return s.taintedLoop(kind == .traced),
                 else => |x| return x,
             };
             if (r) return .{ .ok = s.stack[0..s.sp] };
@@ -822,178 +1091,319 @@ pub const Session = struct {
     /// (non-boxed) values: each one checks everything it needs BEFORE any side effect (stack
     /// depth, operand tags, overflow) and otherwise leaves the instruction to `op`, which does
     /// the full work, so charges, results and errors are those of `op`.
+    ///
+    /// Runtime safety is off in this function's own body (not in the functions it calls, also
+    /// not the inlined ones: `Meter.chargeL`, `Lifo.locals`, `enterCall`, `op` and the value
+    /// helpers keep their checks). What that removes, and why each access is in range anyway:
+    ///   `code[pc]`              `pc < code.len` is tested before every dispatch.
+    ///   `f.locals[idx]`         CopyLoc, MoveLoc, StLoc and the two BorrowLoc: each handler
+    ///                           tests `idx < f.locals.len` first and leaves anything else to
+    ///                           `op`, which reports it. (The bounds checker, always run by
+    ///                           `move_format.deserialize`, refuses such an index, and every
+    ///                           frame's locals have length `n_locals`; the test is there so
+    ///                           that this does not rest on every frame builder keeping that.)
+    ///   `s.stack[..]`           every handler tests `s.sp` against 0, the operand count or
+    ///                           OPERAND_STACK_SIZE_LIMIT (the stack's length) before it reads
+    ///                           or writes a slot; the same tests cover `s.sp += 1` / `-= n`.
+    ///   `pc += 1`, `f.pc + 1`   `pc < code.len <= BYTECODE_COUNT_MAX` (65535), so it fits u16.
+    ///   `@intCast(imm)`         LdU8, LdU16, LdU32: the deserializer read 1, 2 or 4 bytes.
+    ///   module tables           `field_handles`, `field_instantiations` (and its handle),
+    ///                           `function_instantiations` (and its signature), `signatures`
+    ///                           of the vector instructions: indices checked by the bounds
+    ///                           checker. A vector instruction's signature is tested for being
+    ///                           non-empty here (only the verifier guarantees that).
+    ///   container elements      `c.values()[i]` and fields: `i < c.len` is tested first.
+    ///   `small_max[ti]`, shift amounts, `c.len += 1`, `c.len -= 1`, `frames.items.len -= 1`:
+    ///                           each follows an explicit range test in the same handler.
+    /// Every check that produces a Move error is an explicit test and stays.
+    /// The two operations at the entry (the index of the current frame, the alignment of the
+    /// compiled function pointer) run once per call and keep the build mode's checks.
     fn stepRun(s: *Session) (Fail || Error)!bool {
-        const f = &s.frames.items[s.frames.items.len - 1];
-        // aot tier: compiled code for this function runs the same instructions (see aot.zig)
-        if (f.func.aot) |a| return @as(AotFn, @ptrCast(@alignCast(a)))(s, f);
+        return if (s.block_gas) s.stepRunImpl(true) else s.stepRunImpl(false);
+    }
+
+    /// `blk`: block gas charging (`Switches.block_gas`). At the first instruction of a block
+    /// (`Blocks`) the whole block is charged at once when `Meter.chargeBlock` allows it, and
+    /// `left` counts its instructions down: a handler that finds `left` nonzero charges
+    /// nothing. Handlers still test their operands first; one that does not take its operands
+    /// leaves the switch as always, and there the meter is put back to the state after the
+    /// block's instructions before this one (`Meter.uncharge`), so `op` charges this
+    /// instruction and reports its error from exactly the state the instruction by instruction
+    /// path has there. A block that `chargeBlock` refuses (a tier start, the stack height or
+    /// the remaining gas inside it) runs through the charging handlers, so tier changes and
+    /// running out of gas happen where they always did.
+    fn stepRunImpl(s: *Session, comptime blk: bool) (Fail || Error)!bool {
+        // Every inline call counts against the branch quota of this function's analysis, and
+        // the handlers and `op` (inlined below) are made of them.
+        @setEvalBranchQuota(200_000);
+        @setRuntimeSafety(false);
+        var f: *Frame = undefined;
+        {
+            // Once per entry, so the compiler's checks cost nothing here: the build mode's
+            // runtime safety is back on for the index of the current frame and for the
+            // alignment of the compiled function pointer.
+            @setRuntimeSafety(std.debug.runtime_safety);
+            f = &s.frames.items[s.frames.items.len - 1];
+            // aot tier: compiled code for this function runs the same instructions (see aot.zig)
+            if (f.func.aot) |a| return @as(AotFn, @ptrCast(@alignCast(a)))(s, f);
+        }
         // loop accelerator hook: a function with a loop accelerator attached runs through loopaccel.run
         // (off unless loopaccel.enable() or ZUI_VM_LOOPACCEL=1; nothing else in this file knows about it)
         if (f.func.accel != null and loopaccel.live()) return loopaccel.run(s, f);
-        const code = f.func.code;
+        var code = f.func.code;
         const meter = s.meter;
-        // the pc lives in a register here; the frame gets it before every instruction (stores
-        // only: error locations and `step` read it there)
+        // block gas: the frame's tables, the instructions left in the charged block, and the
+        // meter before it was charged
+        var tab: ?*const Blocks = if (comptime blk) try s.blocksOf(f.func) else null;
+        var left: u32 = 0;
+        var mark: gas.Meter.Mark = undefined;
+        // The pc lives in a local; the frame gets it on the way out only (an error location, a
+        // call or return through `step`): nothing else reads `f.pc` while the loop runs.
         var pc = f.pc;
+        // The tier limits live in locals too (`Meter.chargeL`); they are read again after
+        // anything else may have charged the meter.
+        var lim = meter.limits();
         while (true) {
-            f.pc = pc;
-            if (pc >= code.len) return s.step(false);
+            if (pc >= code.len) return s.offEnd(f, pc);
+            if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
             sw: switch (code[pc].op) {
-                .Ret, .Call, .CallGeneric => return s.step(false),
+                // Calls and returns switch the frame in place: `step`'s Ret, Call and
+                // CallGeneric (and `callFunction`) in the same order, without leaving the loop.
+                // A frame this loop does not run (`runsOutside`) goes back through `loop`.
+                .Ret => {
+                    meter.chargeSimpleL(&lim, .Ret) catch return s.chargeErrAt(f, pc);
+                    // drop_all_values: locals still holding values are dropped with the frame.
+                    for (f.locals) |v| {
+                        if (!ownsNothing(v.tag)) s.heap.drop(v);
+                    }
+                    if (s.frames.items.len == 1) {
+                        f.pc = pc;
+                        return true;
+                    }
+                    s.lifo.reset(f.mark);
+                    s.frames.items.len -= 1;
+                    f = &s.frames.items[s.frames.items.len - 1];
+                    pc = f.pc + 1;
+                    if (runsOutside(f.func)) {
+                        f.pc = pc;
+                        return false;
+                    }
+                    code = f.func.code;
+                    if (comptime blk) tab = try s.blocksOf(f.func);
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                .Call => {
+                    const target = try s.link.resolve(f.func.module, code[pc].idx);
+                    if (try s.enterCall(f, pc, &lim, target, &.{}, &.{}, 0, s.lifo.mark())) |callee| {
+                        f = callee;
+                        if (runsOutside(f.func)) return false;
+                        code = f.func.code;
+                        if (comptime blk) tab = try s.blocksOf(f.func);
+                        pc = 0;
+                    } else pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                .CallGeneric => {
+                    const m = f.func.module;
+                    const fi = m.cm.function_instantiations[code[pc].idx];
+                    const sig = m.cm.signatures[fi.type_parameters];
+                    var targs = f.ty_args;
+                    var nodes: ?[]const u64 = f.ty_nodes;
+                    const mk = s.lifo.mark();
+                    if (!passesTypeArgsOn(sig, f)) {
+                        s.checkCallInst(sig, f) catch {
+                            f.pc = pc;
+                            s.atFrame(f);
+                            s.raw_err = s.cfg.rules.legacyVm(); // exec-history-vm: no core-dump remap
+                            return error.Vm;
+                        };
+                        targs = try s.callTypeArgs(f, code[pc].idx, sig);
+                        nodes = null;
+                    }
+                    const target = try s.link.resolve(m, fi.handle);
+                    if (try s.enterCall(f, pc, &lim, target, targs, nodes, f.ty_nodes_sum, mk)) |callee| {
+                        f = callee;
+                        if (runsOutside(f.func)) return false;
+                        code = f.func.code;
+                        if (comptime blk) tab = try s.blocksOf(f.func);
+                        pc = 0;
+                    } else pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
                 .LdU8 => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
-                    meter.chargeSimple(.LdU8) catch return s.atErr(f, s.chargeFail());
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .LdU8) catch return s.chargeErrAt(f, pc);
                     s.stack[s.sp] = Value.u8_(@intCast(code[pc].imm));
                     s.sp += 1;
                     pc += 1;
-                    f.pc = pc;
-                    if (pc >= code.len) return s.step(false);
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                     continue :sw code[pc].op;
                 } else break :sw,
                 .LdU16 => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
-                    meter.chargeSimple(.LdU16) catch return s.atErr(f, s.chargeFail());
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .LdU16) catch return s.chargeErrAt(f, pc);
                     s.stack[s.sp] = Value.u16_(@intCast(code[pc].imm));
                     s.sp += 1;
                     pc += 1;
-                    f.pc = pc;
-                    if (pc >= code.len) return s.step(false);
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                     continue :sw code[pc].op;
                 } else break :sw,
                 .LdU32 => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
-                    meter.chargeSimple(.LdU32) catch return s.atErr(f, s.chargeFail());
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .LdU32) catch return s.chargeErrAt(f, pc);
                     s.stack[s.sp] = Value.u32_(@intCast(code[pc].imm));
                     s.sp += 1;
                     pc += 1;
-                    f.pc = pc;
-                    if (pc >= code.len) return s.step(false);
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                     continue :sw code[pc].op;
                 } else break :sw,
                 .LdU64 => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
-                    meter.chargeSimple(.LdU64) catch return s.atErr(f, s.chargeFail());
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .LdU64) catch return s.chargeErrAt(f, pc);
                     s.stack[s.sp] = Value.u64_(code[pc].imm);
                     s.sp += 1;
                     pc += 1;
-                    f.pc = pc;
-                    if (pc >= code.len) return s.step(false);
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                     continue :sw code[pc].op;
                 } else break :sw,
                 .LdTrue => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
-                    meter.chargeSimple(.LdTrue) catch return s.atErr(f, s.chargeFail());
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .LdTrue) catch return s.chargeErrAt(f, pc);
                     s.stack[s.sp] = Value.bool_(true);
                     s.sp += 1;
                     pc += 1;
-                    f.pc = pc;
-                    if (pc >= code.len) return s.step(false);
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                     continue :sw code[pc].op;
                 } else break :sw,
                 .LdFalse => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
-                    meter.chargeSimple(.LdFalse) catch return s.atErr(f, s.chargeFail());
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .LdFalse) catch return s.chargeErrAt(f, pc);
                     s.stack[s.sp] = Value.bool_(false);
                     s.sp += 1;
                     pc += 1;
-                    f.pc = pc;
-                    if (pc >= code.len) return s.step(false);
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                     continue :sw code[pc].op;
                 } else break :sw,
                 .CopyLoc => {
+                    // inline values and references: nothing to duplicate, the size is a constant
+                    if (code[pc].idx >= f.locals.len) break :sw;
                     const v = f.locals[code[pc].idx];
-                    if (isInline(v.tag) and s.sp < OPERAND_STACK_SIZE_LIMIT) {
-                        meter.chargeCopyLoc(value.size(v, meter.plain)) catch return s.atErr(f, s.chargeFail());
+                    const sz = cheapSize(v, meter.plain) orelse break :sw;
+                    if (comptime blk) {
+                        // the block counted this copy with the size of the local's declared type
+                        if (left != 0 and sz != tab.?.incr[pc]) break :sw;
+                    }
+                    if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                        if (!inBlock(blk, &left)) meter.chargeCopyLocL(&lim, sz) catch return s.chargeErrAt(f, pc);
                         s.stack[s.sp] = v;
                         s.sp += 1;
                         pc += 1;
-                        f.pc = pc;
-                        if (pc >= code.len) return s.step(false);
+                        if (pc >= code.len) return s.offEnd(f, pc);
+                        if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                         continue :sw code[pc].op;
                     } else break :sw;
                 },
                 .MoveLoc => {
+                    if (code[pc].idx >= f.locals.len) break :sw;
                     const v = f.locals[code[pc].idx];
                     if (v.tag != .invalid and s.sp < OPERAND_STACK_SIZE_LIMIT) {
                         f.locals[code[pc].idx] = Value.invalid;
                         const sz = if (meter.moveLocNeedsSize()) value.size(v, meter.plain) else 0;
-                        meter.chargeMoveLoc(sz) catch return s.atErr(f, s.chargeFail());
+                        if (!inBlock(blk, &left)) meter.chargeMoveLocL(&lim, sz) catch return s.chargeErrAt(f, pc);
                         s.stack[s.sp] = v;
                         s.sp += 1;
                         pc += 1;
-                        f.pc = pc;
-                        if (pc >= code.len) return s.step(false);
+                        if (pc >= code.len) return s.offEnd(f, pc);
+                        if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                         continue :sw code[pc].op;
                     } else break :sw;
                 },
                 .StLoc => {
-                    if (s.sp > 0 and isInlineOrInvalid(f.locals[code[pc].idx].tag)) {
+                    // over a local that owns nothing (also a reference): nothing to drop
+                    if (code[pc].idx >= f.locals.len) break :sw;
+                    if (s.sp > 0 and ownsNothing(f.locals[code[pc].idx].tag)) {
                         s.sp -= 1;
                         const v = s.stack[s.sp];
-                        meter.chargeStoreLoc() catch return s.atErr(f, s.chargeFail());
+                        if (!inBlock(blk, &left)) meter.chargeStoreLocL(&lim) catch return s.chargeErrAt(f, pc);
                         f.locals[code[pc].idx] = v;
                         pc += 1;
-                        f.pc = pc;
-                        if (pc >= code.len) return s.step(false);
+                        if (pc >= code.len) return s.offEnd(f, pc);
+                        if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                         continue :sw code[pc].op;
                     } else break :sw;
                 },
                 .Pop => {
-                    if (s.sp > 0 and isInlineOrInvalid(s.stack[s.sp - 1].tag)) {
+                    if (s.sp > 0 and ownsNothing(s.stack[s.sp - 1].tag)) {
                         s.sp -= 1;
-                        meter.chargePop() catch return s.atErr(f, s.chargeFail());
+                        if (!inBlock(blk, &left)) meter.chargePopL(&lim) catch return s.chargeErrAt(f, pc);
                         pc += 1;
-                        f.pc = pc;
-                        if (pc >= code.len) return s.step(false);
+                        if (pc >= code.len) return s.offEnd(f, pc);
+                        if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                         continue :sw code[pc].op;
                     } else break :sw;
                 },
-                .ImmBorrowLoc => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
-                    meter.chargeSimple(.ImmBorrowLoc) catch return s.atErr(f, s.chargeFail());
+                .ImmBorrowLoc => if (code[pc].idx < f.locals.len and s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .ImmBorrowLoc) catch return s.chargeErrAt(f, pc);
                     s.stack[s.sp] = Value.refSlot(&f.locals[code[pc].idx]);
                     s.sp += 1;
                     pc += 1;
-                    f.pc = pc;
-                    if (pc >= code.len) return s.step(false);
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                     continue :sw code[pc].op;
                 } else break :sw,
-                .MutBorrowLoc => if (s.sp < OPERAND_STACK_SIZE_LIMIT) {
-                    meter.chargeSimple(.MutBorrowLoc) catch return s.atErr(f, s.chargeFail());
+                .MutBorrowLoc => if (code[pc].idx < f.locals.len and s.sp < OPERAND_STACK_SIZE_LIMIT) {
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .MutBorrowLoc) catch return s.chargeErrAt(f, pc);
                     s.stack[s.sp] = Value.refSlot(&f.locals[code[pc].idx]);
                     s.sp += 1;
                     pc += 1;
-                    f.pc = pc;
-                    if (pc >= code.len) return s.step(false);
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                     continue :sw code[pc].op;
                 } else break :sw,
+                // The three branches below are the only backward jumps: a loop head is the target
+                // of a taken branch with `code[pc].idx <= pc`. A hook at loop heads (the loop
+                // accelerators) goes right after the new pc is set, before the dispatch.
                 .BrTrue => {
                     if (s.sp > 0 and s.stack[s.sp - 1].tag == .bool) {
-                        meter.chargeSimple(.BrTrue) catch return s.atErr(f, s.chargeFail());
+                        if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .BrTrue) catch return s.chargeErrAt(f, pc);
                         s.sp -= 1;
                         pc = if (s.stack[s.sp].a != 0) code[pc].idx else pc + 1;
-                        f.pc = pc;
-                        if (pc >= code.len) return s.step(false);
+                        if (pc >= code.len) return s.offEnd(f, pc);
+                        if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                         continue :sw code[pc].op;
                     } else break :sw;
                 },
                 .BrFalse => {
                     if (s.sp > 0 and s.stack[s.sp - 1].tag == .bool) {
-                        meter.chargeSimple(.BrFalse) catch return s.atErr(f, s.chargeFail());
+                        if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .BrFalse) catch return s.chargeErrAt(f, pc);
                         s.sp -= 1;
                         pc = if (s.stack[s.sp].a == 0) code[pc].idx else pc + 1;
-                        f.pc = pc;
-                        if (pc >= code.len) return s.step(false);
+                        if (pc >= code.len) return s.offEnd(f, pc);
+                        if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                         continue :sw code[pc].op;
                     } else break :sw;
                 },
                 .Branch => {
-                    meter.chargeSimple(.Branch) catch return s.atErr(f, s.chargeFail());
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .Branch) catch return s.chargeErrAt(f, pc);
                     pc = code[pc].idx;
-                    f.pc = pc;
-                    if (pc >= code.len) return s.step(false);
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                     continue :sw code[pc].op;
                 },
                 .Not => {
                     if (s.sp > 0 and s.stack[s.sp - 1].tag == .bool) {
-                        meter.chargeSimple(.Not) catch return s.atErr(f, s.chargeFail());
+                        if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, .Not) catch return s.chargeErrAt(f, pc);
                         const t = &s.stack[s.sp - 1];
                         t.a = @intFromBool(t.a == 0);
                         pc += 1;
-                        f.pc = pc;
-                        if (pc >= code.len) return s.step(false);
+                        if (pc >= code.len) return s.offEnd(f, pc);
+                        if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                         continue :sw code[pc].op;
                     } else break :sw;
                 },
@@ -1009,12 +1419,12 @@ pub const Session = struct {
                         else => Arith.xor,
                     };
                     if (s.fastArith(k)) |r| {
-                        meter.chargeSimple(@field(gas.Meter.Simple, @tagName(o))) catch return s.atErr(f, s.chargeFail());
+                        if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, @field(gas.Meter.Simple, @tagName(o))) catch return s.chargeErrAt(f, pc);
                         s.sp -= 1;
                         s.stack[s.sp - 1].a = r;
                         pc += 1;
-                        f.pc = pc;
-                        if (pc >= code.len) return s.step(false);
+                        if (pc >= code.len) return s.offEnd(f, pc);
+                        if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                         continue :sw code[pc].op;
                     } else break :sw;
                 },
@@ -1026,28 +1436,346 @@ pub const Session = struct {
                         else => Cmp.ge,
                     };
                     if (s.fastCmp(k)) |r| {
-                        meter.chargeSimple(@field(gas.Meter.Simple, @tagName(o))) catch return s.atErr(f, s.chargeFail());
+                        if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, @field(gas.Meter.Simple, @tagName(o))) catch return s.chargeErrAt(f, pc);
                         s.sp -= 1;
                         s.stack[s.sp - 1] = Value.bool_(r);
                         pc += 1;
-                        f.pc = pc;
-                        if (pc >= code.len) return s.step(false);
+                        if (pc >= code.len) return s.offEnd(f, pc);
+                        if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
                         continue :sw code[pc].op;
                     } else break :sw;
+                },
+                // ---- The handlers below follow `op` step for step on the path where nothing
+                // fails: the same pops before the charge, the same charge, the same writes after
+                // it. Everything `op` could refuse is tested first, with no side effect, and
+                // left to `op`.
+                inline .ImmBorrowField, .MutBorrowField, .ImmBorrowFieldGeneric, .MutBorrowFieldGeneric => |o| {
+                    if (s.sp == 0) break :sw;
+                    const c = contOf(s.stack[s.sp - 1]) orelse break :sw;
+                    const cm = &f.func.module.cm;
+                    const fh = if (comptime (o == .ImmBorrowField or o == .MutBorrowField)) code[pc].idx else cm.field_instantiations[code[pc].idx].handle;
+                    const offset = cm.field_handles[fh].field;
+                    if (c.kind.isPrimVec() or offset >= c.len) break :sw;
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, @field(gas.Meter.Simple, @tagName(o))) catch return s.chargeErrAt(f, pc);
+                    s.stack[s.sp - 1] = Value.refSlot(&c.values()[offset]);
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                .ReadRef => {
+                    // the referent is an inline value: a constant size, nothing to duplicate
+                    if (s.sp == 0) break :sw;
+                    const r = s.stack[s.sp - 1];
+                    var v: Value = undefined;
+                    if (r.tag == .ref_elem) {
+                        const c = r.cont();
+                        if (!inlineElems(c.kind)) break :sw;
+                        v = readInline(c, r.b);
+                    } else if (r.tag == .ref_slot) {
+                        v = r.slot().*;
+                        if (!isInline(v.tag)) break :sw;
+                    } else break :sw;
+                    s.sp -= 1;
+                    meter.chargeReadRefSizeL(&lim, inlineSize(v.tag, meter.readRefCfg())) catch return s.chargeErrAt(f, pc);
+                    s.stack[s.sp] = v;
+                    s.sp += 1;
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                .WriteRef => {
+                    // an inline value over a slot that owns nothing, or into a vector of its type
+                    if (s.sp < 2) break :sw;
+                    const r = s.stack[s.sp - 1];
+                    const v = s.stack[s.sp - 2];
+                    if (!isInline(v.tag)) break :sw;
+                    if (r.tag == .ref_slot) {
+                        if (!ownsNothing(r.slot().tag)) break :sw;
+                    } else if (r.tag == .ref_elem) {
+                        const k = r.cont().kind;
+                        if (!inlineElems(k) or k.elemTag() != v.tag) break :sw;
+                    } else break :sw;
+                    s.sp -= 2;
+                    meter.chargeWriteRefL(&lim, inlineSize(v.tag, meter.plain)) catch return s.chargeErrAt(f, pc);
+                    if (r.tag == .ref_slot) {
+                        s.noteWrite(@intFromPtr(r.slot()));
+                        r.slot().* = v;
+                    } else {
+                        s.noteWrite(@intFromPtr(r.cont()));
+                        writeInline(r.cont(), r.b, v);
+                    }
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                inline .Eq, .Neq => |o| {
+                    // two inline values of one type
+                    if (s.sp < 2) break :sw;
+                    const x = s.stack[s.sp - 1];
+                    const y = s.stack[s.sp - 2];
+                    if (x.tag != y.tag or !isInline(x.tag)) break :sw;
+                    const sz = inlineSize(x.tag, meter.traversal);
+                    s.sp -= 2;
+                    (if (comptime o == .Eq) meter.chargeEqL(&lim, sz, sz) else meter.chargeNeqL(&lim, sz, sz)) catch return s.chargeErrAt(f, pc);
+                    const eq = x.a == y.a and (x.tag != .u128 or x.b == y.b);
+                    s.stack[s.sp] = Value.bool_(if (comptime o == .Eq) eq else !eq);
+                    s.sp += 1;
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                inline .CastU8, .CastU16, .CastU32, .CastU64, .CastU128 => |o| {
+                    // u8..u128 to u8..u128 when the value fits
+                    if (s.sp == 0) break :sw;
+                    const t = &s.stack[s.sp - 1];
+                    const ti = @intFromEnum(t.tag);
+                    if (ti < 1 or ti > 5) break :sw;
+                    const hi: u64 = if (t.tag == .u128) t.b else 0;
+                    if (comptime o != .CastU128) {
+                        const max: u64 = comptime switch (o) {
+                            .CastU8 => 0xff,
+                            .CastU16 => 0xffff,
+                            .CastU32 => 0xffff_ffff,
+                            else => std.math.maxInt(u64),
+                        };
+                        if (hi != 0 or t.a > max) break :sw;
+                    }
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, @field(gas.Meter.Simple, @tagName(o))) catch return s.chargeErrAt(f, pc);
+                    const lo = t.a;
+                    t.* = .{
+                        .tag = comptime @as(value.Tag, switch (o) {
+                            .CastU8 => .u8,
+                            .CastU16 => .u16,
+                            .CastU32 => .u32,
+                            .CastU64 => .u64,
+                            else => .u128,
+                        }),
+                        .a = lo,
+                        .b = hi,
+                    };
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                inline .Or, .And => |o| {
+                    if (s.sp < 2 or s.stack[s.sp - 1].tag != .bool or s.stack[s.sp - 2].tag != .bool) break :sw;
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, @field(gas.Meter.Simple, @tagName(o))) catch return s.chargeErrAt(f, pc);
+                    s.sp -= 1;
+                    const x = s.stack[s.sp].a;
+                    const y = s.stack[s.sp - 1].a;
+                    s.stack[s.sp - 1] = Value.bool_((if (comptime o == .Or) (x | y) else (x & y)) != 0);
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                inline .Shl, .Shr => |o| {
+                    // u8..u64 by a u8 smaller than the width
+                    if (s.sp < 2) break :sw;
+                    const rhs = s.stack[s.sp - 1];
+                    const lhs = s.stack[s.sp - 2];
+                    const ti = @intFromEnum(lhs.tag);
+                    if (rhs.tag != .u8 or ti < 1 or ti > 4) break :sw;
+                    if (rhs.a >= @as(u64, 4) << @intCast(ti)) break :sw; // 8, 16, 32, 64 bits
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, @field(gas.Meter.Simple, @tagName(o))) catch return s.chargeErrAt(f, pc);
+                    const sh: u6 = @intCast(rhs.a);
+                    s.sp -= 1;
+                    s.stack[s.sp - 1] = .{ .tag = lhs.tag, .a = if (comptime o == .Shl) (lhs.a << sh) & small_max[ti] else lhs.a >> sh };
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                inline .FreezeRef, .Nop => |o| {
+                    if (!inBlock(blk, &left)) meter.chargeSimpleL(&lim, @field(gas.Meter.Simple, @tagName(o))) catch return s.chargeErrAt(f, pc);
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                .VecLen => {
+                    if (s.sp == 0) break :sw;
+                    const c = contOf(s.stack[s.sp - 1]) orelse break :sw;
+                    if (!s.vecSigOk(f, code[pc].idx)) break :sw;
+                    s.sp -= 1;
+                    if (!inBlock(blk, &left)) meter.chargeVecLenL(&lim) catch return s.chargeErrAt(f, pc);
+                    s.stack[s.sp] = Value.u64_(c.len);
+                    s.sp += 1;
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                .VecImmBorrow, .VecMutBorrow => {
+                    if (s.sp < 2) break :sw;
+                    const i = s.stack[s.sp - 1].a;
+                    const c = contOf(s.stack[s.sp - 2]) orelse break :sw;
+                    if (i >= c.len or !s.vecSigOk(f, code[pc].idx)) break :sw;
+                    s.sp -= 2;
+                    if (!inBlock(blk, &left)) meter.chargeVecBorrowL(&lim) catch return s.chargeErrAt(f, pc);
+                    s.stack[s.sp] = if (c.kind.isPrimVec()) Value.refElem(c, i) else Value.refSlot(&c.values()[i]);
+                    s.sp += 1;
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                .VecPushBack => {
+                    // room left, and an element that is stored as it is (a boxed vector's value,
+                    // or an inline value into a vector of its type)
+                    if (s.sp < 2) break :sw;
+                    const e = s.stack[s.sp - 1];
+                    const c = contOf(s.stack[s.sp - 2]) orelse break :sw;
+                    if (c.len >= c.cap or c.len >= s.cfg.vector_len_max) break :sw;
+                    if (c.kind == .vec) {
+                        if (e.tag == .invalid) break :sw;
+                    } else if (!inlineElems(c.kind) or c.kind.elemTag() != e.tag) break :sw;
+                    if (!s.vecSigOk(f, code[pc].idx)) break :sw;
+                    s.sp -= 2;
+                    if (!inBlock(blk, &left)) meter.chargeVecPushBackL(&lim) catch return s.chargeErrAt(f, pc);
+                    s.noteWrite(@intFromPtr(c));
+                    c.len += 1;
+                    if (c.kind == .vec) c.values()[c.len - 1] = e else writeInline(c, c.len - 1, e);
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                .VecPopBack => {
+                    if (s.sp == 0) break :sw;
+                    const c = contOf(s.stack[s.sp - 1]) orelse break :sw;
+                    if (c.len == 0) break :sw;
+                    var v: Value = undefined;
+                    if (c.kind == .vec) {
+                        v = c.values()[c.len - 1];
+                        if (v.tag == .invalid) break :sw;
+                    } else if (inlineElems(c.kind)) {
+                        v = readInline(c, c.len - 1);
+                    } else break :sw;
+                    if (!s.vecSigOk(f, code[pc].idx)) break :sw;
+                    s.sp -= 1;
+                    c.len -= 1; // before the charge, as in `op`
+                    if (!inBlock(blk, &left)) meter.chargeVecPopBackL(&lim) catch return s.chargeErrAt(f, pc);
+                    s.noteWrite(@intFromPtr(c));
+                    s.stack[s.sp] = v;
+                    s.sp += 1;
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
+                },
+                .VecSwap => {
+                    if (s.sp < 3) break :sw;
+                    const j = s.stack[s.sp - 1].a;
+                    const i = s.stack[s.sp - 2].a;
+                    const c = contOf(s.stack[s.sp - 3]) orelse break :sw;
+                    if (i >= c.len or j >= c.len or !s.vecSigOk(f, code[pc].idx)) break :sw;
+                    s.sp -= 3;
+                    if (!inBlock(blk, &left)) meter.chargeVecSwapL(&lim) catch return s.chargeErrAt(f, pc);
+                    s.noteWrite(@intFromPtr(c));
+                    swapElems(c, i, j);
+                    pc += 1;
+                    if (pc >= code.len) return s.offEnd(f, pc);
+                    if (comptime blk) left = s.blockAt(tab, pc, left, &lim, &mark);
+                    continue :sw code[pc].op;
                 },
                 else => break :sw,
             }
             // Everything the fast paths did not take.
+            var undone = false;
+            if (comptime blk) {
+                if (left != 0) {
+                    // inside a charged block: back to the meter after the instructions before
+                    // this one; `op` charges this one, and the rest go one by one
+                    meter.uncharge(mark, &tab.?.before[pc]);
+                    left = 0;
+                    s.blocks_undone += 1;
+                    undone = true;
+                }
+            }
             pc = @call(.always_inline, op, .{ s, f, code[pc], pc }) catch |e| {
-                if (e == error.Vm) s.atFrame(f);
+                if (e == error.Vm) {
+                    f.pc = pc;
+                    s.atFrame(f);
+                    if (undone) s.blocks_faulted += 1;
+                }
                 return e;
             };
+            lim = meter.limits();
         }
     }
 
-    inline fn atErr(s: *Session, f: *const Frame, e: Fail) Fail {
+    /// True inside a block that was charged at its first instruction: the instruction is
+    /// counted off and charges nothing. False: the caller charges it.
+    inline fn inBlock(comptime blk: bool, left: *u32) bool {
+        if (!blk or left.* == 0) return false;
+        left.* -= 1;
+        return true;
+    }
+
+    /// Before the instruction at `pc` runs: inside a charged block nothing; at the first
+    /// instruction of a block, charge the block if the meter allows it. Returns the number of
+    /// instructions (this one included) that are charged already.
+    inline fn blockAt(s: *Session, tab: ?*const Blocks, pc: u16, left: u32, lim: *const gas.Meter.Limits, mark: *gas.Meter.Mark) u32 {
+        if (left != 0) return left;
+        const t = tab orelse return 0;
+        const li = t.lead[pc];
+        if (li == 0) return 0;
+        const b = &t.blocks[li - 1];
+        mark.* = s.meter.chargeBlock(lim.*, b) orelse {
+            s.blocks_refused += 1;
+            return 0;
+        };
+        s.blocks_charged += 1;
+        return b.n;
+    }
+
+    /// The block tables of `func` (built on first use), or null when this session's gas model
+    /// version is not covered.
+    inline fn blocksOf(s: *Session, func: *const Function) Allocator.Error!?*const Blocks {
+        const gm = s.meter.gas_model_version;
+        if (!Blocks.covers(gm)) return null;
+        if (func.blocks) |p| return @ptrCast(@alignCast(p));
+        return buildBlocks(func, gm);
+    }
+
+    fn buildBlocks(func: *const Function, gm: u64) Allocator.Error!?*const Blocks {
+        @branchHint(.cold);
+        // In the Runtime's arena, by the thread that runs the function: like `native_memo`,
+        // this assumes the Runtime belongs to one thread (the executor's does).
+        const t = try Blocks.build(func.module.pkg.rt.arena_state.allocator(), func, gm);
+        @constCast(func).blocks = t;
+        return t;
+    }
+
+    /// A function whose frames `stepRun` does not run itself: its entry hands them to another
+    /// runner, so a call into one and a return to one leave the loop (`loop` calls `stepRun`
+    /// again, at the frame's `pc`): compiled code (the aot tier) and functions with a loop
+    /// accelerator attached while the accelerators are on. These are the tests at the entry of
+    /// `stepRun`; a runner added there needs its test here as well, or only its outermost
+    /// frame would ever reach it.
+    inline fn runsOutside(func: *const Function) bool {
+        return func.aot != null or (func.accel != null and loopaccel.live());
+    }
+
+    /// A failed charge in `stepRun` at `pc`.
+    inline fn chargeErrAt(s: *Session, f: *Frame, pc: u16) Fail {
+        f.pc = pc;
+        s.pending = .{ .major = s.meter.err };
         s.atFrame(f);
-        return e;
+        return error.Vm;
+    }
+
+    /// `stepRun` ran past the end of the code: `step` reports it.
+    fn offEnd(s: *Session, f: *Frame, pc: u16) (Fail || Error)!bool {
+        @branchHint(.cold);
+        f.pc = pc;
+        return s.step(false);
     }
 
     /// Values with no heap ownership (nothing to copy or drop).
@@ -1057,8 +1785,101 @@ pub const Session = struct {
             else => false,
         };
     }
-    inline fn isInlineOrInvalid(t: value.Tag) bool {
-        return t == .invalid or isInline(t);
+    /// Tags whose values own no memory (also `invalid` and both references): dropping one
+    /// does nothing, copying one is the value itself.
+    inline fn ownsNothing(t: value.Tag) bool {
+        return switch (t) {
+            .u256, .address, .container => false,
+            else => true,
+        };
+    }
+
+    /// `value.size` of a value with an inline tag, without the call (value.zig `primSize`).
+    inline fn inlineSize(t: value.Tag, cfg: gas.SizeCfg) u64 {
+        if (!cfg.fine_grained) return 16;
+        return if (t == .u128) 16 else 8;
+    }
+
+    /// `value.size(v, cfg)` when it is a constant of the tag: an inline value, or a reference
+    /// under a config that does not look through references. null: `value.size` decides.
+    inline fn cheapSize(v: Value, cfg: gas.SizeCfg) ?u64 {
+        if (isInline(v.tag)) return inlineSize(v.tag, cfg);
+        if (v.isRef() and !cfg.traverse_references) return gas.REFERENCE_SIZE;
+        return null;
+    }
+
+    /// The container behind a reference to a struct or a vector (`refContainer`), or null when
+    /// the value is anything else: the full path reports that.
+    inline fn contOf(r: Value) ?*value.Container {
+        if (r.tag != .ref_slot) return null;
+        const v = r.slot().*;
+        if (v.tag != .container) return null;
+        return v.cont();
+    }
+
+    /// Vector kinds whose elements are inline values (no box per element).
+    inline fn inlineElems(k: value.Kind) bool {
+        return switch (k) {
+            .vec_u8, .vec_u16, .vec_u32, .vec_u64, .vec_u128, .vec_bool => true,
+            else => false,
+        };
+    }
+
+    /// `value.readElem` for the `inlineElems` kinds (nothing to allocate, no error).
+    inline fn readInline(c: *const value.Container, i: u64) Value {
+        return switch (c.kind) {
+            .vec_u8 => Value.u8_(c.data[i]),
+            .vec_bool => Value.bool_(c.data[i] != 0),
+            .vec_u16 => Value.u16_(std.mem.readInt(u16, (c.data + i * 2)[0..2], .little)),
+            .vec_u32 => Value.u32_(std.mem.readInt(u32, (c.data + i * 4)[0..4], .little)),
+            .vec_u64 => Value.u64_(std.mem.readInt(u64, (c.data + i * 8)[0..8], .little)),
+            .vec_u128 => Value.u128_(std.mem.readInt(u128, (c.data + i * 16)[0..16], .little)),
+            else => unreachable,
+        };
+    }
+
+    /// `value.writeElem` for the `inlineElems` kinds.
+    inline fn writeInline(c: *value.Container, i: u64, v: Value) void {
+        switch (c.kind) {
+            .vec_u8, .vec_bool => c.data[i] = @truncate(v.a),
+            .vec_u16 => std.mem.writeInt(u16, (c.data + i * 2)[0..2], @truncate(v.a), .little),
+            .vec_u32 => std.mem.writeInt(u32, (c.data + i * 4)[0..4], @truncate(v.a), .little),
+            .vec_u64 => std.mem.writeInt(u64, (c.data + i * 8)[0..8], v.a, .little),
+            .vec_u128 => std.mem.writeInt(u128, (c.data + i * 16)[0..16], v.asU128(), .little),
+            else => unreachable,
+        }
+    }
+
+    /// Swaps elements `i` and `j` of a vector (both in range): what `VecSwap` in `op` does
+    /// with three copies through a buffer, by element width.
+    inline fn swapElems(c: *value.Container, i: u64, j: u64) void {
+        switch (c.kind.width()) {
+            inline 1, 2, 4, 8, 16, 24, 32 => |w| {
+                const T = [w]u8;
+                const a: *T = (c.data + i * w)[0..w];
+                const b: *T = (c.data + j * w)[0..w];
+                const t = a.*;
+                a.* = b.*;
+                b.* = t;
+            },
+            else => unreachable,
+        }
+    }
+
+    /// A vector instruction's `checkSubst` of its element type (signature `sig`, first token),
+    /// as a test. False also for an empty signature, which only the verifier rules out: `op`
+    /// then indexes it with its own checks.
+    inline fn vecSigOk(s: *const Session, f: *const Frame, sig: u16) bool {
+        const toks = f.func.module.cm.signatures[sig];
+        return toks.len != 0 and s.substOk(toks[0], f);
+    }
+
+    /// `checkSubst` as a test with no error to report: true when it would pass.
+    inline fn substOk(s: *const Session, tok: ff.Token, f: *const Frame) bool {
+        const legacy = s.cfg.rules.legacyVm();
+        if (f.ty_nodes.len == 0) return legacy or tok.len <= MAX_TYPE_INSTANTIATION_NODES;
+        if (legacy) return tok[0].tag != .DatatypeInstantiation or f.ty_nodes_sum +| tok.len <= MAX_TYPE_INSTANTIATION_NODES;
+        return substNodes(tok, f.ty_nodes) <= MAX_TYPE_INSTANTIATION_NODES;
     }
 
     const small_max = [_]u64{ 0, 0xff, 0xffff, 0xffff_ffff, std.math.maxInt(u64) };
@@ -1198,7 +2019,7 @@ pub const Session = struct {
         }
         const args = s.stack[s.sp - n .. s.sp];
         s.sp -= n;
-        const locals = try s.lifo.alloc(Value, target.n_locals);
+        const locals = try s.lifo.locals(target.n_locals);
         @memcpy(locals[0..n], args);
         @memset(locals[n..], Value.invalid);
         if (s.frames.items.len - 1 >= CALL_STACK_SIZE_LIMIT) {
@@ -1208,6 +2029,55 @@ pub const Session = struct {
             return error.Vm;
         }
         try s.frames.append(s.arena, try s.newFrame(target, locals, ty_args, mk));
+    }
+
+    /// `callFunction` for `stepRun`, at the call instruction `pc` of frame `f`: the same checks
+    /// and charge in the same order, the same errors at the same locations. Returns the new
+    /// frame, or null when the target was a native (it ran; the caller goes on at `pc + 1`).
+    /// `nodes`: the type arguments' node counts when the caller already has them (a call that
+    /// passes its own type arguments on), else null and `newFrame` counts them.
+    inline fn enterCall(s: *Session, f: *Frame, pc: u16, lim: *gas.Meter.Limits, target: *const Function, ty_args: []const *const Type, nodes: ?[]const u64, nodes_sum: u64, mk: Lifo.Mark) (Fail || Error)!?*Frame {
+        const n = target.params.len;
+        f.pc = pc; // error locations, and where the return goes on
+        if (s.sp < n) return s.failAt(f, .EMPTY_VALUE_STACK, null);
+        s.meter.chargeCallL(lim, n) catch return s.failAt(f, s.meter.err, null);
+        if (target.is_native) {
+            try s.callNative(false, f, target, ty_args);
+            s.lifo.reset(mk);
+            lim.* = s.meter.limits();
+            return null;
+        }
+        const args = s.stack[s.sp - n .. s.sp];
+        s.sp -= n;
+        const locals = try s.lifo.locals(target.n_locals);
+        @memcpy(locals[0..n], args);
+        @memset(locals[n..], Value.invalid);
+        if (s.frames.items.len - 1 >= CALL_STACK_SIZE_LIMIT) {
+            s.pending = .{ .major = .CALL_STACK_OVERFLOW, .module = target.module, .off = .{ .fdef = target.def_idx, .pc = 0 } };
+            if (s.cfg.rules.legacyVm()) s.atFrame(f);
+            return error.Vm;
+        }
+        const fr = if (nodes) |nd|
+            Frame{ .func = target, .pc = 0, .mark = mk, .locals = locals, .ty_args = ty_args, .ty_nodes = nd, .ty_nodes_sum = nodes_sum }
+        else
+            try s.newFrame(target, locals, ty_args, mk);
+        try s.frames.append(s.arena, fr);
+        return &s.frames.items[s.frames.items.len - 1];
+    }
+
+    /// A `CallGeneric` whose type arguments are exactly the caller's own, in order (`f<T, U>`
+    /// calling `g<T, U>`), with few enough type nodes that `checkCallInst` passes: its sum is
+    /// 1 + the caller's nodes + each argument's nodes = 1 + 2 * `ty_nodes_sum`, and each
+    /// argument alone is 1 + its nodes; with the sum at most 63 both stay under the limit of
+    /// 128, on every rule set. Then the callee's type arguments are the caller's (the same
+    /// types, so the same node counts): nothing to instantiate, count or allocate. Any other
+    /// call site, and any larger type, goes the long way and gets its error there.
+    inline fn passesTypeArgsOn(sig: []const ff.Token, f: *const Frame) bool {
+        if (sig.len == 0 or sig.len != f.ty_args.len or sig.len != f.ty_nodes.len or f.ty_nodes_sum > 63) return false;
+        for (sig, 0..) |t, i| {
+            if (t.len != 1 or t[0].tag != .TypeParameter or t[0].idx != i) return false;
+        }
+        return true;
     }
 
     fn newFrame(s: *Session, func: *const Function, locals: []Value, ty_args: []const *const Type, mk: Lifo.Mark) Allocator.Error!Frame {
@@ -1494,8 +2364,8 @@ pub const Session = struct {
         return t;
     }
 
-    /// One instruction other than Call, CallGeneric and Ret at `pc` (also in `f.pc`); returns
-    /// the next pc.
+    /// One instruction other than Call, CallGeneric and Ret at `pc`; returns the next pc.
+    /// It does not read `f.pc` (the untraced loop stores it only when an error needs it).
     pub fn op(s: *Session, f: *Frame, ins: ff.Instr, pc: u16) (Fail || Error)!u16 {
         const m = f.func.module;
         const meter = s.meter;
@@ -1562,12 +2432,14 @@ pub const Session = struct {
                 try s.push(Value.bool_(false));
             },
             .CopyLoc => {
+                if (ins.idx >= f.locals.len) return s.localOutOfRange(false);
                 const v = f.locals[ins.idx];
                 if (v.tag == .invalid) return s.fail(.UNKNOWN_INVARIANT_VIOLATION_ERROR, null);
                 meter.chargeCopyLoc(value.size(v, meter.plain)) catch return s.chargeFail();
                 try s.push(try s.heap.copy(v));
             },
             .MoveLoc => {
+                if (ins.idx >= f.locals.len) return s.localOutOfRange(false);
                 const v = f.locals[ins.idx];
                 if (v.tag == .invalid) return s.fail(.UNKNOWN_INVARIANT_VIOLATION_ERROR, null);
                 f.locals[ins.idx] = Value.invalid;
@@ -1578,15 +2450,18 @@ pub const Session = struct {
             .StLoc => {
                 const v = try s.pop();
                 meter.chargeStoreLoc() catch return s.chargeFail();
+                if (ins.idx >= f.locals.len) return s.localOutOfRange(false);
                 s.heap.drop(f.locals[ins.idx]);
                 f.locals[ins.idx] = v;
             },
             .MutBorrowLoc => {
                 meter.chargeSimple(.MutBorrowLoc) catch return s.chargeFail();
+                if (ins.idx >= f.locals.len) return s.localOutOfRange(true);
                 try s.push(Value.refSlot(&f.locals[ins.idx]));
             },
             .ImmBorrowLoc => {
                 meter.chargeSimple(.ImmBorrowLoc) catch return s.chargeFail();
+                if (ins.idx >= f.locals.len) return s.localOutOfRange(true);
                 try s.push(Value.refSlot(&f.locals[ins.idx]));
             },
             .ImmBorrowField, .MutBorrowField, .ImmBorrowFieldGeneric, .MutBorrowFieldGeneric => {
@@ -1632,7 +2507,7 @@ pub const Session = struct {
             .ReadRef => {
                 const r = try s.pop();
                 if (!r.isRef()) return s.fail(.INTERNAL_TYPE_ERROR, null);
-                meter.chargeReadRef(value.referentSize(r, meter.plain), value.referentSize(r, meter.traversal)) catch return s.chargeFail();
+                meter.chargeReadRefSize(value.referentSize(r, meter.readRefCfg())) catch return s.chargeFail();
                 try s.push(if (r.tag == .ref_elem) try value.readElem(r.cont(), r.b, s.heap) else try s.heap.copy(r.slot().*));
             },
             .WriteRef => {
@@ -1896,4 +2771,305 @@ test "finalize_execution_error" {
     try std.testing.expect(f.sub == null and f.off == null);
     const g: VmError = .{ .major = .ARITHMETIC_ERROR, .off = .{ .fdef = 0, .pc = 4 } };
     try std.testing.expectEqual(g, finalizeExecutionError(g));
+}
+
+test "inline sizes, element reads and writes, swaps equal the value.zig functions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const h = value.Heap{ .arena = arena_state.allocator() };
+    var prng = std.Random.DefaultPrng.init(0x51_2e5);
+    const rnd = prng.random();
+    const inline_tags = [_]value.Tag{ .u8, .u16, .u32, .u64, .u128, .bool };
+    var gm: u64 = 1;
+    while (gm <= 14) : (gm += 1) {
+        for ([_]gas.SizeCfg{ gas.sizeConfig(gm, false), gas.sizeConfig(gm, true) }) |cfg| {
+            for (inline_tags) |t| {
+                const v: Value = .{ .tag = t, .a = 1 };
+                try std.testing.expectEqual(value.size(v, cfg), Session.inlineSize(t, cfg));
+                try std.testing.expectEqual(@as(?u64, value.size(v, cfg)), Session.cheapSize(v, cfg));
+            }
+            var slot = Value.u64_(5);
+            const r = Value.refSlot(&slot);
+            if (Session.cheapSize(r, cfg)) |sz| try std.testing.expectEqual(value.size(r, cfg), sz) else try std.testing.expect(cfg.traverse_references);
+            try std.testing.expectEqual(@as(?u64, null), Session.cheapSize(Value.invalid, cfg));
+        }
+    }
+    const kinds = [_]value.Kind{ .vec_u8, .vec_u16, .vec_u32, .vec_u64, .vec_u128, .vec_bool };
+    for (kinds) |k| {
+        try std.testing.expect(Session.inlineElems(k));
+        const c = try h.newContainer(k, 9);
+        const d = try h.newContainer(k, 9);
+        rnd.bytes(c.bytes());
+        if (k == .vec_bool) for (c.bytes()) |*x| {
+            x.* &= 1;
+        };
+        @memcpy(d.bytes(), c.bytes());
+        var i: usize = 0;
+        while (i < 9) : (i += 1) {
+            const want = try value.readElem(c, i, h);
+            const got = Session.readInline(c, i);
+            try std.testing.expectEqual(want.tag, got.tag);
+            try std.testing.expectEqual(want.a, got.a);
+            try std.testing.expectEqual(want.b, got.b);
+            try std.testing.expectEqual(k.elemTag(), got.tag);
+            // write element 8 - i's value at i through both
+            const v = try value.readElem(c, 8 - i, h);
+            value.writeElem(c, i, v);
+            Session.writeInline(d, i, v);
+            try std.testing.expectEqualSlices(u8, c.bytes(), d.bytes());
+        }
+    }
+    try std.testing.expect(!Session.inlineElems(.vec) and !Session.inlineElems(.vec_u256) and !Session.inlineElems(.vec_address) and !Session.inlineElems(.struct_));
+    // swaps, for every element width (boxed vectors hold 24-byte values)
+    const all = [_]value.Kind{ .vec, .vec_u8, .vec_u16, .vec_u32, .vec_u64, .vec_u128, .vec_u256, .vec_bool, .vec_address };
+    for (all) |k| {
+        const w = k.width();
+        const c = try h.newContainer(k, 7);
+        const d = try h.newContainer(k, 7);
+        rnd.bytes(c.data[0 .. 7 * w]);
+        @memcpy(d.data[0 .. 7 * w], c.data[0 .. 7 * w]);
+        var n: usize = 0;
+        while (n < 50) : (n += 1) {
+            const i = rnd.uintLessThan(usize, 7);
+            const j = rnd.uintLessThan(usize, 7);
+            if (i != j) { // `op`'s VecSwap
+                var tmp: [32]u8 = undefined;
+                @memcpy(tmp[0..w], c.data[i * w ..][0..w]);
+                @memcpy(c.data[i * w ..][0..w], c.data[j * w ..][0..w]);
+                @memcpy(c.data[j * w ..][0..w], tmp[0..w]);
+            }
+            Session.swapElems(d, i, j);
+            try std.testing.expectEqualSlices(u8, c.data[0 .. 7 * w], d.data[0 .. 7 * w]);
+        }
+    }
+    for ([_]value.Tag{ .invalid, .u8, .u16, .u32, .u64, .u128, .bool, .ref_slot, .ref_elem }) |t| try std.testing.expect(Session.ownsNothing(t));
+    for ([_]value.Tag{ .u256, .address, .container }) |t| try std.testing.expect(!Session.ownsNothing(t));
+}
+
+test "substOk is checkSubst without the error" {
+    var prng = std.Random.DefaultPrng.init(0x5ab5_7);
+    const rnd = prng.random();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var meter = gas.Meter.unmetered();
+    var s: Session = undefined;
+    s.meter = &meter;
+    var round: usize = 0;
+    while (round < 20_000) : (round += 1) {
+        s.cfg = .{ .vector_len_max = 1, .max_value_depth = null, .max_type_nodes = 1, .ld_const_abstract_size = false, .rules = .{ .execution_version = if (rnd.boolean()) 4 else 3 } };
+        const len = if (rnd.uintLessThan(u8, 6) == 0) 120 + rnd.uintLessThan(usize, 20) else 1 + rnd.uintLessThan(usize, 6);
+        const tok = try a.alloc(ff.Node, len);
+        for (tok) |*n| n.* = switch (rnd.uintLessThan(u8, 4)) {
+            0 => .{ .tag = .TypeParameter, .idx = rnd.uintLessThan(u16, 4) },
+            1 => .{ .tag = .DatatypeInstantiation, .arity = 1 },
+            2 => .{ .tag = .Vector },
+            else => .{ .tag = .U64 },
+        };
+        const n_ty = rnd.uintLessThan(usize, 4);
+        const nodes = try a.alloc(u64, n_ty);
+        var f: Frame = .{ .func = undefined, .pc = 0, .locals = &.{}, .ty_args = &.{} };
+        for (nodes) |*n| {
+            n.* = if (rnd.uintLessThan(u8, 4) == 0) 100 + rnd.uintLessThan(u64, 40) else 1 + rnd.uintLessThan(u64, 30);
+            f.ty_nodes_sum +|= n.*;
+        }
+        f.ty_nodes = nodes;
+        const want = if (s.checkSubst(tok, &f)) |_| true else |_| false;
+        try std.testing.expectEqual(want, s.substOk(tok, &f));
+        if (round % 512 == 0) _ = arena_state.reset(.retain_capacity);
+    }
+}
+
+test "Lifo.locals gives what alloc gives: same region, same offsets, same backing requests" {
+    // Two regions run the same calls and returns: `fast` takes locals through `locals`, `plain`
+    // through `alloc`. After every step they are at the same place (chunk and offset) with the
+    // same bytes reserved, and every frame's locals sit at the same offset of the same chunk.
+    var arena_fast = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_fast.deinit();
+    var arena_plain = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_plain.deinit();
+    var fast: Lifo = .{ .backing = arena_fast.allocator() };
+    var plain: Lifo = .{ .backing = arena_plain.allocator() };
+    var prng = std.Random.DefaultPrng.init(0x10ca15);
+    const rnd = prng.random();
+    const Live = struct { mk: [2]Lifo.Mark, locals: []Value };
+    var live: std.ArrayList(Live) = .empty;
+    defer live.deinit(std.testing.allocator);
+    var inline_hits: usize = 0;
+    var round: usize = 0;
+    while (round < 200_000) : (round += 1) {
+        if (live.items.len == 0 or (rnd.uintLessThan(u8, 100) < 52 and live.items.len < 1100)) {
+            const n: usize = switch (rnd.uintLessThan(u8, 40)) {
+                0 => 0,
+                1 => 900 + rnd.uintLessThan(usize, 300),
+                2 => 3000 + rnd.uintLessThan(usize, 3000),
+                else => rnd.uintLessThan(usize, 40),
+            };
+            const mk = [2]Lifo.Mark{ fast.mark(), plain.mark() };
+            const room = fast.ci < fast.chunks.items.len and std.mem.alignForward(usize, fast.off, @alignOf(Value)) + n * @sizeOf(Value) <= fast.chunks.items[fast.ci].len;
+            if (n != 0 and room) inline_hits += 1;
+            const got = try fast.locals(n);
+            const want = try plain.alloc(Value, n);
+            try std.testing.expectEqual(n, got.len);
+            try std.testing.expectEqual(n, want.len);
+            if (n != 0) {
+                const off_fast = @intFromPtr(got.ptr) - @intFromPtr(fast.chunks.items[fast.ci].ptr);
+                const off_plain = @intFromPtr(want.ptr) - @intFromPtr(plain.chunks.items[plain.ci].ptr);
+                try std.testing.expectEqual(off_plain, off_fast);
+            }
+            // its slots are its own: stamp them with the frame's depth
+            for (got) |*v| v.* = Value.u64_(live.items.len);
+            try live.append(std.testing.allocator, .{ .mk = mk, .locals = got });
+            // what else a frame takes from the region: node counts, instantiated types
+            if (rnd.uintLessThan(u8, 3) == 0) {
+                const k = 1 + rnd.uintLessThan(usize, 5);
+                _ = try fast.alloc(u64, k);
+                _ = try plain.alloc(u64, k);
+            }
+            if (rnd.uintLessThan(u8, 5) == 0) {
+                const k = 1 + rnd.uintLessThan(usize, 70);
+                _ = try fast.alloc(u8, k);
+                _ = try plain.alloc(u8, k);
+            }
+        } else {
+            const top = live.pop().?;
+            for (top.locals) |v| try std.testing.expectEqual(@as(u64, live.items.len), v.a); // nobody wrote over it
+            fast.reset(top.mk[0]);
+            plain.reset(top.mk[1]);
+        }
+        try std.testing.expectEqual(plain.mark(), fast.mark());
+        try std.testing.expectEqual(plain.reserved, fast.reserved);
+        try std.testing.expectEqual(plain.chunks.items.len, fast.chunks.items.len);
+    }
+    // every live frame still holds its stamp
+    for (live.items, 0..) |fr, d| for (fr.locals) |v| try std.testing.expectEqual(@as(u64, d), v.a);
+    try std.testing.expect(fast.chunks.items.len > 1 and inline_hits > 50_000);
+}
+
+test "passesTypeArgsOn implies checkCallInst passes with the caller's node counts" {
+    var prng = std.Random.DefaultPrng.init(0x9a55_0a);
+    const rnd = prng.random();
+    var meter = gas.Meter.unmetered();
+    var s: Session = undefined;
+    s.meter = &meter;
+    const tps = [_][1]ff.Node{ .{.{ .tag = .TypeParameter, .idx = 0 }}, .{.{ .tag = .TypeParameter, .idx = 1 }}, .{.{ .tag = .TypeParameter, .idx = 2 }}, .{.{ .tag = .TypeParameter, .idx = 3 }} };
+    const other = [_]ff.Node{ .{ .tag = .Vector }, .{ .tag = .TypeParameter, .idx = 0 } };
+    const dummy: Type = .u8;
+    const tys = [_]*const Type{ &dummy, &dummy, &dummy, &dummy };
+    var hits: usize = 0;
+    var round: usize = 0;
+    while (round < 50_000) : (round += 1) {
+        s.cfg = .{ .vector_len_max = 1, .max_value_depth = null, .max_type_nodes = 1, .ld_const_abstract_size = false, .rules = .{ .execution_version = if (rnd.boolean()) 4 else 3 } };
+        const n_ty = rnd.uintLessThan(usize, 5);
+        var nodes: [4]u64 = undefined;
+        var f: Frame = .{ .func = undefined, .pc = 0, .locals = &.{}, .ty_args = tys[0..n_ty] };
+        for (nodes[0..n_ty]) |*n| {
+            n.* = 1 + rnd.uintLessThan(u64, if (rnd.boolean()) 20 else 70);
+            f.ty_nodes_sum +|= n.*;
+        }
+        f.ty_nodes = nodes[0..n_ty];
+        var sig: [4]ff.Token = undefined;
+        const n_sig = if (rnd.uintLessThan(u8, 8) == 0) rnd.uintLessThan(usize, 5) else n_ty;
+        for (sig[0..n_sig], 0..) |*t, i| t.* = switch (rnd.uintLessThan(u8, 12)) {
+            0 => &other,
+            1 => &tps[rnd.uintLessThan(usize, 4)],
+            else => &tps[i],
+        };
+        if (Session.passesTypeArgsOn(sig[0..n_sig], &f)) {
+            hits += 1;
+            try s.checkCallInst(sig[0..n_sig], &f);
+            // the long way would count the same nodes for the same types
+            for (sig[0..n_sig], 0..) |t, i| try std.testing.expectEqual(@as(u16, @intCast(i)), t[0].idx);
+        }
+    }
+    try std.testing.expect(hits > 5_000);
+}
+
+test "block tables: charges come from the meter, blocks never span a branch target" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const u64_tok = [_]ff.Node{.{ .tag = .U64 }};
+    const vec_tok = [_]ff.Node{ .{ .tag = .Vector }, .{ .tag = .U8 } };
+    const ref_tok = [_]ff.Node{ .{ .tag = .Reference }, .{ .tag = .U64 } };
+    const u128_tok = [_]ff.Node{.{ .tag = .U128 }};
+    const params = [_]ff.Token{ &u64_tok, &vec_tok };
+    const locals = [_]ff.Token{ &ref_tok, &u128_tok };
+    const I = ff.Instr;
+    const code = [_]I{
+        .{ .op = .CopyLoc, .idx = 0 }, // 0  block A: 0..4
+        .{ .op = .LdU64, .imm = 1 }, // 1
+        .{ .op = .Add }, // 2
+        .{ .op = .StLoc, .idx = 0 }, // 3
+        .{ .op = .CopyLoc, .idx = 1 }, // 4  a vector: its size is not static
+        .{ .op = .Pop }, // 5  block B: 5..9 (ends at the branch)
+        .{ .op = .CopyLoc, .idx = 2 }, // 6  a reference
+        .{ .op = .CopyLoc, .idx = 3 }, // 7  a u128
+        .{ .op = .BrTrue, .idx = 11 }, // 8
+        .{ .op = .LdU64, .imm = 2 }, // 9  block C: 9..11 (11 is a branch target)
+        .{ .op = .Pop }, // 10
+        .{ .op = .LdU64, .imm = 3 }, // 11 alone before a Ret: no block
+        .{ .op = .Ret }, // 12
+    };
+    const func: Function = .{ .module = undefined, .def_idx = 0, .name = "f", .is_native = false, .code = &code, .params = &params, .locals = &locals, .returns = &.{}, .n_locals = 4, .n_type_params = 0 };
+    const t = try Blocks.build(a, &func, 11);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0 }, t.lead);
+    try std.testing.expectEqual(@as(usize, 3), t.blocks.len);
+    try std.testing.expectEqual(@as(u32, 4), t.blocks[0].n);
+    try std.testing.expectEqual(@as(u32, 4), t.blocks[1].n);
+    try std.testing.expectEqual(@as(u32, 2), t.blocks[2].n);
+    try std.testing.expectEqualSlices(u8, &.{ 8, 1, 1, 0, 0, 0, 8, 16, 0, 1, 0, 0, 0 }, t.incr);
+    // every block and every prefix is what the meter's own charges add up to
+    var m = gas.Meter.init(11, 1_000_000, 1);
+    m.stack_height_current = 50;
+    m.stack_height_high_water_mark = 50;
+    const start = m;
+    var l = m.limits();
+    try m.chargeCopyLocL(&l, 8);
+    try m.chargeSimpleL(&l, .LdU64);
+    var after2 = start;
+    after2.uncharge(.{ .instructions = start.instructions_executed, .size = start.stack_size_current, .size_hwm = start.stack_size_high_water_mark, .height = start.stack_height_current, .height_hwm = start.stack_height_high_water_mark, .gas_left = start.gas_left }, &t.before[2]);
+    try std.testing.expectEqual(m, after2);
+    try m.chargeSimpleL(&l, .Add);
+    try m.chargeStoreLocL(&l);
+    var whole = start;
+    try std.testing.expect(whole.chargeBlock(start.limits(), &t.blocks[0]) != null);
+    try std.testing.expectEqual(m, whole);
+    // below gas model 11 MoveLoc and the sizes differ: no tables
+    try std.testing.expect(!Blocks.covers(10) and Blocks.covers(11));
+    var with = func;
+    with.blocks = t;
+    const want = [_]Blocks.Pos{ .first, .inside, .inside, .inside, .outside, .first, .inside, .inside, .inside, .first, .inside, .outside, .outside };
+    for (want, 0..) |w, pc| try std.testing.expectEqual(w, Blocks.posOf(&with, pc));
+    try std.testing.expectEqual(Blocks.Pos.outside, Blocks.posOf(&func, 1)); // no tables built
+}
+
+test "static charges are the same on every covered gas model version" {
+    // One table per function serves every covered version, so every static charge (each
+    // opcode, each kind of local a CopyLoc copies) must be the same on all of them; and the
+    // version the node runs today is covered.
+    const latest = try (try protocol.get(protocol.max_protocol_version, .mainnet)).get("gas_model_version");
+    try std.testing.expect(Blocks.covers(latest));
+    try std.testing.expect(Blocks.covers(gas.Meter.unmetered().gas_model_version));
+    const copies = [_]?value.Tag{ null, .u8, .u16, .u32, .u64, .u128, .bool, .ref_slot };
+    const base = gas.Meter.init(Blocks.COVERED_MIN, 1 << 40, 1);
+    var static_ops: usize = 0;
+    var gm = Blocks.COVERED_MIN;
+    while (gm <= Blocks.COVERED_MAX) : (gm += 1) {
+        const probe = gas.Meter.init(gm, 1 << 40, 1);
+        for (std.enums.values(ff.Opcode)) |opc| {
+            for (copies) |copy| {
+                const want = Blocks.staticChargeOf(opc, copy, &base);
+                const got = Blocks.staticChargeOf(opc, copy, &probe);
+                try std.testing.expectEqual(want, got);
+                if (gm == Blocks.COVERED_MIN and copy == null and want != null) static_ops += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 48), static_ops); // the members listed in `staticChargeOf`
+    // the next version down is not: MoveLoc and the sizes differ there
+    const old = gas.Meter.init(10, 1 << 40, 1);
+    try std.testing.expect(Blocks.staticChargeOf(.MoveLoc, null, &old) == null);
+    try std.testing.expect(!std.meta.eql(Blocks.staticChargeOf(.CopyLoc, .u8, &old), Blocks.staticChargeOf(.CopyLoc, .u8, &base)));
 }

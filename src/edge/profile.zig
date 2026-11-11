@@ -22,6 +22,7 @@ pub const Settings = struct {
     retention_epochs: u32,
     /// Superseded object versions kept: whole epochs.
     object_retention_epochs: u32,
+    /// Background age-out, deferred while the node is behind the tip (`--age-out defer`).
     age_out: bool,
     chunk_cache_mb: u32,
     cp_cache_mb: u32,

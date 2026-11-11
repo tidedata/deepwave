@@ -53,7 +53,9 @@ const mods = [_]Mod{
     // zui/1 native serving protocol (lane native-proto, docs/NATIVE-PROTOCOL.md).
     .{ .name = "native", .path = "src/serve/native/root.zig", .deps = &.{ "rt", "net", "bcs", "types", "hash", "store", "serve", "index", "rpc_exec", "edgewire" } },
     // Edge deepwave: zui/1 client, core pool and the node's edge source.
-    .{ .name = "edge", .path = "src/edge/root.zig", .deps = &.{ "rt", "net", "bcs", "types", "hash", "store", "checkpoint", "native", "edgewire" } },
+    // (serve and rpc_exec: the forwarding handler of an edge with a core upstream, forward.zig,
+    // wraps the serve handler and reuses rpc_exec's h2 client; both are below native already.)
+    .{ .name = "edge", .path = "src/edge/root.zig", .deps = &.{ "rt", "net", "bcs", "types", "hash", "store", "checkpoint", "native", "edgewire", "serve", "rpc_exec" } },
     // Wave C: the full node composes every lane (node lane owns this row and the deepwave executable).
     .{ .name = "node", .path = "src/node/root.zig", .deps = &.{ "rt", "net", "bcs", "types", "hash", "sig", "bls", "zk", "move_format", "protocol", "store", "checkpoint", "natives", "move_vm", "exec", "sync", "history", "serve", "index", "rpc_exec", "simulate", "native", "edgewire", "edge", "gpu" } },
 };
@@ -73,6 +75,7 @@ pub fn build(b: *std.Build) void {
     // Runtime CPU dispatch (src/core/cpu.zig): on x86-64 the hot kernels are compiled again per
     // tier above the target's own (AVX2, AVX-512 IFMA) and picked by CPUID at startup.
     const cpu_dispatch = b.option(bool, "cpu-dispatch", "x86-64: link per-tier kernel objects picked by CPUID at runtime (default true)") orelse true;
+    x86_own_backend = b.option(bool, "x86-own-backend", "x86-64 Debug: compile with Zig's own backend, not LLVM (3 to 5x faster to compile; AT YOUR OWN RISK: zig 0.17.1's backend miscompiles == and != between optional errors, so results can be silently wrong; never for gates or anything you rely on; default false)") orelse false;
     const g = moduleGraph(b, target, optimize, .{ .kernel_tier = 0xff, .linked_mask = if (cpu_dispatch) kernelMask(target) else 0 });
     const core = g.core;
     const harness = g.harness;
@@ -282,6 +285,18 @@ pub fn build(b: *std.Build) void {
     });
     const store_bench_step = b.step("store-bench", "Build deepwave-store-bench (restore-shaped commit bench, chunk codec study)");
     store_bench_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-store-bench", .root_module = store_bench_mod }), .{}).step);
+
+    // zui-ager-bench: age-out against an apply loop on a live table that does not fit in memory
+    // (tools/bench/ager_bench.zig, lane ager-catchup). `./zig build ager-bench -Doptimize=ReleaseFast`.
+    const ager_bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench/ager_bench.zig"),
+        .link_libc = true,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "store", .module = built[indexOf("store")] }},
+    });
+    const ager_bench_step = b.step("ager-bench", "Build zui-ager-bench (age-out against an apply loop on a cold live table)");
+    ager_bench_step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "zui-ager-bench", .root_module = ager_bench_mod }), .{}).step);
 
     // deepwave-standby: hot-standby lease agent/acceptor and the watchdog (src/standby, docs/STANDBY.md).
     // Pure std, no lane modules. `./zig build standby`; its tests run under `./zig build test -Dlane=standby`.
@@ -623,15 +638,36 @@ fn addKernelObjects(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     }
 }
 
-/// Zig's own x86 backend (the Debug default on x86-64) assembles inline asm only for the
-/// target's CPU features, so a Debug build for a CPU without SHA (-Dcpu=baseline) cannot compile
-/// the runtime-dispatched SHA-NI kernel (src/crypto/hash/sha2.zig compress256Ni: "no encoding
-/// found for pshufb"). Those builds use LLVM, which assembles it, so the kernel stays compiled
-/// and tested; Debug builds for a SHA CPU (native on the boxes) keep the faster backend.
+/// -Dx86-own-backend (default false), see `llvmFor`.
+var x86_own_backend: bool = false;
+
+/// Every Debug build for x86-64, executables and unit tests, goes through LLVM (true), not
+/// through Zig's own x86 backend, which is Zig's default there. Zig 0.17.1's own x86 backend
+/// miscompiles a comparison: `==` and `!=` between two optional errors (`?anyerror`, which has
+/// no "is set" byte: absent is 0) read such a byte for each side from stack memory nothing
+/// wrote. When the two stale bytes differ, equal values compare unequal; when both are 0,
+/// different errors compare equal. Seen in the move_vm lane: the differential test's `same`
+/// compares two snapshots field by field, starting with a `?anyerror`, and returned false for
+/// snapshots with nothing different in them, in other tests on every run (Debug on Linux only;
+/// the Mac's Debug builds and every release build already go through LLVM and were right).
+/// Wrong code in a Debug node or validator is worse than a slower Debug build, and looking for
+/// this one pattern would not find the next thing that backend gets wrong, so nothing is left
+/// on it by default.
+///
+/// The price is compile time. Cross-compiled on the Mac for x86_64-linux, Debug: the move_vm
+/// lane's test binary took 2 s with Zig's own backend and 10 to 11 s with LLVM; deepwave took
+/// 9 s (1 GB peak) and 32 s (4 GB peak). With LLVM, Debug builds also compile the kernels that
+/// are LLVM only (`zig_backend == .stage2_llvm` in src/crypto), which Zig's own backend skipped.
+///
+/// -Dx86-own-backend=true takes the fast compile back at the builder's own risk. Even then a
+/// target CPU without SHA and SSSE3 (-Dcpu=baseline) stays on LLVM: Zig's own backend
+/// assembles inline asm only for the target's CPU features and cannot compile the
+/// runtime-dispatched SHA-NI kernel (src/crypto/hash/sha2.zig compress256Ni: "no encoding
+/// found for pshufb").
 fn llvmFor(mod: *std.Build.Module) ?bool {
     const t = (mod.resolved_target orelse return null).result;
     if (t.cpu.arch != .x86_64 or (mod.optimize orelse .debug) != .debug) return null;
-    if (std.Target.x86.featureSetHasAll(t.cpu.features, .{ .sha, .ssse3 })) return null;
+    if (x86_own_backend and std.Target.x86.featureSetHasAll(t.cpu.features, .{ .sha, .ssse3 })) return null;
     return true;
 }
 

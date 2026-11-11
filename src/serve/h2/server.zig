@@ -154,6 +154,93 @@ test "accept errors: only a gone listener stops the loop" {
     }
 }
 
+/// Every connection being served, so a stop can end the ones that do not end by themselves
+/// (`forceClose`). A node lives on its connection thread's stack for the length of `serveFd`.
+const Live = struct {
+    fd: std.c.fd_t,
+    prev: ?*Live = null,
+    next: ?*Live = null,
+};
+var live_lock: Atomic(bool) = .init(false);
+var live_head: ?*Live = null;
+
+fn liveLock() void {
+    while (live_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+
+fn liveAdd(n: *Live) void {
+    liveLock();
+    defer live_lock.store(false, .release);
+    n.next = live_head;
+    if (live_head) |h| h.prev = n;
+    live_head = n;
+}
+
+fn liveRemove(n: *Live) void {
+    liveLock();
+    defer live_lock.store(false, .release);
+    if (n.prev) |p| p.next = n.next else live_head = n.next;
+    if (n.next) |x| x.prev = n.prev;
+}
+
+/// Connections on the list now (each joins it when its thread starts serving it).
+pub fn liveCount() u32 {
+    liveLock();
+    defer live_lock.store(false, .release);
+    var n: u32 = 0;
+    var it = live_head;
+    while (it) |l| : (it = l.next) n += 1;
+    return n;
+}
+
+/// Ends every connection still open: shuts its socket down both ways, so whatever its thread
+/// is blocked in (the poll of an idle connection, a read of half a TLS record, a send to a peer
+/// that does not read, the wait for a peer to take the last bytes) returns at once and the
+/// thread leaves through its normal close. For the end of a graceful stop, after the drain:
+/// until this existed a connection that did not end by itself kept its thread (and the store
+/// under it) for up to two minutes, and the node could not close its store. Returns how many
+/// connections it ended. A call still running in a handler is not interrupted: its connection
+/// waits for it (`waitDrained` says when).
+pub fn forceClose() u32 {
+    liveLock();
+    defer live_lock.store(false, .release);
+    var n: u32 = 0;
+    var it = live_head;
+    // Under the lock a connection takes to leave the list before it closes its descriptor: a
+    // number on the list is never one the kernel has since given to someone else.
+    while (it) |l| : (it = l.next) {
+        sock.shutdown(l.fd);
+        n += 1;
+    }
+    return n;
+}
+
+pub const Drained = struct {
+    /// Every connection thread, worker call and pump is gone: nothing of the server can touch
+    /// what the handlers read.
+    drained: bool,
+    /// Connections `forceClose` ended (0: all ended by themselves within the drain).
+    forced: u32 = 0,
+    waited_ns: u64 = 0,
+};
+
+/// The end of a graceful stop, after the `stop` flag is set and the accept loops are woken:
+/// waits up to `drain_ns` for the connections to end by themselves (h2: GOAWAY, open streams
+/// served for `Options.stop_grace_ns`; HTTP/1.1: the response in flight), or until `cut` says
+/// to stop waiting (a second signal). Whatever is left is then ended (`forceClose`) and its
+/// threads are given `force_ns` to leave. `drained` false after that means a handler is still
+/// running a call: the caller must not free what handlers use.
+pub fn drainThenForce(drain_ns: u64, force_ns: u64, cut: ?*const fn () bool) Drained {
+    const t0 = meta.monoNs();
+    while (!waitDrained(20 * std.time.ns_per_ms)) {
+        if (meta.monoNs() -| t0 >= drain_ns) break;
+        if (cut) |c| if (c()) break;
+    } else return .{ .drained = true, .waited_ns = meta.monoNs() -| t0 };
+    const forced = forceClose();
+    const ok = waitDrained(force_ns);
+    return .{ .drained = ok, .forced = forced, .waited_ns = meta.monoNs() -| t0 };
+}
+
 fn spawnConn(gpa: std.mem.Allocator, io: Io, fd: std.c.fd_t, opts: Options, handler: Handler, stop: *const Atomic(bool)) void {
     _ = stats.conns.fetchAdd(1, .monotonic);
     const t = std.Thread.spawn(.{ .stack_size = opts.stack_size }, connMain, .{ gpa, io, fd, opts, handler, stop }) catch {
@@ -171,7 +258,13 @@ fn connMain(gpa: std.mem.Allocator, io: Io, fd: std.c.fd_t, opts: Options, handl
 
 /// Serves one accepted connection (sniff, then h2c or HTTP/1.1) and closes `fd`.
 pub fn serveFd(gpa: std.mem.Allocator, io: Io, fd: std.c.fd_t, opts: Options, handler: Handler, stop: *const Atomic(bool)) void {
-    defer sock.close(fd);
+    var live: Live = .{ .fd = fd };
+    liveAdd(&live);
+    // Off the list first, then closed (see `forceClose`).
+    defer {
+        liveRemove(&live);
+        sock.close(fd);
+    }
     sock.tune(fd);
     if (opts.tls) |t| {
         const sess = t.accept(t.ctx, fd) orelse return;
@@ -589,6 +682,7 @@ fn serveH2(gpa: std.mem.Allocator, io: Io, fd: std.c.fd_t, first: []const u8, op
         gpa.destroy(h);
         return;
     } };
+    sock.peerText(fd, &h.conn.peer);
     if (!opts.inline_unary) h.conn.offload = .{ .ctx = h, .submit = H2.submitFn };
     h.wake = sock.Wake.open();
     defer {

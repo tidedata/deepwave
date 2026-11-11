@@ -36,6 +36,9 @@ pub const Entry = struct {
     /// The same for the store's loaded-list fixes (`Store.list_fix`): a transaction of this
     /// checkpoint whose loaded runtime object list was replaced since makes it stale.
     gen_lists: u64 = 0,
+    /// The same for the store's certificate fixes (`Store.cert_fix`): this checkpoint's quorum
+    /// certificate was replaced since (an edge installing its core's, docs/EDGE.md section 13).
+    gen_certs: u64 = 0,
     mask: []u8,
     bytes: []u8,
     /// Compressed frames of `bytes` (codec.compress), filled by the first call that asks.
@@ -160,6 +163,11 @@ pub const Cache = struct {
     /// `putGens` for a checkpoint of `epoch` (`Entry.epoch`) whose record was read at `now_ns`
     /// (`Entry.checked_ns`).
     pub fn putAt(c: *Cache, gpa: Allocator, seq: u64, epoch: ?u64, now_ns: u64, mask: []const u8, bytes: []const u8, gen: u64, gen_lists: u64) void {
+        c.putAll(gpa, seq, epoch, now_ns, mask, bytes, gen, gen_lists, 0);
+    }
+
+    /// `putAt`, with the certificate fix generation as well.
+    pub fn putAll(c: *Cache, gpa: Allocator, seq: u64, epoch: ?u64, now_ns: u64, mask: []const u8, bytes: []const u8, gen: u64, gen_lists: u64, gen_certs: u64) void {
         if (!c.enabled()) return;
         const shard_budget = c.budget / nshards;
         if (bytes.len + mask.len + @sizeOf(Entry) > shard_budget / 4) {
@@ -169,7 +177,7 @@ pub const Cache = struct {
         }
         const k = keyOf(seq, mask);
         const e = gpa.create(Entry) catch return;
-        e.* = .{ .seq = seq, .hash = k, .gen = gen, .gen_lists = gen_lists, .epoch = epoch, .checked_ns = .init(now_ns), .mask = gpa.dupe(u8, mask) catch {
+        e.* = .{ .seq = seq, .hash = k, .gen = gen, .gen_lists = gen_lists, .gen_certs = gen_certs, .epoch = epoch, .checked_ns = .init(now_ns), .mask = gpa.dupe(u8, mask) catch {
             gpa.destroy(e);
             return;
         }, .bytes = gpa.dupe(u8, bytes) catch {

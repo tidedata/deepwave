@@ -44,7 +44,7 @@ const usage =
     \\  --no-s3-fallback                     http source without the S3 fallback
     \\  --source zui1:ADDR:PORT/KEYHEX[,...]  edge node: follow core nodes (or other edges) over zui/1; the
     \\                                       feeds are verified here like any other source (certificate, digests, objects)
-    \\  --profile core | edge | macmini      flag defaults of a node kind (edge: one epoch of history, no read sets, age-out;
+    \\  --profile core | edge | macmini      flag defaults of a node kind (edge: one epoch of history, no read sets, age-out deferred in catch-up;
     \\                                       macmini: Mac mini 32 GB and up); flags after it win
     \\  --edge-feed                          serve the edge feed and its zstd dictionary on --native-listen (core nodes, and
     \\                                       edges that feed other edges); off by default
@@ -52,6 +52,10 @@ const usage =
     \\                                       put a TLS terminator in front); never dry_run, submit, subscribe or the feed
     \\  --edge-conns N                       zui/1 connections to the cores (default 4; the profile's)
     \\  --no-edge-zstd                       ask the cores for raw feeds (no zstd dictionary)
+    \\  --feed-max-inflight N                most feed requests in flight at the cores in catch-up (default 16;
+    \\                                       set from measurements, never above the window; 0: one per fetcher).
+    \\                                       Keep N well under the core's feed queue (64 for all its clients)
+    \\                                       divided by the number of edges that follow it
     \\  --edge-fallback off | http[:URL] | dir:PATH
     \\                                       with --source zui1: where checkpoints come from while no core can serve the
     \\                                       next one (down, restarting, no --edge-feed, behind, pruned): http is the
@@ -133,7 +137,9 @@ const usage =
     \\                                       with GOAWAY(ENHANCE_YOUR_CALM) (default 4096; deepwave's rapid-reset bound)
     \\  --serve-tls ADDR                     the same sui.rpc.v2 over TLS 1.3 (sui-node rpc.https-address); needs --serve
     \\  --serve-tls-cert FILE --serve-tls-key FILE  PEM certificate chain and private key (rpc.tls; P-256, P-384,
-    \\                                       Ed25519 or RSA); without them a self-signed P-256 cert for localhost (13 days)
+    \\                                       Ed25519 or RSA; loaded again on SIGHUP or when the files change: a renewed
+    \\                                       certificate needs no restart); without them a self-signed P-256 cert for
+    \\                                       localhost (13 days)
     \\  --rpc KEY=VALUE                      fullnode.yaml rpc.* scalar: grpc-timeout-ms (60000, 0 = none),
     \\                                       max-connection-age-secs (14400, 0 = none), max-connection-age-grace-secs (600),
     \\                                       subscription-watermark-interval (25), subscription-max-subscribers (1024)
@@ -148,6 +154,10 @@ const usage =
     \\                                       the WebTransport certificates derive from it
     \\  --native-keys FILE                   zui/1 API keys: `<key> <tier> [<Agent Pass hex>]` per line (NATIVE-PROTOCOL.md 6.1)
     \\  --native-pass-dir DIR                Agent Pass ledgers (default <dir>/node/agent-pass)
+    \\  --native-feed-workers N              threads that assemble edge feeds for --edge-feed (default 4)
+    \\  --native-feed-queue N                edge feed requests held at once, queued or running, for all clients together
+    \\                                       (default 64). Each client with requests in flight has an equal share of it
+    \\                                       and may use what the others leave; over its share of a full queue it is refused
     \\  --rpc-release 1.83 | 1.84 | N        GetEpoch protocol_config lists the fields of this sui-node release (default 1.83, as sui-node 1.83.1; raised to the chain's protocol version when newer)
     \\  --indexes | --no-indexes             StateService indexes (on disk in DIR/state-index: built from the live set once, then replayed from its watermark)
     \\  --metrics ADDR                       Prometheus text at http://ADDR/metrics
@@ -166,6 +176,19 @@ const usage =
     \\  RUST_LOG_JSON=1                      JSON lines (tracing-subscriber layout: timestamp, level, fields.message, target)
     \\  RUST_LOG_FILE=PREFIX                 log to PREFIX.YYYY-MM-DD (UTC day, appended) instead of stderr
     \\  --execute-epoch-from HOST:PORT[/plain]  serve ExecuteTransaction (to validators); committee from GetEpoch there
+    \\  --core-upstream HOST:PORT[/pin=HEX|/plain]  an edge's core (its sui.rpc.v2 gRPC): with --serve, requests this node
+    \\                                       cannot answer exactly are passed to it and its answer returned unchanged
+    \\                                       (docs/EDGE.md 11). TLS against the system CAs; /pin=HEX: TLS with the core's
+    \\                                       certificate SHA-256 pinned; /plain: cleartext (the default only for loopback)
+    \\  --core-upstream-pin HEX              the same pin, as a flag
+    \\  --edge-forward on | off              forwarding with --core-upstream (default on)
+    \\  --edge-raw hold | reads | off        read-after-write for transactions executed through this node (default reads):
+    \\                                       reads: answer the execute at once; reads of what it wrote wait until this node
+    \\                                       applied it; hold: hold the execute answer instead; off: neither
+    \\  --edge-raw-waiters N                 reads that may wait at once (default a quarter of the serve workers); more are forwarded
+    \\  --edge-execute-wait-ms N             the bound of either wait (default 2000; 0: off)
+    \\  --edge-max-lag N                     checkpoints behind the core before everything is forwarded (default 5)
+    \\  --edge-ahead-wait-ms N               wait for a checkpoint or object version ahead of this node before forwarding (default 300)
     \\  --pending-tx-dir PATH|off       ExecuteTransaction's pending-tx log (default DIR/node/pending-tx): resubmitted after a restart
     \\  --exec-driver zui|sui-node      ExecuteTransaction's validator driver: zui (default: 3 proposers, effects with the fastest acks)
     \\                                   or sui-node (1.83.1 exactly: gas price / RGP proposers, acks without details); same responses
@@ -195,7 +218,7 @@ const usage =
     \\  --retention-epochs N                sui-node num-epochs-to-retain-for-checkpoints (default 2): checkpoints, transactions, effects, events (CONTRACTS 6.8)
     \\  --object-retention-epochs N         sui-node num-epochs-to-retain (default 1): superseded object versions
     \\  --no-compress                       write new segments uncompressed (default: zstd chunks, store/chunk.zig)
-    \\  --age-out                           background age-out: superseded versions and checkpoint data below the retention floors become holes in sealed segments, freed by hole punching (default off; ZUI_AGE_OUT=1 also turns it on)
+    \\  --age-out [on | off | defer]        background age-out: superseded versions and checkpoint data below the retention floors become holes in sealed segments, freed by hole punching. on (also the bare flag): always; defer: only while the node is within 10 s of the tip, so catch-up has the disk to itself (it still catches up in one run once 16 GiB of history wait below the checkpoint floor); off. Default off; the edge and macmini profiles set defer. ZUI_AGE_OUT=on|off|defer overrides both (1: on, or defer where that is configured; 0: off)
     \\  --chunk-cache-mb N                  decoded-chunk cache budget in MiB (default 1024)
     \\  --hw SPEC                           machine profile and path overrides (also env ZUI_HW), e.g. profile=server,sha_ni=off,pin=on;
     \\                                       off unless given; explicit cache flags win. keys: src/core/hw.zig, `deepwave-hw report`
@@ -450,6 +473,7 @@ pub fn main(init: std.process.Init) !u8 {
     var cert_batch: ?u32 = null;
     var gpu_mode: ?node.gpu.Mode = null;
     var edge_conns: ?u32 = null;
+    var feed_max_inflight: ?u32 = null;
     var edge_zstd = true;
     var edge_fallback: ?node.node.EdgeFallbackSpec = null;
     var profile: ?edge.profile.Kind = null;
@@ -461,7 +485,8 @@ pub fn main(init: std.process.Init) !u8 {
             const ps = edge.profile.settings(profile.?);
             cfg.store_cfg.retention_epochs = ps.retention_epochs;
             cfg.store_cfg.object_retention_epochs = ps.object_retention_epochs;
-            cfg.age_out = ps.age_out;
+            // A profile with age-out runs it deferred: never against catch-up.
+            cfg.age_out = if (ps.age_out) .deferred else .off;
             cfg.store_cfg.cache_bytes = @as(u64, ps.chunk_cache_mb) << 20;
             cfg.cp_cache_bytes = @as(u64, ps.cp_cache_mb) << 20;
             cfg.fetchers = ps.fetchers;
@@ -509,6 +534,8 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.native_http_rpc = true;
         } else if (std.mem.eql(u8, a, "--edge-conns")) {
             edge_conns = try std.fmt.parseInt(u32, try need(args, &i), 10);
+        } else if (std.mem.eql(u8, a, "--feed-max-inflight")) {
+            feed_max_inflight = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--no-edge-zstd")) {
             edge_zstd = false;
         } else if (std.mem.eql(u8, a, "--edge-fallback")) {
@@ -614,6 +641,24 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.trust_dir = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--execute-epoch-from")) {
             execute_epoch_from = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--core-upstream")) {
+            cfg.core_upstream = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--core-upstream-pin")) {
+            cfg.core_upstream_pin = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--edge-forward")) {
+            const v = try need(args, &i);
+            cfg.edge_forward = if (std.mem.eql(u8, v, "on")) true else if (std.mem.eql(u8, v, "off")) false else return usageErr("--edge-forward on | off");
+        } else if (std.mem.eql(u8, a, "--edge-execute-wait-ms")) {
+            cfg.edge_forward_cfg.execute_wait_ms = std.fmt.parseInt(u32, try need(args, &i), 10) catch return usageErr("--edge-execute-wait-ms N (milliseconds; 0: off)");
+        } else if (std.mem.eql(u8, a, "--edge-raw")) {
+            cfg.edge_forward_cfg.raw = edge.forward.ExecMode.parse(try need(args, &i)) orelse return usageErr("--edge-raw hold | reads | off");
+        } else if (std.mem.eql(u8, a, "--edge-raw-waiters")) {
+            cfg.edge_forward_cfg.raw_max_waiters = std.fmt.parseInt(u32, try need(args, &i), 10) catch return usageErr("--edge-raw-waiters N");
+            cfg.edge_raw_waiters_set = true;
+        } else if (std.mem.eql(u8, a, "--edge-max-lag")) {
+            cfg.edge_forward_cfg.max_lag = std.fmt.parseInt(u64, try need(args, &i), 10) catch return usageErr("--edge-max-lag N (checkpoints)");
+        } else if (std.mem.eql(u8, a, "--edge-ahead-wait-ms")) {
+            cfg.edge_forward_cfg.ahead_wait_ms = std.fmt.parseInt(u32, try need(args, &i), 10) catch return usageErr("--edge-ahead-wait-ms N (milliseconds)");
         } else if (std.mem.eql(u8, a, "--pending-tx-dir")) {
             pending_tx_dir = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--exec-driver")) {
@@ -645,6 +690,10 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.native_keys = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--native-pass-dir")) {
             cfg.native_pass_dir = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--native-feed-workers")) {
+            cfg.native_feed_workers = @max(1, try std.fmt.parseInt(u32, try need(args, &i), 10));
+        } else if (std.mem.eql(u8, a, "--native-feed-queue")) {
+            cfg.native_feed_queue = @max(1, try std.fmt.parseInt(u32, try need(args, &i), 10));
         } else if (std.mem.eql(u8, a, "--rpc-release")) {
             cfg.rpc_release_max = node.node.parseRpcRelease(try need(args, &i)) orelse return usageErr("--rpc-release 1.83 | 1.84 | protocol version");
         } else if (std.mem.eql(u8, a, "--indexes")) {
@@ -741,7 +790,12 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, a, "--no-compress")) {
             cfg.store_cfg.compress = false;
         } else if (std.mem.eql(u8, a, "--age-out")) {
-            cfg.age_out = true;
+            // The bare flag is `on`, as before; a value after it overrides the profile.
+            cfg.age_out = .on;
+            if (i + 1 < args.len) if (node.node.AgeOut.parse(args[i + 1])) |m| {
+                cfg.age_out = m;
+                i += 1;
+            };
         } else if (std.mem.eql(u8, a, "--hw")) {
             hw.parse(&hw_spec, try need(args, &i), &hw_fail) catch |e| return hwSpecErr(e, &hw_fail);
         } else if (std.mem.eql(u8, a, "--cp-cache-mb")) {
@@ -876,6 +930,7 @@ pub fn main(init: std.process.Init) !u8 {
         cfg.stream = if (stream_set) stream_url else null; // an edge follows its cores, not a public full node
         const ps = edge.profile.settings(profile orelse .edge);
         cfg.source.zui1.max_conns = edge_conns orelse ps.max_conns;
+        if (feed_max_inflight) |v| cfg.source.zui1.max_inflight = v;
         cfg.source.zui1.zstd = edge_zstd;
         // The fallback is a default of the edge profiles only: a bare `--source zui1:` behaves
         // as before unless `--edge-fallback` asks for one.
@@ -888,6 +943,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (edge_fallback != null and cfg.source != .zui1) return usageErr("--edge-fallback needs --source zui1:...");
+    if (feed_max_inflight != null and cfg.source != .zui1) return usageErr("--feed-max-inflight needs --source zui1:...");
 
     policy_flags.install() catch |e| {
         std.log.err("start: transaction-deny-config / policy-config: {s}", .{@errorName(e)});

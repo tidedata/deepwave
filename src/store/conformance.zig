@@ -19,6 +19,11 @@
 //! 64 steady-state seeds (2000+ checkpoints each, tiny index limits, a prune every epoch),
 //! 512 age-out seeds (floors moving, holes and punches, crashes inside age-out steps, mixed raw
 //! and compressed segments, a snapshot held across the steps),
+//! 256 `agedefer` seeds (the same with deferred age-out: the catch-up signal flips, the ager
+//! waits, bulk catch-ups run without the segment pass, every step has its read-ahead first,
+//! crashes inside the steps and the bulk runs),
+//! 256 `ageset` seeds (the segment pass with a live set of 8 to 2048 bytes: many table passes
+//! per pass over the aged segments, cut by commits, cleaning and crashes; half of them deferred),
 //! 512 `tail` seeds (the newest group torn, rotted before a durable group, rotted under dir
 //! entries, or rotted with nothing after it), 512 `pending` seeds (every crash garbles the
 //! pending write's target) and 512 `misdir` seeds (whole writes land at wrong places).
@@ -382,6 +387,8 @@ fn runDst(ctx: *harness.Ctx) !void {
     for (1..65) |k| try names.append(gpa, try std.fmt.allocPrint(gpa, "corpus/{d}", .{k}));
     for (1..65) |k| try names.append(gpa, try std.fmt.allocPrint(gpa, "steady/{d}", .{k}));
     for (1..513) |k| try names.append(gpa, try std.fmt.allocPrint(gpa, "age/{d}", .{k}));
+    for (1..257) |k| try names.append(gpa, try std.fmt.allocPrint(gpa, "agedefer/{d}", .{k}));
+    for (1..257) |k| try names.append(gpa, try std.fmt.allocPrint(gpa, "ageset/{d}", .{k}));
     for (1..513) |k| try names.append(gpa, try std.fmt.allocPrint(gpa, "tail/{d}", .{k}));
     for (1..513) |k| try names.append(gpa, try std.fmt.allocPrint(gpa, "pending/{d}", .{k}));
     for (1..513) |k| try names.append(gpa, try std.fmt.allocPrint(gpa, "misdir/{d}", .{k}));
@@ -396,8 +403,13 @@ fn runDst(ctx: *harness.Ctx) !void {
     try ctx.stderr.print("store-dst: lean traces: {d} events checked; steady: max {d} runs, max {d} live slots for {d} distinct ids\n", .{
         totals.lean_events.load(.monotonic), totals.max_runs.load(.monotonic), totals.max_slots.load(.monotonic), totals.steady_ids.load(.monotonic),
     });
-    try ctx.stderr.print("store-dst: age-out: {d} floor moves, {d} steps, {d} records dropped, {d} chunks rewritten\n", .{
+    try ctx.stderr.print("store-dst: age-out: {d} floor moves, {d} steps, {d} records dropped, {d} chunks rewritten; deferred: {d} waits, {d} bulk catch-ups, {d} more cut by a crash\n", .{
         totals.floor_moves.load(.monotonic), totals.age_steps.load(.monotonic), totals.age_dropped.load(.monotonic), totals.age_rewrites.load(.monotonic),
+        totals.age_waits.load(.monotonic),   totals.age_bulks.load(.monotonic), totals.age_bulk_crashes.load(.monotonic),
+    });
+    try ctx.stderr.print("store-dst: live set: {d} table passes ({d} started over, {d} inexact), {d} records kept without a lookup, {d} judged dead without one, {d} lookups, {d} misses\n", .{
+        totals.set_builds.load(.monotonic), totals.set_restarts.load(.monotonic), totals.set_inexact.load(.monotonic), totals.set_kept.load(.monotonic),
+        totals.set_dead.load(.monotonic),   totals.age_lookups.load(.monotonic),  totals.set_misses.load(.monotonic),
     });
     try ctx.stderr.print("store-dst: {d} commits, {d} crashes, {d} recoveries, in-flight kept {d} lost {d}, {d} prunes, {d} reopens, {d} mvcc checks, {d} reads checked, corruption: {d} detected reads, {d} refused opens, {d} rolled back, prunes over rot {d} kept every intact live object and {d} refused; sim: {d} torn sectors, {d} lost sectors, {d} lost files, {d} resurrected files, {d} misdirected, {d} rotted\n", .{
         totals.commits.load(.monotonic),          totals.crashes.load(.monotonic),     totals.recoveries.load(.monotonic),
@@ -442,6 +454,16 @@ const Totals = struct {
     age_steps: A = .init(0),
     age_dropped: A = .init(0),
     age_rewrites: A = .init(0),
+    age_waits: A = .init(0),
+    age_bulks: A = .init(0),
+    age_bulk_crashes: A = .init(0),
+    set_builds: A = .init(0),
+    set_kept: A = .init(0),
+    age_lookups: A = .init(0),
+    set_dead: A = .init(0),
+    set_restarts: A = .init(0),
+    set_inexact: A = .init(0),
+    set_misses: A = .init(0),
     floor_moves: A = .init(0),
     max_runs: A = .init(0),
     max_slots: A = .init(0),
@@ -494,6 +516,19 @@ fn runSeed(st: *const DstState, ctx: *harness.Ctx, name: []const u8) !void {
         opts.lean = false;
         opts.seed ^= 0xa9e;
         opts.checkpoints = 200;
+    } else if (std.mem.eql(u8, kind, "ageset")) {
+        opts.age = true;
+        opts.age_set = true;
+        opts.age_defer = k % 2 == 0;
+        opts.lean = false;
+        opts.seed ^= 0x5e7;
+        opts.checkpoints = 240;
+    } else if (std.mem.eql(u8, kind, "agedefer")) {
+        opts.age = true;
+        opts.age_defer = true;
+        opts.lean = false;
+        opts.seed ^= 0xdefe;
+        opts.checkpoints = 240;
     } else if (std.mem.eql(u8, kind, "corrupt")) {
         opts.corruption = true;
         opts.seed ^= 0xc0;
@@ -538,6 +573,16 @@ fn runSeed(st: *const DstState, ctx: *harness.Ctx, name: []const u8) !void {
     _ = t.age_steps.fetchAdd(r.age_steps, .monotonic);
     _ = t.age_dropped.fetchAdd(r.age_dropped, .monotonic);
     _ = t.age_rewrites.fetchAdd(r.age_rewrites, .monotonic);
+    _ = t.age_waits.fetchAdd(r.age_waits, .monotonic);
+    _ = t.age_bulks.fetchAdd(r.age_bulks, .monotonic);
+    _ = t.age_bulk_crashes.fetchAdd(r.age_bulk_crashes, .monotonic);
+    _ = t.set_builds.fetchAdd(r.set_builds, .monotonic);
+    _ = t.set_kept.fetchAdd(r.set_kept, .monotonic);
+    _ = t.age_lookups.fetchAdd(r.age_lookups, .monotonic);
+    _ = t.set_dead.fetchAdd(r.set_dead, .monotonic);
+    _ = t.set_restarts.fetchAdd(r.set_restarts, .monotonic);
+    _ = t.set_inexact.fetchAdd(r.set_inexact, .monotonic);
+    _ = t.set_misses.fetchAdd(r.set_misses, .monotonic);
     _ = t.floor_moves.fetchAdd(r.floor_moves, .monotonic);
     if (opts.steady) {
         _ = t.max_runs.fetchMax(r.max_runs, .monotonic);

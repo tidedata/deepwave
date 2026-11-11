@@ -856,7 +856,7 @@ test "a write that fails while the waiting calls are started answers each of the
         c.mu.lockUncancelable(io);
         const connecting = c.state == .connecting;
         if (connecting) for (0..2) |k| {
-            try c.queued.append(gpa, .{ .id_slot = &slots[k], .path = try gpa.dupe(u8, path), .body = try gpa.dupe(u8, ""), .sink = .{ .ctx = &w, .done = W.sink }, .tag = k, .timeout_ms = null });
+            try c.queued.append(gpa, .{ .id_slot = &slots[k], .path = try gpa.dupe(u8, path), .body = try gpa.dupe(u8, ""), .sink = .{ .ctx = &w, .done = W.sink }, .tag = k, .opts = .{} });
         };
         c.mu.unlock(io);
         if (connecting) conn = c else releaseAndJoin(c);

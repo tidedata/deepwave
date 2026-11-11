@@ -62,6 +62,10 @@ pub const Scratch = struct {
     /// at the first checkpoint this thread takes from the fallback.
     tmp: std.ArrayList(u8) = .empty,
     idx: ?*types.CheckpointIndex = null,
+    /// After a `fetchRaw` that returned a blob: a core's feed served it (a zui1 source). False
+    /// for everything else, an edge's fallback included: such a checkpoint carries a quorum
+    /// certificate that is not the core's (edge/certs.zig).
+    from_core: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Scratch {
         return .{ .arena = .init(gpa) };
@@ -98,6 +102,35 @@ pub fn feedForm(gpa: std.mem.Allocator, sc: *Scratch, out: *std.ArrayList(u8)) !
     sc.aux.clearRetainingCapacity();
 }
 
+/// The longest a sleeping fetch thread goes without looking at its stop flag.
+pub const stop_slice_ms: u64 = 20;
+
+/// Tells the whole fetch stage to stop, without waiting for it: the fetch threads and, for a
+/// zui1 source, the core pool (a connect or a request in progress ends at its next turn), the
+/// fallback's waits and the prober's probe in progress. The node calls this when it stops the
+/// follower and again before it joins the fetch threads (`Fetcher.stop`). Every flag is set
+/// before any join, and none of them waits on the network: a core that stopped answering, a
+/// response half received or a switch to the fallback in progress end within a few milliseconds
+/// of the call. Until then the fallback's flag was set alone: fetch threads saw the stop as a
+/// source error (`SourceUnavailable`, a retry line and a backoff sleep), and one inside a core
+/// call waited for the network, up to the grace with a fallback (3 s) and the pool's connect and
+/// request timeouts without one (5 s and 20 s per core), with the node's stop deadline running.
+pub fn requestStop(f: ?*Fetcher, src: *const Source, prober: ?*edge.fallback.Prober) void {
+    if (f) |x| x.requestStop();
+    if (src.edge_fb) |fb| fb.stopping.store(true, .release);
+    switch (src.kind) {
+        .zui1 => |p| p.stop(),
+        .http => |h| {
+            h.stopping.store(true, .release);
+            if (h.fallback) |b| b.stopping.store(true, .release);
+        },
+        .s3 => |b| b.stopping.store(true, .release),
+        .dir, .none => {},
+    }
+    if (src.edge_fb) |fb| if (fb.src.kind == .http) fb.src.kind.http.stopping.store(true, .release);
+    if (prober) |p| p.stopping.store(true, .release);
+}
+
 /// The second way to the same checkpoints for a zui1 source (`--edge-fallback`, docs/EDGE.md
 /// section 10): when no core can serve the next checkpoint, the edge takes it from `src` (the
 /// public bucket, or a directory) and returns to the cores when they are healthy again. The
@@ -120,8 +153,14 @@ pub const EdgeFallback = struct {
     const Pool = edge.client.Pool;
     const now = edge.fallback.nowNs;
 
+    /// The pause between two tries inside the grace; a stop ends it.
     fn pause(fb: *EdgeFallback, io: Io) void {
-        io.sleep(.fromMilliseconds(@intCast(@max(1, fb.sw.t.retry_ms))), .awake) catch {};
+        var left: u64 = @max(1, fb.sw.t.retry_ms);
+        while (left > 0 and !fb.stopping.load(.acquire)) {
+            const step = @min(left, stop_slice_ms);
+            io.sleep(.fromMilliseconds(@intCast(step)), .awake) catch return;
+            left -= step;
+        }
     }
 
     /// Before a core call: after a return to the cores, the connections opened before it are
@@ -163,6 +202,9 @@ pub const EdgeFallback = struct {
             const r = p.fetchBlobBy(sc.arena.allocator(), seq, out, fb.sw.deadline(since), &fail) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
+                    // The node is stopping (the pool was stopped under the call): not a word
+                    // about the cores, so no grace clock, no switch and no pause.
+                    if (fb.stopping.load(.acquire)) return error.SourceUnavailable;
                     // A response that was under way when the link failed: the core answered
                     // until its last byte, so a long transfer that breaks is not 3 s of silence.
                     const transport = e == error.Closed or e == error.StreamGone or e == error.Timeout;
@@ -177,6 +219,7 @@ pub const EdgeFallback = struct {
             };
             if (r == .ok) {
                 fb.sw.fetched(.core, seq);
+                sc.from_core = true;
                 return .blob;
             }
             // Below every core's retention: no core will ever hold it.
@@ -241,6 +284,7 @@ pub const EdgeFallback = struct {
             const there = p.existsBy(arena.allocator(), seq, fb.sw.deadline(since)) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
+                    if (fb.stopping.load(.acquire)) return error.SourceUnavailable;
                     first = since;
                     if (!fb.failed(s.io, p, since, e, seq)) fb.pause(s.io);
                     continue;
@@ -266,6 +310,7 @@ pub const EdgeFallback = struct {
             const held = p.lowestHeldBy(arena.allocator(), fb.sw.deadline(since)) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
+                    if (fb.stopping.load(.acquire)) return error.SourceUnavailable;
                     first = since;
                     if (!fb.failed(s.io, p, since, e, lo)) fb.pause(s.io);
                     continue;
@@ -314,6 +359,7 @@ pub const Source = struct {
         if (sc.aux.capacity > scratch_keep) sc.aux.clearAndFree(s.gpa);
         if (sc.tmp.capacity > scratch_keep) sc.tmp.clearAndFree(s.gpa);
         sc.aux.clearRetainingCapacity();
+        sc.from_core = false;
         memstat.keep(.fetch_scratch, &sc.kept, sc.arena.queryCapacity() + sc.raw.capacity + sc.aux.capacity + sc.tmp.capacity);
         var nb: [48]u8 = undefined;
         switch (s.kind) {
@@ -344,11 +390,33 @@ pub const Source = struct {
                     else => return error.SourceUnavailable,
                 };
                 if (r == .missing) return .missing;
+                sc.from_core = true;
                 return .blob;
             },
             .none => return .missing,
         }
         return .zst;
+    }
+
+    /// Can this source take several checkpoints in one pipelined call now (`fetchRun`)? A core
+    /// pool can; an edge on its fallback, or stopping, cannot.
+    pub fn pipelines(s: *const Source) bool {
+        if (s.kind != .zui1) return false;
+        const fb = s.edge_fb orelse return true;
+        return fb.sw.mode() == .core and !fb.stopping.load(.acquire);
+    }
+
+    /// The checkpoints `first .. first + results.len` from the core pool in one pipelined call
+    /// (client.zig `Pool.fetchBlobs`): each blob that comes back goes to `sink`. With a
+    /// fallback the call is bounded by the grace like a single one, but its failure is no
+    /// verdict on the cores: the caller asks again through `fetchRaw`, whose rules decide.
+    pub fn fetchRun(s: *const Source, sc: *Scratch, first: u64, results: []edge.client.Pool.BatchItem, out: *std.ArrayList(u8), sink: edge.client.Pool.Sink, times: *edge.client.Pool.CallTimes) !void {
+        const p = s.kind.zui1;
+        _ = sc.arena.reset(.{ .retain_with_limit = scratch_keep });
+        sc.aux.clearRetainingCapacity();
+        const by = if (s.edge_fb) |fb| fb.sw.deadline(EdgeFallback.now(s.io)) else edge.client.Pool.no_deadline;
+        try p.fetchBlobs(sc.arena.allocator(), first, results, out, sink, by, times);
+        if (s.edge_fb) |fb| for (results, 0..) |r, k| if (r == .ok) fb.sw.fetched(.core, first + k);
     }
 
     /// Step two of `fetch`: the zstd archive proto in `sc.raw` to a blob in `out` and its aux
@@ -485,6 +553,76 @@ fn readInto(io: Io, d: Io.Dir, name: []const u8, gpa: std.mem.Allocator, out: *s
     return true;
 }
 
+/// The fetch stage's in-flight control for a zui1 source (`--feed-max-inflight`): the rules are
+/// edge/inflight.zig's `Controller`; this is what the fetch threads share to feed it and to
+/// read its answer. Only catch-up uses it: at the tip a fetch thread asks one request at a
+/// time, as without it.
+pub const InFlight = struct {
+    ctl: edge.inflight.Controller,
+    mu: std.atomic.Mutex = .unlocked,
+    /// Requests to keep in flight now (the controller's last answer).
+    target: Atomic(u32),
+    /// The follower's time spent waiting for its next checkpoint (sync metrics `stall_ns`).
+    /// Null: unknown, and the count never grows.
+    stall_ns: ?*const Atomic(u64) = null,
+    /// Pipelined calls that failed or were refused.
+    errors: Atomic(u64) = .init(0),
+    /// Smoothed times of a pipelined call: to its first response byte, and to its last.
+    first_byte_ns: Atomic(u64) = .init(0),
+    call_ns: Atomic(u64) = .init(0),
+    /// Requests in flight in pipelined calls now, and the most there ever were.
+    now: Atomic(u32) = .init(0),
+    peak: Atomic(u32) = .init(0),
+    /// Pipelined calls and the checkpoints they brought.
+    calls: Atomic(u64) = .init(0),
+    fetched: Atomic(u64) = .init(0),
+
+    /// The most requests one fetch thread sends in one call.
+    pub const max_depth = 32;
+
+    /// `floor`: the fetch threads (one request each, the profile's count); `cap`:
+    /// `--feed-max-inflight`; `window`: the fetch window.
+    pub fn init(floor: u32, cap: u32, window: u32) InFlight {
+        const ctl = edge.inflight.Controller.init(.{ .floor = @max(1, floor), .cap = cap, .window = window });
+        return .{ .ctl = ctl, .target = .init(ctl.target) };
+    }
+
+    /// One sample for the controller (by whichever fetch thread gets here first); the count
+    /// to keep in flight.
+    fn decide(fl: *InFlight, f: *const Fetcher, at_tip: bool) u32 {
+        if (!fl.mu.tryLock()) return fl.target.load(.acquire);
+        defer fl.mu.unlock();
+        const t = fl.ctl.tick(.{
+            .now_ns = nowNs(),
+            .applied = f.applied_next.load(.acquire),
+            .fetched = f.stats.fetched.load(.monotonic),
+            .stall_ns = if (fl.stall_ns) |p| p.load(.monotonic) else 0,
+            .errors = fl.errors.load(.monotonic),
+            .first_byte_ns = fl.first_byte_ns.load(.monotonic),
+            .call_ns = fl.call_ns.load(.monotonic),
+            .at_tip = at_tip,
+        });
+        fl.target.store(t, .release);
+        return t;
+    }
+
+    fn smooth(slot: *Atomic(u64), v: u64) void {
+        const old = slot.load(.monotonic);
+        slot.store(if (old == 0) v else (old * 7 + v) / 8, .monotonic);
+    }
+
+    fn noteCall(fl: *InFlight, times: edge.client.Pool.CallTimes, got: u32) void {
+        _ = fl.calls.fetchAdd(1, .monotonic);
+        _ = fl.fetched.fetchAdd(got, .monotonic);
+        if (times.first_byte_ns != 0) smooth(&fl.first_byte_ns, times.first_byte_ns);
+        if (times.total_ns != 0) smooth(&fl.call_ns, times.total_ns);
+    }
+
+    fn noteError(fl: *InFlight) void {
+        _ = fl.errors.fetchAdd(1, .monotonic);
+    }
+};
+
 pub const FetcherStats = struct {
     fetched: Atomic(u64) = .init(0),
     bytes: Atomic(u64) = .init(0),
@@ -549,6 +687,10 @@ pub const Fetcher = struct {
     behind_hits: u32 = 4,
     stopping: Atomic(bool) = .init(false),
     stats: FetcherStats = .{},
+    /// When (`nowNs`) the source last answered a request for a checkpoint at the tip: its bytes,
+    /// or "not there yet" (0: never). An edge's freshness guard reads it (`tipKnown`,
+    /// `silentNs`; src/edge/forward.zig): a source that answers nothing cannot say where the tip is.
+    answered_ns: Atomic(u64) = .init(0),
     /// Keep committed blobs in the spool (`--keep-spool`), so `deepwave check` can compare the
     /// whole store with what the source served after a live run.
     keep: bool = false,
@@ -557,6 +699,13 @@ pub const Fetcher = struct {
     max_bad: u32 = 8,
     /// Set when a sequence number hit `max_bad`; the node stops on it.
     stuck: Atomic(u64) = .init(std.math.maxInt(u64)),
+    /// The wait before a failed fetch is tried again: `retry_ms` after the first failure of a
+    /// checkpoint, doubled each time up to `retry_max_ms`.
+    retry_ms: u64 = 100,
+    retry_max_ms: u64 = 10_000,
+    /// In-flight control for a zui1 source in catch-up (`InFlight`); null: one request per
+    /// fetch thread, always.
+    inflight: ?*InFlight = null,
     /// The archive publishes checkpoints in bursts (several appear at once, then nothing for up
     /// to a second). Threads waiting on the next `lookahead` sequence numbers past the frontier
     /// each make one immediate request every time the frontier moves, so a burst lands in one
@@ -573,6 +722,11 @@ pub const Fetcher = struct {
     /// ahead of the follower, far less than len, so a slot is never reused while it matters).
     done: [1 << 14]Atomic(u64) = @splat(.init(std.math.maxInt(u64))),
     /// Arrival wall clock of recent checkpoints' bytes (`noteArrival`).
+    /// Sequence numbers whose spooled blob a core's feed served, by `seq % len` (as `done`).
+    /// Set by the writer before its file is renamed in, cleared by any other writer of the same
+    /// checkpoint: what `fromCore` does not name came from somewhere else (the fallback, a
+    /// stream, p2p, a kept spool), and an edge marks its certificate as foreign.
+    core_origin: [1 << 14]Atomic(u64) = @splat(.init(std.math.maxInt(u64))),
     arrived_seq: [1 << 12]Atomic(u64) = @splat(.init(std.math.maxInt(u64))),
     arrived_ms: [1 << 12]Atomic(u64) = @splat(.init(0)),
     /// First sighting of recent checkpoints per source (wall clock ms, 0: not seen), by
@@ -607,20 +761,33 @@ pub const Fetcher = struct {
             f.gpa.free(f.threads);
         }
         for (f.threads) |*t| {
-            t.* = try std.Thread.spawn(.{ .stack_size = 8 << 20 }, run, .{f});
+            t.* = try std.Thread.spawn(.{ .stack_size = 8 << 20 }, run, .{ f, @as(u32, @intCast(made)) });
             made += 1;
         }
     }
 
-    pub fn stop(f: *Fetcher) void {
+    /// Tells the fetch threads to stop, without waiting for them.
+    pub fn requestStop(f: *Fetcher) void {
         f.stopping.store(true, .release);
+    }
+
+    pub fn stop(f: *Fetcher) void {
+        f.requestStop();
         for (f.threads) |t| t.join();
         f.gpa.free(f.threads);
         f.threads = &.{};
     }
 
+    /// Sleeps `ms`, or until the fetcher is told to stop (looked at every `stop_slice_ms`). The
+    /// backoff after a source error grows to 10 s: slept in one piece, a stop waited that long
+    /// for the thread, longer than the node's stop deadline.
     fn sleepMs(f: *Fetcher, ms: u64) void {
-        f.io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
+        var left = ms;
+        while (left > 0 and !f.stopping.load(.acquire)) {
+            const step = @min(left, stop_slice_ms);
+            f.io.sleep(.fromMilliseconds(@intCast(step)), .awake) catch return;
+            left -= step;
+        }
     }
 
     fn claim(f: *Fetcher) ?u64 {
@@ -636,16 +803,121 @@ pub const Fetcher = struct {
         return null;
     }
 
-    fn run(f: *Fetcher) void {
+    fn run(f: *Fetcher, idx: u32) void {
         var sc = Scratch.init(f.gpa);
         defer sc.deinit(f.gpa);
         var blob: std.ArrayList(u8) = .empty;
         defer blob.deinit(f.gpa);
-        while (f.claim()) |seq| f.fetchOne(&sc, &blob, seq);
+        while (true) {
+            const d = f.depth(idx);
+            if (d <= 1) {
+                const seq = f.claim() orelse break;
+                f.fetchOne(&sc, &blob, seq);
+                continue;
+            }
+            const r = f.claimRun(d) orelse break;
+            if (r.n == 0) continue; // the tip came while it waited for room: the single path
+            if (r.n == 1) f.fetchOne(&sc, &blob, r.first) else f.fetchRun(&sc, &blob, r.first, r.n);
+        }
+    }
+
+    /// Requests fetch thread `idx` sends in its next call: 1 (the single path) without
+    /// in-flight control, at the tip, and while the source cannot pipeline (not a core pool, or
+    /// an edge on its fallback); else its share of the controller's count.
+    fn depth(f: *Fetcher, idx: u32) u32 {
+        const fl = f.inflight orelse return 1;
+        const at_tip = f.frontier.load(.acquire) != std.math.maxInt(u64);
+        const t = fl.decide(f, at_tip);
+        if (at_tip or !f.source.pipelines()) return 1;
+        return @min(InFlight.max_depth, edge.inflight.Controller.depth(t, idx, @intCast(@max(1, f.threads.len))));
+    }
+
+    /// Claims `d` consecutive checkpoints (fewer only at `to`), never past the window: what is
+    /// in flight and what waits for the follower together never exceed it. A whole run or
+    /// nothing: a thread that took the one free place of a full window would be gone for a
+    /// round trip with it, and the window would carry a fraction of what it can.
+    fn claimRun(f: *Fetcher, d_in: u32) ?struct { first: u64, n: u32 } {
+        const d: u64 = @min(@as(u64, d_in), f.window);
+        while (!f.stopping.load(.acquire)) {
+            const cur = f.next.load(.monotonic);
+            if (cur > f.to) return null;
+            const lim = f.applied_next.load(.acquire) + f.window;
+            const want = @min(d, (f.to - cur) +| 1);
+            if (cur >= lim or lim - cur < want) {
+                f.sleepMs(2);
+                // the count may have changed, or the tip come, while this thread waited
+                if (f.frontier.load(.acquire) != std.math.maxInt(u64)) return .{ .first = 0, .n = 0 };
+                continue;
+            }
+            const n: u32 = @intCast(want);
+            if (f.next.cmpxchgWeak(cur, cur + n, .monotonic, .monotonic) == null) return .{ .first = cur, .n = n };
+        }
+        return null;
+    }
+
+    const RunSink = struct {
+        f: *Fetcher,
+        first: u64,
+        /// Checkpoints written to the spool, and those whose write failed (bit `seq - first`).
+        wrote: u32 = 0,
+        failed: u64 = 0,
+
+        fn put(ctx: *anyopaque, seq: u64, bytes: []const u8) void {
+            const s: *RunSink = @ptrCast(@alignCast(ctx));
+            const f = s.f;
+            f.noteSeen(seq, .bucket);
+            // another writer holds it (or wrote it): nothing to do
+            if (!f.markDone(seq)) {
+                _ = f.stats.dup_hits.fetchAdd(1, .monotonic);
+                return;
+            }
+            f.noteArrival(seq);
+            // a pipelined call only ever asks the core pool
+            f.writeSpoolFrom(seq, bytes, "", true) catch |e| {
+                f.unmarkDone(seq);
+                _ = f.stats.errors.fetchAdd(1, .monotonic);
+                std.log.warn("spool {d}: {s}", .{ seq, @errorName(e) });
+                s.failed |= @as(u64, 1) << @intCast(seq - s.first);
+                return;
+            };
+            s.wrote += 1;
+            _ = f.stats.fetched.fetchAdd(1, .monotonic);
+            _ = f.stats.bytes.fetchAdd(bytes.len, .monotonic);
+            Metrics.max(&f.stats.highest, seq);
+        }
+    };
+
+    /// Catch-up only: the checkpoints `first .. first + n` in one pipelined call. Whatever
+    /// does not come out of it (a checkpoint the core does not hold yet, a refused request, a
+    /// failed call) goes to the single path, one by one: the retries, the fallback's rules and
+    /// the tip are all there and only there.
+    fn fetchRun(f: *Fetcher, sc: *Scratch, blob: *std.ArrayList(u8), first: u64, n: u32) void {
+        const fl = f.inflight.?;
+        var results: [InFlight.max_depth]edge.client.Pool.BatchItem = @splat(.failed);
+        var sink: RunSink = .{ .f = f, .first = first };
+        const in_flight = fl.now.fetchAdd(n, .acq_rel) + n;
+        var peak = fl.peak.load(.monotonic);
+        while (in_flight > peak) peak = fl.peak.cmpxchgWeak(peak, in_flight, .monotonic, .monotonic) orelse break;
+        const t0 = nowNs();
+        var times: edge.client.Pool.CallTimes = .{};
+        const ok = if (f.source.fetchRun(sc, first, results[0..n], blob, .{ .ctx = &sink, .put = RunSink.put }, &times)) |_| true else |_| false;
+        _ = fl.now.fetchSub(n, .acq_rel);
+        // a call the stop ended: nothing to count, nothing to ask again
+        if (f.stopping.load(.acquire)) return;
+        if (ok) {
+            _ = f.stats.fetch_ns.fetchAdd(nowNs() - t0, .monotonic);
+            fl.noteCall(times, sink.wrote);
+            if (times.limited) fl.noteError();
+        } else fl.noteError();
+        for (0..n) |k| {
+            if (f.stopping.load(.acquire)) return;
+            if (results[k] == .ok and sink.failed >> @intCast(k) & 1 == 0) continue;
+            f.fetchOne(sc, blob, first + k);
+        }
     }
 
     fn fetchOne(f: *Fetcher, sc: *Scratch, blob: *std.ArrayList(u8), seq: u64) void {
-        var backoff: u64 = 100;
+        var backoff: u64 = f.retry_ms;
         var bad: u32 = 0;
         // The frontier value at this thread's last immediate request: one immediate request per
         // frontier move, everything else at the tip goes through the shared pacer.
@@ -721,7 +993,10 @@ pub const Fetcher = struct {
             const probe = fr != std.math.maxInt(u64) and f.streamLive();
             if (probe) {
                 _ = f.stats.probes.fetchAdd(1, .monotonic);
-                const there = f.source.exists(target) catch false;
+                const there = if (f.source.exists(target)) |t| ok: {
+                    f.answered_ns.store(nowNs(), .monotonic);
+                    break :ok t;
+                } else |_| false;
                 if (there and (f.claimed(target) or f.fetched(target))) continue;
                 if (!there) {
                     _ = f.stats.misses.fetchAdd(1, .monotonic);
@@ -733,15 +1008,18 @@ pub const Fetcher = struct {
                 }
             }
             const raw = f.source.fetchRaw(sc, target, blob) catch |e| {
+                // A request the stop ended is not a source error: no count, no retry line.
+                if (f.stopping.load(.acquire)) return;
                 _ = f.stats.errors.fetchAdd(1, .monotonic);
                 // A helper or speculative request leaves errors to the thread that owns the checkpoint.
                 if (role != .own) continue;
                 _ = f.stats.transient_errors.fetchAdd(1, .monotonic);
                 std.log.warn("fetch {d}: {s}; retry in {d} ms", .{ seq, @errorName(e), backoff });
                 f.sleepMs(backoff);
-                backoff = @min(backoff * 2, 10_000);
+                backoff = @min(backoff * 2, f.retry_max_ms);
                 continue;
             };
+            f.answered_ns.store(nowNs(), .monotonic);
             if (raw == .missing) {
                 _ = f.stats.misses.fetchAdd(1, .monotonic);
                 if (role == .spec) _ = f.stats.lookahead_misses.fetchAdd(1, .monotonic);
@@ -781,12 +1059,12 @@ pub const Fetcher = struct {
                     }
                     std.log.warn("fetch {d}: {s}; retry in {d} ms", .{ seq, @errorName(e), backoff });
                     f.sleepMs(backoff);
-                    backoff = @min(backoff * 2, 10_000);
+                    backoff = @min(backoff * 2, f.retry_max_ms);
                     continue;
                 };
                 _ = f.stats.decode_ns.fetchAdd(nowNs() - t1, .monotonic);
             }
-            f.writeSpool(target, blob.items, sc.aux.items) catch |e| {
+            f.writeSpoolFrom(target, blob.items, sc.aux.items, sc.from_core) catch |e| {
                 f.unmarkDone(target);
                 _ = f.stats.errors.fetchAdd(1, .monotonic);
                 std.log.warn("spool {d}: {s}", .{ target, @errorName(e) });
@@ -820,6 +1098,20 @@ pub const Fetcher = struct {
             }
             if (role == .own) return;
         }
+    }
+
+    /// The newest checkpoint known to exist at the source, or null while the fetcher has not met
+    /// the tip (catch-up: no request has come back "not there yet" since it last fell behind).
+    pub fn tipKnown(f: *const Fetcher) ?u64 {
+        const fr = f.frontier.load(.acquire);
+        if (fr == std.math.maxInt(u64)) return null;
+        return @max(f.stats.highest.load(.monotonic), fr -| 1);
+    }
+
+    /// Nanoseconds since the source last answered (`answered_ns`); the maximum when it never did.
+    pub fn silentNs(f: *const Fetcher) u64 {
+        const at = f.answered_ns.load(.monotonic);
+        return if (at == 0) std.math.maxInt(u64) else nowNs() -| at;
     }
 
     /// Another thread holds the bytes of `seq` (claimed by `markDone`, file not yet written).
@@ -962,9 +1254,21 @@ pub const Fetcher = struct {
         };
     }
 
+    /// The spooled blob of `seq` came from a core's feed (`core_origin`). The follower's observer
+    /// asks before it commits `seq`.
+    pub fn fromCore(f: *const Fetcher, seq: u64) bool {
+        return f.core_origin[seq % f.core_origin.len].load(.acquire) == seq;
+    }
+
     /// `<seq>.aux` first, then `<seq>.chk` (each written to a temporary name and renamed), so a
-    /// reader that sees the `.chk` also sees its `.aux`.
+    /// reader that sees the `.chk` also sees its `.aux`. For bytes that did not come from a
+    /// core's feed (`writeSpoolFrom`).
     pub fn writeSpool(f: *Fetcher, seq: u64, bytes: []const u8, aux: []const u8) !void {
+        return f.writeSpoolFrom(seq, bytes, aux, false);
+    }
+
+    /// `writeSpool`, saying whether a core's feed served the bytes.
+    pub fn writeSpoolFrom(f: *Fetcher, seq: u64, bytes: []const u8, aux: []const u8, from_core: bool) !void {
         var tb: [48]u8 = undefined;
         var nb: [48]u8 = undefined;
         // Unique temporary names: a helper and the owning thread can write the same checkpoint.
@@ -978,6 +1282,9 @@ pub const Fetcher = struct {
         const tmp = std.fmt.bufPrint(&tb, ".{d}.{d}.tmp", .{ seq, u }) catch unreachable;
         const name = std.fmt.bufPrint(&nb, "{d}.chk", .{seq}) catch unreachable;
         try f.spool.writeFile(f.io, .{ .sub_path = tmp, .data = bytes });
+        // Before the rename: whoever reads the file knows where it came from.
+        const origin = &f.core_origin[seq % f.core_origin.len];
+        if (from_core) origin.store(seq, .release) else _ = origin.cmpxchgStrong(seq, std.math.maxInt(u64), .acq_rel, .monotonic);
         try f.spool.rename(tmp, f.spool, name, f.io);
         // After the rename: a reader woken here finds the file.
         if (f.on_spooled) |h| h.call(h.ctx, seq);
@@ -1032,4 +1339,28 @@ pub fn nowNs() u64 {
         _ = std.c.clock_gettime(.MONOTONIC, &ts);
     }
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "fetcher: the tip is known only once a request missed; silence counts from the last answer" {
+    var f: Fetcher = undefined;
+    f.frontier = .init(std.math.maxInt(u64));
+    f.stats = .{};
+    f.answered_ns = .init(0);
+    // nothing fetched, nothing answered
+    try std.testing.expectEqual(@as(?u64, null), f.tipKnown());
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), f.silentNs());
+    // catch-up: checkpoints arrive, but no request has come back "not there yet"
+    f.stats.highest.store(100, .monotonic);
+    try std.testing.expectEqual(@as(?u64, null), f.tipKnown());
+    // the first miss: 101 is not there, so 100 is the tip
+    f.frontier.store(101, .release);
+    try std.testing.expectEqual(@as(?u64, 100), f.tipKnown());
+    // a frontier past the highest spooled (its checkpoints are being written): one under it
+    f.frontier.store(105, .release);
+    try std.testing.expectEqual(@as(?u64, 104), f.tipKnown());
+    // fell behind again (`behind_hits`): unknown until the next miss
+    f.frontier.store(std.math.maxInt(u64), .release);
+    try std.testing.expectEqual(@as(?u64, null), f.tipKnown());
+    f.answered_ns.store(nowNs(), .monotonic);
+    try std.testing.expect(f.silentNs() < std.time.ns_per_s);
 }

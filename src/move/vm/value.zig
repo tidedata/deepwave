@@ -195,7 +195,9 @@ pub const Pool = struct {
     }
 
     fn give(p: *Pool, ptr: [*]u8, cls: u8) void {
-        if (std.debug.runtime_safety) @memset(ptr[0 .. @as(usize, 1) << @intCast(cls + MIN_SHIFT)], 0xaa);
+        // Poisoning the whole freed block is a debugging aid: Debug builds only (ReleaseSafe
+        // runs the node, and a freed 64 KiB vector would cost a 64 KiB write).
+        if (@import("builtin").mode == .debug) @memset(ptr[0 .. @as(usize, 1) << @intCast(cls + MIN_SHIFT)], 0xaa);
         const n: *Node = @ptrCast(@alignCast(ptr));
         n.next = p.heads[cls];
         p.heads[cls] = n;

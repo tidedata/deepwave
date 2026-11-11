@@ -327,7 +327,7 @@ const P256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// A local CA and the leaves it signs, as PEM files in a temporary directory.
-const Pki = struct {
+pub const Pki = struct {
     gpa: std.mem.Allocator,
     io: Io,
     tmp: std.testing.TmpDir,
@@ -340,35 +340,35 @@ const Pki = struct {
 
     const ca_name = "zui test CA";
 
-    fn init(p: *Pki, gpa: std.mem.Allocator, io: Io, now: i64) !void {
+    pub fn init(p: *Pki, gpa: std.mem.Allocator, io: Io, now: i64) !void {
         p.* = .{ .gpa = gpa, .io = io, .tmp = std.testing.tmpDir(.{}), .ca_key = try P256.KeyPair.generateDeterministic(@splat(0x21)) };
         const n = try p.tmp.dir.realPath(io, &p.dir_buf);
         p.dir = p.dir_buf[0..n];
         p.ca = cert_mod.issue(&p.ca_buf, .{ .subject = p.ca_key.public_key, .signer = p.ca_key, .subject_cn = ca_name, .issuer_cn = ca_name, .serial = @splat(1), .not_before = now - 30 * 86400, .not_after = now + 365 * 86400, .ca = true });
     }
 
-    fn deinit(p: *Pki) void {
+    pub fn deinit(p: *Pki) void {
         p.tmp.cleanup();
     }
 
     /// A leaf for `key` named `dns`, valid from `nb` to `na`, signed by the CA.
-    fn leaf(p: *Pki, buf: *[cert_mod.max_len]u8, key: P256.KeyPair, dns: []const u8, nb: i64, na: i64) []const u8 {
+    pub fn leaf(p: *Pki, buf: *[cert_mod.max_len]u8, key: P256.KeyPair, dns: []const u8, nb: i64, na: i64) []const u8 {
         p.serial += 1;
         return cert_mod.issue(buf, .{ .subject = key.public_key, .signer = p.ca_key, .subject_cn = dns, .issuer_cn = ca_name, .serial = @splat(p.serial), .not_before = nb, .not_after = na, .dns = dns });
     }
 
-    fn path(p: *Pki, buf: []u8, name: []const u8) []const u8 {
+    pub fn path(p: *Pki, buf: []u8, name: []const u8) []const u8 {
         return std.fmt.bufPrint(buf, "{s}/{s}", .{ p.dir, name }) catch unreachable;
     }
 
     /// `text` at `name`, the way an ACME client replaces a file: a new file renamed over it.
-    fn put(p: *Pki, name: []const u8, text: []const u8) !void {
+    pub fn put(p: *Pki, name: []const u8, text: []const u8) !void {
         try p.tmp.dir.writeFile(p.io, .{ .sub_path = "new.tmp", .data = text });
         try p.tmp.dir.rename("new.tmp", p.tmp.dir, name, p.io);
     }
 
     /// The chain file (`certs` as PEM blocks, in order) and the key file (SEC1 `EC PRIVATE KEY`).
-    fn putPair(p: *Pki, cert_name: []const u8, key_name: []const u8, chain: []const []const u8, key: P256.KeyPair) !void {
+    pub fn putPair(p: *Pki, cert_name: []const u8, key_name: []const u8, chain: []const []const u8, key: P256.KeyPair) !void {
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(p.gpa);
         for (chain) |der| try pemBlock(&text, p.gpa, "CERTIFICATE", der);
@@ -384,7 +384,7 @@ const Pki = struct {
     }
 };
 
-fn pemBlock(out: *std.ArrayList(u8), gpa: std.mem.Allocator, label: []const u8, der: []const u8) !void {
+pub fn pemBlock(out: *std.ArrayList(u8), gpa: std.mem.Allocator, label: []const u8, der: []const u8) !void {
     const enc = std.base64.standard.Encoder;
     try out.print(gpa, "-----BEGIN {s}-----\n", .{label});
     const b64 = try gpa.alloc(u8, enc.calcSize(der.len));
@@ -398,7 +398,7 @@ fn pemBlock(out: *std.ArrayList(u8), gpa: std.mem.Allocator, label: []const u8, 
     try out.print(gpa, "-----END {s}-----\n", .{label});
 }
 
-fn sha(der: []const u8) [32]u8 {
+pub fn sha(der: []const u8) [32]u8 {
     var h: [32]u8 = undefined;
     Sha256.hash(der, &h, .{});
     return h;

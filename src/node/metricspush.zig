@@ -18,6 +18,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const snappy = @import("net").snappy;
+const netguard = @import("netguard.zig");
 
 pub const content_type = "application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited";
 
@@ -270,6 +271,11 @@ pub const Pusher = struct {
     interval_s: u64 = 60,
     source: Source,
     stop: std.atomic.Value(bool) = .init(false),
+    /// One push (connect, request, response) is bounded by this, and ends within ~100 ms of
+    /// `stop` (netguard.timed). std.http has no timeout: a push to an endpoint that had gone
+    /// silent held the thread for ever, and `deinit`, which joins it, with it: the node's stop
+    /// waited on the network.
+    timeout_ms: u64 = 15_000,
     pushes: std.atomic.Value(u64) = .init(0),
     failures: std.atomic.Value(u64) = .init(0),
     thread: ?std.Thread = null,
@@ -279,6 +285,8 @@ pub const Pusher = struct {
         p.thread = try std.Thread.spawn(.{ .stack_size = 4 << 20 }, run, .{p});
     }
 
+    /// Stops the thread and joins it. A push in flight is ended (see `timeout_ms`), so the join
+    /// is a matter of milliseconds whatever the endpoint does.
     pub fn deinit(p: *Pusher) void {
         p.stop.store(true, .release);
         if (p.thread) |t| t.join();
@@ -295,6 +303,8 @@ pub const Pusher = struct {
                 errors = 0;
                 _ = p.pushes.fetchAdd(1, .monotonic);
             } else |e| {
+                // a push the stop ended is not a failure of the endpoint
+                if (p.stop.load(.acquire)) break;
                 errors += 1;
                 _ = p.failures.fetchAdd(1, .monotonic);
                 if (errors >= 10)
@@ -322,21 +332,89 @@ pub const Pusher = struct {
         const pb = try encodeText(a, text.writer.buffered(), now_ms);
         const body = try compress(a, pb);
         var resp: std.Io.Writer.Allocating = .init(a);
-        const r = try client.fetch(.{
-            .location = .{ .url = p.url },
-            .method = .POST,
-            .payload = body,
-            .response_writer = &resp.writer,
-            .headers = .{ .content_type = .{ .override = content_type }, .accept_encoding = .omit },
-            .extra_headers = &.{.{ .name = "content-encoding", .value = "snappy" }},
-        });
-        if (@intFromEnum(r.status) / 100 != 2) {
+        var ab: netguard.Abort = .{};
+        const status = try netguard.timed(p.io, p.timeout_ms, &p.stop, &ab, postOnce, .{ client, p.url, body, &resp.writer, &ab });
+        if (@intFromEnum(status) / 100 != 2) {
             const b = resp.writer.buffered();
-            std.log.warn("metrics push failed: [{d}]:{s}", .{ @intFromEnum(r.status), b[0..@min(b.len, 200)] });
+            std.log.warn("metrics push failed: [{d}]:{s}", .{ @intFromEnum(status), b[0..@min(b.len, 200)] });
             return error.PushRejected;
         }
     }
 };
+
+/// One POST of `body` (as http.zig's `fetchOnce`: the connection's socket is armed in `abort`,
+/// so the timeout or a stop wakes a blocked read or write at once).
+fn postOnce(c: *std.http.Client, url: []const u8, body: []u8, w: *std.Io.Writer, abort: *netguard.Abort) !std.http.Status {
+    const uri = try std.Uri.parse(url);
+    var req = try c.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{ .content_type = .{ .override = content_type }, .accept_encoding = .omit },
+        .extra_headers = &.{.{ .name = "content-encoding", .value = "snappy" }},
+    });
+    defer req.deinit();
+    // Any failure: the connection is not reused (see http.zig fetchOnce).
+    errdefer if (req.connection) |conn| {
+        conn.closing = true;
+    };
+    try abort.arm(netguard.socketOf(req.connection.?));
+    defer abort.disarm();
+    try req.sendBodyComplete(body);
+    var res = try req.receiveHead(&.{});
+    const reader = res.reader(&.{});
+    _ = reader.streamRemaining(w) catch |err| switch (err) {
+        error.ReadFailed => return res.bodyErr() orelse error.ReadFailed,
+        else => |e| return e,
+    };
+    return res.head.status;
+}
+
+test "metrics push: a stop ends a push in flight to an endpoint that never answers; the join does not wait for the network" {
+    const io = std.testing.io;
+    var srv: netguard.TestServer = undefined;
+    try srv.start(io, null); // accepts, never answers
+    var srv_up = true;
+    defer if (srv_up) srv.stop();
+    var ub: [64]u8 = undefined;
+    const R = struct {
+        fn render(_: *anyopaque, w: *std.Io.Writer) anyerror!void {
+            try w.writeAll("# TYPE zui_test counter\nzui_test 1\n");
+        }
+        var ctx: u8 = 0;
+    };
+    var p: Pusher = .{ .gpa = std.testing.allocator, .io = io, .url = srv.url(&ub), .interval_s = 60, .source = .{ .ctx = &R.ctx, .render = R.render } };
+    try p.start();
+    // the push is in flight: the endpoint has the connection and says nothing
+    var waited: u32 = 0;
+    while (srv.accepts.load(.acquire) == 0 and waited < 5000) : (waited += 1) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    try std.testing.expect(srv.accepts.load(.acquire) >= 1);
+    io.sleep(.fromMilliseconds(100), .awake) catch {};
+    // the stop, on its own thread so the test stays bounded if the join hangs
+    const J = struct {
+        p: *Pusher,
+        done_ms: std.atomic.Value(u64) = .init(0),
+        fn run(j: *@This()) void {
+            j.p.deinit();
+            j.done_ms.store(netguard.wallMs(), .release);
+        }
+    };
+    var j: J = .{ .p = &p };
+    const t0 = netguard.wallMs();
+    const th = try std.Thread.spawn(.{}, J.run, .{&j});
+    waited = 0;
+    while (j.done_ms.load(.acquire) == 0 and waited < 3000) : (waited += 1) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    const in_time = j.done_ms.load(.acquire) != 0;
+    // not in time: the endpoint hangs up, which ends the push the old way, and the test fails
+    if (!in_time) {
+        srv.stop();
+        srv_up = false;
+    }
+    th.join();
+    try std.testing.expect(in_time);
+    try std.testing.expect(j.done_ms.load(.acquire) - t0 < 1_000);
+    // a push the stop ended is not counted against the endpoint
+    try std.testing.expectEqual(@as(u64, 0), p.failures.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), p.pushes.load(.monotonic));
+}
 
 // ------------------------------------------------------------------ tests
 

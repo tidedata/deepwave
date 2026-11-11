@@ -301,3 +301,28 @@ pub fn waitConn(fd: c.fd_t, want_in: bool, want_out: bool, wake: ?Wake, timeout_
         };
     }
 }
+
+/// The address of the socket's peer as text into `out` ("1.2.3.4:5678", "[hex groups]:5678";
+/// left empty when the kernel does not say): `conn.Request.peer`.
+pub fn peerText(fd: std.c.fd_t, out: *@import("conn.zig").Peer) void {
+    var ss: std.c.sockaddr.storage = undefined;
+    var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
+    if (std.c.getpeername(fd, @ptrCast(&ss), &len) != 0) return;
+    var b: [54]u8 = undefined;
+    const sa: *const std.c.sockaddr = @ptrCast(&ss);
+    if (sa.family == std.c.AF.INET) {
+        const in: *const std.c.sockaddr.in = @ptrCast(@alignCast(&ss));
+        const a: [4]u8 = @bitCast(in.addr);
+        out.set(std.fmt.bufPrint(&b, "{d}.{d}.{d}.{d}:{d}", .{ a[0], a[1], a[2], a[3], std.mem.bigToNative(u16, in.port) }) catch return);
+    } else if (sa.family == std.c.AF.INET6) {
+        const in6: *const std.c.sockaddr.in6 = @ptrCast(@alignCast(&ss));
+        var w: std.Io.Writer = .fixed(&b);
+        w.writeByte('[') catch return;
+        for (0..8) |i| {
+            if (i > 0) w.writeByte(':') catch return;
+            w.print("{x}", .{std.mem.readInt(u16, in6.addr[2 * i ..][0..2], .big)}) catch return;
+        }
+        w.print("]:{d}", .{std.mem.bigToNative(u16, in6.port)}) catch return;
+        out.set(w.buffered());
+    }
+}

@@ -3,12 +3,17 @@
 //! layer is here (RFC 8446 section 5). It plugs into the h2 server as an `h2.sock.Session` per
 //! accepted fd, so h2c and HTTP/1.1 run over it unchanged and TLS terminates in the deepwave process
 //! (no proxy hop: this is what the zui/1 bench compares against).
+//!
+//! With `Server.certs` (the node's `--serve-tls-cert/-key`) the chain and key are the ones
+//! certs.zig holds at the moment a handshake starts: a renewed certificate reaches new
+//! connections without a restart, and connections made before it go on.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const net = @import("net");
 const serve = @import("serve");
 const cert_mod = @import("cert.zig");
+const certs_mod = @import("certs.zig");
 const tls_srv = net.tls13_server;
 const x509 = net.x509;
 const qc = net.qcrypto;
@@ -51,6 +56,10 @@ pub const Server = struct {
     /// sui-node `rpc.tls`: the operator's PEM chain and key (`--serve-tls-cert/-key`), served
     /// instead of the self-signed `cert`. Owned by the server.
     files: ?net.tls_identity.Identity = null,
+    /// `--serve-tls-cert/-key` kept current (certs.zig loads the files again on SIGHUP or when
+    /// they change): each handshake presents the chain and key of its moment, and holds them
+    /// until it is done. The caller's; it outlives every handshake.
+    certs: ?*certs_mod.Certs = null,
     /// Ed25519 mode (validator gRPC, sui-tls): the self-signed certificate of `identity` is served
     /// and signs CertificateVerify. Null: the P-256 `cert`.
     ed_cert: ?struct { der: [x509.max_cert_len]u8, len: usize } = null,
@@ -64,14 +73,25 @@ pub const Server = struct {
 
     /// A server presenting `files` (cert chain + key loaded with `net.tls_identity.load`).
     pub fn initFiles(gpa: Allocator, io: Io, files: net.tls_identity.Identity) Server {
+        var s = initPlaceholder(gpa, io);
+        s.files = files;
+        return s;
+    }
+
+    /// A server presenting what `cs` holds when a handshake starts (`Certs.initLoaded`).
+    pub fn initCerts(gpa: Allocator, io: Io, cs: *certs_mod.Certs) Server {
+        var s = initPlaceholder(gpa, io);
+        s.certs = cs;
+        return s;
+    }
+
+    fn initPlaceholder(gpa: Allocator, io: Io) Server {
         var seed: [32]u8 = undefined;
         io.random(&seed);
         const kp = P256.KeyPair.generate(io);
-        // `cert` stays a valid placeholder (only `files` is ever served)
+        // `cert` stays a valid placeholder (only the loaded chain is ever served)
         const now_unix: i64 = @intCast(@divTrunc(Io.Clock.real.now(io).toNanoseconds(), std.time.ns_per_s));
-        var s = init(gpa, io, cert_mod.generate(kp, seed[0..16].*, now_unix, 1, "zui"));
-        s.files = files;
-        return s;
+        return init(gpa, io, cert_mod.generate(kp, seed[0..16].*, now_unix, 1, "zui"));
     }
 
     pub fn deinit(s: *Server) void {
@@ -134,6 +154,12 @@ pub const Conn = struct {
         var rnd: [64]u8 = undefined;
         srv.io.random(&rnd);
         const ed = srv.ed_cert != null;
+        // The chain and key of this moment. The reference is held to the end of the handshake
+        // (nothing reads them after CertificateVerify), so a reload in the middle of it frees
+        // nothing under this thread; later handshakes get what the reload put in place.
+        const held: ?*certs_mod.Entry = if (srv.certs) |cs| cs.acquire() else null;
+        defer if (held) |e| srv.certs.?.release(e);
+        const chain: ?*const net.tls_identity.Identity = if (held) |e| e.chainPtr() else if (srv.files) |*f| f else null;
         var st = tls_srv.Server.init(.{
             .server_name = srv.server_name,
             .local_tp = "",
@@ -146,7 +172,7 @@ pub const Conn = struct {
             .client_auth = false,
             .alt = if (ed) null else .{ .alpn_index = 0, .cert_der = srv.cert.bytes(), .key = srv.cert.key },
             .tcp = true,
-            .chain = if (srv.files) |*f| f else null,
+            .chain = chain,
         });
         defer st.deinit(gpa);
         // ClientHello (plaintext handshake records)

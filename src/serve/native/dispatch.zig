@@ -88,6 +88,60 @@ pub const EpochFallback = struct {
 };
 pub const EpochSummary = struct { epoch: u64, protocol_version: u64, reference_gas_price: u64, epoch_start_timestamp_ms: u64 };
 
+/// An edge's checkpoints whose quorum certificate is not its core's yet (src/edge/certs.zig,
+/// docs/EDGE.md section 13): taken from the fallback, a stream or the bucket, valid, and other
+/// bytes than the core's. While a core can be asked, an answer that would carry such a
+/// certified summary is not this node's to give: the request is passed to a core (`forward`)
+/// and the core's answer goes out, whatever it is (the core's own errors too). While no core
+/// can be reached (`reachable` says so, or the forward finds none: a connection-class failure)
+/// the answer is this node's after all, with the certificate it holds: it verifies, and
+/// surviving a core outage is what an edge's fallback is for (`held` counts it). The feed is
+/// the exception in both cases: a marked checkpoint's feed reads as not held yet, so a node
+/// that follows this one never stores this node's certificate as its core's; it takes the
+/// checkpoint from its own second source and marks it itself. Null (every node that is not
+/// such an edge): nothing changes.
+pub const Foreign = struct {
+    ctx: *anyopaque,
+    /// Marked checkpoints now: one load, zero almost always.
+    pending: *const std.atomic.Value(u64),
+    marked: *const fn (ctx: *anyopaque, seq: u64) bool,
+    /// A core can be asked now (the edge is not on its fallback). State the node keeps; never
+    /// a probe.
+    reachable: *const fn (ctx: *anyopaque) bool,
+    /// Passes `req` to a core: its whole response into `out`. False: no core answered.
+    forward: *const fn (ctx: *anyopaque, a: Allocator, req: proto.Request, out: *std.ArrayList(u8)) bool,
+    /// An answer went out with a held certificate; `proof`: inside a proof (a verified read,
+    /// the epoch proof), else a checkpoint.
+    held: *const fn (ctx: *anyopaque, proof: bool) void,
+};
+
+/// Set by a thread that may wait on the network while it answers (the listener's workers, the
+/// HTTP front): the I/O thread never does.
+pub threadlocal var may_block: bool = false;
+/// The dispatcher's `Foreign` while it answers a request on this thread, and whether the answer
+/// reached for the certified summary of a marked checkpoint.
+threadlocal var foreign_watch: ?*const Foreign = null;
+threadlocal var foreign_hit: bool = false;
+
+/// Before the record of checkpoint `seq` is read for its certified summary. (Before: a mark is
+/// cleared only after the core's certificate is installed, so a record read after a "no" here
+/// carries the core's.)
+fn noteCert(seq: u64) void {
+    const fh = foreign_watch orelse return;
+    if (fh.pending.load(.acquire) != 0 and fh.marked(fh.ctx, seq)) foreign_hit = true;
+}
+
+pub const ForeignStats = struct {
+    /// Requests passed to a core; requests answered UNAVAILABLE (a core is reachable and this
+    /// thread could not wait for it); requests answered with the held certificate (no core
+    /// reachable).
+    forwarded: std.atomic.Value(u64) = .init(0),
+    unavailable: std.atomic.Value(u64) = .init(0),
+    held: std.atomic.Value(u64) = .init(0),
+    /// Feed requests answered "not held yet" for a marked checkpoint.
+    feed_withheld: std.atomic.Value(u64) = .init(0),
+};
+
 pub const Hooks = struct {
     epoch_fallback: ?EpochFallback = null,
     simulator: ?Simulator = null,
@@ -112,10 +166,55 @@ pub const Dispatcher = struct {
     software: []const u8 = "",
     /// Who said hello with which minor, and the hellos refused (hello.zig).
     hello: hello_mod.Stats = .{},
+    /// An edge's marked certificates (`Foreign`); null: none.
+    foreign: ?Foreign = null,
+    foreign_stats: ForeignStats = .{},
+
+    /// While this edge holds marked certificates: the requests whose answer can carry a
+    /// certified summary run on a worker, where a marked one can be passed to a core (the
+    /// listener asks; with nothing marked every request is where it always was).
+    pub fn offThread(d: *const Dispatcher, req: proto.Request) bool {
+        const fh = d.foreign orelse return false;
+        if (fh.pending.load(.acquire) == 0) return false;
+        // no core to pass anything to: answered where it always was, with what the edge holds
+        if (!fh.reachable(fh.ctx)) return false;
+        return switch (req.method) {
+            .get_checkpoint, .get_epoch_proof => true,
+            .get_object, .batch_get_objects, .get_transaction, .batch_get_transactions => req.flags & proto.flag_verify != 0,
+            else => false,
+        };
+    }
+
+    /// Is the certificate this node holds for `seq` not its core's (yet)? The feed asks: a
+    /// marked checkpoint is never fed on, whether a core is reachable or not.
+    pub fn markedSeq(d: *const Dispatcher, seq: u64) bool {
+        const fh = d.foreign orelse return false;
+        return fh.pending.load(.acquire) != 0 and fh.marked(fh.ctx, seq);
+    }
+
+    /// A subscription is about to push checkpoint `seq` with its certified summary: true when
+    /// it must end there instead (the certificate is not the core's and a core can be asked).
+    /// With no core reachable the frame goes out with the held certificate, counted here.
+    pub fn withholdSeq(d: *Dispatcher, seq: u64) bool {
+        if (!d.markedSeq(seq)) return false;
+        const fh = d.foreign.?;
+        if (fh.reachable(fh.ctx)) return true;
+        _ = d.foreign_stats.held.fetchAdd(1, .monotonic);
+        fh.held(fh.ctx, false);
+        return false;
+    }
 
     /// Answers one request into `out` (a whole response: header, body, proof).
     pub fn handle(d: *Dispatcher, a: Allocator, req: proto.Request, principal: ?Principal, out: *std.ArrayList(u8)) void {
         defer dicts_mod.Dicts.compressResponse(d.dicts, a, req.method, req.flags, out) catch {};
+        foreign_watch = if (d.foreign) |*fh| fh else null;
+        foreign_hit = false;
+        defer foreign_watch = null;
+        defer if (foreign_hit) d.foreignAnswer(a, req, principal, out);
+        d.answer(a, req, principal, out);
+    }
+
+    fn answer(d: *Dispatcher, a: Allocator, req: proto.Request, principal: ?Principal, out: *std.ArrayList(u8)) void {
         d.handleInner(a, req, principal, out) catch |e| {
             const code: Code = switch (e) {
                 error.Malformed, error.EndOfStream, error.InvalidValue => .bad_request,
@@ -126,6 +225,33 @@ pub const Dispatcher = struct {
             };
             proto.errorResponse(out, a, code, @errorName(e), "") catch {};
         };
+    }
+
+    /// The answer built here would carry a marked certificate. With a core reachable: the
+    /// core's answer in its place. With none (the edge is on its fallback, or the forward found
+    /// no core: a connection-class failure, never the core's own error): the answer again,
+    /// with the certificate this node holds.
+    fn foreignAnswer(d: *Dispatcher, a: Allocator, req: proto.Request, principal: ?Principal, out: *std.ArrayList(u8)) void {
+        foreign_hit = false;
+        const fh = d.foreign orelse return;
+        if (fh.reachable(fh.ctx)) {
+            if (!may_block) {
+                // (a checkpoint marked between the listener's look and this one: the next try
+                // runs on a worker)
+                _ = d.foreign_stats.unavailable.fetchAdd(1, .monotonic);
+                proto.errorResponse(out, a, .unavailable, "this edge holds another certificate for the checkpoint than its core; retry", "") catch {};
+                return;
+            }
+            if (fh.forward(fh.ctx, a, req, out)) {
+                _ = d.foreign_stats.forwarded.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+        foreign_watch = null;
+        out.clearRetainingCapacity();
+        d.answer(a, req, principal, out);
+        _ = d.foreign_stats.held.fetchAdd(1, .monotonic);
+        fh.held(fh.ctx, req.method != .get_checkpoint);
     }
 
     fn handleInner(d: *Dispatcher, a: Allocator, req: proto.Request, principal: ?Principal, out: *std.ArrayList(u8)) !void {
@@ -211,6 +337,7 @@ pub const Dispatcher = struct {
                 try r.done();
                 if (seq) |s| if (snap.lowestAvailable()) |lo| if (s < lo) return pruned(out, a, lo);
                 try proto.okHeader(out, a, 0); // the certified summary is its own proof
+                if (seq) |s| noteCert(s);
                 const rec = if (seq) |s| snap.checkpoint(s) else null;
                 if (rec) |c| {
                     try w.u8_(1);
@@ -312,6 +439,16 @@ pub const Dispatcher = struct {
             },
             .get_checkpoint_feed => {
                 const fd = d.edge orelse return error.Unimplemented;
+                // A marked checkpoint is not fed on, with a core reachable or without: the
+                // receiver would store this node's certificate as its core's. "Not held yet"
+                // until the core's is installed (the receiver's own rules then take it from
+                // its second source, docs/EDGE.md 13.5).
+                if (req.body.len >= 8 and d.markedSeq(std.mem.readInt(u64, req.body[0..8], .little))) {
+                    if (req.body.len != 12 or req.flags & ~(proto.flag_verify | proto.flag_zstd_ok) != 0) return error.Malformed;
+                    _ = d.foreign_stats.feed_withheld.fetchAdd(1, .monotonic);
+                    try proto.okHeader(out, a, 0);
+                    return w.u8_(0);
+                }
                 return fd.handle(a, &snap, req, out);
             },
             .subscribe, .pair_relay => return error.Malformed, // handled by the listener
@@ -339,6 +476,7 @@ pub const Dispatcher = struct {
             if (x.epoch(e)) |rec| if (rec.start) |st| if (st.start_checkpoint) |sc| if (sc > 0) break :blk sc - 1;
             return null;
         };
+        noteCert(seq);
         const c = snap.checkpoint(seq) orelse return null;
         return c.summary_cert;
     }
@@ -494,6 +632,7 @@ const Proof = struct {
     }
 
     fn item(p: *Proof, a: Allocator, snap: *store.Snapshot, comptime kind: enum { tx, object }, t: store.TransactionRecord) !void {
+        noteCert(t.checkpoint);
         const c = snap.checkpoint(t.checkpoint) orelse return p.none(a);
         var idx: ?u32 = null;
         for (p.cps.items, 0..) |x, i| if (x.seq == c.seq) {

@@ -141,6 +141,10 @@ pub const Options = struct {
     allow_truncation_attacks: bool = false,
     /// deepwave: require this Ed25519 key in the leaf certificate (sui-tls pinning).
     pin_ed25519: ?[32]u8 = null,
+    /// deepwave: require this SHA-256 of the leaf certificate (its DER bytes; the value a deepwave node
+    /// logs for its `--serve-tls` certificate). No CA chain and no name is consulted; the
+    /// handshake still proves the peer holds the certificate's key (CertificateVerify).
+    pin_cert_sha256: ?[32]u8 = null,
     /// Populated when `error.TlsAlert` is returned from `init`.
     alert: ?*tls.Alert = null,
 
@@ -658,6 +662,13 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 if (options.pin_ed25519) |pin| {
                                     if (subject.pub_key_algo != .curveEd25519) return error.TlsCertificateNotVerified;
                                     if (!mem.eql(u8, subject.pubKey(), &pin)) return error.TlsCertificateNotVerified;
+                                    handshake_state = .trust_chain_established;
+                                    break :cert;
+                                }
+                                if (options.pin_cert_sha256) |pin| {
+                                    var got: [32]u8 = undefined;
+                                    crypto.hash.sha2.Sha256.hash(certd.buf, &got, .{});
+                                    if (!crypto.timing_safe.eql([32]u8, got, pin)) return error.TlsCertificateNotVerified;
                                     handshake_state = .trust_chain_established;
                                     break :cert;
                                 }

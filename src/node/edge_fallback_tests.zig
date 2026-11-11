@@ -8,46 +8,46 @@
 //! that is the failure no listener stop can show, because a stopping listener says goodbye.
 //! The fallback is a directory, either of archive protos (what the bucket serves) or of blobs.
 //! Everything needs the corpus (`$ZUI_CORPUS`) and skips without it.
-const std = @import("std");
-const Io = std.Io;
-const testing = std.testing;
-const Atomic = std.atomic.Value;
-const store = @import("store");
-const types = @import("types");
-const bcs = @import("bcs");
-const sync = @import("sync");
-const net = @import("net");
-const native = @import("native");
-const serve = @import("serve");
-const edge = @import("edge");
-const checkpoint = @import("checkpoint");
-const trust = @import("trust.zig");
-const source_mod = @import("source.zig");
-const node_mod = @import("node.zig");
+pub const std = @import("std");
+pub const Io = std.Io;
+pub const testing = std.testing;
+pub const Atomic = std.atomic.Value;
+pub const store = @import("store");
+pub const types = @import("types");
+pub const bcs = @import("bcs");
+pub const sync = @import("sync");
+pub const net = @import("net");
+pub const native = @import("native");
+pub const serve = @import("serve");
+pub const edge = @import("edge");
+pub const checkpoint = @import("checkpoint");
+pub const trust = @import("trust.zig");
+pub const source_mod = @import("source.zig");
+pub const node_mod = @import("node.zig");
 
-const io = testing.io;
-const Mode = edge.fallback.Mode;
-const Reason = edge.fallback.Reason;
-const ms: u64 = std.time.ns_per_ms;
+pub const io = testing.io;
+pub const Mode = edge.fallback.Mode;
+pub const Reason = edge.fallback.Reason;
+pub const ms: u64 = std.time.ns_per_ms;
 
 /// First checkpoint of the corpus' consecutive run (epoch 1303), in `chk/` and `binpb-done/`.
-const first: u64 = 342446161;
-const epoch: u64 = 1303;
+pub const first: u64 = 342446161;
+pub const epoch: u64 = 1303;
 
 /// Short rules for the tests that only need the order of events, not the default numbers.
-const quick: edge.fallback.Tuning = .{ .fail_after_ms = 400, .behind_after_ms = 400, .behind_check_ms = 100, .probe_ms = 100, .probe_reply_ms = 150, .probe_timeout_ms = 300, .probe_idle_ms = 200, .back_after_ms = 500, .flap_window_ms = 60_000, .back_max_ms = 8_000, .retry_ms = 20 };
+pub const quick: edge.fallback.Tuning = .{ .fail_after_ms = 400, .behind_after_ms = 400, .behind_check_ms = 100, .probe_ms = 100, .probe_reply_ms = 150, .probe_timeout_ms = 300, .probe_idle_ms = 200, .back_after_ms = 500, .flap_window_ms = 60_000, .back_max_ms = 8_000, .retry_ms = 20 };
 
-fn corpus() ![]const u8 {
+pub fn corpus() ![]const u8 {
     const p = std.c.getenv("ZUI_CORPUS") orelse return error.SkipZigTest;
     return std.mem.span(p);
 }
 
-fn corpusDir(sub: []const u8) !Io.Dir {
+pub fn corpusDir(sub: []const u8) !Io.Dir {
     var pb: [512]u8 = undefined;
     return Io.Dir.cwd().openDir(io, try std.fmt.bufPrint(&pb, "{s}/{s}", .{ try corpus(), sub }), .{}) catch return error.SkipZigTest;
 }
 
-fn readSeq(a: std.mem.Allocator, dir: Io.Dir, seq: u64, ext: []const u8) ![]u8 {
+pub fn readSeq(a: std.mem.Allocator, dir: Io.Dir, seq: u64, ext: []const u8) ![]u8 {
     var nb: [64]u8 = undefined;
     return dir.readFileAlloc(io, try std.fmt.bufPrint(&nb, "{d}{s}", .{ seq, ext }), a, .limited(1 << 30)) catch |e| switch (e) {
         error.FileNotFound => return error.SkipZigTest,
@@ -56,7 +56,7 @@ fn readSeq(a: std.mem.Allocator, dir: Io.Dir, seq: u64, ext: []const u8) ![]u8 {
 }
 
 /// The committee of `epoch`, from the end-of-epoch checkpoint before it (the test's trust root).
-fn committee(a: std.mem.Allocator) !sync.Committee {
+pub fn committee(a: std.mem.Allocator) !sync.Committee {
     var pb: [512]u8 = undefined;
     const idx = trust.EpochIndex.load(a, io, try std.fmt.bufPrint(&pb, "{s}/epochs.jsonl", .{try corpus()})) catch return error.SkipZigTest;
     const eoe = idx.last[epoch - 1] orelse return error.SkipZigTest;
@@ -70,15 +70,15 @@ fn committee(a: std.mem.Allocator) !sync.Committee {
     return info.syncCommittee(a);
 }
 
-fn nowNs() u64 {
+pub fn nowNs() u64 {
     return edge.fallback.nowNs(io);
 }
 
-fn sleepMs(n: u64) void {
+pub fn sleepMs(n: u64) void {
     io.sleep(.fromMilliseconds(@intCast(n)), .awake) catch {};
 }
 
-const store_cfg: store.Config = .{
+pub const store_cfg: store.Config = .{
     .retention_epochs = 2,
     .max_live_objects = 1 << 17,
     .max_object_versions = 1 << 19,
@@ -94,18 +94,21 @@ const store_cfg: store.Config = .{
 
 /// A UDP relay on loopback between the edge and the core. `down`: every datagram is dropped,
 /// both ways (a box that died without a word). The core's port can change (a restarted core).
-const Link = struct {
+pub const Link = struct {
     front: Io.net.Socket,
     fus: net.udpio.Sock,
     core_port: Atomic(u16) = .init(0),
     down: Atomic(bool) = .init(false),
+    /// Datagrams from the core still let through before the link goes down by itself (0: off):
+    /// a link that dies in the middle of the responses under way.
+    cut_in: Atomic(u32) = .init(0),
     stopping: Atomic(bool) = .init(false),
     thread: ?std.Thread = null,
     clients: [96]Client = @splat(.{}),
     rx: net.udpio.RxBatch = .{},
     tx: net.udpio.TxBatch = .{},
 
-    const Client = struct {
+    pub     const Client = struct {
         used: bool = false,
         addr: Io.net.IpAddress = undefined,
         sock: Io.net.Socket = undefined,
@@ -113,7 +116,7 @@ const Link = struct {
         last: u64 = 0,
     };
 
-    fn create(gpa: std.mem.Allocator) !*Link {
+    pub     fn create(gpa: std.mem.Allocator) !*Link {
         const l = try gpa.create(Link);
         errdefer gpa.destroy(l);
         var lo: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(0) };
@@ -123,7 +126,7 @@ const Link = struct {
         return l;
     }
 
-    fn destroy(l: *Link, gpa: std.mem.Allocator) void {
+    pub     fn destroy(l: *Link, gpa: std.mem.Allocator) void {
         l.stopping.store(true, .release);
         if (l.thread) |t| t.join();
         for (&l.clients) |*c| if (c.used) c.sock.close(io);
@@ -132,15 +135,15 @@ const Link = struct {
     }
 
     /// What the edge dials.
-    fn spec(l: *const Link, key: [32]u8) edge.client.Spec {
+    pub     fn spec(l: *const Link, key: [32]u8) edge.client.Spec {
         return .{ .addr = .{ .ip4 = Io.net.Ip4Address.loopback(l.front.address.getPort()) }, .key = key };
     }
 
-    fn same(a: *const Io.net.IpAddress, b: *const Io.net.IpAddress) bool {
+    pub     fn same(a: *const Io.net.IpAddress, b: *const Io.net.IpAddress) bool {
         return a.* == .ip4 and b.* == .ip4 and a.ip4.port == b.ip4.port and std.mem.eql(u8, &a.ip4.bytes, &b.ip4.bytes);
     }
 
-    fn clientFor(l: *Link, from: *const Io.net.IpAddress, now: u64) ?*Client {
+    pub     fn clientFor(l: *Link, from: *const Io.net.IpAddress, now: u64) ?*Client {
         var free: ?*Client = null;
         for (&l.clients) |*c| {
             if (c.used and same(&c.addr, from)) return c;
@@ -157,7 +160,7 @@ const Link = struct {
         return c;
     }
 
-    fn run(l: *Link) void {
+    pub     fn run(l: *Link) void {
         while (!l.stopping.load(.acquire)) {
             var moved: usize = 0;
             const now = nowNs();
@@ -182,6 +185,8 @@ const Link = struct {
                 moved += k;
                 if (dropping) continue;
                 for (0..k) |i| {
+                    if (l.down.load(.acquire)) break;
+                    if (l.cut_in.load(.acquire) != 0 and l.cut_in.fetchSub(1, .acq_rel) == 1) l.down.store(true, .release);
                     const d = l.rx.data(i);
                     @memcpy(l.tx.slot()[0..d.len], d);
                     l.tx.commit(d.len, &c.addr);
@@ -198,7 +203,7 @@ const Link = struct {
 
 /// A core: corpus checkpoints in a store, served over zui/1 by the node's listener and
 /// dispatcher, with or without the edge feed.
-const Core = struct {
+pub const Core = struct {
     gpa: std.mem.Allocator,
     st: *store.Store,
     sio: *store.RealIo,
@@ -212,13 +217,13 @@ const Core = struct {
     /// Highest checkpoint stored (`first - 1`: none).
     have: u64 = first - 1,
 
-    const id_seed: [32]u8 = @splat(9);
+    pub     const id_seed: [32]u8 = @splat(9);
 
-    fn key() [32]u8 {
+    pub     fn key() [32]u8 {
         return (std.crypto.sign.Ed25519.KeyPair.generateDeterministic(id_seed) catch unreachable).public_key.toBytes();
     }
 
-    fn create(gpa: std.mem.Allocator, dir: []const u8) !*Core {
+    pub     fn create(gpa: std.mem.Allocator, dir: []const u8) !*Core {
         const c = try gpa.create(Core);
         errdefer gpa.destroy(c);
         var cfg = store_cfg;
@@ -241,7 +246,7 @@ const Core = struct {
         return c;
     }
 
-    fn destroy(c: *Core) void {
+    pub     fn destroy(c: *Core) void {
         c.stop();
         c.svc.deinit();
         c.dicts.deinit();
@@ -252,7 +257,7 @@ const Core = struct {
     }
 
     /// Starts listening (a new port each time). `feed`: with `--edge-feed`.
-    fn start(c: *Core, feed: bool) !u16 {
+    pub     fn start(c: *Core, feed: bool) !u16 {
         c.stop();
         c.disp.edge = if (feed) &c.feeder else null;
         const l = try native.listener.Listener.start(c.gpa, io, .{ .listen = .{ .ip4 = Io.net.Ip4Address.loopback(0) }, .identity_seed = id_seed, .cert = &c.cert }, &c.disp);
@@ -261,13 +266,13 @@ const Core = struct {
     }
 
     /// Stops listening the way a node does: every client is told (CONNECTION_CLOSE, `shutdown`).
-    fn stop(c: *Core) void {
+    pub     fn stop(c: *Core) void {
         if (c.listener) |l| l.stop();
         c.listener = null;
     }
 
     /// Stores corpus checkpoints up to `upto` (inclusive), as the follower would.
-    fn advance(c: *Core, upto: u64) !void {
+    pub     fn advance(c: *Core, upto: u64) !void {
         var arena = std.heap.ArenaAllocator.init(c.gpa);
         defer arena.deinit();
         while (c.have < upto) {
@@ -281,7 +286,7 @@ const Core = struct {
 };
 
 /// One checkpoint blob into `st`: the checkpoint record, every transaction, the output objects.
-fn storeBlob(st: *store.Store, a: std.mem.Allocator, blob: []const u8) !void {
+pub fn storeBlob(st: *store.Store, a: std.mem.Allocator, blob: []const u8) !void {
     const cp = try bcs.decode(types.CheckpointData, a, blob[1..]);
     const sum = &cp.checkpoint_summary.data;
     const b = try st.begin(sum.sequence_number, sum.epoch);
@@ -310,12 +315,12 @@ fn storeBlob(st: *store.Store, a: std.mem.Allocator, blob: []const u8) !void {
 // ------------------------------------------------------------------ the bucket
 
 /// The fallback as a directory that fills over time, like the bucket at the tip.
-const Bucket = struct {
+pub const Bucket = struct {
     dir: Io.Dir,
     chk: Io.Dir,
     have: u64 = first - 1,
 
-    fn publish(b: *Bucket, gpa: std.mem.Allocator, upto: u64) !void {
+    pub     fn publish(b: *Bucket, gpa: std.mem.Allocator, upto: u64) !void {
         var nb: [64]u8 = undefined;
         var tb: [64]u8 = undefined;
         while (b.have < upto) {
@@ -331,7 +336,7 @@ const Bucket = struct {
 
 // ------------------------------------------------------------------ the edge
 
-const Edge = struct {
+pub const Edge = struct {
     gpa: std.mem.Allocator,
     st: *store.Store,
     sio: *store.RealIo,
@@ -348,8 +353,13 @@ const Edge = struct {
     /// Sequence numbers in the order the follower applied them.
     seqs: [512]u64 = undefined,
     n: Atomic(usize) = .init(0),
+    /// Each apply takes this much longer (ms; 0: off), so a catch-up test has the follower's
+    /// window full of checked checkpoints behind the one in hand.
+    apply_delay_ms: Atomic(u32) = .init(0),
+    /// `closeStore` ran: `destroy` leaves the store alone.
+    store_closed: bool = false,
 
-    const Opts = struct {
+    pub     const Opts = struct {
         /// `<tmp>/<name>` holds the store and the spool.
         root: Io.Dir,
         root_path: []const u8,
@@ -361,7 +371,7 @@ const Edge = struct {
         committee: sync.Committee,
     };
 
-    fn create(gpa: std.mem.Allocator, o: Opts) !*Edge {
+    pub     fn create(gpa: std.mem.Allocator, o: Opts) !*Edge {
         const e = try gpa.create(Edge);
         errdefer gpa.destroy(e);
         var pb: [600]u8 = undefined;
@@ -414,36 +424,45 @@ const Edge = struct {
         return e;
     }
 
-    fn spooled(ctx: *anyopaque, seq: u64) void {
+    pub     fn spooled(ctx: *anyopaque, seq: u64) void {
         const f: *sync.Follower = @ptrCast(@alignCast(ctx));
         f.notify(seq);
     }
 
-    fn onCheckpoint(ctx: *anyopaque, seq: u64, _: *const sync.verify.Checked, _: []const u8) void {
+    pub     fn onCheckpoint(ctx: *anyopaque, seq: u64, _: *const sync.verify.Checked, _: []const u8) void {
         const e: *Edge = @ptrCast(@alignCast(ctx));
         const i = e.n.load(.monotonic);
         if (i < e.seqs.len) e.seqs[i] = seq;
         e.n.store(i + 1, .release);
+        const d = e.apply_delay_ms.load(.acquire);
+        if (d != 0) sleepMs(d);
     }
 
-    fn follow(e: *Edge) !void {
+    /// The clean close of the store, as the node's deinit does it.
+    pub fn closeStore(e: *Edge) !void {
+        e.store_closed = true;
+        defer e.sio.deinit();
+        try e.st.close();
+    }
+
+    pub     fn follow(e: *Edge) !void {
         try e.fetcher.start(3);
         e.run_thread = try std.Thread.spawn(.{}, runMain, .{e});
     }
 
-    fn runMain(e: *Edge) void {
+    pub     fn runMain(e: *Edge) void {
         e.follower.run(null) catch |err| {
             e.run_err = err;
         };
     }
 
     /// Checkpoints the store has committed (the follower counts one in `n` before its commit).
-    fn committed(e: *Edge) u64 {
+    pub     fn committed(e: *Edge) u64 {
         const next = e.follower.applied_next.load(.acquire);
         return next - first;
     }
 
-    fn waitCommitted(e: *Edge, count: u64, limit_ms: u64) bool {
+    pub     fn waitCommitted(e: *Edge, count: u64, limit_ms: u64) bool {
         const t0 = nowNs();
         while (e.committed() < count) {
             if (e.run_err != null or nowNs() - t0 > limit_ms * ms) return false;
@@ -452,7 +471,7 @@ const Edge = struct {
         return true;
     }
 
-    fn waitMode(e: *Edge, m: Mode, limit_ms: u64) bool {
+    pub     fn waitMode(e: *Edge, m: Mode, limit_ms: u64) bool {
         const t0 = nowNs();
         while (e.fb.?.sw.mode() != m) {
             if (nowNs() - t0 > limit_ms * ms) return false;
@@ -461,13 +480,13 @@ const Edge = struct {
         return true;
     }
 
-    fn stats(e: *Edge) *edge.fallback.Stats {
+    pub     fn stats(e: *Edge) *edge.fallback.Stats {
         return &e.fb.?.sw.stats;
     }
 
     /// Every checkpoint applied once, in order, from `first`: no gap, no duplicate. Call after
     /// `follower.stop()`.
-    fn expectOrdered(e: *Edge, count: u64) !void {
+    pub     fn expectOrdered(e: *Edge, count: u64) !void {
         if (e.run_thread) |t| t.join();
         e.run_thread = null;
         try testing.expectEqual(@as(?anyerror, null), e.run_err);
@@ -479,12 +498,12 @@ const Edge = struct {
     }
 
     /// The first `count` checkpoints applied are `first..`, each once, in order.
-    fn expectPrefix(e: *Edge, count: u64) !void {
+    pub     fn expectPrefix(e: *Edge, count: u64) !void {
         try testing.expect(e.n.load(.acquire) >= count);
         for (e.seqs[0..@intCast(count)], 0..) |s, i| try testing.expectEqual(first + i, s);
     }
 
-    fn destroy(e: *Edge) void {
+    pub     fn destroy(e: *Edge) void {
         e.follower.stop();
         if (e.run_thread) |t| t.join();
         if (e.fb) |fb| fb.stopping.store(true, .release);
@@ -493,15 +512,17 @@ const Edge = struct {
         e.follower.deinit();
         if (e.fb) |fb| e.gpa.destroy(fb);
         e.pool.deinit();
-        e.st.deinit();
-        e.sio.deinit();
+        if (!e.store_closed) {
+            e.st.deinit();
+            e.sio.deinit();
+        }
         e.spool.close(io);
         e.gpa.destroy(e);
     }
 };
 
 /// A core behind a link, a bucket directory and a temporary root: what every test starts from.
-const World = struct {
+pub const World = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     tmp: testing.TmpDir,
@@ -511,7 +532,7 @@ const World = struct {
     bucket: Bucket,
     committee: sync.Committee,
 
-    fn init(w: *World) !void {
+    pub     fn init(w: *World) !void {
         const gpa = testing.allocator;
         w.gpa = gpa;
         w.arena = .init(gpa);
@@ -529,7 +550,7 @@ const World = struct {
         w.link = try Link.create(gpa);
     }
 
-    fn deinit(w: *World) void {
+    pub     fn deinit(w: *World) void {
         w.link.destroy(w.gpa);
         w.core.destroy();
         w.bucket.dir.close(io);
@@ -539,17 +560,17 @@ const World = struct {
     }
 
     /// Starts the core and points the link at it.
-    fn coreUp(w: *World, feed: bool) !void {
+    pub     fn coreUp(w: *World, feed: bool) !void {
         w.link.core_port.store(try w.core.start(feed), .release);
     }
 
     /// The same checkpoints on the core and in the bucket, as at the tip.
-    fn publish(w: *World, count: u64) !void {
+    pub     fn publish(w: *World, count: u64) !void {
         try w.core.advance(first + count - 1);
         try w.bucket.publish(w.gpa, first + count - 1);
     }
 
-    fn edge_(w: *World, name: []const u8, fallback: bool, tuning: edge.fallback.Tuning) !*Edge {
+    pub     fn edge_(w: *World, name: []const u8, fallback: bool, tuning: edge.fallback.Tuning) !*Edge {
         const specs = [_]edge.client.Spec{w.link.spec(Core.key())};
         return Edge.create(w.gpa, .{ .root = w.tmp.dir, .root_path = w.root_path, .name = name, .specs = &specs, .fallback = if (fallback) w.bucket.dir else null, .tuning = tuning, .committee = w.committee });
     }
@@ -742,7 +763,7 @@ test "edge fallback: a core that says it is shutting down is left at once; a cor
 
 /// `ok`, or the test fails saying where the edge stood (a bare expect would only give a line
 /// number, and the test runner's trace is full of other tests' handled errors).
-fn must(ok: bool, comptime what: []const u8, e: *Edge) !void {
+pub fn must(ok: bool, comptime what: []const u8, e: *Edge) !void {
     if (ok) return;
     const fb = e.fb orelse {
         std.debug.print("edge fallback test: {s} FAILED: no fallback, {d} committed, follower error {any}\n", .{ what, e.committed(), e.run_err });
