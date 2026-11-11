@@ -124,8 +124,24 @@ native clients, and WebTransport over HTTP/3 for browsers. Both carry the same s
 - subscriptions are filtered on the server, pushed on unidirectional streams with credit-based
   backpressure, and can resume from any retained checkpoint;
 - responses can carry proofs that a light client checks against a BLS-certified checkpoint,
-  without trusting the server.
+  without trusting the server;
+- `dry_run` returns each command's results (return values and `&mut` argument values), as
+  gRPC's command outputs do;
+- a client's hello can name the chain it expects, the lowest protocol minor it works with and
+  the features it needs; a node that cannot serve them answers with a specific error.
 
-The server presents a self-signed Ed25519 certificate that native clients pin; the node logs its
-key, and `--native-cert-hash-file` writes the WebTransport certificate hash and the key for
-browser clients. `deepwave-native` is a command-line test and benchmark client.
+Native clients pin the node's Ed25519 key, which the node logs. Browsers connect over
+WebTransport in one of two ways:
+- with `--native-cert` and `--native-key`, the node presents a WebPKI certificate chain and
+  browsers connect with a plain https URL. The files are checked at start and loaded again on
+  SIGHUP or when they change;
+- without them, the node presents a self-signed P-256 certificate that rotates every 7 days.
+  `--native-cert-hash-file` writes its hash, the node key, the next certificate's hash and the
+  time it takes over, so clients can pin both across a rotation.
+
+`deepwave-native` is a command-line test and benchmark client.
+
+The QUIC sender has optional pacing (RFC 9002 7.7), HyStart++ (RFC 9406), CUBIC (RFC 9438), path
+MTU discovery (RFC 8899), an initial window sized to the datagram and HTTP/3 SETTINGS sent with
+the handshake flight. Each is switched on by an environment variable (see
+[configuration.md](configuration.md)); NewReno with a fixed datagram size is the default.

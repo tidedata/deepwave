@@ -125,6 +125,7 @@ Leave `--live-capacity` and `--memtable-versions` unset for a restore.
 | flag | meaning |
 |---|---|
 | `--native-listen ADDR`, `--native-cert-hash-file FILE` | the `zui/1` native protocol over QUIC and WebTransport (off by default), see [rpc.md](rpc.md) |
+| `--native-cert FILE`, `--native-key FILE` | PEM certificate chain (leaf first) and key for `zui/1` and WebTransport (P-256, P-384, Ed25519 or RSA), reloaded on SIGHUP or when the files change. Without them, a self-signed P-256 certificate rotated every 7 days |
 | `--metrics ADDR` | Prometheus text at `http://ADDR/metrics` |
 | `--metrics-push-url URL`, `--metrics-push-interval S` | push the registry as sui-node does (no mTLS) |
 | `--admin-port N` | admin interface on `127.0.0.1:N` (default 1337, 0 = off) |
@@ -139,6 +140,7 @@ Leave `--live-capacity` and `--memtable-versions` unset for a restore.
 | `RUST_LOG_FILE=PREFIX` | log to `PREFIX.YYYY-MM-DD` instead of stderr |
 | `ZUI_AGE_OUT` | `1` turns on age-out like `--age-out`, `0` forces it off |
 | `ZUI_INDEX_BUILD_GROUPS` | passes over the live set when building the StateService index (default 4; 1 needs temp space for every row) |
+| `ZUI_NATIVE_PACING`, `ZUI_NATIVE_HYSTART`, `ZUI_NATIVE_CUBIC`, `ZUI_NATIVE_PMTUD`, `ZUI_NATIVE_IW_MTU`, `ZUI_NATIVE_EARLY_SETTINGS` | `1` turns on the native listener's QUIC pacing, HyStart++, CUBIC, path MTU discovery, datagram-sized initial window, and HTTP/3 SETTINGS with the handshake flight (all off by default) |
 
 ## fullnode.yaml
 

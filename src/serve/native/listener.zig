@@ -18,6 +18,7 @@ const h3 = @import("h3.zig");
 const dispatch = @import("dispatch.zig");
 const sub = @import("sub.zig");
 const cert_mod = @import("cert.zig");
+const certs_mod = @import("certs.zig");
 const jobs_mod = @import("jobs.zig");
 
 pub const alpns = [_][]const u8{ proto.alpn, "h3" };
@@ -26,8 +27,12 @@ pub const Options = struct {
     listen: Io.net.IpAddress,
     /// Ed25519 identity for raw zui/1 (self-signed cert, pinned by public key).
     identity_seed: [32]u8,
-    /// P-256 certificate for WebTransport (h3).
-    cert: *const cert_mod.Cert,
+    /// P-256 certificate for WebTransport (h3): one fixed certificate (tests), or
+    /// `certs`, which rotates it (certs.zig) and wins when both are set. With `--native-cert`,
+    /// `certs` holds the operator's chain instead, presented under both ALPNs (a zui/1 client
+    /// that pins the identity key still gets the identity certificate: net/tls13_server.zig).
+    cert: ?*const cert_mod.Cert = null,
+    certs: ?*certs_mod.Certs = null,
     max_connections: u32 = 1000,
     /// After a pass that moved datagrams, poll the socket without blocking for up to this long
     /// before sleeping in the kernel (busy-poll: a request that follows within the window skips
@@ -52,7 +57,37 @@ pub const Options = struct {
     /// A connection that has not finished its handshake this long after its first Initial is
     /// dropped (instead of holding a slot for the 30 s idle timeout).
     handshake_timeout_ms: u64 = 5_000,
+    /// Sender-side QUIC switches for every connection of this listener (zui/1 and
+    /// WebTransport), all off by default: see `net.conn.Config`. Env overrides (1 or 0):
+    /// ZUI_NATIVE_PACING, ZUI_NATIVE_HYSTART, ZUI_NATIVE_CUBIC, ZUI_NATIVE_PMTUD,
+    /// ZUI_NATIVE_IW_MTU.
+    pacing: bool = false,
+    hystart: bool = false,
+    cubic: bool = false,
+    pmtud: bool = false,
+    iw_mtu: bool = false,
+    /// WebTransport cold connect: the HTTP/3 control stream (SETTINGS) and the two QPACK
+    /// streams are sent right behind the server's handshake flight ("0.5-RTT",
+    /// `net.conn.Config.early_send`) instead of after the client's Finished has arrived. A
+    /// browser may not send its CONNECT before it has the SETTINGS, so this takes one round
+    /// trip off the first response of every new WebTransport session. Nothing else is sent
+    /// early and nothing is read early. Off by default; env override ZUI_NATIVE_EARLY_SETTINGS.
+    early_settings: bool = false,
 };
+
+fn envSwitch(name: [*:0]const u8, default: bool) bool {
+    const v = std.c.getenv(name) orelse return default;
+    return v[0] == '1';
+}
+
+/// The largest UDP payload an Ethernet path carries to `a`: 1472 over IPv4 (also an
+/// IPv4-mapped address on a dual-stack socket), 1452 over IPv6.
+fn pathCeiling(a: *const Io.net.IpAddress) u16 {
+    return switch (a.*) {
+        .ip4 => 1472,
+        .ip6 => |v| if (std.mem.eql(u8, v.bytes[0..12], &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) 1472 else 1452,
+    };
+}
 
 /// A live subscription sends a Heartbeat after this long without a match (spec 5.1).
 pub const heartbeat_ms = 5000;
@@ -68,6 +103,10 @@ pub const Stats = struct {
     /// Retry packets sent, and Initials whose Retry token checked out.
     retries: Atomic(u64) = .init(0),
     retried_ok: Atomic(u64) = .init(0),
+    /// Datagrams sent and the send syscalls that carried them (udpio batches: sendmsg_x on
+    /// macOS, sendmmsg with UDP GSO on Linux). Their ratio is the send batching achieved.
+    datagrams_out: Atomic(u64) = .init(0),
+    send_calls: Atomic(u64) = .init(0),
 };
 
 const Kind = enum { pending, zui, h3 };
@@ -151,6 +190,8 @@ const Slot = struct {
     odcid: [20]u8 = undefined,
     odcid_len: u8 = 0,
     kind: Kind = .pending,
+    /// The `Options.certs` certificate this connection's handshake uses (held until freed).
+    ident: ?*certs_mod.Entry = null,
     h3s: ?h3.ServerSession = null,
     session: ?u64 = null,
     principal: ?dispatch.Principal = null,
@@ -205,6 +246,14 @@ pub const Listener = struct {
         rx.* = .{};
         var o = opts;
         if (std.c.getenv("ZUI_NATIVE_SPIN_US")) |v| o.spin_us = std.fmt.parseInt(u32, std.mem.span(v), 10) catch o.spin_us;
+        o.pacing = envSwitch("ZUI_NATIVE_PACING", o.pacing);
+        o.hystart = envSwitch("ZUI_NATIVE_HYSTART", o.hystart);
+        o.cubic = envSwitch("ZUI_NATIVE_CUBIC", o.cubic);
+        o.pmtud = envSwitch("ZUI_NATIVE_PMTUD", o.pmtud);
+        o.iw_mtu = envSwitch("ZUI_NATIVE_IW_MTU", o.iw_mtu);
+        o.early_settings = envSwitch("ZUI_NATIVE_EARLY_SETTINGS", o.early_settings);
+        if (o.pacing or o.hystart or o.cubic or o.pmtud or o.iw_mtu or o.early_settings)
+            std.log.info("native: QUIC sender switches: pacing={} hystart={} cubic={} pmtud={} iw_mtu={} early_settings={}", .{ o.pacing, o.hystart, o.cubic, o.pmtud, o.iw_mtu, o.early_settings });
         l.* = .{ .gpa = gpa, .io = io, .opts = o, .disp = disp, .sock = sock, .keys = .init(gpa), .us = .init(sock.handle), .tx = tx, .rx = rx, .req_arena = .init(gpa) };
         var gk: [32]u8 = undefined;
         io.random(&gk);
@@ -280,6 +329,7 @@ pub const Listener = struct {
         if (c.pkts_lost != 0 or c.ptos != 0)
             std.log.info("native: connection done, {d} packets sent, {d} lost, {d} PTOs, path MTU {d}", .{ c.pkts_sent, c.pkts_lost, c.ptos, c.mtu });
         s.conn.deinit();
+        if (s.ident) |e| l.opts.certs.?.release(e);
         if (s.h3s) |*h| h.deinit();
         s.h3_streams.deinit(l.gpa);
         for (s.reqs.values()) |*r| r.buf.deinit(l.gpa);
@@ -347,6 +397,8 @@ pub const Listener = struct {
                 if (s.conn.isClosed()) dead.append(l.gpa, s.key) catch {};
             }
             l.tx.flush(&l.us);
+            l.stats.datagrams_out.store(l.us.stats.sent, .monotonic);
+            l.stats.send_calls.store(l.us.stats.send_calls, .monotonic);
             for (dead.items) |k| if (l.slots.fetchRemove(k)) |kv| {
                 _ = l.stats.active.fetchSub(1, .monotonic);
                 if (kv.value.kind == .pending) l.half_open -|= 1;
@@ -420,6 +472,9 @@ pub const Listener = struct {
         var seed: [64]u8 = undefined;
         l.io.random(&seed);
         const now_unix: i64 = @intCast(@divTrunc(Io.Clock.real.now(l.io).toNanoseconds(), std.time.ns_per_s));
+        // the certificate of this moment: a rotation changes what later handshakes get
+        const ident: ?*certs_mod.Entry = if (l.opts.certs) |cs| cs.acquire() else null;
+        const h3_cert: ?*const cert_mod.Cert = if (ident) |e| &e.cert else l.opts.cert;
         const c = conn_mod.Connection.initServer(l.gpa, .{
             .server_name = "zui",
             .identity_seed = l.opts.identity_seed,
@@ -433,20 +488,31 @@ pub const Listener = struct {
             .keep_alive_ms = 0,
             .alpn = &alpns,
             .client_auth = false,
-            .alt = .{ .alpn_index = 1, .cert_der = l.opts.cert.bytes(), .key = l.opts.cert.key },
+            .alt = if (h3_cert) |ct| .{ .alpn_index = 1, .cert_der = ct.bytes(), .key = ct.key } else null,
+            .chain = if (ident) |e| e.chainPtr() else null,
             .max_datagram_frame_size = 65535,
-            .pmtu_max = 1452,
+            .pmtu_max = if (l.opts.pmtud) pathCeiling(&from) else 1452,
             .handshake_timeout_ms = l.opts.handshake_timeout_ms,
-        }, now, dcid, scid) catch return;
+            .pacing = l.opts.pacing,
+            .hystart = l.opts.hystart,
+            .cubic = l.opts.cubic,
+            .pmtud = l.opts.pmtud,
+            .iw_mtu = l.opts.iw_mtu,
+            .early_send = l.opts.early_settings,
+        }, now, dcid, scid) catch {
+            if (ident) |e| l.opts.certs.?.release(e);
+            return;
+        };
         if (orig) |o| {
             c.markRetried(o, dcid);
             _ = l.stats.retried_ok.fetchAdd(1, .monotonic);
         }
         const s = l.gpa.create(Slot) catch {
             c.deinit();
+            if (ident) |e| l.opts.certs.?.release(e);
             return;
         };
-        s.* = .{ .conn = c, .addr = from, .key = std.mem.readInt(u64, &c.scid, .little) };
+        s.* = .{ .conn = c, .addr = from, .key = std.mem.readInt(u64, &c.scid, .little), .ident = ident };
         s.odcid_len = dl;
         @memcpy(s.odcid[0..dl], dcid);
         l.slots.put(l.gpa, s.key, s) catch {
@@ -478,12 +544,20 @@ pub const Listener = struct {
 
     fn service(l: *Listener, s: *Slot, tip: ?u64) void {
         const c = s.conn;
-        if (!c.isEstablished()) return;
         const cio: CIo = .{ .c = c };
+        if (!c.isEstablished()) {
+            // `early_settings`: an HTTP/3 client gets the control and QPACK streams with the
+            // handshake flight. The slot stays `.pending` until the handshake is done.
+            if (c.canSendEarly() and s.h3s == null and c.alpnIndex() == 1) {
+                s.h3s = h3.ServerSession.init(l.gpa);
+                s.h3s.?.start(cio) catch return c.closeApp(0x101);
+            }
+            return;
+        }
         if (s.kind == .pending) {
             l.half_open -|= 1;
             s.kind = if (c.alpnIndex() == 1) .h3 else .zui;
-            if (s.kind == .h3) {
+            if (s.kind == .h3 and s.h3s == null) {
                 s.h3s = h3.ServerSession.init(l.gpa);
                 s.h3s.?.start(cio) catch return c.closeApp(0x101);
             }
@@ -1245,6 +1319,9 @@ test "zui/1 listener: cancelled requests give their stream back, and stop sends 
     }
     try std.testing.expect(c.stream(id).?.recv.contiguous().len > 0);
     c.streamFree(id);
+    // every datagram left through the batched send path, and it is counted
+    const calls = l.stats.send_calls.load(.monotonic);
+    try std.testing.expect(calls > 0 and l.stats.datagrams_out.load(.monotonic) >= calls);
     // stop: the client hears CONNECTION_CLOSE (zui/1 `shutdown`) instead of timing out
     l.stop();
     stopped = true;
@@ -1253,4 +1330,21 @@ test "zui/1 listener: cancelled requests give their stream back, and stop sends 
     const cc = c.close orelse return error.TestUnexpectedResult;
     try std.testing.expect(cc.remote);
     try std.testing.expectEqual(@as(u64, @intFromEnum(proto.Code.shutdown)), cc.code);
+}
+
+test "native listener: the path MTU ceiling follows the address family; switches default off" {
+    const v4: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(1) };
+    try std.testing.expectEqual(@as(u16, 1472), pathCeiling(&v4));
+    var v6: Io.net.IpAddress = .{ .ip6 = .{ .port = 1, .bytes = @splat(0) } };
+    v6.ip6.bytes[15] = 1;
+    try std.testing.expectEqual(@as(u16, 1452), pathCeiling(&v6));
+    // an IPv4 client on a dual-stack socket
+    v6.ip6.bytes[10] = 0xff;
+    v6.ip6.bytes[11] = 0xff;
+    try std.testing.expectEqual(@as(u16, 1472), pathCeiling(&v6));
+    const o: Options = .{ .listen = v4, .identity_seed = @splat(0), .cert = undefined };
+    try std.testing.expect(!o.pacing and !o.hystart and !o.cubic and !o.pmtud and !o.iw_mtu and !o.early_settings);
+    const d: conn_mod.Config = .{ .server_name = "", .identity_seed = @splat(0), .seed = @splat(0), .now_unix = 0 };
+    try std.testing.expect(!d.pacing and !d.hystart and !d.cubic and !d.pmtud and !d.iw_mtu and !d.early_send);
+    try std.testing.expect(!envSwitch("ZUI_NATIVE_NO_SUCH_SWITCH", false) and envSwitch("ZUI_NATIVE_NO_SUCH_SWITCH", true));
 }

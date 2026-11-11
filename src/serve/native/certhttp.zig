@@ -3,6 +3,14 @@
 //! cross-origin before `new WebTransport(url, { serverCertificateHashes })`). Plain HTTP/1.1 on
 //! TCP at the native listen address (same host and port number as the UDP listener). One tiny
 //! thread; every other path is 404. Dev only: prod uses a WebPKI certificate and needs no hash.
+//! The certificate rotates (certs.zig): the hash is read per request, and
+//! `GET /native/cert-hashes` lists the current and the next one, a line each:
+//! `<sha256 hex> <from> <until>` (the unix seconds between which the node presents it).
+//! With `--native-cert` there is no hash to pin and both answer 204 with no body: a page that
+//! still fetches the hash then gets an empty string and connects without
+//! `serverCertificateHashes`, which is right for a WebPKI certificate. (The real certificate's
+//! hash would make Chrome apply its pinned-certificate rules, at most 14 days of validity, and
+//! refuse it; a 404 would fail deployed pages at the fetch.)
 //!
 //! With an rpc dispatcher (`--native-http-rpc`, docs/EDGE.md section 7) the same listener also
 //! answers `POST /zui1/rpc`: the body is one zui/1 request exactly as a stream carries it (varint
@@ -16,6 +24,7 @@ const c = std.c;
 const Atomic = std.atomic.Value;
 const dispatch = @import("dispatch.zig");
 const proto = @import("proto.zig");
+const certs_mod = @import("certs.zig");
 
 pub const max_conns = 64;
 const max_body = 128 << 10;
@@ -72,6 +81,8 @@ fn writeAll(fd: c.fd_t, b: []const u8) void {
 pub const Server = struct {
     fd: c.fd_t,
     hash_hex: [64]u8,
+    /// The rotating certificate; null: `hash_hex`, fixed at start.
+    certs: ?*certs_mod.Certs = null,
     stop_flag: Atomic(bool) = .init(false),
     thread: ?std.Thread = null,
     gpa: std.mem.Allocator = undefined,
@@ -86,6 +97,15 @@ pub const Server = struct {
     }
 
     pub fn startRpc(gpa: std.mem.Allocator, ip4: [4]u8, port: u16, hash: [32]u8, rpc: ?*dispatch.Dispatcher) !*Server {
+        return startInner(gpa, ip4, port, hash, null, rpc);
+    }
+
+    /// As `startRpc`, with the hashes read from `cs` at every request (they change at a rotation).
+    pub fn startCerts(gpa: std.mem.Allocator, ip4: [4]u8, port: u16, cs: *certs_mod.Certs, rpc: ?*dispatch.Dispatcher) !*Server {
+        return startInner(gpa, ip4, port, @splat(0), cs, rpc);
+    }
+
+    fn startInner(gpa: std.mem.Allocator, ip4: [4]u8, port: u16, hash: [32]u8, cs: ?*certs_mod.Certs, rpc: ?*dispatch.Dispatcher) !*Server {
         const fd = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
         if (fd < 0) return error.Socket;
         errdefer _ = c.close(fd);
@@ -95,9 +115,17 @@ pub const Server = struct {
         if (c.bind(fd, @ptrCast(&sa), @sizeOf(c.sockaddr.in)) != 0) return error.Bind;
         if (c.listen(fd, 64) != 0) return error.Listen;
         const s = try gpa.create(Server);
-        s.* = .{ .fd = fd, .hash_hex = std.fmt.bytesToHex(hash, .lower), .gpa = gpa, .rpc = rpc };
+        s.* = .{ .fd = fd, .hash_hex = std.fmt.bytesToHex(hash, .lower), .certs = cs, .gpa = gpa, .rpc = rpc };
         s.thread = try std.Thread.spawn(.{}, loop, .{s});
         return s;
+    }
+
+    /// The TCP port bound (tests bind port 0).
+    pub fn boundPort(s: *const Server) u16 {
+        var sa: c.sockaddr.in = undefined;
+        var len: c.socklen_t = @sizeOf(c.sockaddr.in);
+        if (c.getsockname(s.fd, @ptrCast(&sa), &len) != 0) return 0;
+        return std.mem.bigToNative(u16, sa.port);
     }
 
     pub fn stop(s: *Server, gpa: std.mem.Allocator) void {
@@ -198,6 +226,21 @@ pub const Server = struct {
         writeAll(fd, h);
     }
 
+    /// The body of `/native/cert-hash` (64 hex characters, no newline: deployed pages pass the
+    /// whole body as one hash) or, with `all`, of `/native/cert-hashes`. Empty: there is no
+    /// hash to pin (`--native-cert`).
+    fn hashBody(s: *Server, buf: *[256]u8, all: bool) []const u8 {
+        const v: certs_mod.View = if (s.certs) |cs| cs.view() else {
+            if (!all) return &s.hash_hex;
+            return std.fmt.bufPrint(buf, "{s}\n", .{&s.hash_hex}) catch unreachable;
+        };
+        if (v.n == 0) return "";
+        if (!all) return std.fmt.bufPrint(buf, "{x}", .{&v.sha256[0]}) catch unreachable;
+        var n: usize = 0;
+        for (0..v.n) |i| n += (std.fmt.bufPrint(buf[n..], "{x} {d} {d}\n", .{ &v.sha256[i], v.from[i], v.until[i] }) catch unreachable).len;
+        return buf[0..n];
+    }
+
     fn serveOne(s: *Server, fd: c.fd_t, deadline: i64) void {
         var buf: [4096]u8 = undefined;
         var n: usize = 0;
@@ -216,12 +259,16 @@ pub const Server = struct {
         const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
         const cors = "access-control-allow-origin: *\r\naccess-control-allow-methods: GET, POST, OPTIONS\r\naccess-control-allow-headers: *\r\n";
         if (s.rpc != null and std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/zui1/rpc")) return s.serveRpc(fd, buf[0..], n, cors, deadline);
-        var out: [512]u8 = undefined;
+        var out: [1024]u8 = undefined;
+        const get = std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD");
+        var body_buf: [256]u8 = undefined;
         const resp = if (std.mem.eql(u8, method, "OPTIONS"))
             std.fmt.bufPrint(&out, "HTTP/1.1 204 No Content\r\n{s}content-length: 0\r\nconnection: close\r\n\r\n", .{cors}) catch return
-        else if (std.mem.eql(u8, path, "/native/cert-hash") and (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD")))
-            std.fmt.bufPrint(&out, "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncache-control: no-store\r\n{s}content-length: 64\r\nconnection: close\r\n\r\n{s}", .{ cors, if (method[0] == 'H') "" else &s.hash_hex }) catch return
-        else
+        else if (get and (std.mem.eql(u8, path, "/native/cert-hash") or std.mem.eql(u8, path, "/native/cert-hashes"))) blk: {
+            const body = s.hashBody(&body_buf, path.len == "/native/cert-hashes".len);
+            if (body.len == 0) break :blk std.fmt.bufPrint(&out, "HTTP/1.1 204 No Content\r\ncache-control: no-store\r\n{s}content-length: 0\r\nconnection: close\r\n\r\n", .{cors}) catch return;
+            break :blk std.fmt.bufPrint(&out, "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncache-control: no-store\r\n{s}content-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ cors, body.len, if (method[0] == 'H') "" else body }) catch return;
+        } else
             std.fmt.bufPrint(&out, "HTTP/1.1 404 Not Found\r\n{s}content-length: 0\r\nconnection: close\r\n\r\n", .{cors}) catch return;
         _ = c.write(fd, resp.ptr, resp.len);
     }

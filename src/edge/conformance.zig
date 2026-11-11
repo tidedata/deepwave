@@ -5,6 +5,9 @@
 //! in every part an edge keeps, (2) have empty input objects, (3) pass the output-object check
 //! against its effects, and (4) hash to the summary's contents digest. That is what the follower
 //! checks first on an edge, so a pass here means a feed loses nothing verification needs.
+//! And (5) `feed.feedForm` of the corpus blob (what an edge's fallback source hands the
+//! follower) has the rebuilt blob's parts and length, and each transaction's output objects are
+//! its effects' references in their order: the order a core's feed has them in.
 //! There is no Mysten side: the feed is deepwave's own format, the corpus is the truth for the bytes.
 const std = @import("std");
 const harness = @import("harness");
@@ -45,6 +48,7 @@ threadlocal var tl_hist: Hist = .{};
 
 threadlocal var tl_a: ?*index.CheckpointIndex = null;
 threadlocal var tl_b: ?*index.CheckpointIndex = null;
+threadlocal var tl_c: ?*index.CheckpointIndex = null;
 
 fn scratchIndex(slot: *?*index.CheckpointIndex) !*index.CheckpointIndex {
     if (slot.* == null) {
@@ -149,6 +153,39 @@ fn file(_: void, ctx: *harness.Ctx, name: []const u8) !void {
     try feed.toBlob(&blob2, a, &f);
     const ib = try scratchIndex(&tl_b);
     index.indexCheckpointData(blob2.items, ib) catch |e| return c.failf("rebuilt blob does not index: {s}", .{@errorName(e)});
+    // An edge's fallback (docs/EDGE.md section 10) takes the full blob from the bucket and hands
+    // the follower its feed form: that must be this very blob, byte for byte.
+    // (Not blob2: this suite builds its feed from the corpus blob's own object order, the
+    // archive's; a core reads a transaction's output objects from its store in the order of the
+    // effects' references, and the feed form is in that order.) So: the same bytes in every
+    // other part, the same length, and per transaction exactly the effects' output references,
+    // in their order, each object hashing to its reference's digest.
+    var ff: std.ArrayList(u8) = .empty;
+    try feed.feedForm(&ff, a, a, blob, ia);
+    const ic = try scratchIndex(&tl_c);
+    index.indexCheckpointData(ff.items, ic) catch |e| return c.failf("feed form does not index: {s}", .{@errorName(e)});
+    c.eql("feed form length", blob2.items.len, ff.items.len);
+    c.bytes("feed form: summary and certificate", blob2.items[ib.summary.o .. ib.sig.o + ib.sig.n], ff.items[ic.summary.o .. ic.sig.o + ic.sig.n]);
+    c.bytes("feed form: contents", ib.contents.slice(blob2.items), ic.contents.slice(ff.items));
+    if (ic.tx_count != ib.tx_count) return c.failf("feed form: tx count {d} vs {d}", .{ ic.tx_count, ib.tx_count });
+    var refs: std.ArrayList(checkpoint.objects.OutRef) = .empty;
+    for (0..ic.tx_count) |i| {
+        const y = ib.txAt(i);
+        const z = ic.txAt(i);
+        if (!std.mem.eql(u8, y.transaction.slice(blob2.items), z.transaction.slice(ff.items))) return c.failf("feed form tx {d}: envelope differs", .{i});
+        if (!std.mem.eql(u8, y.effects.slice(blob2.items), z.effects.slice(ff.items))) return c.failf("feed form tx {d}: effects differ", .{i});
+        const ey = if (y.events) |e| e.slice(blob2.items) else null;
+        const ez = if (z.events) |e| e.slice(ff.items) else null;
+        if ((ey == null) != (ez == null) or (ey != null and !std.mem.eql(u8, ey.?, ez.?))) return c.failf("feed form tx {d}: events differ", .{i});
+        if (z.in_count != 0) return c.failf("feed form tx {d}: input objects", .{i});
+        refs.clearRetainingCapacity();
+        feed.outputRefs(a, z.effects.slice(ff.items), &refs) catch return c.failf("feed form tx {d}: effects do not decode", .{i});
+        if (refs.items.len != z.out_count) return c.failf("feed form tx {d}: {d} output objects for {d} references", .{ i, z.out_count, refs.items.len });
+        for (refs.items, ic.objs[z.out_first..][0..z.out_count], 0..) |*ref, rg, k| {
+            const got = checkpoint.objects.outputRef(rg.slice(ff.items)) orelse return c.failf("feed form tx {d}: output object {d} has no reference", .{ i, k });
+            if (!std.mem.eql(u8, ref, &got)) return c.failf("feed form tx {d}: output object {d} is not the effects' reference {d}", .{ i, k, k });
+        }
+    }
 
     c.bytes("summary", ia.summary.slice(blob), ib.summary.slice(blob2.items));
     c.bytes("signature", ia.sig.slice(blob), ib.sig.slice(blob2.items));

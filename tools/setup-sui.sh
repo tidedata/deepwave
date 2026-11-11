@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Links the Mysten mainnet-v1.83.1 source tree at tools/sui so every Rust truth tool resolves
-# sui-types & co. by the same relative path from any checkout or lane worktree. Idempotent.
+# sui-types & co. by the same relative path from any checkout or worktree. Idempotent.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=/dev/null

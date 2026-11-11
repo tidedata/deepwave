@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs the pinned Zig toolchain into the shared deepwave cache (one copy for every
-# checkout, worktree and agent). Idempotent. Usage: tools/bootstrap.sh
+# checkout and worktree). Idempotent. Usage: tools/bootstrap.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=/dev/null

@@ -97,9 +97,18 @@ fn compareSets(outs: []const Ref, changed: []const Ref) struct { out_not_changed
 
 /// The reference of one `Object` (its BCS bytes): id, version, digest. Null when the contents
 /// are too short to hold an id.
-fn outputRef(obj: []const u8) ?Ref {
-    var r = bcs.Reader.init(obj);
+pub fn outputRef(obj: []const u8) ?Ref {
     var ref: Ref = undefined;
+    ref[0..40].* = outputKey(obj) orelse return null;
+    ref[40..72].* = hash.blake2b256(&.{ "Object::", obj });
+    return ref;
+}
+
+/// id (32) ++ version (u64 LE) of one `Object` (its BCS bytes), without hashing it. Null when the
+/// contents are too short to hold an id.
+pub fn outputKey(obj: []const u8) ?[40]u8 {
+    var r = bcs.Reader.init(obj);
+    var key: [40]u8 = undefined;
     const tag = r.uleb32() catch return null;
     switch (tag) {
         0 => {
@@ -109,19 +118,18 @@ fn outputRef(obj: []const u8) ?Ref {
             const n = r.length() catch return null;
             const contents = r.bytes(n) catch return null;
             if (contents.len < 32) return null;
-            @memcpy(ref[0..32], contents[0..32]);
-            std.mem.writeInt(u64, ref[32..40], version, .little);
+            @memcpy(key[0..32], contents[0..32]);
+            std.mem.writeInt(u64, key[32..40], version, .little);
         },
         1 => {
             const id = r.bytes(32) catch return null;
             const version = r.int(u64) catch return null;
-            @memcpy(ref[0..32], id);
-            std.mem.writeInt(u64, ref[32..40], version, .little);
+            @memcpy(key[0..32], id);
+            std.mem.writeInt(u64, key[32..40], version, .little);
         },
         else => return null,
     }
-    ref[40..72].* = hash.blake2b256(&.{ "Object::", obj });
-    return ref;
+    return key;
 }
 
 const Owner = types.Owner;

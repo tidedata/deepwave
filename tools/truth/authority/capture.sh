@@ -8,7 +8,7 @@ root="$(cd "$here/../../.." && pwd)"
 # 1. localnet + consensus vectors (stops the localnet cleanly)
 "$root/tools/truth/consensus/capture.sh" "$out"
 # 2. authority tables
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/zui/target-swarm}"   # shared, never per agent
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/zui/target-swarm}"   # shared
 sui_src="${ZUI_SUI_SRC:-$root/tools/sui}"
 dump="$here/dump"
 cargo run --release --manifest-path "$dump/Cargo.toml" -- \

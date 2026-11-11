@@ -75,6 +75,9 @@ pub const RecvBuf = struct {
     ooo: std.ArrayList(Chunk) = .empty,
     /// Total length announced by FIN, if any.
     fin_at: ?u64 = null,
+    /// Inserts that added no byte (everything was already held or consumed): what a sender's
+    /// spurious retransmissions look like from the receiving side.
+    dups: u64 = 0,
 
     pub const Chunk = struct {
         off: u64,
@@ -120,7 +123,10 @@ pub const RecvBuf = struct {
         if (bytes.len == 0) return;
         const end = off + bytes.len;
         const ce = b.cend();
-        if (end <= ce) return; // already have it
+        if (end <= ce) {
+            b.dups += 1; // already have it
+            return;
+        }
         if (off <= ce) {
             try b.data.appendSlice(gpa, bytes[@intCast(ce - off)..]);
             b.absorb(gpa);
@@ -130,6 +136,10 @@ pub const RecvBuf = struct {
         var o = off;
         var src = bytes;
         var i: usize = 0;
+        var gained = false;
+        defer if (!gained) {
+            b.dups += 1;
+        };
         while (i < b.ooo.items.len and b.ooo.items[i].end() <= o) i += 1;
         while (src.len > 0) {
             if (i < b.ooo.items.len and b.ooo.items[i].off <= o) {
@@ -143,6 +153,7 @@ pub const RecvBuf = struct {
             }
             const gap_end = if (i < b.ooo.items.len) b.ooo.items[i].off else std.math.maxInt(u64);
             const take: usize = @intCast(@min(@as(u64, src.len), gap_end - o));
+            gained = true;
             if (i > 0 and b.ooo.items[i - 1].end() == o) {
                 try b.ooo.items[i - 1].bytes.appendSlice(gpa, src[0..take]);
             } else {
@@ -227,6 +238,15 @@ test "RecvBuf out of order and overlap" {
     try std.testing.expect(b.complete());
     b.consume(5);
     try std.testing.expectEqualStrings("world", b.contiguous());
+    // inserts that add nothing are counted: below the cursor, inside the prefix, inside a chunk
+    try std.testing.expectEqual(@as(u64, 0), b.dups);
+    try b.insert(gpa, 0, "hello");
+    try b.insert(gpa, 6, "or");
+    try b.insert(gpa, 20, "tail");
+    try b.insert(gpa, 21, "ai");
+    try std.testing.expectEqual(@as(u64, 3), b.dups);
+    try b.insert(gpa, 18, "..tail..");
+    try std.testing.expectEqual(@as(u64, 3), b.dups);
 }
 
 test "RecvBuf holds what arrived, not up to the highest offset" {

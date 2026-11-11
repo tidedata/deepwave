@@ -92,6 +92,10 @@ pub const Request = struct {
     overrides: Overrides = .{},
     /// Rebase owned and receiving input refs (and gas coins) to the overlay's versions.
     rebase: bool = true,
+    /// Per-command results (sui-node's `execution_result`, gRPC `command_outputs`):
+    /// `Executed.command_results`, set when the transaction succeeded. Tracking leaves gas and
+    /// effects unchanged.
+    results: bool = false,
 };
 
 pub const Result = union(enum) {
@@ -146,6 +150,8 @@ pub const ObjectChange = struct {
 };
 
 pub const BalanceChange = serve.balance.Change;
+/// One command's results (`Executed.command_results`): return values and `&mut` argument values.
+pub const CommandResult = exec.ptb.CommandResult;
 
 pub const Executed = struct {
     /// The TransactionData as run (after overrides and rebasing), BCS.
@@ -166,6 +172,10 @@ pub const Executed = struct {
     loaded: []const core.Ref,
     /// The state the simulation read (the overlay), for rendering.
     state: State,
+    /// With `Request.results`: one entry per command (return values and `&mut` argument values
+    /// after the command), as gRPC SimulateTransaction's `command_outputs`. Null without
+    /// `results` or when the transaction failed (sui-node's `execution_result` is an error then).
+    command_results: ?[]const CommandResult = null,
 };
 
 /// Where `simulate` reads the tip: the store and the epoch the node is in.
@@ -285,7 +295,10 @@ pub const Engine = struct {
         // ---- run (the same core as gRPC SimulateTransaction)
         const dev = req.mode == .dev_inspect;
         const allow_mock = dev or !(try core.addressBalancePaysGas(arena, &e.core, env, state, &td));
-        const sim = switch (try core.run(&e.core, arena, env, state, tx_raw, td, allow_mock, dev)) {
+        // as gRPC SimulateTransaction: tracking on a copy, only when the results are wanted
+        var ce = e.core;
+        ce.track_results = req.results;
+        const sim = switch (try core.run(&ce, arena, env, state, tx_raw, td, allow_mock, dev)) {
             .ok => |s| s,
             .fail => |f| return reject(f.code, f.message),
             .unimplemented => |why| return reject(12, why),
@@ -330,6 +343,7 @@ pub const Engine = struct {
             .objects = sim.objects,
             .loaded = sim.loaded,
             .state = state,
+            .command_results = if (req.results and status == .success) sim.command_results else null,
         } };
     }
 };
@@ -583,4 +597,56 @@ test "a chain step's deletions and writes reach the next step" {
     try std.testing.expectEqualSlices(u8, wx, s.latest(&x).?);
     try std.testing.expect(s.latest(&y) == null);
     try std.testing.expect(ov.own(&y).? == .gone);
+}
+
+// zui/1 dry_run 0x02 (NATIVE-PROTOCOL.md 4.2) and gRPC SimulateTransaction `command_outputs`
+// come from the same tracked run: per command, its return values; with checks on and off.
+// The system packages come from the corpus (`ptb.devinspect_test.Fixture`): skipped without it.
+test "results: per-command return values, with checks on and with checks off" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dt = exec.ptb.devinspect_test;
+    var f: dt.Fixture = undefined;
+    try f.init(a, std.testing.io);
+    defer f.deinit();
+    const coin = try dt.coinObject(a, dt.idOf(0x71), 5, 5000, .{ .AddressOwner = .{ .@"0" = dt.sender } });
+    try f.add(coin);
+    const td = try f.data(.{
+        .inputs = &.{ .{ .Pure = &.{ 2, 'h', 'i' } }, .{ .Object = .{ .ImmOrOwnedObject = try dt.refOf(coin) } } },
+        .commands = &.{
+            dt.moveCall(1, "string", "utf8", &.{}, &.{.{ .Input = 0 }}),
+            dt.moveCall(2, "coin", "value", &.{dt.suiInput()}, &.{.{ .Input = 1 }}),
+        },
+    });
+    const tx_raw = try bcs.encodeAlloc(types.TransactionData, a, &td);
+    var ms: rpc_exec.state.MapState = .{};
+    var it = f.objs.iterator();
+    while (it.next()) |kv| try ms.put(a, kv.key_ptr.*, (try ObjectView.parse(kv.value_ptr.*)).version, kv.value_ptr.*);
+    const eng: Engine = .{ .core = .{ .gpa = std.heap.page_allocator, .pkgs = &f.pkgs, .dev_inspect = .enabled } };
+    const env: EpochEnv = .{ .chain_id = @splat(0), .epoch = f.epoch, .pv = f.pv, .cfg = f.cfg, .rgp = f.rgp, .epoch_start_ms = f.start_ms, .committee_size = 100 };
+    for ([_]Mode{ .simulate, .dev_inspect }) |mode| {
+        const plain = switch (try eng.simulateAt(a, &env, ms.state(), .{ .tx = .{ .data = tx_raw }, .mode = mode })) {
+            .executed => |x| x,
+            .rejected => |r| {
+                std.debug.print("{s}: rejected {d}: {s}\n", .{ @tagName(mode), r.code, r.message });
+                return error.TestUnexpectedResult;
+            },
+        };
+        try std.testing.expect(plain.status == .success);
+        try std.testing.expect(plain.command_results == null);
+        const x = switch (try eng.simulateAt(a, &env, ms.state(), .{ .tx = .{ .data = tx_raw }, .mode = mode, .results = true })) {
+            .executed => |x| x,
+            .rejected => return error.TestUnexpectedResult,
+        };
+        const cr = x.command_results orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 2), cr.len);
+        try std.testing.expectEqual(@as(usize, 1), cr[0].returns.len);
+        try std.testing.expectEqualSlices(u8, &.{ 2, 'h', 'i' }, cr[0].returns[0].bytes);
+        try std.testing.expectEqual(@as(usize, 1), cr[1].returns.len);
+        try std.testing.expectEqualSlices(u8, try dt.u64Bytes(a, 5000), cr[1].returns[0].bytes);
+        // tracking changes nothing else
+        try std.testing.expectEqualSlices(u8, plain.effects, x.effects);
+        try std.testing.expectEqual(plain.gas, x.gas);
+    }
 }

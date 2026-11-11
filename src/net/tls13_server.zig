@@ -17,6 +17,7 @@ const tls = @import("tls13.zig");
 const tls_identity = @import("tls_identity.zig");
 
 pub const Level = tls.Level;
+pub const Identity = tls_identity.Identity;
 pub const Error = tls.Error || error{NoApplicationProtocol};
 
 pub const Config = struct {
@@ -42,9 +43,14 @@ pub const Config = struct {
     /// TLS over TCP (`--serve-tls`), not QUIC: no quic_transport_parameters either way, ALPN
     /// optional (std.crypto.tls.Client sends none), and `alt`'s certificate always (or `chain`'s).
     tcp: bool = false,
-    /// TCP only: a loaded certificate chain and key (sui-node `rpc.tls`, tls_identity.zig),
-    /// served instead of `alt`. A client offering ALPN without one of `alpn` is refused
-    /// (no_application_protocol, as rustls does).
+    /// A loaded certificate chain and key (tls_identity.zig).
+    /// TCP (sui-node `rpc.tls`): served instead of `alt`. A client offering ALPN without one of
+    /// `alpn` is refused (no_application_protocol, as rustls does).
+    /// QUIC (the zui/1 listener's `--native-cert`): served instead of `alt`'s certificate, and
+    /// instead of the identity certificate as well, except to a client that asks for the
+    /// identity under an ALPN other than `alt`'s: one whose SNI is `server_name` (what clients
+    /// that pin the identity key send), or one that offers ed25519 and no scheme the chain's
+    /// key signs with.
     chain: ?*const tls_identity.Identity = null,
 };
 
@@ -77,6 +83,8 @@ pub const Server = struct {
     complete: bool = false,
     /// Index into `cfg.alpn` of the protocol we selected (null: no ALPN).
     alpn: ?u8 = null,
+    /// QUIC with `cfg.chain`: this client gets the identity certificate, not the chain.
+    identity_asked: bool = false,
 
     pub fn init(cfg: Config) Server {
         return .{ .cfg = cfg, .x_pub = X25519.recoverPublicKey(cfg.x25519_secret) };
@@ -143,12 +151,11 @@ pub const Server = struct {
                     s.alpn = pickAlpn(s.cfg.alpn, ch.alpn) orelse return error.HandshakeFailure;
                 }
                 if (!s.cfg.tcp and ch.tp == null) return error.MissingTransportParameters;
-                const can_sign = if (s.chainOf()) |id| switch (id.key) {
-                    .p256 => ch.p256,
-                    .p384 => ch.p384,
-                    .ed25519 => ch.ed25519,
-                    .rsa => ch.rsa_pss,
-                } else if (s.useAlt() != null) ch.p256 else ch.ed25519;
+                if (!s.cfg.tcp) if (s.cfg.chain) |id| {
+                    const alt_alpn = if (s.cfg.alt) |a| s.alpn != null and s.alpn.? == a.alpn_index else false;
+                    s.identity_asked = !alt_alpn and ch.ed25519 and (std.mem.eql(u8, ch.sni, s.cfg.server_name) or !canSign(id, ch));
+                };
+                const can_sign = if (s.chainOf()) |id| canSign(id, ch) else if (s.useAlt() != null) ch.p256 else ch.ed25519;
                 if (!can_sign) return error.HandshakeFailure;
                 s.transcript.update(m);
                 try s.respond(gpa, ch);
@@ -186,6 +193,8 @@ pub const Server = struct {
         client_pub: [32]u8,
         tp: ?[]const u8,
         alpn: []const u8 = "", // ProtocolNameList body (after its u16 length)
+        /// server_name's host_name ("" when absent or malformed).
+        sni: []const u8 = "",
         ed25519: bool = false,
         p256: bool = false,
         p384: bool = false,
@@ -193,13 +202,40 @@ pub const Server = struct {
     };
 
     fn chainOf(s: *const Server) ?*const tls_identity.Identity {
-        return if (s.cfg.tcp) s.cfg.chain else null;
+        const id = s.cfg.chain orelse return null;
+        return if (s.cfg.tcp or !s.identity_asked) id else null;
+    }
+
+    /// The client offered the signature scheme `id`'s key signs with.
+    fn canSign(id: *const tls_identity.Identity, ch: ClientHello) bool {
+        return switch (id.key) {
+            .p256 => ch.p256,
+            .p384 => ch.p384,
+            .ed25519 => ch.ed25519,
+            .rsa => ch.rsa_pss,
+        };
     }
 
     fn useAlt(s: *const Server) ?Alt {
         const a = s.cfg.alt orelse return null;
         if (s.cfg.tcp) return a;
         return if (s.alpn != null and s.alpn.? == a.alpn_index) a else null;
+    }
+
+    /// The host_name of a server_name extension; "" when there is none or it does not parse
+    /// (the extension was never read before, so a malformed one still is not an error).
+    fn hostName(ed: []const u8) []const u8 {
+        if (ed.len < 2) return "";
+        var k: usize = 2;
+        while (ed.len - k >= 3) {
+            const ty = ed[k];
+            const l: usize = std.mem.readInt(u16, ed[k + 1 ..][0..2], .big);
+            k += 3;
+            if (ed.len - k < l) return "";
+            if (ty == 0) return ed[k..][0..l];
+            k += l;
+        }
+        return "";
     }
 
     fn pickAlpn(ours: []const []const u8, list: []const u8) ?u8 {
@@ -249,6 +285,7 @@ pub const Server = struct {
         var client_pub: ?[32]u8 = null;
         var tp: ?[]const u8 = null;
         var alpn: []const u8 = "";
+        var sni: []const u8 = "";
         while (p < b.len) {
             if (b.len - p < 4) return error.DecodeError;
             const et = std.mem.readInt(u16, b[p..][0..2], .big);
@@ -291,6 +328,7 @@ pub const Server = struct {
                         k += kl;
                     }
                 },
+                0x0000 => sni = hostName(ed), // server_name
                 0x0039 => tp = ed, // quic_transport_parameters
                 0x0010 => { // application_layer_protocol_negotiation
                     if (ed.len < 2 or @as(usize, std.mem.readInt(u16, ed[0..2], .big)) + 2 != ed.len) return error.DecodeError;
@@ -301,7 +339,7 @@ pub const Server = struct {
         }
         if (!tls13 or !has_suite) return error.HandshakeFailure;
         if (client_pub == null) return error.HelloRetryRequest;
-        return .{ .session_id = sid, .client_pub = client_pub.?, .tp = tp, .alpn = alpn, .ed25519 = ed25519, .p256 = p256, .p384 = p384, .rsa_pss = rsa_pss };
+        return .{ .session_id = sid, .client_pub = client_pub.?, .tp = tp, .alpn = alpn, .sni = sni, .ed25519 = ed25519, .p256 = p256, .p384 = p384, .rsa_pss = rsa_pss };
     }
 
     /// ServerHello (Initial), then EncryptedExtensions, CertificateRequest, Certificate,
@@ -514,6 +552,88 @@ test "tls13 server over TCP with a loaded chain refuses a client whose ALPN list
             try std.testing.expectEqual(@as(?u8, 0), s.alpn);
         }
     }
+}
+
+test "a client that pins certificate hashes (tls13.Trust.hashes) refuses an unknown hash and a validity over 14 days" {
+    const gpa = std.testing.allocator;
+    // the rpc-surface capture's P-256 certificate: valid for years, so never acceptable pinned
+    var id = try tls_identity.load(gpa, tls_identity.testdata.p256_cert, tls_identity.testdata.p256_key);
+    defer id.deinit();
+    const parsed = try (std.crypto.Certificate{ .buffer = id.certs[0], .index = 0 }).parse();
+    const now: i64 = @intCast(parsed.validity.not_before + 86400);
+    var hash: [32]u8 = undefined;
+    Sha256.hash(id.certs[0], &hash, .{});
+    const ckp = try Ed25519.KeyPair.generateDeterministic(@splat(1));
+    const skp = try Ed25519.KeyPair.generateDeterministic(@splat(2));
+    const cases = [_]struct { pin: [32]u8, want: tls.Error }{
+        .{ .pin = hash, .want = error.BadCertificate }, // the right hash, but valid for too long
+        .{ .pin = @splat(0x11), .want = error.PeerIdMismatch },
+    };
+    for (cases) |case| {
+        var c = tls.Client.init(.{ .server_name = "localhost", .local_tp = "ctp", .identity = ckp, .cert_der = "", .trust = .{ .hashes = &.{case.pin} }, .now_unix = now, .random = @splat(7), .x25519_secret = @splat(8), .alpn = "h3" });
+        defer c.deinit(gpa);
+        var s = Server.init(.{ .server_name = "zui", .local_tp = "stp", .identity = skp, .cert_der = "", .now_unix = now, .random = @splat(9), .x25519_secret = @splat(10), .alpn = &.{ "zui/1", "h3" }, .client_auth = false, .alt = .{ .alpn_index = 1, .cert_der = id.certs[0], .key = id.key.p256 } });
+        defer s.deinit(gpa);
+        try c.start(gpa);
+        // the pinning client offers ecdsa_secp256r1_sha256, so the server can sign for `h3`
+        try s.feed(gpa, .initial, c.takeOutput(.initial));
+        try std.testing.expectEqual(@as(?u8, 1), s.alpn);
+        try c.feed(gpa, .initial, s.takeOutput(.initial));
+        try std.testing.expectError(case.want, c.feed(gpa, .handshake, s.takeOutput(.handshake)));
+        try std.testing.expectEqual(hash, c.peer_cert_sha256.?);
+        try std.testing.expect(!c.complete);
+    }
+}
+
+test "QUIC with a loaded chain: everyone gets it but a client that asks for the identity certificate" {
+    const gpa = std.testing.allocator;
+    var id = try tls_identity.load(gpa, tls_identity.testdata.p256_cert, tls_identity.testdata.p256_key);
+    defer id.deinit();
+    const ckp = try Ed25519.KeyPair.generateDeterministic(@splat(1));
+    const skp = try Ed25519.KeyPair.generateDeterministic(@splat(2));
+    var scert: [x509.max_cert_len]u8 = undefined;
+    const sl = x509.generateSelfSigned(&scert, skp, @splat(6), "zui");
+    const roots = [_][]const u8{id.certs[0]};
+    const cases = [_]struct { name: []const u8, alpn: []const u8, webpki: bool, identity: bool }{
+        // deployed zui/1 clients and edges: the name `zui`, ed25519 only, the key pinned
+        .{ .name = "zui", .alpn = "zui/1", .webpki = false, .identity = true },
+        // ed25519 only under another name: it could not check the chain's signature anyway
+        .{ .name = "node.example", .alpn = "zui/1", .webpki = false, .identity = true },
+        // a client that takes ECDSA and names the host: the chain
+        .{ .name = "node.example", .alpn = "zui/1", .webpki = true, .identity = false },
+        // asked for by name, whatever it could verify
+        .{ .name = "zui", .alpn = "zui/1", .webpki = true, .identity = true },
+        // browsers (the `alt` ALPN) always get the chain
+        .{ .name = "zui", .alpn = "h3", .webpki = true, .identity = false },
+        .{ .name = "node.example", .alpn = "h3", .webpki = true, .identity = false },
+    };
+    for (cases) |case| {
+        var c = tls.Client.init(.{ .server_name = case.name, .local_tp = "ctp", .identity = ckp, .cert_der = "", .trust = if (case.webpki) .{ .roots = &roots } else null, .now_unix = 1_800_000_000, .random = @splat(7), .x25519_secret = @splat(8), .alpn = case.alpn });
+        defer c.deinit(gpa);
+        var s = Server.init(.{ .server_name = "zui", .local_tp = "stp", .identity = skp, .cert_der = scert[0..sl], .now_unix = 1_800_000_000, .random = @splat(9), .x25519_secret = @splat(10), .alpn = &.{ "zui/1", "h3" }, .client_auth = false, .alt = .{ .alpn_index = 1, .cert_der = id.certs[0], .key = id.key.p256 }, .chain = &id });
+        defer s.deinit(gpa);
+        try c.start(gpa);
+        try s.feed(gpa, .initial, c.takeOutput(.initial));
+        try std.testing.expectEqual(case.identity, s.identity_asked);
+        try std.testing.expectEqual(case.identity, s.chainOf() == null);
+        // the Certificate message carries the identity certificate, or the chain's leaf
+        const flight = s.takeOutput(.handshake);
+        const want: []const u8 = if (case.identity) scert[0..sl] else id.certs[0];
+        try std.testing.expect(std.mem.indexOf(u8, flight, want) != null);
+        try std.testing.expect(std.mem.indexOf(u8, flight, if (case.identity) id.certs[0] else scert[0..sl]) == null);
+    }
+    // without a chain nothing changes: SNI is not looked at
+    var c = tls.Client.init(.{ .server_name = "zui", .local_tp = "ctp", .identity = ckp, .cert_der = "", .now_unix = 1_800_000_000, .random = @splat(7), .x25519_secret = @splat(8), .alpn = "zui/1" });
+    defer c.deinit(gpa);
+    var s = Server.init(.{ .server_name = "zui", .local_tp = "stp", .identity = skp, .cert_der = scert[0..sl], .now_unix = 1_800_000_000, .random = @splat(9), .x25519_secret = @splat(10), .alpn = &.{ "zui/1", "h3" }, .client_auth = false });
+    defer s.deinit(gpa);
+    try c.start(gpa);
+    try s.feed(gpa, .initial, c.takeOutput(.initial));
+    try std.testing.expect(!s.identity_asked);
+    // server_name extensions that do not parse are "no name", never an error
+    try std.testing.expectEqualStrings("zui", Server.hostName(&.{ 0, 6, 0, 0, 3, 'z', 'u', 'i' }));
+    for ([_][]const u8{ "", &.{0}, &.{ 0, 6, 0 }, &.{ 0, 6, 0, 0xff, 0xff, 'z' }, &.{ 0, 6, 1, 0, 3, 'z', 'u', 'i' }, &.{ 0, 6, 0, 0, 9, 'z' } }) |ext|
+        try std.testing.expectEqualStrings("", Server.hostName(ext));
 }
 
 /// Offset, in a ClientHello handshake message (its 4-byte header included), of the data of

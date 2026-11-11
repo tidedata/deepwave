@@ -60,6 +60,7 @@ pub const sync = @import("sync");
 test {
     std.testing.refAllDecls(@This());
     _ = @import("tests.zig");
+    _ = @import("edge_fallback_tests.zig");
     _ = @import("rpcmetrics.zig");
     _ = @import("opsmetrics.zig");
     _ = @import("statehash.zig");

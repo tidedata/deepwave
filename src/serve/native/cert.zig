@@ -124,6 +124,88 @@ pub fn generate(key: P256.KeyPair, serial: [16]u8, now_unix: i64, days: u32, nam
     return c;
 }
 
+/// What `issue` puts in a certificate.
+pub const Issue = struct {
+    /// The key the certificate is for, and the key that signs it (the same one: self-signed).
+    subject: P256.PublicKey,
+    signer: P256.KeyPair,
+    subject_cn: []const u8,
+    issuer_cn: []const u8,
+    serial: [16]u8,
+    not_before: i64,
+    not_after: i64,
+    /// DNS subjectAltName (none when empty).
+    dns: []const u8 = "",
+    /// basicConstraints CA:TRUE.
+    ca: bool = false,
+};
+
+fn putName(w: *Writer, cn: []const u8) void {
+    const name = w.begin(0x30);
+    const set = w.begin(0x31);
+    const atv = w.begin(0x30);
+    w.put(&.{ 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, @intCast(cn.len) });
+    w.put(cn);
+    w.end(atv);
+    w.end(set);
+    w.end(name);
+}
+
+/// Test support for `--native-cert` (a local CA and its leaves; the node itself only ever makes
+/// `generate`'s self-signed certificate): an X.509v3 ECDSA P-256 certificate into `buf`.
+pub fn issue(buf: *[max_len]u8, o: Issue) []const u8 {
+    std.debug.assert(o.subject_cn.len < 64 and o.issuer_cn.len < 64 and o.dns.len < 64);
+    var w: Writer = .{ .buf = buf };
+    const cert = w.begin(0x30);
+    const tbs_start = w.len;
+    const tbs = w.begin(0x30);
+    w.put(&.{ 0xa0, 0x03, 0x02, 0x01, 0x02 }); // v3
+    var s = o.serial;
+    s[0] = (s[0] & 0x7f) | 0x01;
+    w.put(&.{ 0x02, 16 });
+    w.put(&s);
+    w.put(&oid_ecdsa_sha256);
+    putName(&w, o.issuer_cn);
+    var nb: [13]u8 = undefined;
+    var na: [13]u8 = undefined;
+    utcTime(&nb, o.not_before);
+    utcTime(&na, o.not_after);
+    w.put(&.{ 0x30, 0x1e, 0x17, 0x0d });
+    w.put(&nb);
+    w.put(&.{ 0x17, 0x0d });
+    w.put(&na);
+    putName(&w, o.subject_cn);
+    w.put(&.{ 0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00 });
+    w.put(&o.subject.toUncompressedSec1());
+    if (o.dns.len > 0 or o.ca) {
+        const e3 = w.begin(0xa3);
+        const eseq = w.begin(0x30);
+        if (o.ca) w.put(&.{ 0x30, 0x0f, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x01, 0x01, 0xff, 0x04, 0x05, 0x30, 0x03, 0x01, 0x01, 0xff });
+        if (o.dns.len > 0) {
+            const san = w.begin(0x30);
+            w.put(&.{ 0x06, 0x03, 0x55, 0x1d, 0x11 });
+            const oct = w.begin(0x04);
+            const names = w.begin(0x30);
+            w.put(&.{ 0x82, @intCast(o.dns.len) });
+            w.put(o.dns);
+            w.end(names);
+            w.end(oct);
+            w.end(san);
+        }
+        w.end(eseq);
+        w.end(e3);
+    }
+    w.end(tbs);
+    const sig = o.signer.sign(buf[tbs_start..w.len], null) catch unreachable;
+    var der_buf: [P256.Signature.der_encoded_length_max]u8 = undefined;
+    const sder = sig.toDer(&der_buf);
+    w.put(&oid_ecdsa_sha256);
+    w.put(&.{ 0x03, @intCast(sder.len + 1), 0x00 });
+    w.put(sder);
+    w.end(cert);
+    return buf[0..w.len];
+}
+
 fn tlv(d: []const u8, at: usize) struct { hdr: usize, len: usize } {
     const l = d[at + 1];
     if (l < 0x80) return .{ .hdr = 2, .len = l };
@@ -144,4 +226,25 @@ test "p256 certificate signs and parses as DER" {
     const sig_der = rest[oid_ecdsa_sha256.len + 3 ..];
     const sig = try P256.Signature.fromDer(sig_der);
     try sig.verify(tbs, kp.public_key);
+}
+
+test "issue: a CA and a leaf it signed verify with std.crypto.Certificate" {
+    const ca_key = P256.KeyPair.generateDeterministic(@splat(1)) catch unreachable;
+    const leaf_key = P256.KeyPair.generateDeterministic(@splat(2)) catch unreachable;
+    var cb: [max_len]u8 = undefined;
+    var lb: [max_len]u8 = undefined;
+    const now: i64 = 1_800_000_000;
+    const ca = issue(&cb, .{ .subject = ca_key.public_key, .signer = ca_key, .subject_cn = "zui test CA", .issuer_cn = "zui test CA", .serial = @splat(3), .not_before = now - 86400, .not_after = now + 86400, .ca = true });
+    const leaf = issue(&lb, .{ .subject = leaf_key.public_key, .signer = ca_key, .subject_cn = "node.test", .issuer_cn = "zui test CA", .serial = @splat(4), .not_before = now - 3600, .not_after = now + 3600, .dns = "node.test" });
+    const C = std.crypto.Certificate;
+    const pca = try (C{ .buffer = ca, .index = 0 }).parse();
+    const pleaf = try (C{ .buffer = leaf, .index = 0 }).parse();
+    try pleaf.verify(pca, now);
+    try pca.verify(pca, now);
+    try pleaf.verifyHostName("node.test");
+    try std.testing.expectError(error.CertificateHostMismatch, pleaf.verifyHostName("other.test"));
+    try std.testing.expectError(error.CertificateExpired, pleaf.verify(pca, now + 7200));
+    try std.testing.expectEqualSlices(u8, &leaf_key.public_key.toUncompressedSec1(), pleaf.pubKey());
+    // not signed by itself
+    try std.testing.expectError(error.CertificateIssuerMismatch, pleaf.verify(pleaf, now));
 }

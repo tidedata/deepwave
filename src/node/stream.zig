@@ -564,6 +564,15 @@ pub const Stream = struct {
             std.log.warn("stream checkpoint {d}: {s}; left to the bucket", .{ seq, @errorName(e) });
             return;
         };
+        // An edge with a fallback (`--source zui1:`, `--edge-fallback`) and a `--stream` racing
+        // its cores at the tip applies the feed form whichever source wins a checkpoint
+        // (source.zig `feedForm`, docs/EDGE.md 10.3). Without a fallback nothing changes here.
+        if (f.source.kind == .zui1 and f.source.edge_fb != null) source.feedForm(s.gpa, sc, blob) catch |e| {
+            f.unmarkDone(seq);
+            _ = s.stats.bad.fetchAdd(1, .monotonic);
+            std.log.warn("stream checkpoint {d}: {s}; left to the cores", .{ seq, @errorName(e) });
+            return;
+        };
         _ = s.stats.decode_ns.fetchAdd(source.nowNs() - t0, .monotonic);
         f.writeSpool(seq, blob.items, sc.aux.items) catch |e| {
             f.unmarkDone(seq);

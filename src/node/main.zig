@@ -52,8 +52,22 @@ const usage =
     \\                                       put a TLS terminator in front); never dry_run, submit, subscribe or the feed
     \\  --edge-conns N                       zui/1 connections to the cores (default 4; the profile's)
     \\  --no-edge-zstd                       ask the cores for raw feeds (no zstd dictionary)
+    \\  --edge-fallback off | http[:URL] | dir:PATH
+    \\                                       with --source zui1: where checkpoints come from while no core can serve the
+    \\                                       next one (down, restarting, no --edge-feed, behind, pruned): http is the
+    \\                                       network's public bucket (the --source http path, never S3; --net-max-mbps
+    \\                                       applies), dir a local mirror. Falls back after 3 s without an answer (at once
+    \\                                       on a core's shutdown notice or a hello without the feed), probes the cores
+    \\                                       twice a second and returns after 5 s healthy (docs/EDGE.md section 10). Every
+    \\                                       checkpoint is verified whichever side served it, and stored as the core's feed
+    \\                                       of it would be. One unit restores, follows by the bucket and attaches to the
+    \\                                       core when it serves the feed. With http the edge also asks the network's
+    \\                                       full node for signature orders, as --source http does (--sig-order-from,
+    \\                                       --sig-order-rps 0 = off). Default: http with --profile edge or macmini, else
+    \\                                       off (an outage of every core stalls the edge)
     \\  --stream URL[,URL...] | off         live SubscribeCheckpoints streams (gRPC-web) racing each other and the
-    \\                                       tip polls; default https://fullnode.<network>.sui.io with a network source.
+    \\                                       tip polls; default https://fullnode.<network>.sui.io with a network source
+    \\                                       (off with --source zui1: give one to race the cores from a far edge).
     \\                                       Any node works (http://127.0.0.1:9000 = the local sui-node standby);
     \\                                       every checkpoint is verified whichever source wins
     \\  --sig-order-from URL                 node (gRPC-web) asked for the submitted signature order of bucket
@@ -124,8 +138,14 @@ const usage =
     \\                                       max-connection-age-secs (14400, 0 = none), max-connection-age-grace-secs (600),
     \\                                       subscription-watermark-interval (25), subscription-max-subscribers (1024)
     \\  --native-listen ADDR                 zui/1 native protocol on UDP (QUIC zui/1 + WebTransport), off by default
-    \\  --native-cert-hash-file FILE         write the WebTransport cert sha256 and the zui/1 key (hex lines)
-    \\  --native-identity-file FILE          zui/1 Ed25519 seed, kept across restarts (default <dir>/node/native-identity.seed)
+    \\  --native-cert FILE --native-key FILE  PEM certificate chain (leaf first) and private key for zui/1 and WebTransport:
+    \\                                       a WebPKI certificate, so browsers connect with a plain https URL and no hash
+    \\                                       (P-256, P-384, Ed25519 or RSA; checked at start; loaded again on SIGHUP or when
+    \\                                       the files change). Without them: a self-signed P-256 certificate, rotated weekly
+    \\  --native-cert-hash-file FILE         write the WebTransport cert sha256, the zui/1 key, the next cert's sha256 and the
+    \\                                       unix second it takes over (one per line; rewritten at each 7-day rotation)
+    \\  --native-identity-file FILE          zui/1 Ed25519 seed, kept across restarts (default <dir>/node/native-identity.seed);
+    \\                                       the WebTransport certificates derive from it
     \\  --native-keys FILE                   zui/1 API keys: `<key> <tier> [<Agent Pass hex>]` per line (NATIVE-PROTOCOL.md 6.1)
     \\  --native-pass-dir DIR                Agent Pass ledgers (default <dir>/node/agent-pass)
     \\  --rpc-release 1.83 | 1.84 | N        GetEpoch protocol_config lists the fields of this sui-node release (default 1.83, as sui-node 1.83.1; raised to the chain's protocol version when newer)
@@ -431,6 +451,7 @@ pub fn main(init: std.process.Init) !u8 {
     var gpu_mode: ?node.gpu.Mode = null;
     var edge_conns: ?u32 = null;
     var edge_zstd = true;
+    var edge_fallback: ?node.node.EdgeFallbackSpec = null;
     var profile: ?edge.profile.Kind = null;
     // `--profile` sets defaults, so it is applied before any other flag (a flag still wins).
     {
@@ -490,6 +511,18 @@ pub fn main(init: std.process.Init) !u8 {
             edge_conns = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--no-edge-zstd")) {
             edge_zstd = false;
+        } else if (std.mem.eql(u8, a, "--edge-fallback")) {
+            const v = try need(args, &i);
+            edge_fallback = if (std.mem.eql(u8, v, "off"))
+                .off
+            else if (std.mem.eql(u8, v, "http"))
+                .{ .http = .{} }
+            else if (std.mem.startsWith(u8, v, "http:") and v.len > 5)
+                .{ .http = .{ .base = v[5..] } }
+            else if (std.mem.startsWith(u8, v, "dir:") and v.len > 4)
+                .{ .dir = v[4..] }
+            else
+                return usageErr("--edge-fallback off | http[:URL] | dir:PATH");
         } else if (std.mem.eql(u8, a, "--stream")) {
             const v = try need(args, &i);
             stream_url = if (std.mem.eql(u8, v, "off")) null else v;
@@ -553,6 +586,8 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, a, "--p2p-race")) {
             cfg.p2p_race = try std.fmt.parseInt(u8, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--no-s3-fallback")) {
+            // An edge's bucket fallback (--edge-fallback http) never has S3 behind it: already so.
+            if (cfg.source == .zui1) continue;
             if (cfg.source != .http) return usageErr("--no-s3-fallback needs --source http");
             cfg.source.http.fallback = null;
         } else if (std.mem.eql(u8, a, "--s3-profile")) {
@@ -600,6 +635,10 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.native_listen = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--native-cert-hash-file")) {
             cfg.native_cert_hash_file = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--native-cert")) {
+            cfg.native_cert = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--native-key")) {
+            cfg.native_key = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--native-identity-file")) {
             cfg.native_identity_file = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--native-keys")) {
@@ -838,12 +877,17 @@ pub fn main(init: std.process.Init) !u8 {
         const ps = edge.profile.settings(profile orelse .edge);
         cfg.source.zui1.max_conns = edge_conns orelse ps.max_conns;
         cfg.source.zui1.zstd = edge_zstd;
+        // The fallback is a default of the edge profiles only: a bare `--source zui1:` behaves
+        // as before unless `--edge-fallback` asks for one.
+        cfg.source.zui1.fallback = edge_fallback orelse if (profile != null and ps.edge_fallback) .{ .http = .{} } else .off;
         // The feed carries no input objects, so input read sets (and the package floor rows for
         // system packages upgraded in place) cannot be built from it: off, not silently partial.
         if (cfg.read_sets) std.log.info("read sets: off (a zui1 source carries no input objects)", .{});
         cfg.read_sets = false;
         if (cfg.poll_ms == null and profile != null) cfg.poll_ms = ps.poll_ms;
     }
+
+    if (edge_fallback != null and cfg.source != .zui1) return usageErr("--edge-fallback needs --source zui1:...");
 
     policy_flags.install() catch |e| {
         std.log.err("start: transaction-deny-config / policy-config: {s}", .{@errorName(e)});

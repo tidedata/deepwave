@@ -20,6 +20,8 @@ const sigorder = @import("sigorder.zig");
 const s3 = @import("s3.zig");
 const http = @import("http.zig");
 const edge = @import("edge");
+const edgewire = @import("edgewire");
+const types = @import("types");
 const Atomic = std.atomic.Value;
 const Metrics = struct {
     fn max(slot: *Atomic(u64), n: u64) void {
@@ -56,6 +58,10 @@ pub const Scratch = struct {
     arena: std.heap.ArenaAllocator,
     /// Bytes last added to memstat's `fetch_scratch` gauge.
     kept: u64 = 0,
+    /// Edge fallback only (`feedForm`): the second blob buffer and the checkpoint index, made
+    /// at the first checkpoint this thread takes from the fallback.
+    tmp: std.ArrayList(u8) = .empty,
+    idx: ?*types.CheckpointIndex = null,
 
     pub fn init(gpa: std.mem.Allocator) Scratch {
         return .{ .arena = .init(gpa) };
@@ -63,7 +69,211 @@ pub const Scratch = struct {
     pub fn deinit(s: *Scratch, gpa: std.mem.Allocator) void {
         s.raw.deinit(gpa);
         s.aux.deinit(gpa);
+        s.tmp.deinit(gpa);
+        if (s.idx) |i| {
+            i.deinit(gpa);
+            gpa.destroy(i);
+        }
         s.arena.deinit();
+    }
+};
+
+/// Rewrites the full checkpoint blob in `out` to its feed form (edgewire `feed.feedForm`: no
+/// input objects) and drops its aux record: exactly what a core's feed of the same checkpoint
+/// rebuilds to. Every consumer of an edge's blobs (the store, the rpc and ledger-history indexes,
+/// which read a blob's input objects when it has them) then sees the same bytes whichever source
+/// served the checkpoint.
+pub fn feedForm(gpa: std.mem.Allocator, sc: *Scratch, out: *std.ArrayList(u8)) !void {
+    if (sc.idx == null) {
+        const i = try gpa.create(types.CheckpointIndex);
+        errdefer gpa.destroy(i);
+        i.* = try types.CheckpointIndex.init(gpa);
+        sc.idx = i;
+    }
+    const idx = sc.idx.?;
+    types.indexCheckpointData(out.items, idx) catch return error.BadData;
+    sc.tmp.clearRetainingCapacity();
+    try edgewire.feed.feedForm(&sc.tmp, gpa, sc.arena.allocator(), out.items, idx);
+    std.mem.swap(std.ArrayList(u8), out, &sc.tmp);
+    sc.aux.clearRetainingCapacity();
+}
+
+/// The second way to the same checkpoints for a zui1 source (`--edge-fallback`, docs/EDGE.md
+/// section 10): when no core can serve the next checkpoint, the edge takes it from `src` (the
+/// public bucket, or a directory) and returns to the cores when they are healthy again. The
+/// rules are edge/fallback.zig's `Switch`; this is the fetch path that follows them. Whatever
+/// side a checkpoint comes from, the follower gets the feed-form blob (`feedForm`) and verifies it.
+pub const EdgeFallback = struct {
+    // (Explicit `anyerror` below: these call `Source`'s methods on `src`, and `Source`'s call
+    // them back, so the error sets cannot be inferred.)
+    /// Where checkpoints come from while the cores cannot serve them. Never a zui1 source.
+    src: Source,
+    sw: edge.fallback.Switch = .{},
+    /// The follower's next checkpoint to apply: the lowest the edge still needs (what a core
+    /// must still hold for the edge to return to it). Null until the follower exists.
+    applied_next: ?*const Atomic(u64) = null,
+    /// Set at shutdown: a call waiting out the grace returns `SourceUnavailable`.
+    stopping: Atomic(bool) = .init(false),
+    /// Returns to the cores (`sw.stats.to_core`) the pool's connections were retired for.
+    retired: Atomic(u64) = .init(0),
+
+    const Pool = edge.client.Pool;
+    const now = edge.fallback.nowNs;
+
+    fn pause(fb: *EdgeFallback, io: Io) void {
+        io.sleep(.fromMilliseconds(@intCast(@max(1, fb.sw.t.retry_ms))), .awake) catch {};
+    }
+
+    /// Before a core call: after a return to the cores, the connections opened before it are
+    /// closed and opened again (client.zig `Pool.retire`). What they saw during the spell on the
+    /// fallback (the shutdown notice of a core since restarted, a core that went silent) is not
+    /// news about the cores now, and must not send the edge straight back to the fallback.
+    fn freshPool(fb: *EdgeFallback, p: *Pool) void {
+        const backs = fb.sw.stats.to_core.load(.acquire);
+        const seen = fb.retired.load(.acquire);
+        if (backs != seen and fb.retired.cmpxchgStrong(seen, backs, .acq_rel, .monotonic) == null) p.retire();
+    }
+
+    /// A core call failed with `e`; `since` is when this caller's run of unanswered tries began.
+    /// True: the edge is on the fallback now. False: still inside the grace; the caller pauses
+    /// and asks the cores again.
+    fn failed(fb: *EdgeFallback, io: Io, p: *Pool, since: u64, e: anyerror, seq: u64) bool {
+        const why: edge.fallback.Reason = switch (e) {
+            error.NoEdgeFeed => .no_feed,
+            error.WrongChain => .wrong_chain,
+            // the core said it is going away and no other core answered in this call
+            else => if (p.shutdown_ns.load(.monotonic) >= since) .shutdown else .silent,
+        };
+        return fb.sw.coreFailed(now(io), since, why, seq);
+    }
+
+    fn fetchRaw(fb: *EdgeFallback, s: *const Source, p: *Pool, sc: *Scratch, seq: u64, out: *std.ArrayList(u8)) anyerror!Source.Raw {
+        if (fb.applied_next) |an| fb.sw.need.store(an.load(.acquire), .monotonic);
+        // When this call's run of unanswered tries began (0: none yet). Its grace runs from
+        // there even if the cores answer other threads meanwhile: a core that serves every
+        // checkpoint but this one must not hold the edge on it.
+        var first: u64 = 0;
+        while (true) {
+            if (fb.stopping.load(.acquire)) return error.SourceUnavailable;
+            if (fb.sw.mode() == .fallback) return fb.fromFallback(s, sc, seq, out);
+            fb.freshPool(p);
+            const t0 = now(s.io);
+            const since = if (first != 0) first else t0;
+            var fail: edge.client.Fail = .{};
+            const r = p.fetchBlobBy(sc.arena.allocator(), seq, out, fb.sw.deadline(since), &fail) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    // A response that was under way when the link failed: the core answered
+                    // until its last byte, so a long transfer that breaks is not 3 s of silence.
+                    const transport = e == error.Closed or e == error.StreamGone or e == error.Timeout;
+                    first = since;
+                    if (transport and fail.progress_ns > since) {
+                        fb.sw.coreAnswered();
+                        first = fail.progress_ns;
+                    }
+                    if (!fb.failed(s.io, p, first, e, seq)) fb.pause(s.io);
+                    continue;
+                },
+            };
+            if (r == .ok) {
+                fb.sw.fetched(.core, seq);
+                return .blob;
+            }
+            // Below every core's retention: no core will ever hold it.
+            if (p.pruned_seq.load(.monotonic) == seq) {
+                fb.sw.behind(now(s.io), seq, .pruned);
+                continue;
+            }
+            // "Not held yet": the tip, unless the cores are behind. After `behind_after_ms` of it
+            // for the lowest checkpoint wanted, the fallback is asked whether it has it.
+            if (fb.sw.coreMissed(now(s.io), seq)) {
+                const there = fb.src.exists(seq) catch false;
+                fb.sw.behindChecked();
+                if (there) {
+                    fb.sw.behind(now(s.io), seq, .behind);
+                    continue;
+                }
+            }
+            return .missing;
+        }
+    }
+
+    /// Checkpoint `seq` from the fallback side. A ready blob comes back in feed form; an archive
+    /// proto is put in feed form by `Source.decode` (the fetcher claims between the two steps).
+    fn fromFallback(fb: *EdgeFallback, s: *const Source, sc: *Scratch, seq: u64, out: *std.ArrayList(u8)) anyerror!Source.Raw {
+        const r = try fb.src.fetchRaw(sc, seq, out);
+        if (r == .blob) {
+            try feedForm(s.gpa, sc, out);
+            fb.sw.fetched(.fallback, seq);
+        }
+        return r;
+    }
+
+    /// Checkpoint `seq` from the fallback whatever the switch says, as a feed-form blob in `out`
+    /// (the node's second try for a checkpoint whose core feed failed verification).
+    pub fn fetchFromFallback(fb: *EdgeFallback, s: *const Source, sc: *Scratch, seq: u64, out: *std.ArrayList(u8)) anyerror!Result {
+        switch (try fb.src.fetchRaw(sc, seq, out)) {
+            .missing => return .missing,
+            .blob => try feedForm(s.gpa, sc, out),
+            .zst => {
+                const proto = convert.unzstdArena(sc.arena.allocator(), sc.raw.items, max_blob) catch |e| switch (e) {
+                    error.OutOfMemory => return e,
+                    else => return error.BadData,
+                };
+                try decodeProto(s.gpa, sc, proto, seq, out);
+                try feedForm(s.gpa, sc, out);
+            },
+        }
+        fb.sw.fetched(.fallback, seq);
+        return .ok;
+    }
+
+    fn exists(fb: *EdgeFallback, s: *const Source, p: *Pool, seq: u64) anyerror!bool {
+        var arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena.deinit();
+        var first: u64 = 0;
+        while (true) {
+            if (fb.stopping.load(.acquire)) return error.SourceUnavailable;
+            if (fb.sw.mode() == .fallback) return fb.src.exists(seq);
+            fb.freshPool(p);
+            const t0 = now(s.io);
+            const since = if (first != 0) first else t0;
+            const there = p.existsBy(arena.allocator(), seq, fb.sw.deadline(since)) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    first = since;
+                    if (!fb.failed(s.io, p, since, e, seq)) fb.pause(s.io);
+                    continue;
+                },
+            };
+            fb.sw.coreAnswered();
+            return there;
+        }
+    }
+
+    /// The floor of a tip search from `lo`: the lowest checkpoint the core in use holds, or `lo`
+    /// itself when the edge is on the fallback.
+    fn searchFloor(fb: *EdgeFallback, s: *const Source, p: *Pool, lo: u64) anyerror!u64 {
+        var arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena.deinit();
+        var first: u64 = 0;
+        while (true) {
+            if (fb.stopping.load(.acquire)) return error.SourceUnavailable;
+            if (fb.sw.mode() == .fallback) return lo;
+            fb.freshPool(p);
+            const t0 = now(s.io);
+            const since = if (first != 0) first else t0;
+            const held = p.lowestHeldBy(arena.allocator(), fb.sw.deadline(since)) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    first = since;
+                    if (!fb.failed(s.io, p, since, e, lo)) fb.pause(s.io);
+                    continue;
+                },
+            };
+            fb.sw.coreAnswered();
+            return @max(lo, held);
+        }
     }
 };
 
@@ -71,6 +281,8 @@ pub const Source = struct {
     gpa: std.mem.Allocator,
     io: Io,
     kind: Kind,
+    /// A zui1 source's fallback (`--edge-fallback`); null: the cores are the only source.
+    edge_fb: ?*EdgeFallback = null,
 
     /// Fetches checkpoint `seq` as a blob into `out`.
     pub fn fetch(s: *const Source, sc: *Scratch, seq: u64, out: *std.ArrayList(u8)) !Result {
@@ -100,8 +312,9 @@ pub const Source = struct {
         _ = sc.arena.reset(.{ .retain_with_limit = scratch_keep });
         if (sc.raw.capacity > scratch_keep) sc.raw.clearAndFree(s.gpa);
         if (sc.aux.capacity > scratch_keep) sc.aux.clearAndFree(s.gpa);
+        if (sc.tmp.capacity > scratch_keep) sc.tmp.clearAndFree(s.gpa);
         sc.aux.clearRetainingCapacity();
-        memstat.keep(.fetch_scratch, &sc.kept, sc.arena.queryCapacity() + sc.raw.capacity + sc.aux.capacity);
+        memstat.keep(.fetch_scratch, &sc.kept, sc.arena.queryCapacity() + sc.raw.capacity + sc.aux.capacity + sc.tmp.capacity);
         var nb: [48]u8 = undefined;
         switch (s.kind) {
             .dir => |d| {
@@ -124,6 +337,7 @@ pub const Source = struct {
             },
             .http => |h| if (try h.get(seq, &sc.raw) == .missing) return .missing,
             .zui1 => |p| {
+                if (s.edge_fb) |fb| return fb.fetchRaw(s, p, sc, seq, out);
                 const r = p.fetchBlob(sc.arena.allocator(), seq, out) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.BadData, error.TooLarge => return error.BadData,
@@ -144,7 +358,16 @@ pub const Source = struct {
             error.OutOfMemory => return e,
             else => return error.BadData,
         };
-        return decodeProto(s.gpa, sc, proto, seq, out);
+        try decodeProto(s.gpa, sc, proto, seq, out);
+        return s.edgeForm(sc, seq, out);
+    }
+
+    /// After a conversion: a zui1 source only converts what its fallback served, and hands the
+    /// follower the feed form of it (`feedForm`), as for a core's feed.
+    fn edgeForm(s: *const Source, sc: *Scratch, seq: u64, out: *std.ArrayList(u8)) !void {
+        if (s.kind != .zui1) return;
+        try feedForm(s.gpa, sc, out);
+        if (s.edge_fb) |fb| fb.sw.fetched(.fallback, seq);
     }
 
     /// `decode`, restoring the submitted signature order from `ov` (sigorder.zig) when the proto
@@ -163,7 +386,8 @@ pub const Source = struct {
             else => false, // the conversion reports the bad bytes
         };
         if (wants) opts.sig_overlay = o.get(a, seq);
-        return decodeProtoOpts(s.gpa, sc, proto, seq, out, opts);
+        try decodeProtoOpts(s.gpa, sc, proto, seq, out, opts);
+        return s.edgeForm(sc, seq, out);
     }
     /// Does checkpoint `seq` exist at the source (one cheap request)?
     pub fn exists(s: *const Source, seq: u64) !bool {
@@ -179,6 +403,7 @@ pub const Source = struct {
             .s3 => |b| return b.exists(std.fmt.bufPrint(&nb, "{d}.binpb.zst", .{seq}) catch unreachable),
             .http => |h| return h.exists(seq),
             .zui1 => |p| {
+                if (s.edge_fb) |fb| return fb.exists(s, p, seq);
                 var arena = std.heap.ArenaAllocator.init(s.gpa);
                 defer arena.deinit();
                 return p.exists(arena.allocator(), seq) catch |e| switch (e) {
@@ -197,7 +422,9 @@ pub const Source = struct {
     /// doubling steps, then bisection. About 2 log2(tip - lo) requests.
     pub fn latest(s: *const Source, lo_in: u64) !u64 {
         var lo = lo_in;
-        if (s.kind == .zui1) {
+        if (s.kind == .zui1) if (s.edge_fb) |fb| {
+            lo = try fb.searchFloor(s, s.kind.zui1, lo);
+        } else {
             var arena = std.heap.ArenaAllocator.init(s.gpa);
             defer arena.deinit();
             const held = s.kind.zui1.lowestHeld(arena.allocator()) catch |e| switch (e) {
@@ -208,7 +435,7 @@ pub const Source = struct {
                 },
             };
             lo = @max(lo, held);
-        }
+        };
         if (!try s.exists(lo)) return error.SourceMissing;
         var step: u64 = 1;
         var hi: u64 = lo +| step;

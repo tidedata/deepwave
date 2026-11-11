@@ -78,11 +78,22 @@ fn dryRun(ctx: *anyopaque, a: Allocator, tx_data: []const u8, flags: u8, out: *s
     // Held until the response is written: the Result borrows store bytes through it.
     var snap = tip.store.snapshot();
     defer snap.release();
-    const res = engine.simulate(a, &snap, .{ .tx = .{ .data = tx_data }, .mode = if (flags & 0x01 != 0) .dev_inspect else .simulate }) catch |e| switch (e) {
+    const res = engine.simulate(a, &snap, dryRunRequest(tx_data, flags)) catch |e| switch (e) {
         error.NoTip, error.EpochUnavailable => return nproto.errorResponse(out, a, .unavailable, @errorName(e), ""),
         error.OutOfMemory => return e,
         else => return nproto.errorResponse(out, a, .tx_rejected, @errorName(e), ""),
     };
+    try writeDryRun(a, res, out);
+}
+
+/// The engine request of a DryRunReq: 0x01 runs as dev-inspect, 0x02 tracks per-command results
+/// (the same tracked run as gRPC SimulateTransaction's `command_outputs`, with checks on or off).
+pub fn dryRunRequest(tx_data: []const u8, flags: u8) simulate.api.Request {
+    return .{ .tx = .{ .data = tx_data }, .mode = if (flags & 0x01 != 0) .dev_inspect else .simulate, .results = flags & 0x02 != 0 };
+}
+
+/// `DryRunResp` (spec 4.2), or TX_REJECTED when the transaction did not run.
+pub fn writeDryRun(a: Allocator, res: simulate.api.Result, out: *std.ArrayList(u8)) !void {
     switch (res) {
         .rejected => |r| return nproto.errorResponse(out, a, .tx_rejected, r.message, ""),
         .executed => |x| {
@@ -99,10 +110,21 @@ fn dryRun(ctx: *anyopaque, a: Allocator, tx_data: []const u8, flags: u8, out: *s
                     try w.str(f.message);
                 },
             }
-            // per-command results: the engine does not return them yet (spec: "where the engine
-            // has them"), so `results` stays empty even with 0x02
-            try w.uleb(0);
+            try writeCommandResults(w, x.command_results orelse &.{});
         },
+    }
+}
+
+/// `results: vector<CommandResult { return_values: vector<bytes>, mutated_refs: vector<bytes> }>`:
+/// the BCS of each return value and of each `&mut` argument after the command, in the engine's
+/// order (gRPC `command_outputs`' `return_values` and `mutated_by_ref` values).
+pub fn writeCommandResults(w: W, results: []const simulate.api.CommandResult) !void {
+    try w.uleb(results.len);
+    for (results) |r| {
+        try w.uleb(r.returns.len);
+        for (r.returns) |v| try w.bytes(v.bytes);
+        try w.uleb(r.mutated.len);
+        for (r.mutated) |v| try w.bytes(v.bytes);
     }
 }
 
@@ -206,4 +228,85 @@ test "ExecuteTransactionRequest carries the data and every signature" {
         sigs += 1;
     };
     try std.testing.expectEqual(@as(usize, 2), sigs);
+}
+
+/// Decodes a DryRunResp's `results` (after effects, events, objects, error).
+fn testDryRunResults(a: Allocator, resp: []const u8) ![]const []const []const u8 {
+    var r: nproto.R = .{ .b = resp };
+    try std.testing.expectEqual(@as(u8, 0), try r.u8_());
+    try std.testing.expectEqual(@as(u64, 0), try r.uleb());
+    _ = try r.bytes();
+    if (try r.option()) _ = try r.bytes();
+    for (0..try r.uleb()) |_| _ = try r.bytes();
+    if (try r.option()) _ = try r.str();
+    const n = try r.uleb();
+    const out = try a.alloc([]const []const u8, n);
+    for (out) |*cmd| {
+        const nr = try r.uleb();
+        const vals = try a.alloc([]const u8, nr);
+        for (vals) |*v| v.* = try r.bytes();
+        try std.testing.expectEqual(@as(u64, 0), try r.uleb()); // no &mut arguments here
+        cmd.* = vals;
+    }
+    try r.done();
+    return out;
+}
+
+// zui/1 dry_run returned no per-command results (`results` was always empty), while gRPC
+// SimulateTransaction on the same node returned `command_outputs`. With 0x02 they come back, with
+// checks on (0x02) and off (0x03); without 0x02 the vector stays empty.
+test "dry_run 0x02 returns each command's return values, with checks on and off" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const bcs = @import("bcs");
+    const types = @import("types");
+    const exec = @import("exec");
+    const dt = exec.ptb.devinspect_test;
+    var f: dt.Fixture = undefined;
+    try f.init(a, std.testing.io);
+    defer f.deinit();
+    const coin = try dt.coinObject(a, dt.idOf(0x71), 5, 5000, .{ .AddressOwner = .{ .@"0" = dt.sender } });
+    try f.add(coin);
+    const td = try f.data(.{
+        .inputs = &.{ .{ .Pure = &.{ 2, 'h', 'i' } }, .{ .Object = .{ .ImmOrOwnedObject = try dt.refOf(coin) } } },
+        .commands = &.{
+            dt.moveCall(1, "string", "utf8", &.{}, &.{.{ .Input = 0 }}),
+            dt.moveCall(2, "coin", "value", &.{dt.suiInput()}, &.{.{ .Input = 1 }}),
+        },
+    });
+    const tx_raw = try bcs.encodeAlloc(types.TransactionData, a, &td);
+    var ms: rpc_exec.state.MapState = .{};
+    var it = f.objs.iterator();
+    while (it.next()) |kv| try ms.put(a, kv.key_ptr.*, (try exec.objects.ObjectView.parse(kv.value_ptr.*)).version, kv.value_ptr.*);
+    const eng: simulate.api.Engine = .{ .core = .{ .gpa = std.heap.page_allocator, .pkgs = &f.pkgs, .dev_inspect = .enabled } };
+    const env: simulate.api.EpochEnv = .{ .chain_id = @splat(0), .epoch = f.epoch, .pv = f.pv, .cfg = f.cfg, .rgp = f.rgp, .epoch_start_ms = f.start_ms, .committee_size = 100 };
+    for ([_]u8{ 0x00, 0x01, 0x02, 0x03 }) |flags| {
+        var out: std.ArrayList(u8) = .empty;
+        try writeDryRun(a, try eng.simulateAt(a, &env, ms.state(), dryRunRequest(tx_raw, flags)), &out);
+        const res = try testDryRunResults(a, out.items);
+        if (flags & 0x02 == 0) {
+            try std.testing.expectEqual(@as(usize, 0), res.len);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 2), res.len);
+        try std.testing.expectEqual(@as(usize, 1), res[0].len);
+        try std.testing.expectEqualSlices(u8, &.{ 2, 'h', 'i' }, res[0][0]);
+        try std.testing.expectEqual(@as(usize, 1), res[1].len);
+        try std.testing.expectEqualSlices(u8, try dt.u64Bytes(a, 5000), res[1][0]);
+    }
+}
+
+test "command results: return values then mutated references, per command" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    const w: W = .{ .gpa = a, .out = &out };
+    const results = [_]simulate.api.CommandResult{
+        .{ .returns = &.{ .{ .bytes = &.{7}, .ty = .u8 }, .{ .bytes = &.{ 1, 0 }, .ty = .u16 } }, .mutated = &.{.{ .arg = .{ .Input = 0 }, .bytes = &.{ 9, 9 }, .ty = .u16 }} },
+        .{ .returns = &.{}, .mutated = &.{} },
+    };
+    try writeCommandResults(w, &results);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 2, 1, 7, 2, 1, 0, 1, 2, 9, 9, 0, 0 }, out.items);
 }

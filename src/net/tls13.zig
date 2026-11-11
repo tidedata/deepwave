@@ -12,6 +12,7 @@ const Ed25519 = crypto.sign.Ed25519;
 const zsig = @import("sig");
 const qc = @import("qcrypto.zig");
 const x509 = @import("x509.zig");
+const tls_identity = @import("tls_identity.zig");
 
 pub const Level = enum(u2) { initial = 0, handshake = 1, app = 2 };
 
@@ -44,7 +45,39 @@ pub const Config = struct {
     /// TLS over TCP (consensus gRPC), not QUIC: no quic_transport_parameters extension is sent
     /// and none is required from the server. Default off: the anemo/QUIC path is unchanged.
     tcp: bool = false,
+    /// Check the server's certificate this way instead of as an anemo identity certificate
+    /// (`expected_peer` is then unused, and `peer_id` stays null). Null: the anemo/zui/1 path.
+    trust: ?Trust = null,
 };
+
+/// How a client checks a server that presents an X.509 certificate that is not an identity
+/// certificate (the zui/1 listener under ALPN `h3`, or with `--native-cert`;
+/// docs/NATIVE-PROTOCOL.md 1.3).
+pub const Trust = union(enum) {
+    /// As a browser checks WebTransport `serverCertificateHashes`: the SHA-256 of the DER leaf is
+    /// one of these, its key is ECDSA P-256, its validity is at most 14 days and holds now.
+    /// Names are not checked.
+    hashes: []const [32]u8,
+    /// As a WebPKI client: every certificate the server sends is signed by the next one, the
+    /// last one by one of these DER roots (or is one of them), all are valid now, and the leaf
+    /// names `cfg.server_name`. Leaf keys: ECDSA P-256 and P-384, Ed25519, RSA 2048 to 4096
+    /// (rsa_pss_rsae_sha256).
+    roots: []const []const u8,
+};
+
+/// The leaf's public key under `Trust`: what CertificateVerify is checked against.
+const LeafKey = union(enum) {
+    p256: EcdsaP256.PublicKey,
+    p384: EcdsaP384.PublicKey,
+    ed25519: [32]u8,
+    rsa: struct { key: crypto.Certificate.rsa.PublicKey, len: usize },
+};
+
+/// Longest validity a browser accepts for a certificate pinned by hash.
+pub const max_pinned_validity_s: u64 = 14 * 86400;
+
+const EcdsaP256 = crypto.sign.ecdsa.EcdsaP256Sha256;
+const EcdsaP384 = crypto.sign.ecdsa.EcdsaP384Sha384;
 
 const State = enum { wait_sh, wait_ee, wait_cert_or_req, wait_cert, wait_cert_verify, wait_finished, connected };
 
@@ -74,6 +107,11 @@ pub const Client = struct {
     cert_request_context_len: u8 = 0,
     client_auth: bool = false,
     server_key: [32]u8 = undefined,
+    /// With `cfg.trust`: the leaf's key (CertificateVerify is checked against it), the SHA-256
+    /// of the DER leaf the server presented, and how many certificates it sent.
+    server_leaf: ?LeafKey = null,
+    peer_cert_sha256: ?[32]u8 = null,
+    peer_chain_len: usize = 0,
     peer_id: ?[32]u8 = null,
     peer_tp: [1024]u8 = undefined,
     peer_tp_len: usize = 0,
@@ -130,8 +168,15 @@ pub const Client = struct {
         try l.appendSlice(gpa, sn);
         // supported_groups: x25519
         try l.appendSlice(gpa, &.{ 0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d });
-        // signature_algorithms: ed25519
-        try l.appendSlice(gpa, &.{ 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x08, 0x07 });
+        if (c.cfg.trust) |t| switch (t) {
+            // signature_algorithms: ecdsa_secp256r1_sha256, ed25519
+            .hashes => try l.appendSlice(gpa, &.{ 0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x04, 0x03, 0x08, 0x07 }),
+            // and ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256
+            .roots => try l.appendSlice(gpa, &.{ 0x00, 0x0d, 0x00, 0x0a, 0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x08, 0x07, 0x08, 0x04 }),
+        } else {
+            // signature_algorithms: ed25519
+            try l.appendSlice(gpa, &.{ 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x08, 0x07 });
+        }
         // key_share
         try l.appendSlice(gpa, &.{ 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 });
         try l.appendSlice(gpa, &c.x_pub);
@@ -337,6 +382,7 @@ pub const Client = struct {
         const cl = (@as(usize, b[4]) << 16) | (@as(usize, b[5]) << 8) | b[6];
         if (7 + cl > b.len) return error.DecodeError;
         const der = b[7..][0..cl];
+        if (c.cfg.trust) |t| return c.trustedCertificate(t, der, b[7 + cl ..]);
         // Only the end-entity certificate matters: the chain is the self-signed certificate.
         const parsed = x509.verifyPeerCert(der, c.cfg.server_name, .server, c.cfg.now_unix) catch return error.BadCertificate;
         if (c.cfg.expected_peer) |e| if (!std.mem.eql(u8, &e, &parsed.public_key)) return error.PeerIdMismatch;
@@ -344,16 +390,120 @@ pub const Client = struct {
         c.peer_id = parsed.public_key;
     }
 
+    /// `cfg.trust`: the leaf `der` checked the way `t` says; its key is kept for CertificateVerify.
+    /// `rest`: what follows the leaf in the certificate list (its extensions, then the other
+    /// entries).
+    fn trustedCertificate(c: *Client, t: Trust, der: []const u8, rest: []const u8) Error!void {
+        const Cert = crypto.Certificate;
+        // (tls_identity.parseCertificate: std's parser must not see bytes that are not shaped
+        // like a certificate)
+        const leaf = tls_identity.parseCertificate(der) catch return error.BadCertificate;
+        c.server_leaf = switch (leaf.pub_key_algo) {
+            .X9_62_id_ecPublicKey => |curve| switch (curve) {
+                .X9_62_prime256v1 => .{ .p256 = EcdsaP256.PublicKey.fromSec1(leaf.pubKey()) catch return error.BadCertificate },
+                .secp384r1 => .{ .p384 = EcdsaP384.PublicKey.fromSec1(leaf.pubKey()) catch return error.BadCertificate },
+                else => return error.BadCertificate,
+            },
+            .curveEd25519 => blk: {
+                if (leaf.pubKey().len != 32) return error.BadCertificate;
+                break :blk .{ .ed25519 = leaf.pubKey()[0..32].* };
+            },
+            .rsaEncryption => blk: {
+                const pk = Cert.rsa.PublicKey.parseDer(leaf.pubKey()) catch return error.BadCertificate;
+                break :blk .{ .rsa = .{ .key = Cert.rsa.PublicKey.fromBytes(pk.exponent, pk.modulus) catch return error.BadCertificate, .len = pk.modulus.len } };
+            },
+            else => return error.BadCertificate,
+        };
+        var h: [32]u8 = undefined;
+        Sha256.hash(der, &h, .{});
+        c.peer_cert_sha256 = h;
+        c.peer_chain_len = 1;
+        const now: i64 = @max(c.cfg.now_unix, 0);
+        switch (t) {
+            .hashes => |list| {
+                if (c.server_leaf.? != .p256) return error.BadCertificate;
+                const pinned = for (list) |want| {
+                    if (std.mem.eql(u8, &want, &h)) break true;
+                } else false;
+                if (!pinned) return error.PeerIdMismatch;
+                const v = leaf.validity;
+                if (v.not_after < v.not_before or v.not_after - v.not_before > max_pinned_validity_s) return error.BadCertificate;
+                if (now < v.not_before or now > v.not_after) return error.BadCertificate;
+            },
+            .roots => |roots| {
+                leaf.verifyHostName(c.cfg.server_name) catch return error.BadCertificate;
+                // walk the list: each certificate signed by the one after it
+                var subject = leaf;
+                var p: usize = 0;
+                while (true) {
+                    // (extensions of the entry just read)
+                    if (rest.len - p < 2) return error.DecodeError;
+                    const el = std.mem.readInt(u16, rest[p..][0..2], .big);
+                    p += 2;
+                    if (rest.len - p < el) return error.DecodeError;
+                    p += el;
+                    if (p == rest.len) break;
+                    if (rest.len - p < 3) return error.DecodeError;
+                    const cl = (@as(usize, rest[p]) << 16) | (@as(usize, rest[p + 1]) << 8) | rest[p + 2];
+                    p += 3;
+                    if (rest.len - p < cl) return error.DecodeError;
+                    const issuer = tls_identity.parseCertificate(rest[p..][0..cl]) catch return error.BadCertificate;
+                    p += cl;
+                    subject.verify(issuer, now) catch return error.BadCertificate;
+                    subject = issuer;
+                    c.peer_chain_len += 1;
+                }
+                // the last one is a root, or signed by one
+                for (roots) |r| {
+                    if (std.mem.eql(u8, r, subject.certificate.buffer)) {
+                        subject.verify(subject, now) catch return error.BadCertificate;
+                        return;
+                    }
+                    const root = tls_identity.parseCertificate(r) catch continue;
+                    if (subject.verify(root, now)) |_| return else |_| {}
+                }
+                return error.BadCertificate;
+            },
+        }
+    }
+
     fn certificateVerify(c: *Client, b: []const u8) Error!void {
         if (b.len < 4) return error.DecodeError;
         const scheme = std.mem.readInt(u16, b[0..2], .big);
         const sl = std.mem.readInt(u16, b[2..4], .big);
-        if (scheme != 0x0807 or b.len != 4 + @as(usize, sl) or sl != 64) return error.BadSignature;
         const th = c.transcriptHash();
         var msg: [64 + 34 + 32]u8 = undefined;
         @memset(msg[0..64], 0x20);
         @memcpy(msg[64..][0..34], "TLS 1.3, server CertificateVerify\x00");
         @memcpy(msg[98..][0..32], &th);
+        if (c.server_leaf) |leaf| {
+            if (b.len != 4 + @as(usize, sl)) return error.BadSignature;
+            const sig = b[4..];
+            switch (leaf) {
+                .p256 => |pk| {
+                    if (scheme != 0x0403) return error.BadSignature;
+                    (EcdsaP256.Signature.fromDer(sig) catch return error.BadSignature).verify(&msg, pk) catch return error.BadSignature;
+                },
+                .p384 => |pk| {
+                    if (scheme != 0x0503) return error.BadSignature;
+                    (EcdsaP384.Signature.fromDer(sig) catch return error.BadSignature).verify(&msg, pk) catch return error.BadSignature;
+                },
+                .ed25519 => |pk| {
+                    if (scheme != 0x0807 or sl != 64) return error.BadSignature;
+                    if (zsig.ed25519.verify(&pk, &msg, sig[0..64]) != .valid) return error.BadSignature;
+                },
+                .rsa => |r| {
+                    if (scheme != 0x0804 or sig.len != r.len) return error.BadSignature;
+                    const Pss = crypto.Certificate.rsa.PSSSignature;
+                    switch (r.len) {
+                        inline 256, 384, 512 => |n| Pss.verify(n, sig[0..n], &msg, r.key, Sha256) catch return error.BadSignature,
+                        else => return error.BadSignature,
+                    }
+                },
+            }
+            return;
+        }
+        if (scheme != 0x0807 or b.len != 4 + @as(usize, sl) or sl != 64) return error.BadSignature;
         if (zsig.ed25519.verify(&c.server_key, &msg, b[4..68]) != .valid) return error.BadSignature;
     }
 

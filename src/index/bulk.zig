@@ -1,4 +1,4 @@
-//! bulk: the partitioned bulk build of the StateService index's base run (lane fix/index-catchup).
+//! bulk: the partitioned bulk build of the StateService index's base run.
 //!
 //! The sort-and-merge build (lsm.zig `Builder.runFromMerge`) spills sorted temp tables of rows
 //! drawn from the whole key space and then merges every range from all of them: about two

@@ -864,7 +864,7 @@ fn racyClient(until_ns: u64, streams_done: *std.atomic.Value(u32), failed: *std.
 /// connection thread reads them in large batches, and more than `max_pending_resets` (20) resets
 /// of streams opened in one `feed` pass close the connection with GOAWAY(ENHANCE_YOUR_CALM), the
 /// rapid reset guard: the client's next write fails (WriteFailed, as many as `reset_closes`;
-/// 2026-11-10 on a test machine: 1 to 6 per run, every run, from 4721b4de on). This test is about late
+/// 2026-11-10 on a test machine: 1 to 6 per run, every run). This test is about late
 /// pump wakes, not that guard (h2/test_limits.zig covers it), so its server takes every reset.
 const racy_opts: h2.server.Options = .{ .h2 = .{ .max_pending_resets = std.math.maxInt(u32) } };
 

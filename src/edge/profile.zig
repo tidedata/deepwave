@@ -39,15 +39,18 @@ pub const Settings = struct {
     indexes: bool,
     /// `POST /zui1/rpc` for Workers and browsers (behind a TLS terminator).
     http_rpc: bool,
+    /// With `--source zui1:`: take checkpoints from the public bucket while no core can serve
+    /// them (`--edge-fallback http`; fallback.zig). Off for a core, which follows no core.
+    edge_fallback: bool,
 };
 
 pub fn settings(k: Kind) Settings {
     return switch (k) {
         // what deepwave does without a profile
-        .core => .{ .retention_epochs = 2, .object_retention_epochs = 1, .age_out = false, .chunk_cache_mb = 1024, .cp_cache_mb = 256, .fetchers = 8, .window = 64, .read_sets = true, .max_conns = 4, .poll_ms = 25, .edge_feed = true, .indexes = false, .http_rpc = false },
+        .core => .{ .retention_epochs = 2, .object_retention_epochs = 1, .age_out = false, .chunk_cache_mb = 1024, .cp_cache_mb = 256, .fetchers = 8, .window = 64, .read_sets = true, .max_conns = 4, .poll_ms = 25, .edge_feed = true, .indexes = false, .http_rpc = false, .edge_fallback = false },
         // recent history of one epoch, the live set, little memory
-        .edge => .{ .retention_epochs = 1, .object_retention_epochs = 1, .age_out = true, .chunk_cache_mb = 1024, .cp_cache_mb = 128, .fetchers = 4, .window = 32, .read_sets = false, .max_conns = 4, .poll_ms = 50, .edge_feed = true, .indexes = true, .http_rpc = true },
-        .macmini => .{ .retention_epochs = 2, .object_retention_epochs = 1, .age_out = true, .chunk_cache_mb = 8192, .cp_cache_mb = 1024, .fetchers = 8, .window = 128, .read_sets = false, .max_conns = 8, .poll_ms = 25, .edge_feed = true, .indexes = true, .http_rpc = true },
+        .edge => .{ .retention_epochs = 1, .object_retention_epochs = 1, .age_out = true, .chunk_cache_mb = 1024, .cp_cache_mb = 128, .fetchers = 4, .window = 32, .read_sets = false, .max_conns = 4, .poll_ms = 50, .edge_feed = true, .indexes = true, .http_rpc = true, .edge_fallback = true },
+        .macmini => .{ .retention_epochs = 2, .object_retention_epochs = 1, .age_out = true, .chunk_cache_mb = 8192, .cp_cache_mb = 1024, .fetchers = 8, .window = 128, .read_sets = false, .max_conns = 8, .poll_ms = 25, .edge_feed = true, .indexes = true, .http_rpc = true, .edge_fallback = true },
     };
 }
 
@@ -64,6 +67,8 @@ test "profiles" {
     const m = settings(.macmini);
     try std.testing.expect(e.retention_epochs <= settings(.core).retention_epochs);
     try std.testing.expect(!e.read_sets and !m.read_sets);
+    // an edge keeps following through a core restart; a core has no core to fall back from
+    try std.testing.expect(e.edge_fallback and m.edge_fallback and !settings(.core).edge_fallback);
     // the Mac mini profile fits a 32 GB machine with room for the live-set index and the OS
     try std.testing.expect(cacheBudgetMb(m) < 16 * 1024);
     try std.testing.expect(cacheBudgetMb(e) < 3 * 1024);

@@ -8,7 +8,9 @@ pub const qpack = @import("qpack.zig");
 pub const h3 = @import("h3.zig");
 pub const proto = @import("proto.zig");
 pub const cert = @import("cert.zig");
+pub const certs = @import("certs.zig");
 pub const dispatch = @import("dispatch.zig");
+pub const hello = @import("hello.zig");
 pub const sub = @import("sub.zig");
 pub const listener = @import("listener.zig");
 pub const certhttp = @import("certhttp.zig");
@@ -20,6 +22,8 @@ pub const dicts = @import("dicts.zig");
 pub const agentpass = @import("agentpass.zig");
 
 test {
+    _ = @import("certs_test.zig");
+    _ = @import("hello_test.zig");
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(listener.Listener);
     std.testing.refAllDecls(dispatch.Dispatcher);

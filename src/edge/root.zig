@@ -6,6 +6,7 @@ const std = @import("std");
 
 pub const conformance = @import("conformance.zig");
 pub const client = @import("client.zig");
+pub const fallback = @import("fallback.zig");
 pub const profile = @import("profile.zig");
 
 test {

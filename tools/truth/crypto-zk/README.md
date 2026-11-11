@@ -4,7 +4,7 @@ Ground truth for the crypto-zk suites (`groth16`, `poseidon`, `zklogin`), produc
 code: fastcrypto / fastcrypto-zkp at rev `da61cd46013fdd65361e57f7b9d4ae2244f86430` (the rev
 sui mainnet-v1.83.1 pins) and sui-types / sui-protocol-config from `$ZUI_SUI_SRC`.
 
-Build (shared target dir, never a per-agent one):
+Build (shared target dir):
 
     source tools/env.sh
     cargo build --release --manifest-path tools/truth/crypto-zk/Cargo.toml   # -> $CARGO_TARGET_DIR/release/zui-zk-truth

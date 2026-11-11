@@ -113,6 +113,21 @@ pub const Zui1Spec = struct {
     max_conns: u32 = 4,
     /// Ask for zstd frames with the cores' dictionary (`--no-edge-zstd` turns it off).
     zstd: bool = true,
+    /// Where checkpoints come from while no core can serve them (`--edge-fallback`).
+    fallback: EdgeFallbackSpec = .off,
+    /// The switch rules' numbers (edge/fallback.zig; tests shorten them).
+    tuning: edge.fallback.Tuning = .{},
+};
+
+/// `--edge-fallback off | http[:URL] | dir:PATH` (docs/EDGE.md section 10).
+pub const EdgeFallbackSpec = union(enum) {
+    /// The cores are the only source: an outage of every core stalls the edge (as before).
+    off,
+    /// The public checkpoint bucket, the `--source http` path without S3 behind it (an edge
+    /// holds no credentials and spends nothing). `base` null: the network's bucket.
+    http: struct { base: ?[]const u8 = null },
+    /// A directory of `<seq>.chk` or `<seq>.binpb.zst` files (a local mirror; tests).
+    dir: []const u8,
 };
 
 /// `--rpc-release` value: `1.83`, `1.83.1`, `v1.84.0` or a max protocol version (serve protocfg).
@@ -157,6 +172,10 @@ pub const Config = struct {
     native_listen: ?[]const u8 = null,
     /// Write the WebTransport certificate's SHA-256 (hex) here at startup (dev: serverCertificateHashes).
     native_cert_hash_file: ?[]const u8 = null,
+    /// `--native-cert` and `--native-key`: a PEM chain and key the zui/1 listener presents instead
+    /// of its self-signed certificate (native/certs.zig; reloaded on SIGHUP or a file change).
+    native_cert: ?[]const u8 = null,
+    native_key: ?[]const u8 = null,
     /// zui/1 Ed25519 identity seed (32 raw bytes, 0600; created on first start). Clients and
     /// edges pin the key it derives, so it must survive restarts. Null: `<dir>/node/native-identity.seed`.
     native_identity_file: ?[]const u8 = null,
@@ -527,6 +546,23 @@ fn sleepMs(ms: u64) void {
     _ = std.c.nanosleep(&ts, &ts);
 }
 
+/// SIGHUP with `--native-cert`: the zui/1 certificate files are loaded again (native/certs.zig
+/// reads the flag four times a second). Without `--native-cert` SIGHUP keeps its default action.
+var native_reload: std.atomic.Value(bool) = .init(false);
+
+fn onReloadSignal(_: std.posix.SIG) callconv(.c) void {
+    native_reload.store(true, .release);
+}
+
+fn installReloadSignal() void {
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onReloadSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART,
+    };
+    std.posix.sigaction(.HUP, &act, null);
+}
+
 pub fn installSignalHandlers() void {
     if (std.c.getenv("ZUI_STOP_DEADLINE_S")) |v| {
         stop_deadline_s = std.fmt.parseInt(c_uint, std.mem.span(v), 10) catch 8;
@@ -564,6 +600,10 @@ pub const Node = struct {
     public: ?*http.Public = null,
     /// `--source zui1:`: the cores this node follows.
     edge_pool: ?*edge.client.Pool = null,
+    /// `--edge-fallback`: the fallback source and its switch, and the thread that probes the
+    /// cores while the edge is on the fallback.
+    edge_fb: ?*source_mod.EdgeFallback = null,
+    edge_prober: ?*edge.fallback.Prober = null,
     /// `--edge-feed`: the zui/1 feed state.
     edge_feeder: ?*native.edgefeed.Feeder = null,
     /// zui/1 response dictionaries (`--native-listen`): hello, get_dictionary, ZSTD responses,
@@ -653,7 +693,8 @@ pub const Node = struct {
     serve_tls: native.tcptls.Server = undefined,
     native_listener: ?*native.listener.Listener = null,
     native_disp: native.dispatch.Dispatcher = undefined,
-    native_cert: native.cert.Cert = undefined,
+    /// The WebTransport certificate and its rotation (native/certs.zig).
+    native_certs: ?*native.certs.Certs = null,
     native_certhttp: ?*native.certhttp.Server = null,
     native_hooks: native_hooks.Hooks = undefined,
     /// `--native-keys`: API keys and Agent Passes (lives until exit, after the listener).
@@ -824,6 +865,7 @@ pub const Node = struct {
                 n.edge_pool = pool;
                 n.source = .{ .gpa = gpa, .io = io, .kind = .{ .zui1 = pool } };
                 std.log.info("source: zui/1 from {d} core(s), {d} connection(s), zstd {s}", .{ specs.len, spec.max_conns, if (spec.zstd) "on" else "off" });
+                try n.initEdgeFallback(spec, specs, pool);
             },
             .dir => |p| n.source = .{ .gpa = gpa, .io = io, .kind = .{ .dir = try cwd.openDir(io, p, .{}) } },
             .s3 => |spec| {
@@ -910,6 +952,8 @@ pub const Node = struct {
             .cert_batch = cfg.cert_batch,
         }, anchor);
         n.follower.observer = .{ .ctx = n, .on_checkpoint = onCheckpoint, .on_batch = onBatch, .on_committed = onCommitted, .on_idle = onIdle };
+        // What a core must still hold for the edge to return to it: the next checkpoint to apply.
+        if (n.edge_fb) |fb| fb.applied_next = &n.follower.applied_next;
         if (cfg.read_sets) {
             const h = try gpa.create(history.History);
             h.* = try history.History.init(gpa, io, if (direct) try cwd.openDir(io, cfg.source.dir, .{}) else n.spool_dir.?);
@@ -985,14 +1029,7 @@ pub const Node = struct {
             };
             // An explicit `--sig-order-from` works without a stream (`--stream off`); else the
             // first loopback stream URL, else the first one.
-            const sig_base: ?[]const u8 = if (cfg.sig_order_from) |u|
-                std.mem.trimEnd(u8, std.mem.trim(u8, u, " "), "/")
-            else if (cfg.p2p_only)
-                null
-            else if (cfg.stream) |urls|
-                sigorder.pickBase(urls)
-            else
-                null;
+            const sig_base: ?[]const u8 = sigOrderBase(&cfg, n.edge_fb != null);
             if (sig_base) |b| if (b.len > 0) {
                 const rps = cfg.sig_order_rps orelse (if (sigorder.isLoopback(b)) sigorder.loopback_rps else sigorder.default_rps);
                 if (rps > 0) {
@@ -1003,6 +1040,10 @@ pub const Node = struct {
                     std.log.info("signature order for bucket checkpoints from {s}, {d} req/s", .{ b, rps });
                 }
             };
+            // The one thing a fallback checkpoint can store differently from a core's feed of it
+            // (docs/EDGE.md section 10): said once, not papered over.
+            if (n.edge_fb != null and n.sig_order == null)
+                std.log.info("edge fallback: no signature-order node (--sig-order-from, or --sig-order-rps is 0): a checkpoint taken from the fallback stores sponsored and multi-signer transactions with their signatures in the contents' order, where a core's feed carries the order the core serves", .{});
         }
         // One network identity for the follower and the server (the same peer id both ways).
         var p2p_seed: [32]u8 = undefined;
@@ -1207,6 +1248,70 @@ pub const Node = struct {
         b.bucket = spec.bucket orelse n.cfg.network.params().s3_bucket;
         b.budget_usd = spec.budget_usd;
         return b;
+    }
+
+    /// The node asked for the submitted signature order of bucket checkpoints (sigorder.zig):
+    /// an explicit `--sig-order-from` (works without a stream), else the first loopback
+    /// `--stream` URL, else the first one. An edge whose fallback is the public bucket and that
+    /// has neither gets the network's public full node, the node a `--source http` node asks by
+    /// default (through its default stream): the bucket path stores the same signature order
+    /// whether it is a node's source or an edge's fallback. `--sig-order-rps 0` turns it off.
+    pub fn sigOrderBase(c: *const Config, edge_fallback_on: bool) ?[]const u8 {
+        if (c.sig_order_from) |u| return std.mem.trimEnd(u8, std.mem.trim(u8, u, " "), "/");
+        if (c.p2p_only) return null;
+        if (c.stream) |urls| return sigorder.pickBase(urls);
+        if (edge_fallback_on and c.source == .zui1 and c.source.zui1.fallback == .http) {
+            const u = c.network.params().fullnode_url;
+            if (u.len > 0) return u;
+        }
+        return null;
+    }
+
+    /// `--edge-fallback`: the zui1 source's second way to the same checkpoints (source.zig
+    /// `EdgeFallback`, rules in edge/fallback.zig). Off: nothing is created and the source is
+    /// the pool alone, as before.
+    fn initEdgeFallback(n: *Node, spec: Zui1Spec, specs: []const edge.client.Spec, pool: *edge.client.Pool) !void {
+        const gpa = n.gpa;
+        const fsrc: source_mod.Source = switch (spec.fallback) {
+            .off => {
+                std.log.info("edge fallback: off (when no core serves the next checkpoint, this edge waits for one)", .{});
+                return;
+            },
+            .http => |hs| blk: {
+                const base = hs.base orelse n.cfg.network.params().bucket_url;
+                if (base.len == 0) {
+                    std.log.warn("edge fallback: off (this network has no public checkpoint bucket; give --edge-fallback http:URL or dir:PATH)", .{});
+                    return;
+                }
+                const h = try gpa.create(http.Public);
+                h.* = http.Public.init(gpa, n.io, base);
+                _ = h.setConcurrency(n.cfg.fetchers);
+                n.public = h;
+                break :blk .{ .gpa = gpa, .io = n.io, .kind = .{ .http = h } };
+            },
+            .dir => |path| .{ .gpa = gpa, .io = n.io, .kind = .{ .dir = try Io.Dir.cwd().openDir(n.io, path, .{}) } },
+        };
+        var t = spec.tuning;
+        t.fail_after_ms = envU32("ZUI_EDGE_FAIL_MS", t.fail_after_ms);
+        t.behind_after_ms = envU32("ZUI_EDGE_BEHIND_MS", t.behind_after_ms);
+        t.probe_ms = @max(1, envU32("ZUI_EDGE_PROBE_MS", t.probe_ms));
+        t.back_after_ms = envU32("ZUI_EDGE_BACK_MS", t.back_after_ms);
+        const fb = try gpa.create(source_mod.EdgeFallback);
+        fb.* = .{ .src = fsrc, .sw = .{ .t = t } };
+        fb.sw.since_ns.store(edge.fallback.nowNs(n.io), .monotonic);
+        n.edge_fb = fb;
+        n.source.edge_fb = fb;
+        // A core call never outlives the grace: connects share it, a request that stops making
+        // progress for as long fails (client.zig `fetchBlobBy`).
+        pool.stall_ms = t.fail_after_ms;
+        const pr = try edge.fallback.Prober.init(gpa, n.io, &fb.sw, specs, pool.chain_id);
+        n.edge_prober = pr;
+        try pr.start();
+        switch (spec.fallback) {
+            .off => unreachable,
+            .http => std.log.info("edge fallback: {s} (no S3 behind it) when no core serves the next checkpoint for {d} ms; cores probed every {d} ms, back after {d} ms healthy", .{ n.public.?.base, t.fail_after_ms, t.probe_ms, t.back_after_ms }),
+            .dir => |path| std.log.info("edge fallback: directory {s} when no core serves the next checkpoint for {d} ms; cores probed every {d} ms, back after {d} ms healthy", .{ path, t.fail_after_ms, t.probe_ms, t.back_after_ms }),
+        }
     }
 
     fn snapshotOrigin(n: *const Node, spec: SnapshotSpec) snapshot.Origin {
@@ -2315,7 +2420,7 @@ pub const Node = struct {
                     if (e != error.BadCheckpoint) break;
                     const fl = n.follower.failure orelse break;
                     if (!n.refetchFromOtherCore(pool, fl.seq)) break;
-                    std.log.warn("edge: checkpoint {d} failed verification ({s}); fetched again from another core", .{ fl.seq, fl.verdict.name() });
+                    std.log.warn("edge: checkpoint {d} failed verification ({s}); fetched again from another core{s}", .{ fl.seq, fl.verdict.name(), if (n.edge_fb != null) " or the fallback" else "" });
                     n.follower.rewind();
                     res = n.follower.run(if (n.fetcher != null) null else n.cfg.to);
                     continue;
@@ -2345,16 +2450,23 @@ pub const Node = struct {
         if (n.failure) |f| return if (std.mem.eql(u8, f, "rejected checkpoint") or std.mem.eql(u8, f, "execute mismatch")) error.Mismatch else error.NodeFailed;
     }
 
-    /// Marks the core that served `seq` as bad for it and spools the checkpoint again from another.
+    /// Marks the core that served `seq` as bad for it and spools the checkpoint again from another
+    /// core, or, when none is left and the edge has a fallback, from the fallback.
     fn refetchFromOtherCore(n: *Node, pool: *edge.client.Pool, seq: u64) bool {
         const f = n.fetcher orelse return false;
-        if (!pool.blame(seq)) return false;
         var sc = source_mod.Scratch.init(n.gpa);
         defer sc.deinit(n.gpa);
         var blob: std.ArrayList(u8) = .empty;
         defer blob.deinit(n.gpa);
-        const raw = n.source.fetchRaw(&sc, seq, &blob) catch return false;
-        if (raw != .blob) return false;
+        if (pool.blame(seq)) {
+            // Straight from the pool: with a fallback the source might route this elsewhere.
+            const r = pool.fetchBlob(sc.arena.allocator(), seq, &blob) catch return false;
+            if (r != .ok) return false;
+        } else {
+            const fb = n.edge_fb orelse return false;
+            const r = fb.fetchFromFallback(&n.source, &sc, seq, &blob) catch return false;
+            if (r != .ok) return false;
+        }
         f.writeSpool(seq, blob.items, sc.aux.items) catch return false;
         return true;
     }
@@ -2398,6 +2510,9 @@ pub const Node = struct {
         if (n.public) |p| p.stopping.store(true, .release);
         http.net_cap.stopping.store(true, .release); // fetchers asleep on the download cap
         n.edge_stop.store(true, .release);
+        // Fetchers waiting out the grace on a silent core return; the prober is joined in deinit.
+        if (n.edge_fb) |fb| fb.stopping.store(true, .release);
+        if (n.edge_prober) |pr| pr.stopping.store(true, .release);
         if (n.sig_order) |o| o.stopping.store(true, .release);
         if (n.sig_sweep) |sw| sw.join();
         if (n.reconcile) |r| r.stop();
@@ -2412,6 +2527,10 @@ pub const Node = struct {
         if (n.native_certhttp) |h| {
             h.stop(n.gpa);
             n.native_certhttp = null;
+        }
+        if (n.native_certs) |cs| {
+            cs.deinit();
+            n.native_certs = null;
         }
         if (n.edge_warm) |t| {
             t.join();
@@ -2554,6 +2673,18 @@ pub const Node = struct {
         if (n.history) |h| {
             h.deinit();
             n.gpa.destroy(h);
+        }
+        if (n.edge_prober) |pr| {
+            pr.deinit();
+            n.edge_prober = null;
+        }
+        if (n.edge_fb) |fb| {
+            const st = &fb.sw.stats;
+            std.log.info("edge fallback: {d} switches to the fallback, {d} back; {d} checkpoints from the cores, {d} from the fallback; {d} probes ({d} good); ended on {s}", .{ st.to_fallback.load(.monotonic), st.to_core.load(.monotonic), st.from_core.load(.monotonic), st.from_fallback.load(.monotonic), st.probes.load(.monotonic), st.probes_ok.load(.monotonic), if (fb.sw.mode() == .core) "zui1" else "the fallback" });
+            n.source.edge_fb = null;
+            if (fb.src.kind == .dir) fb.src.kind.dir.close(n.io);
+            n.gpa.destroy(fb);
+            n.edge_fb = null;
         }
         if (n.edge_pool) |p| {
             const st = &p.stats;
@@ -2858,6 +2989,10 @@ pub const Node = struct {
                 w.writeAll(")") catch {};
             }
         }
+        if (n.edge_fb) |fb| {
+            const st = &fb.sw.stats;
+            w.print(" | edge source {s} ({d} falls, {d} back, {d} from fallback)", .{ if (fb.sw.mode() == .core) "zui1" else "FALLBACK", st.to_fallback.load(.monotonic), st.to_core.load(.monotonic), st.from_fallback.load(.monotonic) }) catch {};
+        }
         if (n.public) |h| {
             w.print(" | public {d} gets {d} hits", .{ h.stats.gets.load(.monotonic), h.stats.hits.load(.monotonic) }) catch {};
         }
@@ -3004,8 +3139,6 @@ pub const Node = struct {
         return Io.net.IpAddress.parse(text[0..colon], port);
     }
 
-    /// zui/1 on `text` (UDP): raw QUIC ALPN zui/1 with the Ed25519 identity below, WebTransport
-    /// (h3) with a fresh 13-day P-256 certificate whose hash goes to `native_cert_hash_file`.
     /// The 32-byte seed in `path`, or a fresh one written there (0600, exclusive create) when the
     /// file does not exist. Returns whether it was created. A file of another size is an error,
     /// never silently replaced: every edge and client pinned the key it derives.
@@ -3033,15 +3166,12 @@ pub const Node = struct {
         return true;
     }
 
+    /// zui/1 on `text` (UDP): raw QUIC ALPN zui/1 with the Ed25519 identity below, WebTransport
+    /// (h3) with a self-signed P-256 certificate that rotates every 7 days (native/certs.zig:
+    /// derived from the identity seed, so a restart keeps it); its hash and the next one go to
+    /// `native_cert_hash_file` and `GET /native/cert-hash`.
     fn startNative(n: *Node, text: []const u8) !void {
         const addr = try parseAddr(text);
-        var seed: [32]u8 = undefined;
-        n.io.random(&seed);
-        const kp = std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.generate(n.io);
-        var serial: [16]u8 = undefined;
-        n.io.random(&serial);
-        const now_unix: i64 = @intCast(@divTrunc(Io.Clock.real.now(n.io).toNanoseconds(), std.time.ns_per_s));
-        n.native_cert = native.cert.generate(kp, serial, now_unix, 13, "localhost");
         n.native_hooks = .{ .io = n.io, .st = n.st, .rpc = &n.exec_rpc, .epochs_dir = n.epochs_dir };
         const ds = try n.gpa.create(native.dicts.Dicts);
         ds.* = native.dicts.Dicts.init(n.gpa);
@@ -3057,7 +3187,7 @@ pub const Node = struct {
             const ld = n.cfg.native_pass_dir orelse try std.fmt.bufPrint(&lb, "{s}/node/agent-pass", .{n.cfg.dir});
             n.native_policy = try native_pass.load(n.gpa, n.io, keys_path, ld, &n.native_hooks);
         }
-        n.native_disp = .{ .svc = &n.service, .ix = n.ix, .edge = n.edge_feeder, .dicts = ds, .hooks = .{
+        n.native_disp = .{ .svc = &n.service, .ix = n.ix, .edge = n.edge_feeder, .dicts = ds, .software = n.cfg.version_label, .hooks = .{
             .epoch_fallback = n.native_hooks.epochFallback(),
             .simulator = n.native_hooks.simulator(),
             .submitter = n.native_hooks.submitter(),
@@ -3068,23 +3198,46 @@ pub const Node = struct {
         var pb: [std.fs.max_path_bytes]u8 = undefined;
         const id_path = n.cfg.native_identity_file orelse try std.fmt.bufPrint(&pb, "{s}/node/native-identity.seed", .{n.cfg.dir});
         const created = try loadOrCreateSeed(n.io, id_path, &id_seed);
-        n.native_listener = try native.listener.Listener.start(n.gpa, n.io, .{ .listen = addr, .identity_seed = id_seed, .cert = &n.native_cert, .slow_worker_exit = simulate.api.releaseThreadCaches }, &n.native_disp);
-        const hash = n.native_cert.sha256();
         const ed = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(id_seed);
+        // `--native-cert` and `--native-key` come together: a real certificate replaces the
+        // self-signed one, and a file that does not pass the checks stops the start
+        const files: ?native.certs.Files = if (n.cfg.native_cert != null or n.cfg.native_key != null) .{
+            .cert = n.cfg.native_cert orelse {
+                std.log.err("zui/1: --native-key without --native-cert", .{});
+                return error.BadTlsConfig;
+            },
+            .key = n.cfg.native_key orelse {
+                std.log.err("zui/1: --native-cert without --native-key", .{});
+                return error.BadTlsConfig;
+            },
+        } else null;
+        const certs = native.certs.Certs.init(n.gpa, n.io, .{ .seed = id_seed, .hash_file = n.cfg.native_cert_hash_file, .identity_key = ed.public_key.toBytes(), .files = files, .reload = &native_reload }) catch |e| {
+            if (files) |f| {
+                std.log.err("zui/1: --native-cert {s} with --native-key {s} refused: {s}", .{ f.cert, f.key, native.certs.describe(e) });
+                return error.BadTlsConfig;
+            }
+            std.log.err("zui/1: certificate setup failed ({s}); --native-cert-hash-file {s}", .{ @errorName(e), n.cfg.native_cert_hash_file orelse "(none)" });
+            return e;
+        };
+        n.native_certs = certs;
+        if (files != null) installReloadSignal();
+        n.native_listener = try native.listener.Listener.start(n.gpa, n.io, .{ .listen = addr, .identity_seed = id_seed, .certs = certs, .slow_worker_exit = simulate.api.releaseThreadCaches }, &n.native_disp);
+        const hash = certs.cur.sha256;
         // GET http://ADDR/native/cert-hash on TCP at the same address (CORS, for dapps in dev)
         switch (addr) {
-            .ip4 => |a4| n.native_certhttp = native.certhttp.Server.startRpc(n.gpa, a4.bytes, a4.port, hash, if (n.cfg.native_http_rpc) &n.native_disp else null) catch |e| blk: {
+            .ip4 => |a4| n.native_certhttp = native.certhttp.Server.startCerts(n.gpa, a4.bytes, a4.port, certs, if (n.cfg.native_http_rpc) &n.native_disp else null) catch |e| blk: {
                 std.log.warn("zui/1: /native/cert-hash not served on tcp {s}: {s}", .{ text, @errorName(e) });
                 break :blk null;
             },
             .ip6 => {},
         }
-        if (n.cfg.native_cert_hash_file) |f| {
-            var buf: [200]u8 = undefined;
-            const line = try std.fmt.bufPrint(&buf, "{x}\n{x}\n", .{ &hash, &ed.public_key.toBytes() });
-            try Io.Dir.cwd().writeFile(n.io, .{ .sub_path = f, .data = line });
+        if (files) |f| {
+            std.log.info("serving zui/1 (QUIC zui/1 + WebTransport h3) on {s}; certificate chain from {s} ({d} certificate(s), {s} key, leaf sha256 {x}, not after unix {d}; SIGHUP or a file change loads it again); zui/1 key {x} ({s} {s})", .{ text, f.cert, certs.cur.chain.?.certs.len, @tagName(certs.cur.chain.?.key), &certs.cur.sha256, certs.cur.notAfter(), &ed.public_key.toBytes(), if (created) "new identity in" else "identity from", id_path });
+        } else {
+            std.log.info("serving zui/1 (QUIC zui/1 + WebTransport h3) on {s}; cert sha256 {x} (rotates at unix {d}); zui/1 key {x} ({s} {s})", .{ text, &hash, certs.view().until[0], &ed.public_key.toBytes(), if (created) "new identity in" else "identity from", id_path });
         }
-        std.log.info("serving zui/1 (QUIC zui/1 + WebTransport h3) on {s}; cert sha256 {x}; zui/1 key {x} ({s} {s})", .{ text, &hash, &ed.public_key.toBytes(), if (created) "new identity in" else "identity from", id_path });
+        // from here the certificate rotates (or is loaded again) in the background
+        try certs.start();
     }
 
     /// Builds the zui/1 response dictionaries (object, checkpoint and edge feed, effects) once the
@@ -3223,9 +3376,26 @@ pub const Node = struct {
         if (c.admin_port) |p| try w.print("admin-port = {d}\n", .{p});
         if (c.stream) |u| try w.print("stream = {s}\n", .{u});
         if (n.sig_order) |o| try w.print("sig-order-from = {s}\nsig-order-rps = {d}\n", .{ o.base, o.rps });
+        if (c.source == .zui1) switch (c.source.zui1.fallback) {
+            .off => try w.print("edge-fallback = off\n", .{}),
+            .http => try w.print("edge-fallback = http{s}{s}\n", .{ if (n.public != null) ":" else " (off: no bucket for this network)", if (n.public) |h| h.base else "" }),
+            .dir => |path| try w.print("edge-fallback = dir:{s}\n", .{path}),
+        };
         try w.print("indexes = {}\nread-sets = {}\nfetchers = {d}\nwindow = {d}\nlookahead = {d}\nsync = {s}\nretention-epochs = {d}\nstate-hash = {s}\nhalt-on-mismatch = {}\n", .{ c.indexes, c.read_sets, c.fetchers, c.window, c.lookahead, @tagName(c.sync_mode), n.st.cfg.retention_epochs, @tagName(c.state_hash), c.halt_on_mismatch });
         const o = &c.serve_opts;
         try w.print("rpc.max-concurrent-streams = {d}\nrpc.max-request-bytes = {d}\nrpc.grpc-timeout-ms = {?d}\nrpc.http1-header-read-timeout-ms = {d}\nrpc.max-connection-age-secs = {?d}\nrpc.max-connection-age-grace-secs = {d}\nrpc.listen-backlog = {d}\n", .{ o.h2.max_streams, o.h2.max_request_bytes, if (o.h2.default_timeout_ns) |t| t / std.time.ns_per_ms else null, o.web.idle_ns / std.time.ns_per_ms, if (o.max_age_ns) |a| a / std.time.ns_per_s else null, o.age_grace_ns / std.time.ns_per_s, listen_backlog });
+    }
+
+    /// The `zui_edge_fallback_*` and `zui_edge_source_*` lines of a switch.
+    pub fn renderEdgeFallback(w: *std.Io.Writer, sw: *edge.fallback.Switch) !void {
+        const on_fb = sw.mode() == .fallback;
+        try w.print("# TYPE zui_edge_source_fallback gauge\nzui_edge_source_fallback {d}\n", .{@intFromBool(on_fb)});
+        try w.print("# TYPE zui_edge_source gauge\nzui_edge_source{{source=\"zui1\"}} {d}\nzui_edge_source{{source=\"fallback\"}} {d}\n", .{ @intFromBool(!on_fb), @intFromBool(on_fb) });
+        try w.print("# TYPE zui_edge_fallback_switches counter\nzui_edge_fallback_switches{{to=\"fallback\"}} {d}\nzui_edge_fallback_switches{{to=\"zui1\"}} {d}\n", .{ sw.stats.to_fallback.load(.monotonic), sw.stats.to_core.load(.monotonic) });
+        try w.print("# TYPE zui_edge_fallback_checkpoints counter\nzui_edge_fallback_checkpoints{{from=\"zui1\"}} {d}\nzui_edge_fallback_checkpoints{{from=\"fallback\"}} {d}\n", .{ sw.stats.from_core.load(.monotonic), sw.stats.from_fallback.load(.monotonic) });
+        try w.print("# TYPE zui_edge_fallback_probes counter\nzui_edge_fallback_probes {d}\n# TYPE zui_edge_fallback_probes_ok counter\nzui_edge_fallback_probes_ok {d}\n# TYPE zui_edge_fallback_behind_checks counter\nzui_edge_fallback_behind_checks {d}\n", .{ sw.stats.probes.load(.monotonic), sw.stats.probes_ok.load(.monotonic), sw.stats.behind_checks.load(.monotonic) });
+        // the reason of the last fall (edge/fallback.zig `Reason`: 0 silent, 1 no feed, 2 wrong chain, 3 shutdown, 4 pruned, 5 behind) and the wait the next return needs
+        try w.print("# TYPE zui_edge_fallback_last_reason gauge\nzui_edge_fallback_last_reason {d}\n# TYPE zui_edge_fallback_back_after_ms gauge\nzui_edge_fallback_back_after_ms {d}\n", .{ @intFromEnum(sw.lastReason()), sw.backAfterMs() });
     }
 
     fn startMetrics(n: *Node, text: []const u8) !void {
@@ -3391,12 +3561,34 @@ pub const Node = struct {
                 try w.print("# TYPE zui_native_{s} counter\nzui_native_{s} {d}\n", .{ name, name, @field(nl.stats, name).load(.monotonic) });
             }
         }
+        // zui/1 hellos by the client's protocol minor, and the ones refused (wrong chain, a minor
+        // or a feature this node does not have).
+        if (n.native_listener != null) {
+            const hs = &n.native_disp.hello;
+            try w.writeAll("# TYPE zui_native_hello counter\n");
+            for (native.hello.minor_labels, 0..) |label, i| try w.print("zui_native_hello{{minor=\"{s}\"}} {d}\n", .{ label, hs.by_minor[i].load(.monotonic) });
+            try w.writeAll("# TYPE zui_native_hello_refused counter\n");
+            try w.print("zui_native_hello_refused{{reason=\"wrong_chain\"}} {d}\n", .{hs.wrong_chain.load(.monotonic)});
+            try w.print("zui_native_hello_refused{{reason=\"minor_unsupported\"}} {d}\n", .{hs.minor_unsupported.load(.monotonic)});
+            try w.print("zui_native_hello_refused{{reason=\"feature_missing\"}} {d}\n", .{hs.feature_missing.load(.monotonic)});
+        }
+        // The WebTransport certificate: when the one presented now expires, and rotations so far.
+        if (n.native_certs) |cs| {
+            try w.print("# TYPE zui_native_cert_not_after_seconds gauge\nzui_native_cert_not_after_seconds {d}\n", .{cs.stats.not_after.load(.acquire)});
+            try w.print("# TYPE zui_native_cert_rotations counter\nzui_native_cert_rotations {d}\n", .{cs.stats.rotations.load(.monotonic)});
+            try w.print("# TYPE zui_native_cert_hash_file_errors counter\nzui_native_cert_hash_file_errors {d}\n", .{cs.stats.hash_file_errors.load(.monotonic)});
+            try w.print("# TYPE zui_native_cert_reloads counter\nzui_native_cert_reloads {d}\n", .{cs.stats.reloads.load(.monotonic)});
+            try w.print("# TYPE zui_native_cert_reload_errors counter\nzui_native_cert_reload_errors {d}\n", .{cs.stats.reload_errors.load(.monotonic)});
+        }
         // Edge source (`--source zui1:`): requests, failovers, and wire / feed / blob bytes.
         if (n.edge_pool) |ep| {
             inline for (comptime std.meta.fieldNames(edge.client.Stats)) |name| {
                 try w.print("# TYPE zui_edge_{s} counter\nzui_edge_{s} {d}\n", .{ name, name, @field(ep.stats, name).load(.monotonic) });
             }
         }
+        // Edge fallback (`--edge-fallback`): the active source (0 the zui/1 cores, 1 the
+        // fallback), switches each way, checkpoints from each side, probes of the cores.
+        if (n.edge_fb) |fb| try renderEdgeFallback(w, &fb.sw);
         if (n.p2p_listener) |l| {
             inline for (comptime std.meta.fieldNames(@import("net").server.Stats)) |name| {
                 try w.print("# TYPE zui_p2p_listener_{s} counter\nzui_p2p_listener_{s} {d}\n", .{ name, name, @field(l.stats, name).load(.monotonic) });

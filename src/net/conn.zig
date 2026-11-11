@@ -13,6 +13,7 @@ const tls = @import("tls13.zig");
 const tls_srv = @import("tls13_server.zig");
 const x509 = @import("x509.zig");
 const buf = @import("buf.zig");
+const cong = @import("cc.zig");
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const max_datagram = 1200; // datagram size before path MTU validation (and every Initial)
@@ -27,6 +28,13 @@ const max_crypto_buffer = 1 << 20;
 const max_peer_cids = 8;
 const ms = std.time.ns_per_ms;
 const us = std.time.ns_per_us;
+/// Path MTU search (`Config.pmtud`): it stops when the largest size that passed and the
+/// smallest that failed are closer than this; a finished search runs again after
+/// `pmtu_raise_ns` (RFC 8899 PMTU_RAISE_TIMER), and after a black hole once `pmtu_cooldown_ns`
+/// has passed.
+const pmtu_step = 24;
+const pmtu_raise_ns = 600 * std.time.ns_per_s;
+const pmtu_cooldown_ns = 60 * std.time.ns_per_s;
 
 pub var trace: bool = false;
 fn tr(comptime fmt: []const u8, args: anytype) void {
@@ -47,6 +55,9 @@ pub const Config = struct {
     /// Ed25519 network key seed: the anemo PeerId is its public key.
     identity_seed: [32]u8,
     expected_peer: ?[32]u8 = null,
+    /// Client role: check the server's certificate as `tls13.Trust` says (a P-256 certificate
+    /// pinned by hash, as browsers do) instead of as an identity certificate.
+    trust: ?tls.Trust = null,
     /// 64 bytes of fresh randomness: connection ids, TLS random, x25519 secret, cert serial.
     seed: [64]u8,
     now_unix: i64,
@@ -65,6 +76,9 @@ pub const Config = struct {
     client_auth: bool = true,
     /// Serve a P-256 certificate when the client picks `alpn[alt.alpn_index]` (tls13_server.Alt).
     alt: ?tls_srv.Alt = null,
+    /// Serve this loaded chain and key instead (tls13_server.Config.chain: to everyone but a
+    /// client that asks for the identity certificate).
+    chain: ?*const tls_srv.Identity = null,
     /// RFC 9221 max_datagram_frame_size we advertise (0: not sent). Received DATAGRAM frames are
     /// dropped (WebTransport needs the parameter; zui/1 reserves datagrams).
     max_datagram_frame_size: u64 = 0,
@@ -80,7 +94,52 @@ pub const Config = struct {
     /// only the idle timeout). Listeners set it so half-open connections cannot hold a slot for
     /// a whole idle timeout.
     handshake_timeout_ms: u64 = 0,
+    // Sender-side switches (src/net/cc.zig). All off by default: the sender is then exactly the
+    // unpaced NewReno of this file. None changes a byte on the wire, only when datagrams leave.
+    /// Pacing (RFC 9002 section 7.7): sends are spread over the round trip at 1.25 times the
+    /// window per smoothed RTT (2 times in slow start) in runs of at most 64 datagrams, instead
+    /// of a whole window in one burst. `nextTimeout` then also reports when the next run is due.
+    pacing: bool = false,
+    /// HyStart++ (RFC 9406): the first slow start ends when the round-trip time of a round
+    /// rises by an eighth (4 to 16 ms) over the round before, instead of when the bottleneck
+    /// queue overflows and a burst of packets is lost.
+    hystart: bool = false,
+    /// CUBIC (RFC 9438) instead of NewReno: the window is cut to 0.7 (not 0.5) on a loss and
+    /// regrows along the cubic function, never slower than Reno would; one reduction per round
+    /// trip, tracked by send time as RFC 9002 section 7.3.2 describes. NewReno stays the default.
+    /// CUBIC brings HyStart++ with it (RFC 9438 section 4.10): cutting to 0.7 after a slow
+    /// start that overshot leaves the window above the path and loses a second burst.
+    cubic: bool = false,
+    /// Path MTU search (RFC 8899 DPLPMTUD, RFC 9000 section 14.3) instead of the single probe
+    /// of `pmtu_max`: when the largest size does not pass, smaller ones are tried (1452, then
+    /// by halving) until the path's size is known to within 24 bytes, so a path below 1500
+    /// (PPPoE, a tunnel) still gets more than 1200. The search runs again every 10 minutes.
+    /// And the validated size is no longer trusted for ever: when full-size packets keep being
+    /// lost while smaller ones pass, or two probe timeouts in a row go unanswered, the
+    /// connection falls back to 1200 (a black hole after a route change) and searches again a
+    /// minute later. `pmtu_max` is the ceiling (1472 fits IPv4 over Ethernet, 1452 IPv6).
+    pmtud: bool = false,
+    /// The initial congestion window follows the datagram size (RFC 9002 section 7.2: 10
+    /// datagrams, at most 14,720 bytes, at least 2 datagrams; recalculated when the size
+    /// changes). At 1200 bytes that is the 12,000 every connection starts with, switch or not.
+    /// With the switch on, a datagram size raised before the first slow start has ended adds
+    /// the difference to the window (1452: 14,520, so 2,520 more; 1472: 14,720).
+    iw_mtu: bool = false,
+    /// Server only. The 1-RTT send keys are installed when the server's Finished is written
+    /// (not when the client's arrives), so the application may open streams and write right
+    /// behind the handshake flight (`canSendEarly`): "0.5-RTT data", RFC 9001 sections 4.1.1 and
+    /// 5.7, RFC 8446 section 4.4.4. It reaches the client with the handshake instead of a
+    /// round trip later. Nothing is read early: the receive keys still wait for the client's
+    /// Finished, and the 3x anti-amplification limit covers these packets like any other. The
+    /// data goes to a client that has not proven it holds its key, so a listener that
+    /// authenticates clients must only send what any client may see (HTTP/3 SETTINGS).
+    early_send: bool = false,
 };
+
+/// RFC 9002 section 7.2.
+fn initialWindow(mtu: u64) u64 {
+    return @min(10 * mtu, @max(2 * mtu, 14_720));
+}
 
 pub const Error = error{ OutOfMemory, ConnectionClosed, StreamLimit, InvalidStream, FlowControl };
 
@@ -322,6 +381,16 @@ pub const Connection = struct {
     mtu: usize = max_datagram,
     pmtu_inflight: bool = false,
     pmtu_tries: u8 = 0,
+    /// Path MTU search (`cfg.pmtud`): the size being probed (0: none chosen yet), the smallest
+    /// size known not to pass (0: none), and when a finished search starts again (0: running).
+    pmtu_probe: u16 = 0,
+    pmtu_fail: u16 = 0,
+    pmtu_search_at: u64 = 0,
+    /// Black-hole detection: loss events in a row that took full-size packets while no
+    /// full-size packet was acknowledged; set by a loss pass that lost one.
+    big_loss: u8 = 0,
+    big_lost_pass: bool = false,
+    pmtu_black_holes: u64 = 0,
     /// Freed streams kept with their buffer capacity for reuse (warm streams: a request stream
     /// costs no allocation once the connection has served a few).
     stream_pool: std.ArrayList(*Stream) = .empty,
@@ -329,6 +398,10 @@ pub const Connection = struct {
     pkts_sent: u64 = 0,
     pkts_lost: u64 = 0,
     ptos: u64 = 0,
+    /// STREAM frames sent again (after a loss, or by a PTO probe), and STREAM frames received
+    /// that carried nothing new (the peer's spurious retransmissions).
+    stream_retx: u64 = 0,
+    dup_frames: u64 = 0,
 
     peer: PeerParams = .{},
     peer_tp_checked: bool = false,
@@ -393,10 +466,18 @@ pub const Connection = struct {
     rttvar: u64 = 333 * ms / 2,
     pto_count: u32 = 0,
     bytes_in_flight: u64 = 0,
-    cwnd: u64 = 12_000,
+    cwnd: u64 = initialWindow(max_datagram),
     ssthresh: u64 = std.math.maxInt(u64),
     recovery_start: ?u64 = null,
     timer: ?u64 = null,
+    pacer: cong.Pacer = .{},
+    hystart: cong.HyStart = .{},
+    cubic: cong.Cubic = .{},
+    /// The last transmit round ended because the window was full (not because the application
+    /// had nothing more): only then does CUBIC grow the window (RFC 9438 section 5.8).
+    cwnd_limited: bool = false,
+    /// Set by a transmit round that the pacer held back: when the next run may leave.
+    pace_at: ?u64 = null,
 
     // timing
     last_recv: u64 = 0,
@@ -409,6 +490,9 @@ pub const Connection = struct {
     close_reason_buf: [64]u8 = undefined,
 
     const PeerCid = struct { seq: u64, len: u8, cid: [20]u8, token: [16]u8 };
+    /// What an ACK frame told the congestion controller: its space and largest acknowledged
+    /// packet number, and the round-trip sample it produced, if any.
+    const AckInfo = struct { space: Space, largest: u64, rtt: ?u64, newest_sent: u64 };
 
     pub fn init(gpa: Allocator, cfg: Config, now: u64) Error!*Connection {
         const c = try gpa.create(Connection);
@@ -449,6 +533,7 @@ pub const Connection = struct {
             .identity = kp,
             .cert_der = c.cert[0..c.cert_len],
             .expected_peer = cfg.expected_peer,
+            .trust = cfg.trust,
             .now_unix = cfg.now_unix,
             .random = tls_random,
             .x25519_secret = xsec,
@@ -513,6 +598,7 @@ pub const Connection = struct {
             .alpn = cfg.alpn,
             .client_auth = cfg.client_auth,
             .alt = cfg.alt,
+            .chain = cfg.chain,
             .now_unix = cfg.now_unix,
             .random = tls_random,
             .x25519_secret = xsec,
@@ -670,10 +756,17 @@ pub const Connection = struct {
             c.spaces[1].send = qc.PacketKeys.fromSecret(st.s_hs.?);
             c.spaces[1].recv = qc.PacketKeys.fromSecret(st.c_hs.?);
         }
-        if (st.complete and c.spaces[2].send == null) {
+        if (c.cfg.early_send and !st.complete and st.s_ap != null and c.spaces[2].send == null) {
+            // the flight through Finished is written: the server may send 1-RTT data now
             c.spaces[2].send = qc.PacketKeys.fromSecret(st.s_ap.?);
-            c.spaces[2].recv = qc.PacketKeys.fromSecret(st.c_ap.?);
             try c.checkPeerParams();
+        }
+        if (st.complete and c.spaces[2].recv == null) {
+            if (c.spaces[2].send == null) {
+                c.spaces[2].send = qc.PacketKeys.fromSecret(st.s_ap.?);
+                try c.checkPeerParams();
+            }
+            c.spaces[2].recv = qc.PacketKeys.fromSecret(st.c_ap.?);
             c.state = .established;
             // The server's handshake is confirmed once complete (RFC 9001 section 4.1.2): tell the
             // client with HANDSHAKE_DONE and drop the Handshake keys.
@@ -766,6 +859,11 @@ pub const Connection = struct {
 
     pub fn isEstablished(c: *const Connection) bool {
         return c.state == .established;
+    }
+    /// A server with `cfg.early_send` between writing its Finished and reading the client's:
+    /// streams of ours can be opened and written, nothing can be read yet.
+    pub fn canSendEarly(c: *const Connection) bool {
+        return c.srv != null and c.state == .handshaking and c.spaces[2].send != null;
     }
     pub fn isClosed(c: *const Connection) bool {
         return c.state == .closed or c.state == .draining or (c.state == .closing and c.close_sent);
@@ -1261,10 +1359,12 @@ pub const Connection = struct {
             c.creditDiscard(s);
             return;
         }
+        const dups = s.recv.dups;
         s.recv.insert(c.gpa, off, data) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Fragmented => return c.fail(0x0a, "stream data too fragmented"),
         };
+        c.dup_frames += s.recv.dups - dups;
         if (!s.watched) {
             c.recv_watch.append(c.gpa, s) catch return error.OutOfMemory;
             s.watched = true;
@@ -1374,6 +1474,8 @@ pub const Connection = struct {
         var newly_largest_eliciting_time: ?u64 = null;
         var newly_acked_any = false;
         var acked_bytes: u64 = 0;
+        var newest_sent: u64 = 0;
+        var big_acked = false;
         // Ranges arrive in descending order; keep the first `max_ranges` (later ones are acked
         // again by the peer's next ACK) and validate them all.
         const max_ranges = 64;
@@ -1413,10 +1515,15 @@ pub const Connection = struct {
                     continue;
                 }
                 newly_acked_any = true;
+                newest_sent = @max(newest_sent, s.time);
+                if (s.size > max_datagram) big_acked = true;
                 for (s.recs[0..s.nrec]) |r| switch (r) {
                     .pmtu => |m| {
+                        if (c.cfg.iw_mtu and m > c.mtu and c.ssthresh == std.math.maxInt(u64))
+                            c.cwnd += initialWindow(m) - initialWindow(c.mtu);
                         c.mtu = @max(c.mtu, m);
                         c.pmtu_inflight = false;
+                        if (m == c.pmtu_probe) c.pmtu_probe = 0; // passed: the search moves up
                     },
                     .stream => |sr| if (c.streams.get(sr.id)) |st| {
                         st.inflight -|= 1;
@@ -1453,9 +1560,10 @@ pub const Connection = struct {
         }
         if (newly_acked_any) {
             c.pto_count = 0;
-            c.onAckedBytes(now, acked_bytes);
+            c.onAckedBytes(now, acked_bytes, .{ .space = space, .largest = largest, .rtt = if (newly_largest_eliciting_time != null) c.latest_rtt else null, .newest_sent = newest_sent });
         }
         c.detectLoss(now, space);
+        if (c.cfg.pmtud and space == .app) c.blackHoleCheck(now, big_acked);
         c.updateTimer(now);
     }
 
@@ -1474,11 +1582,25 @@ pub const Connection = struct {
         c.srtt = (7 * c.srtt + adjusted) / 8;
     }
 
-    fn onAckedBytes(c: *Connection, now: u64, bytes: u64) void {
-        _ = now;
-        if (c.recovery_start != null) return; // simplified: no growth while in recovery
+    fn onAckedBytes(c: *Connection, now: u64, bytes: u64, a: AckInfo) void {
+        if (c.cfg.cubic) {
+            // in recovery until a packet sent after the reduction is acknowledged
+            if (c.cubic.inRecovery(a.newest_sent)) return;
+        } else if (c.recovery_start != null) return; // simplified: no growth while in recovery
         if (c.cwnd < c.ssthresh) {
+            // HyStart++ runs in the first slow start only (RFC 9406 section 4.3), on the
+            // application space's packet numbers.
+            if ((c.cfg.hystart or c.cfg.cubic) and c.ssthresh == std.math.maxInt(u64) and a.space == .app) {
+                const step = c.hystart.onAck(a.largest, c.spaces[2].next_pn, a.rtt);
+                // an unpaced sender adds at most 8 datagrams per ACK (section 4.3, L)
+                const n = if (c.cfg.pacing) bytes else @min(bytes, cong.HyStart.l_unpaced * c.mtu);
+                c.cwnd += n / step.divisor;
+                if (step.exit) c.ssthresh = c.cwnd;
+                return;
+            }
             c.cwnd += bytes;
+        } else if (c.cfg.cubic) {
+            c.cubic.onAck(now, bytes, &c.cwnd, c.mtu, c.srtt, c.cwnd_limited);
         } else {
             c.cwnd += c.mtu * bytes / c.cwnd;
         }
@@ -1509,14 +1631,27 @@ pub const Connection = struct {
             .max_streams_bidi => c.need_max_streams_bidi = true,
             .retire_cid => |seq| c.pending_retire.append(c.gpa, seq) catch c.internalError(),
             .handshake_done => c.need_handshake_done = true,
-            .pmtu => {
+            .pmtu => |m| {
                 c.pmtu_inflight = false;
-                c.pmtu_tries += 1;
+                if (!c.cfg.pmtud) {
+                    c.pmtu_tries += 1;
+                } else if (m == c.pmtu_probe) {
+                    c.pmtu_tries += 1;
+                    if (c.pmtu_tries >= 3) {
+                        // three probes of this size lost: it does not pass
+                        c.pmtu_fail = m;
+                        c.pmtu_probe = 0;
+                        c.pmtu_tries = 0;
+                    }
+                }
                 return; // a lost probe says nothing about congestion (RFC 9000 section 14.4)
             },
         };
+        if (s.size > max_datagram) c.big_lost_pass = true;
         // congestion event
-        if (c.recovery_start == null or s.time > c.recovery_start.?) {
+        if (c.cfg.cubic) {
+            _ = c.cubic.onCongestion(now, s.time, &c.cwnd, &c.ssthresh, c.mtu);
+        } else if (c.recovery_start == null or s.time > c.recovery_start.?) {
             c.recovery_start = now;
             c.cwnd = @max(c.cwnd / 2, 2 * c.mtu);
             c.ssthresh = c.cwnd;
@@ -1526,6 +1661,7 @@ pub const Connection = struct {
     fn detectLoss(c: *Connection, now: u64, space: Space) void {
         const sp = &c.spaces[@intFromEnum(space)];
         sp.loss_time = null;
+        c.big_lost_pass = false;
         const largest_acked = sp.largest_acked orelse return;
         const base = @max(c.latest_rtt, c.srtt);
         const loss_delay = @max(base + base / 8, 1 * ms);
@@ -1568,6 +1704,32 @@ pub const Connection = struct {
         }
     }
 
+    /// After a loss pass of the application space (path MTU search on). A loss event that took
+    /// full-size packets while this ACK brought none back is suspicious; three in a row with no
+    /// full-size packet acknowledged in between mean the path stopped carrying them.
+    fn blackHoleCheck(c: *Connection, now: u64, big_acked: bool) void {
+        if (big_acked) {
+            c.big_loss = 0;
+            return;
+        }
+        if (!c.big_lost_pass or c.mtu <= max_datagram) return;
+        c.big_loss += 1;
+        if (c.big_loss >= 3) c.pmtuBlackHole(now);
+    }
+
+    /// The path no longer carries the validated size: back to 1200 (what is lost is resent in
+    /// packets of that size, since retransmission works on stream ranges), search again later.
+    fn pmtuBlackHole(c: *Connection, now: u64) void {
+        tr("pmtu black hole: {d} -> {d}", .{ c.mtu, max_datagram });
+        c.mtu = max_datagram;
+        c.pmtu_black_holes += 1;
+        c.big_loss = 0;
+        c.pmtu_probe = 0;
+        c.pmtu_fail = 0;
+        c.pmtu_tries = 0;
+        c.pmtu_search_at = now + pmtu_cooldown_ns;
+    }
+
     fn ptoDuration(c: *const Connection, space: Space) u64 {
         var d = c.srtt + @max(4 * c.rttvar, 1 * ms);
         if (space == .app) d += c.peer.max_ack_delay_ms * ms;
@@ -1597,6 +1759,7 @@ pub const Connection = struct {
     /// Next time `onTimeout` should be called (null: nothing pending).
     pub fn nextTimeout(c: *const Connection) ?u64 {
         var best: ?u64 = c.timer;
+        if (c.pace_at) |t| best = if (best) |b| @min(b, t) else t;
         if (c.spaces[2].ack_needed) if (c.spaces[2].ack_deadline) |t| {
             best = if (best) |b| @min(b, t) else t;
         };
@@ -1678,12 +1841,16 @@ pub const Connection = struct {
             };
             if (earliest_loss != null) {
                 c.detectLoss(now, loss_space);
+                if (c.cfg.pmtud and loss_space == .app) c.blackHoleCheck(now, false);
             } else {
                 // PTO
                 var space: Space = .initial;
                 var best: ?u64 = null;
                 for (c.spaces, 0..) |s, i| {
                     if (s.discarded or s.send == null) continue;
+                    // no probe of 1-RTT data before the handshake is done (RFC 9002 section
+                    // 6.2.1); the space only has keys this early with `cfg.early_send`
+                    if (i == 2 and c.state == .handshaking) continue;
                     if (s.ack_eliciting_in_flight == 0 and !(c.state == .handshaking and !c.handshake_confirmed)) continue;
                     const tt = s.time_last_ack_eliciting + c.ptoDuration(@enumFromInt(i));
                     if (best == null or tt < best.?) {
@@ -1693,6 +1860,9 @@ pub const Connection = struct {
                 }
                 c.pto_count += 1;
                 c.ptos += 1;
+                // two probe timeouts in a row with nothing acknowledged, at a raised datagram
+                // size: the probes themselves may be what the path drops
+                if (c.cfg.pmtud and space == .app and c.pto_count >= 2 and c.mtu > max_datagram) c.pmtuBlackHole(now);
                 const sp = &c.spaces[@intFromEnum(space)];
                 sp.probe = 2;
                 if (space != .app) {
@@ -1774,8 +1944,9 @@ pub const Connection = struct {
             c.creditScan();
             if (c.state == .closing) return c.buildClose(now, out);
         }
+        c.pace_at = null;
         if (!c.addr_validated and c.amp_sent + max_datagram > 3 * c.amp_recv) return null;
-        if (c.pmtuProbeDue(out.len)) return c.buildProbe(now, out);
+        if (c.pmtuProbeDue(now, out.len)) return c.buildProbe(now, out);
         const mtu = @min(c.mtu, out.len, max_mtu);
         var scratch: [3][max_mtu]u8 = undefined;
         var plans: [3]Plan = undefined;
@@ -1823,16 +1994,44 @@ pub const Connection = struct {
         return pos;
     }
 
-    fn pmtuProbeDue(c: *const Connection, out_len: usize) bool {
+    fn pmtuProbeDue(c: *Connection, now: u64, out_len: usize) bool {
+        if (c.cfg.pmtud) return c.pmtuSearchDue(now, out_len);
         const target = c.cfg.pmtu_max;
         return target > c.mtu and out_len >= target and target <= max_mtu and c.handshake_confirmed and
             !c.pmtu_inflight and c.pmtu_tries < 3 and c.peer.max_udp_payload >= target and
             c.spaces[2].send != null and c.state == .established;
     }
 
-    /// PING + PADDING filling exactly `cfg.pmtu_max` bytes.
+    /// Path MTU search: true when a probe of `pmtu_probe` bytes should leave now. Picks the
+    /// next size when the last one was settled, and ends the search when no size is left.
+    fn pmtuSearchDue(c: *Connection, now: u64, out_len: usize) bool {
+        if (c.pmtu_inflight or !c.handshake_confirmed or c.spaces[2].send == null or c.state != .established) return false;
+        if (c.pmtu_search_at != 0) {
+            if (now < c.pmtu_search_at) return false;
+            // again from the top: the path may carry more than it did
+            c.pmtu_search_at = 0;
+            c.pmtu_fail = 0;
+            c.pmtu_probe = 0;
+        }
+        if (c.pmtu_probe == 0) {
+            const ceiling: u64 = @min(@as(u64, c.cfg.pmtu_max), max_mtu, out_len, c.peer.max_udp_payload);
+            const hi: u64 = if (c.pmtu_fail != 0) @min(ceiling, c.pmtu_fail - 1) else ceiling;
+            if (hi < c.mtu + pmtu_step) {
+                c.pmtu_search_at = now + pmtu_raise_ns;
+                return false;
+            }
+            // First the ceiling itself (most paths carry it). When that failed, the size of
+            // IPv6 over Ethernet, then halfway between what passed and what failed.
+            const next: u64 = if (c.pmtu_fail == 0) hi else if (c.pmtu_fail > 1452 and c.mtu < 1452) 1452 else (c.mtu + hi + 1) / 2;
+            c.pmtu_probe = @intCast(next);
+            c.pmtu_tries = 0;
+        }
+        return c.pmtu_probe <= out_len;
+    }
+
+    /// PING + PADDING filling exactly the probe size (`cfg.pmtu_max`, or the search's choice).
     fn buildProbe(c: *Connection, now: u64, out: []u8) usize {
-        const target: usize = c.cfg.pmtu_max;
+        const target: usize = if (c.cfg.pmtud) c.pmtu_probe else c.cfg.pmtu_max;
         const overhead = c.headerOverhead(.app) + 16;
         var plan: Plan = .{ .space = .app, .frames = out[overhead - 16 ..][0 .. target - overhead] };
         plan.frames[0] = 0x01;
@@ -1856,7 +2055,15 @@ pub const Connection = struct {
         var ack_len: usize = 0;
         if (sp.ack_needed and sp.recv_set.n > 0) ack_len = encodeAck(sp, now, f[p..lim]);
         p += ack_len;
-        const can_send = c.bytes_in_flight < c.cwnd or sp.probe > 0;
+        var can_send = c.bytes_in_flight < c.cwnd or sp.probe > 0;
+        if (c.cfg.pacing and can_send and sp.probe == 0 and plan.space == .app and c.rtt_initialized) {
+            // Probes and ACKs are never paced; the handshake flights fit the first bucket.
+            const slow_start = c.cwnd < c.ssthresh;
+            if (c.pacer.delay(now, c.srtt, c.cwnd, c.mtu, c.cwnd - c.bytes_in_flight, if (slow_start) 2 else 5, if (slow_start) 1 else 4)) |at| {
+                can_send = false;
+                c.pace_at = at;
+            }
+        }
         if (can_send) {
             // CRYPTO: retransmissions first, then new bytes
             while (p + 16 < lim) {
@@ -1896,6 +2103,11 @@ pub const Connection = struct {
         if (plan.space == .app) {
             if (c.state == .established or c.spaces[2].send != null) {
                 p = c.fillApp(plan, p, lim, can_send);
+            }
+            if (c.cfg.cubic) {
+                if (c.bytes_in_flight >= c.cwnd) {
+                    c.cwnd_limited = true;
+                } else if (!plan.eliciting and c.pace_at == null) c.cwnd_limited = false;
             }
         }
         // PING for probes
@@ -2073,9 +2285,12 @@ pub const Connection = struct {
             if (is_new) {
                 s.send_off += take;
                 c.sent_data += take;
-            } else if (@as(u64, take) == end - start) {
-                _ = s.retx.orderedRemove(0);
-            } else s.retx.items[0].start += take;
+            } else {
+                c.stream_retx += 1;
+                if (@as(u64, take) == end - start) {
+                    _ = s.retx.orderedRemove(0);
+                } else s.retx.items[0].start += take;
+            }
             if (send_fin) s.fin_sent = true;
             if (take == 0) break;
         }
@@ -2205,6 +2420,7 @@ pub const Connection = struct {
             sp.time_last_ack_eliciting = now;
             sp.ack_eliciting_in_flight += 1;
             c.bytes_in_flight += total;
+            if (c.cfg.pacing) c.pacer.onSend(total);
         }
         // Initial keys are dropped as soon as the first Handshake packet is sent (client).
         if (plan.space == .handshake and c.srv == null) c.discardSpace(.initial);
@@ -2217,6 +2433,9 @@ pub const Connection = struct {
         for (order) |sid| {
             const sp = &c.spaces[@intFromEnum(sid)];
             if (sp.send == null) continue;
+            // early 1-RTT send keys (`cfg.early_send`): until the handshake is done the peer may
+            // not be able to read a 1-RTT packet, so the close goes in a Handshake packet
+            if (sid == .app and sp.recv == null) continue;
             var close_buf: [max_datagram]u8 = undefined;
             var plan: Plan = .{ .space = sid, .frames = &close_buf };
             const info = c.close.?;
@@ -3297,6 +3516,63 @@ test "a QUIC Initial whose ClientHello has an overflowing extension length close
     }
 }
 
+test "early_send: 1-RTT data rides behind the server's handshake flight; nothing is read early; a close stays in the Handshake space" {
+    const gpa = std.testing.allocator;
+    var seed: [64]u8 = @splat(4);
+    const server_seed: [32]u8 = @splat(5);
+    const skey = (try Ed25519.KeyPair.generateDeterministic(server_seed)).public_key.toBytes();
+    for ([_]bool{ false, true }) |early| {
+        const client = try Connection.init(gpa, .{ .server_name = "zui", .identity_seed = @as([32]u8, @splat(3)), .expected_peer = skey, .seed = seed, .now_unix = 1_800_000_000, .alpn = &.{"zui/1"}, .max_streams_uni = 4 }, 0);
+        defer client.deinit();
+        var d: [max_datagram]u8 = undefined;
+        const n = client.pollTransmit(0, &d).?;
+        const dl = d[5];
+        const dcid = d[6..][0..dl];
+        const sl = d[6 + dl];
+        const scid = d[7 + dl ..][0..sl];
+        seed[0] +%= 1;
+        const server = try Connection.initServer(gpa, .{ .server_name = "zui", .identity_seed = server_seed, .seed = seed, .now_unix = 1_800_000_000, .alpn = &.{"zui/1"}, .client_auth = false, .early_send = early }, 0, dcid, scid);
+        defer server.deinit();
+        seed[0] +%= 1;
+        server.handleDatagram(1000, d[0..n]);
+        // the flight through Finished is written, the client's Finished is a round trip away
+        try std.testing.expect(!server.isEstablished());
+        try std.testing.expectEqual(early, server.canSendEarly());
+        try std.testing.expectEqual(early, server.spaces[2].send != null);
+        try std.testing.expect(server.spaces[2].recv == null);
+        var o: [max_mtu]u8 = undefined;
+        if (!early) {
+            // the old path: the flight alone; the client is established and has no stream
+            while (server.pollTransmit(2000, &o)) |m| client.handleDatagram(3000, o[0..m]);
+            try std.testing.expect(client.isEstablished());
+            try std.testing.expect(client.acceptUni() == null);
+            continue;
+        }
+        const id = try server.openUni();
+        try server.streamWrite(id, "settings", false);
+        // the handshake flight and the stream data arrive without one more packet from the
+        // client, inside the 3x anti-amplification budget of its one Initial
+        var sent: usize = 0;
+        while (server.pollTransmit(2000, &o)) |m| {
+            sent += m;
+            client.handleDatagram(3000, o[0..m]);
+        }
+        try std.testing.expect(sent <= 3 * n);
+        try std.testing.expect(client.isEstablished());
+        const got = client.acceptUni().?;
+        try std.testing.expectEqualStrings("settings", client.stream(got).?.recv.contiguous());
+        try std.testing.expect(!server.isEstablished());
+        // a close before the handshake is done goes in a long-header packet, which a client
+        // without 1-RTT keys can still read
+        server.closeApp(0x101);
+        const m = server.pollTransmit(4000, &o).?;
+        try std.testing.expect(o[0] & 0x80 != 0);
+        try std.testing.expect(m >= 20);
+        // and the client's Finished still completes a server that was not closed: covered by
+        // the linkbench cold-connect test, which runs whole workloads with the switch on
+    }
+}
+
 fn ackFrame(out: []u8, largest: u64, first_range: u64) usize {
     var q: usize = 0;
     out[q] = 0x02;
@@ -3333,6 +3609,266 @@ test "PMTU probe: one PING+PADDING datagram of pmtu_max, its ACK raises the data
     try std.testing.expect(!c.pmtu_inflight);
     const n2 = c.pollTransmit(2_000_001, &out).?;
     try std.testing.expect(n2 > 1430 and n2 <= 1452);
+}
+
+test "initial window: 10 datagrams capped at 14,720 bytes; the switch adds the difference when the size is raised" {
+    try std.testing.expectEqual(@as(u64, 12_000), initialWindow(1200));
+    try std.testing.expectEqual(@as(u64, 14_520), initialWindow(1452));
+    try std.testing.expectEqual(@as(u64, 14_720), initialWindow(1472));
+    try std.testing.expectEqual(@as(u64, 14_720), initialWindow(1500));
+    try std.testing.expectEqual(@as(u64, 18_000), initialWindow(9000));
+    const gpa = std.testing.allocator;
+    var grown: [3]u64 = undefined;
+    // off; on; on, but after a loss has ended slow start
+    for ([_]bool{ false, true, true }, [_]bool{ false, false, true }, 0..) |on, after_loss, k| {
+        const c = try testEstablished(gpa);
+        defer c.deinit();
+        c.cfg.iw_mtu = on;
+        c.cfg.pmtu_max = 1452;
+        try std.testing.expectEqual(initialWindow(max_datagram), c.cwnd);
+        if (after_loss) c.ssthresh = c.cwnd;
+        var out: [max_mtu]u8 = undefined;
+        try std.testing.expectEqual(@as(?usize, 1452), c.pollTransmit(1_000_000, &out));
+        const before = c.cwnd;
+        var ack: [32]u8 = undefined;
+        sendTheirs(c, 0, ack[0..ackFrame(&ack, 0, 0)], 2_000_000);
+        try std.testing.expectEqual(@as(usize, 1452), c.mtu);
+        grown[k] = c.cwnd - before;
+    }
+    // the probe's own acknowledgement grows the window as any packet's does; the switch adds
+    // 14,520 - 12,000 on top, and only while the first slow start lasts
+    try std.testing.expectEqual(grown[0] + 2_520, grown[1]);
+    try std.testing.expect(grown[2] <= grown[0]);
+}
+
+test "pacing: a window leaves in bucket-sized runs spread over the round trip (RFC 9002 7.7)" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |paced| {
+        const c = try testEstablished(gpa);
+        defer c.deinit();
+        c.cfg.pacing = paced;
+        // a measured 40 ms round trip and a 100-datagram window in congestion avoidance
+        c.rtt_initialized = true;
+        c.srtt = 40 * ms;
+        c.latest_rtt = 40 * ms;
+        c.min_rtt = 40 * ms;
+        c.rttvar = 1 * ms;
+        c.cwnd = 100 * max_datagram;
+        c.ssthresh = c.cwnd;
+        const id = try c.openBidi();
+        const chunk: [64 << 10]u8 = @splat(1);
+        for (0..4) |_| try c.streamWrite(id, &chunk, false);
+        var out: [max_mtu]u8 = undefined;
+        const t0: u64 = 1_000_000;
+        var now = t0;
+        var first: u64 = 0;
+        while (c.pollTransmit(now, &out)) |_| first += 1;
+        if (!paced) {
+            // the switch is off: the whole window in one burst, as before
+            try std.testing.expect(first >= 100);
+            try std.testing.expectEqual(@as(?u64, null), c.pace_at);
+            continue;
+        }
+        // the bucket: 2 ms of 100 datagrams per 40 ms is 5, so the floor of 10 datagrams
+        try std.testing.expectEqual(@as(u64, 10), first);
+        // the next run is due when the bucket is full again: 10 datagrams at 1.25 windows per
+        // round trip is 3.2 ms
+        const due = c.nextTimeout().?;
+        try std.testing.expect(due > now + 3 * ms and due <= now + 3200 * us);
+        // one round trip without an ACK: runs of a bucket, the window and no more
+        var total = first;
+        var max_run = first;
+        var runs: u64 = 1;
+        while (c.nextTimeout()) |at| {
+            if (at > t0 + 40 * ms) break;
+            now = at;
+            c.onTimeout(now);
+            var run: u64 = 0;
+            while (c.pollTransmit(now, &out)) |_| run += 1;
+            total += run;
+            max_run = @max(max_run, run);
+            if (run > 0) runs += 1;
+        }
+        try std.testing.expect(max_run <= 11);
+        try std.testing.expect(runs >= 9);
+        try std.testing.expect(total >= 100 and total <= 102);
+        try std.testing.expect(c.bytes_in_flight >= c.cwnd);
+        // the window is full: nothing is pending for the pacer, only the probe timer
+        try std.testing.expectEqual(@as(?u64, null), c.pace_at);
+        // a probe timeout is not paced
+        const pto = c.nextTimeout().?;
+        c.onTimeout(pto);
+        try std.testing.expect(c.pollTransmit(pto, &out) != null);
+    }
+}
+
+test "cubic switch: a loss cuts the window to 0.7, once per round trip; off, NewReno halves" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |cubic| {
+        const c = try testEstablished(gpa);
+        defer c.deinit();
+        c.cfg.cubic = cubic;
+        c.cwnd = 100 * max_datagram;
+        c.ssthresh = c.cwnd; // congestion avoidance
+        const id = try c.openBidi();
+        const chunk: [32 << 10]u8 = @splat(1);
+        try c.streamWrite(id, &chunk, false);
+        var out: [max_mtu]u8 = undefined;
+        for (0..10) |_| _ = c.pollTransmit(1_000_000, &out).?;
+        // the peer has 4..8: packets 0..3 are lost (three later packets acknowledged)
+        var ack: [32]u8 = undefined;
+        sendTheirs(c, 0, ack[0..ackFrame(&ack, 8, 4)], 2_000_000);
+        try std.testing.expectEqual(@as(u64, 4), c.pkts_lost);
+        const reduced = c.cwnd;
+        if (cubic) {
+            try std.testing.expectEqual(@as(u64, 70 * max_datagram), reduced);
+            try std.testing.expectEqual(reduced, c.ssthresh);
+        } else {
+            // the old path: half (of a window the ACK had grown by a fraction of a datagram)
+            try std.testing.expect(reduced >= 50 * max_datagram and reduced < 50 * max_datagram + 100);
+        }
+        // packet 9 (sent before the reduction) is lost as well: no second reduction
+        for (0..3) |_| _ = c.pollTransmit(2_000_001, &out).?;
+        sendTheirs(c, 1, ack[0..ackFrame(&ack, 12, 2)], 2_000_002);
+        try std.testing.expectEqual(@as(u64, 5), c.pkts_lost);
+        try std.testing.expectEqual(reduced, c.cwnd);
+    }
+}
+
+test "path MTU search: a failed ceiling is followed by 1452 and halving; a black hole falls back to 1200" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    c.cfg.pmtud = true;
+    c.cfg.pmtu_max = 1472;
+    c.cfg.keep_alive_ms = 0;
+    var out: [max_mtu]u8 = undefined;
+    var ack: [32]u8 = undefined;
+    var now: u64 = 1_000_000;
+    var their_pn: u64 = 0;
+    // A path that carries 1400 bytes. Each probe is followed by three small packets; the peer
+    // acknowledges those, and the probe too when it fits.
+    const path: usize = 1400;
+    var sizes: [16]usize = undefined;
+    var n_sizes: usize = 0;
+    const id = try c.openBidi();
+    var guard: usize = 0;
+    while (c.pmtu_search_at == 0 and guard < 64) : (guard += 1) {
+        const n = c.pollTransmit(now, &out) orelse break;
+        try std.testing.expect(n > c.mtu); // a probe
+        const probe_pn = c.spaces[2].next_pn - 1;
+        if (n_sizes == 0 or sizes[n_sizes - 1] != n) {
+            sizes[n_sizes] = n;
+            n_sizes += 1;
+        }
+        for (0..3) |_| {
+            try c.streamWrite(id, "x", false);
+            const m = c.pollTransmit(now, &out).?;
+            try std.testing.expect(m < 100);
+        }
+        now += 1_000_000;
+        // ack the three small packets, and the probe with them when the path carried it
+        const fits = n <= path;
+        sendTheirs(c, their_pn, ack[0..ackFrame(&ack, probe_pn + 3, if (fits) 3 else 2)], now);
+        their_pn += 1;
+        now += 1_000_000;
+    }
+    try std.testing.expect(c.pmtu_search_at != 0);
+    // 1472 three times, 1452 three times, then halving between 1200 and 1451
+    try std.testing.expectEqualSlices(usize, &.{ 1472, 1452, 1326, 1389, 1420, 1404 }, sizes[0..n_sizes]);
+    try std.testing.expectEqual(@as(usize, 1389), c.mtu);
+    try std.testing.expect(path - c.mtu < pmtu_step);
+    // nothing more is probed until the raise timer
+    try std.testing.expect(c.pollTransmit(now, &out) == null);
+    try std.testing.expectEqual(@as(u64, 0), c.pmtu_black_holes);
+
+    // The route changes: full-size packets vanish, small ones still pass. Three loss events
+    // without a full-size packet acknowledged and the connection is back at 1200.
+    const big: [1380]u8 = @splat(7);
+    for (0..3) |_| {
+        c.cwnd = 1 << 20; // the losses below halve it; this test is not about the window
+        try c.streamWrite(id, &big, false);
+        const n = c.pollTransmit(now, &out).?;
+        try std.testing.expect(n > max_datagram);
+        const big_pn = c.spaces[2].next_pn - 1;
+        for (0..3) |_| {
+            try c.streamWrite(id, "y", false);
+            _ = c.pollTransmit(now, &out).?;
+        }
+        now += 1_000_000;
+        try std.testing.expectEqual(@as(usize, 1389), c.mtu);
+        sendTheirs(c, their_pn, ack[0..ackFrame(&ack, big_pn + 3, 2)], now);
+        their_pn += 1;
+        // the lost range is resent at once; drain it so the next round starts clean
+        while (c.pollTransmit(now, &out)) |_| {}
+        now += 1_000_000;
+    }
+    try std.testing.expectEqual(@as(usize, max_datagram), c.mtu);
+    try std.testing.expectEqual(@as(u64, 1), c.pmtu_black_holes);
+    // the search starts again after the cooldown, not before
+    try std.testing.expect(c.pmtu_search_at > now);
+    // (the black hole was seen one step of this test's clock ago)
+    try std.testing.expectEqual(now - 1_000_000 + pmtu_cooldown_ns, c.pmtu_search_at);
+    now = c.pmtu_search_at - 1;
+    while (c.pollTransmit(now, &out)) |n| try std.testing.expect(n <= max_datagram);
+    // then from the ceiling again
+    now += 1;
+    try std.testing.expectEqual(@as(?usize, 1472), c.pollTransmit(now, &out));
+}
+
+test "path MTU search: two probe timeouts in a row at a raised size fall back to 1200; off, the size stays" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |search| {
+        const c = try testEstablished(gpa);
+        defer c.deinit();
+        c.cfg.pmtud = search;
+        c.cfg.keep_alive_ms = 0;
+        c.mtu = 1452; // validated earlier on this connection
+        const id = try c.openBidi();
+        const big: [1400]u8 = @splat(3);
+        try c.streamWrite(id, &big, false);
+        var out: [max_mtu]u8 = undefined;
+        var now: u64 = 1_000_000;
+        try std.testing.expect(c.pollTransmit(now, &out).? > max_datagram);
+        // nothing comes back, not even for the first probe timeout's probes
+        for (0..2) |k| {
+            try std.testing.expectEqual(@as(usize, 1452), c.mtu);
+            now = c.nextTimeout().?;
+            c.onTimeout(now);
+            try std.testing.expectEqual(@as(u32, @intCast(k + 1)), c.pto_count);
+            while (c.pollTransmit(now, &out)) |_| {}
+        }
+        try std.testing.expectEqual(@as(usize, if (search) max_datagram else 1452), c.mtu);
+        try std.testing.expectEqual(@as(u64, if (search) 1 else 0), c.pmtu_black_holes);
+        if (search) try std.testing.expectEqual(now + pmtu_cooldown_ns, c.pmtu_search_at);
+    }
+}
+
+test "path MTU search off: one probe of pmtu_max, three tries, then 1200 for good (the old path)" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    c.cfg.pmtu_max = 1452;
+    c.cfg.keep_alive_ms = 0;
+    var out: [max_mtu]u8 = undefined;
+    var ack: [32]u8 = undefined;
+    var now: u64 = 1_000_000;
+    const id = try c.openBidi();
+    for (0..3) |k| {
+        const n = c.pollTransmit(now, &out).?;
+        try std.testing.expectEqual(@as(usize, 1452), n);
+        const probe_pn = c.spaces[2].next_pn - 1;
+        for (0..3) |_| {
+            try c.streamWrite(id, "x", false);
+            _ = c.pollTransmit(now, &out).?;
+        }
+        now += 1_000_000;
+        sendTheirs(c, k, ack[0..ackFrame(&ack, probe_pn + 3, 2)], now);
+        now += 1_000_000;
+    }
+    try std.testing.expect(c.pollTransmit(now, &out) == null);
+    try std.testing.expectEqual(@as(usize, max_datagram), c.mtu);
+    try std.testing.expectEqual(@as(u8, 3), c.pmtu_tries);
 }
 
 test "ACK of a long in-flight run removes exactly the acked packets" {

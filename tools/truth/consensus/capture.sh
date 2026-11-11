@@ -9,7 +9,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
 sui_src="${ZUI_SUI_SRC:-$root/tools/sui}"
 [ -d "$sui_src/crates/sui" ] || { echo "capture: Mysten source missing at $sui_src (tools/setup-sui.sh)" >&2; exit 2; }
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/zui/target-swarm}"   # shared, never per agent
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/zui/target-swarm}"   # shared
 mkdir -p "$out"
 cargo build --release --manifest-path "$sui_src/Cargo.toml" -p sui --bin sui
 sui="$CARGO_TARGET_DIR/release/sui"

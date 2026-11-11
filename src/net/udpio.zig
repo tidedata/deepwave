@@ -353,3 +353,66 @@ test "udpio: batch send and receive on loopback, address round trip" {
     try std.testing.expectEqual(@as(usize, 5), total);
     try std.testing.expectEqual(@as(usize, 0), rx.recv(&sb, false));
 }
+
+test "udpio: a 64-datagram burst to one address leaves in batched send calls and arrives whole" {
+    // The path every zui/1 and WebTransport response takes (the native listener and the anemo
+    // server queue a pass's datagrams in one TxBatch): 32 datagrams per syscall on macOS
+    // (sendmsg_x) and Linux (sendmmsg), and on Linux with UDP GSO one super-packet per batch.
+    const sys = posix.system;
+    const fd_a: posix.fd_t = @intCast(sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0));
+    defer _ = sys.close(fd_a);
+    const fd_b: posix.fd_t = @intCast(sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0));
+    defer _ = sys.close(fd_b);
+    const rcvbuf: c_int = 1 << 20;
+    posix.setsockopt(fd_b, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&rcvbuf)) catch {};
+    var bind_addr: Addr = undefined;
+    const lo: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(0) };
+    const bl = toPosix(&lo, &bind_addr);
+    try std.testing.expectEqual(@as(c_int, 0), @as(c_int, @intCast(sys.bind(fd_b, &bind_addr.any, bl))));
+    var got: Addr = undefined;
+    var gl: posix.socklen_t = @sizeOf(Addr);
+    try std.testing.expectEqual(@as(c_int, 0), @as(c_int, @intCast(sys.getsockname(fd_b, &got.any, &gl))));
+    const dest = fromPosix(&got);
+    var sa = Sock.init(fd_a);
+    var sb = Sock.init(fd_b);
+    sb.setWait(20 * std.time.ns_per_ms);
+    const tx = try std.testing.allocator.create(TxBatch);
+    defer std.testing.allocator.destroy(tx);
+    tx.* = .{};
+    // a checkpoint's worth: 63 full datagrams and a short last one, as the listener's flush
+    // queues them (the batch is sent when full and at the end of the pass)
+    const total_dgrams = 64;
+    for (0..total_dgrams) |i| {
+        if (tx.full()) tx.flush(&sa);
+        const sl = tx.slot();
+        const n: usize = if (i == total_dgrams - 1) 700 else 1452;
+        @memset(sl[0..n], @truncate(i));
+        std.mem.writeInt(u16, sl[0..2], @intCast(i), .little);
+        tx.commit(n, &dest);
+    }
+    tx.flush(&sa);
+    try std.testing.expectEqual(@as(u64, total_dgrams), sa.stats.sent);
+    // two calls (one per batch of 32) unless the kernel took a batch in parts
+    if (is_darwin or is_linux) try std.testing.expect(sa.stats.send_calls <= 4);
+    const rx = try std.testing.allocator.create(RxBatch);
+    defer std.testing.allocator.destroy(rx);
+    rx.* = .{};
+    var seen: [total_dgrams]bool = @splat(false);
+    var total: usize = 0;
+    var tries: usize = 0;
+    while (total < total_dgrams and tries < 50) : (tries += 1) {
+        const n = rx.recv(&sb, true);
+        for (0..n) |i| {
+            const d = rx.data(i);
+            const k = std.mem.readInt(u16, d[0..2], .little);
+            try std.testing.expect(k < total_dgrams and !seen[k]);
+            seen[k] = true;
+            try std.testing.expectEqual(@as(usize, if (k == total_dgrams - 1) 700 else 1452), d.len);
+            try std.testing.expectEqual(@as(u8, @truncate(k)), d[d.len - 1]);
+        }
+        total += n;
+    }
+    try std.testing.expectEqual(@as(usize, total_dgrams), total);
+    // fewer receive calls than datagrams as well
+    try std.testing.expect(sb.stats.recv_calls < total_dgrams / 2);
+}

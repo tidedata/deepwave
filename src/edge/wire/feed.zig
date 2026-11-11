@@ -19,6 +19,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const checkpoint = @import("checkpoint");
+const types = @import("types");
 
 pub const Error = error{ Malformed, TooLarge } || Allocator.Error;
 
@@ -169,6 +170,76 @@ pub fn toBlob(out: *std.ArrayList(u8), gpa: Allocator, f: *const Feed) Allocator
         try uleb(out, gpa, t.count);
         for (f.objects(t)) |o| try out.appendSlice(gpa, o);
     }
+}
+
+/// Appends the feed-form blob of a full checkpoint blob (`idx` is its index): the blob `toBlob`
+/// gives for the feed a core builds of the same checkpoint (serve/native/edgefeed.zig
+/// `assemble`). The same summary, certificate, contents, envelopes, effects and events; no input
+/// objects; and each transaction's output objects in the order of its effects' references
+/// (`outputRefs`), which is the order a core reads them from its store in. A full blob from the
+/// archive lists them in another order (mutated, created, unwrapped). An edge that takes a
+/// checkpoint from a full source (the public bucket, a directory) hands the follower this form,
+/// so the bytes it applies and indexes do not depend on which source served the checkpoint.
+/// A transaction whose output objects are not exactly its effects' references keeps the blob's
+/// order (the follower's check of outputs against effects then gives the verdict).
+/// `arena` holds the tables.
+pub fn feedForm(out: *std.ArrayList(u8), gpa: Allocator, arena: Allocator, blob: []const u8, idx: *const types.index.CheckpointIndex) Allocator.Error!void {
+    const txs = try arena.alloc(Feed.Tx, idx.tx_count);
+    var n_out: usize = 0;
+    for (0..idx.tx_count) |i| n_out += idx.txAt(i).out_count;
+    const objs = try arena.alloc([]const u8, n_out);
+    var refs: std.ArrayList(checkpoint.objects.OutRef) = .empty;
+    var keys: std.ArrayList(Key) = .empty;
+    var at: u32 = 0;
+    for (txs, 0..) |*t, i| {
+        const x = idx.txAt(i);
+        const outs = idx.objs[x.out_first..][0..x.out_count];
+        const dst = objs[at..][0..x.out_count];
+        t.* = .{ .tx = x.transaction.slice(blob), .effects = x.effects.slice(blob), .events = if (x.events) |e| e.slice(blob) else null, .first = at, .count = @intCast(x.out_count) };
+        at += @intCast(x.out_count);
+        if (!try inEffectsOrder(arena, blob, t.effects, outs, dst, &refs, &keys)) {
+            for (dst, outs) |*d, r| d.* = r.slice(blob);
+        }
+    }
+    const f: Feed = .{ .seq = 0, .summary_cert = blob[idx.summary.o .. idx.sig.o + idx.sig.n], .contents = idx.contents.slice(blob), .txs = txs, .objs = objs };
+    try toBlob(out, gpa, &f);
+}
+
+/// (id, version) of an output object and its place in the blob's list.
+const Key = struct { k: [40]u8, i: u32 };
+
+fn keyLess(_: void, a: Key, b: Key) bool {
+    return std.mem.order(u8, &a.k, &b.k) == .lt;
+}
+
+/// Fills `dst` with the objects of `outs` in the order of the effects' output references. False
+/// (and `dst` unspecified) unless the two are the same set of (id, version).
+fn inEffectsOrder(arena: Allocator, blob: []const u8, effects: []const u8, outs: []const types.index.Range, dst: [][]const u8, refs: *std.ArrayList(checkpoint.objects.OutRef), keys: *std.ArrayList(Key)) Allocator.Error!bool {
+    refs.clearRetainingCapacity();
+    checkpoint.objects.outputRefsOf(arena, effects, refs) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Decode => return false,
+    };
+    if (refs.items.len != outs.len) return false;
+    keys.clearRetainingCapacity();
+    try keys.ensureTotalCapacity(arena, outs.len);
+    for (outs, 0..) |r, i| {
+        const k = checkpoint.objects.outputKey(r.slice(blob)) orelse return false;
+        keys.appendAssumeCapacity(.{ .k = k, .i = @intCast(i) });
+    }
+    std.mem.sort(Key, keys.items, {}, keyLess);
+    for (refs.items, dst) |*ref, *d| {
+        const want = ref[0..40];
+        var lo: usize = 0;
+        var hi: usize = keys.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.order(u8, &keys.items[mid].k, want) == .lt) lo = mid + 1 else hi = mid;
+        }
+        if (lo == keys.items.len or !std.mem.eql(u8, &keys.items[lo].k, want)) return false;
+        d.* = outs[keys.items[lo].i].slice(blob);
+    }
+    return true;
 }
 
 /// The output objects a transaction's effects commit to, as (id, version, digest) references in

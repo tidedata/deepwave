@@ -11,6 +11,7 @@ const proto = @import("proto.zig");
 const indexq = @import("indexq.zig");
 const edgefeed = @import("edgefeed.zig");
 const dicts_mod = @import("dicts.zig");
+const hello_mod = @import("hello.zig");
 const W = proto.W;
 const R = proto.R;
 const Code = proto.Code;
@@ -106,6 +107,11 @@ pub const Dispatcher = struct {
     /// Response dictionaries (hello, get_dictionary, ZSTD frames); null: plain zstd only and
     /// get_dictionary answers NOT_FOUND.
     dicts: ?*const dicts_mod.Dicts = null,
+    /// The node's software version (`<version>-<git sha>`): hello's `server` is `zui/<this>` for
+    /// clients of minor 1 and later. Minor 0 clients read `server`, as they always did.
+    software: []const u8 = "",
+    /// Who said hello with which minor, and the hellos refused (hello.zig).
+    hello: hello_mod.Stats = .{},
 
     /// Answers one request into `out` (a whole response: header, body, proof).
     pub fn handle(d: *Dispatcher, a: Allocator, req: proto.Request, principal: ?Principal, out: *std.ArrayList(u8)) void {
@@ -132,18 +138,24 @@ pub const Dispatcher = struct {
         var proof: Proof = .{};
         switch (req.method) {
             .hello => {
-                _ = try r.str();
-                _ = try r.int(u16);
+                const client = try r.str();
+                const cminor = try r.int(u16);
                 var authed = false;
                 if (try r.option()) {
                     const tok = try r.bytes();
                     if (d.hooks.auth) |au| authed = au.check(au.ctx, tok) != null;
                 }
+                // minor 1: what the client requires of the node (absent from older clients)
+                const want = try hello_mod.Want.read(&r);
                 try r.done();
                 const ei = d.epochInfo(&snap);
                 try proto.okHeader(out, a, 0);
-                try w.str(d.server);
-                try w.int(u16, proto.minor);
+                if (cminor >= 1 and d.software.len > 0) {
+                    try w.uleb(4 + d.software.len);
+                    try w.fixed("zui/");
+                    try w.fixed(d.software);
+                } else try w.str(d.server);
+                try w.int(u16, @min(cminor, proto.server_minor));
                 try w.fixed(&d.svc.chain_id);
                 try w.int(u64, snap.lowestAvailable() orelse 0);
                 try w.int(u64, snap.highestCommitted() orelse 0);
@@ -157,6 +169,9 @@ pub const Dispatcher = struct {
                 if (d.hooks.submitter != null) feat |= 1 << 4;
                 feat |= 1 << 1; // ZSTD responses (spec 2.2), with or without dictionaries
                 if (d.edge != null) feat |= @as(u64, 1) << feature_edge_feed_bit;
+                const refusal = if (want) |wn| hello_mod.refuse(wn, &d.svc.chain_id, feat) else null;
+                _ = d.hello.record(client, cminor, if (refusal) |rf| rf.code else null, hello_mod.monoMs());
+                if (refusal) |rf| return proto.errorResponse(out, a, rf.code, rf.message, rf.detail());
                 try w.int(u64, feat);
                 // Limits
                 try w.int(u32, 128);

@@ -5,7 +5,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const alpn = "zui/1";
+/// The minor deepwave's own clients state in hello (src/edge): they use nothing newer.
 pub const minor: u16 = 0;
+/// The highest minor the server speaks; hello answers the lower of this and the client's.
+/// 1: the optional requirement fields of HelloReq and the errors 15 to 17 (hello.zig).
+pub const server_minor: u16 = 1;
 
 pub const Method = enum(u64) {
     hello = 0x00,
@@ -55,6 +59,10 @@ pub const Code = enum(u32) {
     tx_rejected = 12,
     timeout = 13,
     shutdown = 14,
+    /// hello (minor 1): the node cannot be what the client requires.
+    wrong_chain = 15,
+    minor_unsupported = 16,
+    feature_missing = 17,
 };
 
 pub const Frame = enum(u64) {

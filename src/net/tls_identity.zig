@@ -291,6 +291,86 @@ fn pkcs1(a: Allocator, der: []const u8) LoadError!Key {
     return .{ .rsa = .{ .n = m, .k = n.len, .d = try a.dupe(u8, priv), .e = try a.dupe(u8, e) } };
 }
 
+// ------------------------------------------------------------------ certificates, parsed safely
+
+const oid_san = [_]u8{ 0x55, 0x1d, 0x11 };
+
+/// `std.crypto.Certificate.parse` and the checks on its result (`verify`, `verifyHostName`) read
+/// DER lengths without holding them against the buffer: a truncated or malformed certificate is
+/// an out-of-bounds read (a panic in safe builds). This walks the same fields first, with every
+/// element inside its parent, and only then hands the bytes to std. Use it for any certificate
+/// that comes from a file or from a peer.
+pub fn parseCertificate(der: []const u8) error{BadCertificate}!std.crypto.Certificate.Parsed {
+    certificateShape(der) catch return error.BadCertificate;
+    return (std.crypto.Certificate{ .buffer = der, .index = 0 }).parse() catch error.BadCertificate;
+}
+
+/// Every element std reads is where std will look for it, and in bounds.
+fn certificateShape(der: []const u8) LoadError!void {
+    var top: Der = .{ .b = der };
+    var c: Der = .{ .b = try top.want(0x30) };
+    if (!top.done()) return error.BadKey;
+    var t: Der = .{ .b = try c.want(0x30) }; // TBSCertificate
+    var sig_alg: Der = .{ .b = try c.want(0x30) };
+    _ = try sig_alg.want(0x06);
+    if ((try c.want(0x03)).len < 1) return error.BadKey; // signature BIT STRING: its unused-bits byte
+    if (!c.done()) return error.BadKey;
+
+    var first = try t.any();
+    if (first.tag == 0xa0) { // [0] version, then the serial
+        if (first.v.len != 3) return error.BadKey;
+        first = try t.any();
+    }
+    if (first.tag != 0x02) return error.BadKey;
+    _ = try t.want(0x30); // signature algorithm
+    _ = try t.want(0x30); // issuer
+    var validity: Der = .{ .b = try t.want(0x30) };
+    _ = try validity.any();
+    _ = try validity.any();
+    // subject: std walks RDN sets, their attributes, and each attribute's type and value
+    var names: Der = .{ .b = try t.want(0x30) };
+    while (!names.done()) {
+        var rdn: Der = .{ .b = (try names.any()).v };
+        while (!rdn.done()) {
+            var atav: Der = .{ .b = (try rdn.any()).v };
+            while (!atav.done()) {
+                _ = try atav.any();
+                _ = try atav.any();
+            }
+        }
+    }
+    var spki: Der = .{ .b = try t.want(0x30) };
+    var alg: Der = .{ .b = try spki.want(0x30) };
+    const alg_oid = try alg.want(0x06);
+    if (std.mem.eql(u8, alg_oid, &oid_ec_public_key)) _ = try alg.want(0x06); // the named curve
+    const key_bits = try spki.want(0x03);
+    if (key_bits.len < 1) return error.BadKey;
+    if (std.mem.eql(u8, alg_oid, &oid_rsa)) { // RSAPublicKey: SEQ { modulus, exponent }
+        var k: Der = .{ .b = key_bits[1..] };
+        var seq: Der = .{ .b = try k.want(0x30) };
+        _ = try seq.want(0x02);
+        _ = try seq.want(0x02);
+    }
+    // std takes the element after the key for the extensions when its tag number is 3 ([3])
+    if (t.done()) return;
+    const after = try t.any();
+    if (after.tag & 0x1f != 3) return;
+    var outer: Der = .{ .b = after.v };
+    var exts: Der = .{ .b = (try outer.any()).v };
+    while (!exts.done()) {
+        var ext: Der = .{ .b = (try exts.any()).v };
+        const id = try ext.want(0x06);
+        const second = try ext.any(); // critical BOOLEAN, or the value
+        const value = if (second.tag & 0x1f == 1) try ext.any() else second;
+        // subjectAltName is parsed again for the host name: GeneralNames, a list of elements
+        if (std.mem.eql(u8, id, &oid_san)) {
+            var v: Der = .{ .b = value.v };
+            var general: Der = .{ .b = (try v.any()).v };
+            while (!general.done()) _ = try general.any();
+        }
+    }
+}
+
 // ------------------------------------------------------------------ RSASSA-PSS (RFC 8017 8.1.1)
 
 fn mgf1Xor(out: []u8, seed: []const u8) void {
@@ -422,6 +502,39 @@ test "tls_identity: RSA-PSS signatures verify with std's RSASSA-PSS" {
     const pk = try rsa.PublicKey.fromBytes(k.rsa.e, &n_bytes);
     try rsa.PSSSignature.verify(256, sig[0..256], msg, pk, Sha256);
     try std.testing.expectError(error.InvalidSignature, rsa.PSSSignature.verify(256, sig[0..256], "other", pk, Sha256));
+}
+
+test "tls_identity: parseCertificate refuses truncated and damaged certificates instead of reading past them" {
+    const gpa = std.testing.allocator;
+    for ([_][2][]const u8{ .{ testdata.p256_cert, testdata.p256_key }, .{ testdata.rsa_cert, testdata.rsa_key } }) |pair| {
+        var id = try load(gpa, pair[0], pair[1]);
+        defer id.deinit();
+        const der = id.certs[0];
+        const good = try parseCertificate(der);
+        const now: i64 = @intCast(good.validity.not_before + 86400);
+        try good.verify(good, now); // both test certificates are self-signed
+        try good.verifyHostName("localhost");
+        // every proper prefix: refused (an exactly sized copy, so a read past the end is caught)
+        for (0..der.len) |n| {
+            const cut = try gpa.dupe(u8, der[0..n]);
+            defer gpa.free(cut);
+            try std.testing.expectError(error.BadCertificate, parseCertificate(cut));
+        }
+        // one byte damaged, anywhere: refused, or parsed and then safe to check
+        const copy = try gpa.dupe(u8, der);
+        defer gpa.free(copy);
+        for (0..der.len) |i| {
+            for ([_]u8{ 0x00, 0x7f, 0x80, 0x81, 0x84, 0xff }) |v| {
+                if (der[i] == v) continue;
+                copy[i] = v;
+                defer copy[i] = der[i];
+                const p = parseCertificate(copy) catch continue;
+                p.verifyHostName("localhost") catch {};
+                // (the signature check is the slow part: sample it)
+                if (i % 16 == 0) p.verify(p, now) catch {};
+            }
+        }
+    }
 }
 
 /// Test keys and certificates (never for production): the rpc-surface capture's P-256 pair and a

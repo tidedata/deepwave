@@ -104,6 +104,14 @@ pub const Conn = struct {
     bytes_out: u64 = 0,
     hello: Hello = undefined,
     request_timeout_ms: u64 = 20_000,
+    /// A request whose response makes no progress (no new byte) for this long fails with
+    /// `Timeout`. 0: off (only `request_timeout_ms` bounds a request).
+    stall_ms: u64 = 0,
+    /// Monotonic ns: a request that has no response byte by then fails with `Timeout` (the
+    /// caller's deadline for an answer to start; a response under way is left to `stall_ms`).
+    first_byte_by: u64 = std.math.maxInt(u64),
+    /// When the last request last received a response byte (monotonic ns; 0: it never did).
+    last_progress: u64 = 0,
 
     pub fn connect(gpa: Allocator, io: Io, spec: Spec, connect_timeout_ms: u64) Error!*Conn {
         const cl = try gpa.create(Conn);
@@ -153,6 +161,13 @@ pub const Conn = struct {
         return !cl.c.isClosed();
     }
 
+    /// The server closed this connection saying it is shutting down (the listener's stop sends
+    /// CONNECTION_CLOSE with zui/1 `shutdown`): it is going away, not slow.
+    pub fn peerShutdown(cl: *const Conn) bool {
+        const ci = cl.c.close orelse return false;
+        return ci.remote and ci.app and ci.code == @intFromEnum(proto.Code.shutdown);
+    }
+
     fn send(cl: *Conn, now: u64) void {
         while (true) {
             if (cl.tx.full()) cl.tx.flush(&cl.us);
@@ -195,7 +210,10 @@ pub const Conn = struct {
         try proto.encodeRequest(&req, a, m, flags, body);
         cl.c.streamWrite(id, req.items, true) catch return error.Closed;
         var resp: std.ArrayList(u8) = .empty;
-        const deadline = nowNs(cl.io) + cl.request_timeout_ms * std.time.ns_per_ms;
+        const start = nowNs(cl.io);
+        const deadline = start + cl.request_timeout_ms * std.time.ns_per_ms;
+        var progress = start;
+        cl.last_progress = 0;
         while (true) {
             const st = cl.c.stream(id) orelse return error.StreamGone;
             const d = st.recv.contiguous();
@@ -203,10 +221,15 @@ pub const Conn = struct {
                 if (resp.items.len + d.len > response_max) return error.TooLarge;
                 try resp.appendSlice(a, d);
                 st.recv.consume(d.len);
+                progress = nowNs(cl.io);
+                cl.last_progress = progress;
             }
             if (st.recv.complete()) break;
             if (cl.c.isClosed()) return error.Closed;
-            if (nowNs(cl.io) > deadline) return error.Timeout;
+            const now = nowNs(cl.io);
+            if (now > deadline) return error.Timeout;
+            if (cl.stall_ms != 0 and now -| progress > cl.stall_ms * std.time.ns_per_ms) return error.Timeout;
+            if (resp.items.len == 0 and now > cl.first_byte_by) return error.Timeout;
             try cl.pump(5);
         }
         return resp.items;
@@ -324,6 +347,14 @@ pub const Conn = struct {
 
 pub const Result = enum { ok, missing };
 
+/// What a failed `fetchBlobBy` can tell its caller beyond the error.
+pub const Fail = struct {
+    /// When the failed feed request last received a response byte (monotonic ns; 0: it never
+    /// did, or no request was sent). A response that was under way means the core answered
+    /// until then.
+    progress_ns: u64 = 0,
+};
+
 pub const Stats = struct {
     requests: Atomic(u64) = .init(0),
     failovers: Atomic(u64) = .init(0),
@@ -363,6 +394,19 @@ pub const Pool = struct {
     dicts: std.ArrayList(*dict.Dictionary) = .empty,
     use_zstd: bool = true,
     connect_timeout_ms: u64 = 5_000,
+    /// `Conn.stall_ms` of every connection the pool opens (0: off). Set before the first request.
+    stall_ms: u64 = 0,
+    /// Monotonic ns at which a core last closed a connection saying it is shutting down (0:
+    /// never). A caller with a fallback takes it as "that core is going away now".
+    shutdown_ns: Atomic(u64) = .init(0),
+    /// The last checkpoint every core answered PRUNED for (below each one's retention: no core
+    /// will ever hold it).
+    pruned_seq: Atomic(u64) = .init(std.math.maxInt(u64)),
+    /// Bumped by `retire`: a connection opened under an older value is closed at its next use.
+    gen: Atomic(u32) = .init(0),
+
+    /// No deadline: the pool's own timeouts bound a call.
+    pub const no_deadline: u64 = std.math.maxInt(u64);
 
     const served_n = 64;
     const Served = struct {
@@ -376,6 +420,8 @@ pub const Pool = struct {
         idx: u32 = 0,
         conn: ?*Conn = null,
         dict: ?*const dict.Dictionary = null,
+        /// `Pool.gen` when `conn` was opened.
+        gen: u32 = 0,
     };
 
     pub fn init(gpa: Allocator, io: Io, specs: []const Spec, max_conns: u32) Allocator.Error!*Pool {
@@ -444,19 +490,30 @@ pub const Pool = struct {
     }
 
     /// Opens a connection for `s` to the first core that answers (starting at `pref`), checks it.
-    fn open(p: *Pool, a: Allocator, s: *Slot, excl: u64) Error!void {
+    /// With a deadline `by` (monotonic ns), the time left is shared by the cores still to try, so
+    /// one silent core cannot use up the whole budget.
+    fn open(p: *Pool, a: Allocator, s: *Slot, excl: u64, by: u64) Error!void {
         var last: Error = error.NoCores;
         const n = p.specs.len;
         const start = p.pref.load(.monotonic);
         for (0..n) |k| {
             const i = (start + k) % n;
             if (i < 64 and excl >> @intCast(i) & 1 == 1) continue;
-            const c = Conn.connect(p.gpa, p.io, p.specs[i], p.connect_timeout_ms) catch |e| {
+            var budget_ms = p.connect_timeout_ms;
+            if (by != no_deadline) {
+                const now = nowNs(p.io);
+                if (now >= by) return if (last == error.NoCores) error.Timeout else last;
+                budget_ms = @min(budget_ms, @max(1, (by - now) / std.time.ns_per_ms / (n - k)));
+            }
+            const c = Conn.connect(p.gpa, p.io, p.specs[i], budget_ms) catch |e| {
                 last = e;
                 continue;
             };
+            c.stall_ms = p.stall_ms;
+            c.first_byte_by = by;
             ok: {
                 c.doHello(a) catch |e| {
+                    if (c.peerShutdown()) p.shutdown_ns.store(nowNs(p.io), .monotonic);
                     last = e;
                     break :ok;
                 };
@@ -481,13 +538,46 @@ pub const Pool = struct {
                         break :blk try p.keepDict(d);
                     };
                 }
+                c.first_byte_by = no_deadline;
                 s.conn = c;
+                s.gen = p.gen.load(.acquire);
                 p.pref.store(@intCast(i), .monotonic);
                 return;
             }
             c.close();
         }
         return last;
+    }
+
+    /// Every connection open now is closed at its next use, without a word about how it ended.
+    /// For a caller that stopped using the pool for a while (an edge on its fallback): what
+    /// those connections saw meanwhile (a shutdown notice of a core since restarted, a core that
+    /// went silent) says nothing about the cores now.
+    pub fn retire(p: *Pool) void {
+        _ = p.gen.fetchAdd(1, .acq_rel);
+    }
+
+    /// Closes the connection of `s` if it is retired or dead. True when it was dead because its
+    /// core said it is shutting down (noted in `shutdown_ns`).
+    fn reap(p: *Pool, s: *Slot) bool {
+        const c = s.conn orelse return false;
+        if (s.gen != p.gen.load(.acquire)) {
+            c.close();
+            s.conn = null;
+            return false;
+        }
+        if (c.alive()) return false;
+        const going = c.peerShutdown();
+        if (going) p.shutdown_ns.store(nowNs(p.io), .monotonic);
+        c.close();
+        s.conn = null;
+        return going;
+    }
+
+    /// With a deadline and one core, a shutdown notice ends the call: there is nothing to
+    /// reconnect to, and the caller has somewhere else to go.
+    fn gone(p: *const Pool, going: bool, by: u64) bool {
+        return going and by != no_deadline and p.specs.len == 1;
     }
 
     /// A core pruned `seq`: logged at most every 10 s (the follower polls a missing checkpoint).
@@ -548,12 +638,21 @@ pub const Pool = struct {
     /// Fetches checkpoint `seq` and appends its blob (`0x01 ++ BCS(CheckpointData)`, input objects
     /// empty) to `out` (cleared first). `.missing`: no core holds it yet. `a` is scratch.
     pub fn fetchBlob(p: *Pool, a: Allocator, seq: u64, out: *std.ArrayList(u8)) Error!Result {
+        return p.fetchBlobBy(a, seq, out, no_deadline, null);
+    }
+
+    /// `fetchBlob` that gives up at `by` (monotonic ns; `no_deadline`: never): connects share the
+    /// time left, a request with no response byte by then fails, and no new try starts after it.
+    /// A response under way is not cut at `by` (see `stall_ms`).
+    pub fn fetchBlobBy(p: *Pool, a: Allocator, seq: u64, out: *std.ArrayList(u8), by: u64, fail: ?*Fail) Error!Result {
         const s = p.acquire();
         defer release(s);
         var last: Error = error.NoCores;
         var missing: usize = 0;
+        var pruned: usize = 0;
         // one try per core, plus one for a connection that had gone stale
-        for (0..p.specs.len + 1) |_| {
+        for (0..p.specs.len + 1) |k| {
+            if (k > 0 and by != no_deadline and nowNs(p.io) >= by) break;
             const excl = p.exclFor(seq);
             if (s.conn != null and s.idx < 64 and excl >> @intCast(s.idx) & 1 == 1) {
                 // this connection's core served a bad feed for `seq`: not asked again for it
@@ -561,10 +660,9 @@ pub const Pool = struct {
                 s.conn = null;
                 _ = p.pref.fetchAdd(1, .monotonic);
             }
-            if (s.conn == null or !s.conn.?.alive()) {
-                if (s.conn) |c| c.close();
-                s.conn = null;
-                p.open(a, s, excl) catch |e| {
+            if (p.gone(p.reap(s), by)) return error.Closed;
+            if (s.conn == null) {
+                p.open(a, s, excl, by) catch |e| {
                     last = e;
                     continue;
                 };
@@ -573,10 +671,16 @@ pub const Pool = struct {
             _ = p.stats.requests.fetchAdd(1, .monotonic);
             const before = c.bytes_in;
             const t_req = nowNs(p.io);
+            c.first_byte_by = by;
+            defer if (s.conn == c) {
+                c.first_byte_by = no_deadline;
+            };
             const got = c.getFeed(a, seq, s.dict, p.use_zstd) catch |e| if (e == error.Pruned) {
                 // the core's answer, not a bad link: no failover counted; another core may hold it
                 missing += 1;
+                pruned += 1;
                 p.warnPruned(seq, s.idx);
+                if (pruned >= p.specs.len) p.pruned_seq.store(seq, .monotonic);
                 if (missing >= p.specs.len) return .missing;
                 last = error.NoCores;
                 c.close();
@@ -588,8 +692,12 @@ pub const Pool = struct {
                 _ = p.stats.errors.fetchAdd(1, .monotonic);
                 // was silent: a 20 s request timeout looked like an idle edge
                 std.log.warn("edge: core {d} feed {d}: {s} after {d} ms ({d} bytes in); reconnecting", .{ s.idx, seq, @errorName(e), (nowNs(p.io) - t_req) / std.time.ns_per_ms, c.bytes_in - before });
+                const going = c.peerShutdown();
+                if (going) p.shutdown_ns.store(nowNs(p.io), .monotonic);
+                if (fail) |f| f.progress_ns = c.last_progress;
                 // a server error (unavailable) is that core's answer; others are a bad link
                 p.drop(s);
+                if (p.gone(going, by)) return e;
                 continue;
             };
             const raw = got orelse {
@@ -636,34 +744,49 @@ pub const Pool = struct {
     /// The tip search starts here: a floor from a stale epochs index lies below a core's
     /// retention, and a core holds nothing below its lowest.
     pub fn lowestHeld(p: *Pool, a: Allocator) Error!u64 {
+        return p.lowestHeldBy(a, no_deadline);
+    }
+
+    /// `lowestHeld` that gives up at `by` (see `fetchBlobBy`).
+    pub fn lowestHeldBy(p: *Pool, a: Allocator, by: u64) Error!u64 {
         const s = p.acquire();
         defer release(s);
-        if (s.conn == null or !s.conn.?.alive()) {
-            if (s.conn) |c| c.close();
-            s.conn = null;
-            try p.open(a, s, 0);
-        }
+        if (p.gone(p.reap(s), by)) return error.Closed;
+        if (s.conn == null) try p.open(a, s, 0, by);
         return s.conn.?.hello.lowest;
     }
 
     pub fn exists(p: *Pool, a: Allocator, seq: u64) Error!bool {
+        return p.existsBy(a, seq, no_deadline);
+    }
+
+    /// `exists` that gives up at `by` (see `fetchBlobBy`).
+    pub fn existsBy(p: *Pool, a: Allocator, seq: u64, by: u64) Error!bool {
         if (p.highest_seen.load(.monotonic) >= seq) return true;
         const s = p.acquire();
         defer release(s);
         var last: Error = error.NoCores;
-        for (0..p.specs.len + 1) |_| {
-            if (s.conn == null or !s.conn.?.alive()) {
-                if (s.conn) |c| c.close();
-                s.conn = null;
-                p.open(a, s, 0) catch |e| {
+        for (0..p.specs.len + 1) |k| {
+            if (k > 0 and by != no_deadline and nowNs(p.io) >= by) break;
+            if (p.gone(p.reap(s), by)) return error.Closed;
+            if (s.conn == null) {
+                p.open(a, s, 0, by) catch |e| {
                     last = e;
                     continue;
                 };
             }
-            return s.conn.?.hasCheckpoint(a, seq) catch |e| {
+            const c = s.conn.?;
+            c.first_byte_by = by;
+            defer if (s.conn == c) {
+                c.first_byte_by = no_deadline;
+            };
+            return c.hasCheckpoint(a, seq) catch |e| {
                 last = e;
                 std.log.warn("edge: core {d} checkpoint {d} probe: {s}; reconnecting", .{ s.idx, seq, @errorName(e) });
+                const going = c.peerShutdown();
+                if (going) p.shutdown_ns.store(nowNs(p.io), .monotonic);
                 p.drop(s);
+                if (p.gone(going, by)) return e;
                 continue;
             };
         }
