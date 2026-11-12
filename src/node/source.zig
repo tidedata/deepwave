@@ -87,7 +87,10 @@ pub const Scratch = struct {
 /// rebuilds to. Every consumer of an edge's blobs (the store, the rpc and ledger-history indexes,
 /// which read a blob's input objects when it has them) then sees the same bytes whichever source
 /// served the checkpoint.
-pub fn feedForm(gpa: std.mem.Allocator, sc: *Scratch, out: *std.ArrayList(u8)) !void {
+/// `keep_lists` (an edge that keeps read sets, `Source.edge_read_sets`): the aux record is cut
+/// down to its loaded runtime object lists instead (`convert.auxListsOnly`), the record a
+/// core's feed with read sets gives for the same checkpoint.
+pub fn feedForm(gpa: std.mem.Allocator, sc: *Scratch, out: *std.ArrayList(u8), keep_lists: bool) !void {
     if (sc.idx == null) {
         const i = try gpa.create(types.CheckpointIndex);
         errdefer gpa.destroy(i);
@@ -99,7 +102,12 @@ pub fn feedForm(gpa: std.mem.Allocator, sc: *Scratch, out: *std.ArrayList(u8)) !
     sc.tmp.clearRetainingCapacity();
     try edgewire.feed.feedForm(&sc.tmp, gpa, sc.arena.allocator(), out.items, idx);
     std.mem.swap(std.ArrayList(u8), out, &sc.tmp);
-    sc.aux.clearRetainingCapacity();
+    if (keep_lists and sc.aux.items.len > 0) {
+        convert.auxListsOnly(&sc.aux, gpa, sc.arena.allocator()) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.BadData,
+        };
+    } else sc.aux.clearRetainingCapacity();
 }
 
 /// The longest a sleeping fetch thread goes without looking at its stop flag.
@@ -199,7 +207,7 @@ pub const EdgeFallback = struct {
             const t0 = now(s.io);
             const since = if (first != 0) first else t0;
             var fail: edge.client.Fail = .{};
-            const r = p.fetchBlobBy(sc.arena.allocator(), seq, out, fb.sw.deadline(since), &fail) catch |e| switch (e) {
+            const r = s.poolFetch(p, sc, seq, out, fb.sw.deadline(since), &fail) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     // The node is stopping (the pool was stopped under the call): not a word
@@ -246,7 +254,7 @@ pub const EdgeFallback = struct {
     fn fromFallback(fb: *EdgeFallback, s: *const Source, sc: *Scratch, seq: u64, out: *std.ArrayList(u8)) anyerror!Source.Raw {
         const r = try fb.src.fetchRaw(sc, seq, out);
         if (r == .blob) {
-            try feedForm(s.gpa, sc, out);
+            try feedForm(s.gpa, sc, out, s.edge_read_sets);
             fb.sw.fetched(.fallback, seq);
         }
         return r;
@@ -257,14 +265,14 @@ pub const EdgeFallback = struct {
     pub fn fetchFromFallback(fb: *EdgeFallback, s: *const Source, sc: *Scratch, seq: u64, out: *std.ArrayList(u8)) anyerror!Result {
         switch (try fb.src.fetchRaw(sc, seq, out)) {
             .missing => return .missing,
-            .blob => try feedForm(s.gpa, sc, out),
+            .blob => try feedForm(s.gpa, sc, out, s.edge_read_sets),
             .zst => {
                 const proto = convert.unzstdArena(sc.arena.allocator(), sc.raw.items, max_blob) catch |e| switch (e) {
                     error.OutOfMemory => return e,
                     else => return error.BadData,
                 };
                 try decodeProto(s.gpa, sc, proto, seq, out);
-                try feedForm(s.gpa, sc, out);
+                try feedForm(s.gpa, sc, out, s.edge_read_sets);
             },
         }
         fb.sw.fetched(.fallback, seq);
@@ -328,6 +336,14 @@ pub const Source = struct {
     kind: Kind,
     /// A zui1 source's fallback (`--edge-fallback`); null: the cores are the only source.
     edge_fb: ?*EdgeFallback = null,
+    /// A zui1 source whose edge keeps read sets (`--edge-read-sets on`, docs/EDGE.md section
+    /// 12): cores that advertise them are asked for each checkpoint's loaded runtime object
+    /// lists, and the fallback's archive lists are kept, both as an aux record of lists only in
+    /// `Scratch.aux`. False: the aux record of every checkpoint of a zui1 source is empty.
+    edge_read_sets: bool = false,
+    /// With `edge_read_sets`: where a checkpoint goes that a core answered without its read
+    /// sets although they were asked for (reask.zig asks again). Null: nothing asks again.
+    reask: ?*@import("reask.zig").ReAsk = null,
 
     /// Fetches checkpoint `seq` as a blob into `out`.
     pub fn fetch(s: *const Source, sc: *Scratch, seq: u64, out: *std.ArrayList(u8)) !Result {
@@ -384,7 +400,7 @@ pub const Source = struct {
             .http => |h| if (try h.get(seq, &sc.raw) == .missing) return .missing,
             .zui1 => |p| {
                 if (s.edge_fb) |fb| return fb.fetchRaw(s, p, sc, seq, out);
-                const r = p.fetchBlob(sc.arena.allocator(), seq, out) catch |e| switch (e) {
+                const r = s.poolFetch(p, sc, seq, out, edge.client.Pool.no_deadline, null) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.BadData, error.TooLarge => return error.BadData,
                     else => return error.SourceUnavailable,
@@ -419,6 +435,24 @@ pub const Source = struct {
         if (s.edge_fb) |fb| for (results, 0..) |r, k| if (r == .ok) fb.sw.fetched(.core, first + k);
     }
 
+    /// Checkpoint `seq` from the core pool as a blob in `out`. With `edge_read_sets`, a core
+    /// that advertises read sets is asked for them, and the lists it holds for the checkpoint
+    /// become the aux record in `sc.aux` (`convert.auxOfLists`); `sc.aux` is empty when the core
+    /// was not asked or holds none.
+    pub fn poolFetch(s: *const Source, p: *edge.client.Pool, sc: *Scratch, seq: u64, out: *std.ArrayList(u8), by: u64, fail: ?*edge.client.Fail) edge.client.Error!edge.client.Result {
+        sc.aux.clearRetainingCapacity();
+        if (!s.edge_read_sets) return p.fetchBlobBy(sc.arena.allocator(), seq, out, by, fail);
+        var extra: edge.client.Extra = .{};
+        const r = try p.fetchBlobWith(sc.arena.allocator(), seq, out, by, fail, &extra);
+        if (r == .ok and extra.asked and extra.lists == null) if (s.reask) |q| q.note(seq);
+        if (r == .ok) if (extra.lists) |lists| convert.auxOfLists(&sc.aux, s.gpa, lists) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // (the client refuses a list that is not whole entries before it gets here)
+            else => return error.BadData,
+        };
+        return r;
+    }
+
     /// Step two of `fetch`: the zstd archive proto in `sc.raw` to a blob in `out` and its aux
     /// record in `sc.aux`.
     pub fn decode(s: *const Source, sc: *Scratch, seq: u64, out: *std.ArrayList(u8)) !void {
@@ -434,7 +468,7 @@ pub const Source = struct {
     /// follower the feed form of it (`feedForm`), as for a core's feed.
     fn edgeForm(s: *const Source, sc: *Scratch, seq: u64, out: *std.ArrayList(u8)) !void {
         if (s.kind != .zui1) return;
-        try feedForm(s.gpa, sc, out);
+        try feedForm(s.gpa, sc, out, s.edge_read_sets);
         if (s.edge_fb) |fb| fb.sw.fetched(.fallback, seq);
     }
 
@@ -861,9 +895,32 @@ pub const Fetcher = struct {
         /// Checkpoints written to the spool, and those whose write failed (bit `seq - first`).
         wrote: u32 = 0,
         failed: u64 = 0,
+        /// An edge that keeps read sets: the aux record of the checkpoint being put (the lists
+        /// its core sent with it, `convert.auxOfLists`).
+        aux: std.ArrayList(u8) = .empty,
 
         fn put(ctx: *anyopaque, seq: u64, bytes: []const u8) void {
             const s: *RunSink = @ptrCast(@alignCast(ctx));
+            s.write(seq, bytes, "");
+        }
+
+        /// `put` for a call that asked for read sets (`Source.edge_read_sets`): the lists the
+        /// core holds for the checkpoint are spooled with its blob, as the single path does
+        /// (`Source.poolFetch`). No lists (not asked of this core, or none held): no aux record.
+        fn putWith(ctx: *anyopaque, seq: u64, bytes: []const u8, extra: edge.client.Extra) void {
+            const s: *RunSink = @ptrCast(@alignCast(ctx));
+            s.aux.clearRetainingCapacity();
+            if (extra.asked and extra.lists == null) if (s.f.source.reask) |q| q.note(seq);
+            if (extra.lists) |lists| convert.auxOfLists(&s.aux, s.f.gpa, lists) catch |e| {
+                // not spooled: the single path fetches it again, lists and all
+                std.log.warn("spool {d}: read sets: {s}", .{ seq, @errorName(e) });
+                s.failed |= @as(u64, 1) << @intCast(seq - s.first);
+                return;
+            };
+            s.write(seq, bytes, s.aux.items);
+        }
+
+        fn write(s: *RunSink, seq: u64, bytes: []const u8, aux: []const u8) void {
             const f = s.f;
             f.noteSeen(seq, .bucket);
             // another writer holds it (or wrote it): nothing to do
@@ -873,7 +930,7 @@ pub const Fetcher = struct {
             }
             f.noteArrival(seq);
             // a pipelined call only ever asks the core pool
-            f.writeSpoolFrom(seq, bytes, "", true) catch |e| {
+            f.writeSpoolFrom(seq, bytes, aux, true) catch |e| {
                 f.unmarkDone(seq);
                 _ = f.stats.errors.fetchAdd(1, .monotonic);
                 std.log.warn("spool {d}: {s}", .{ seq, @errorName(e) });
@@ -895,12 +952,15 @@ pub const Fetcher = struct {
         const fl = f.inflight.?;
         var results: [InFlight.max_depth]edge.client.Pool.BatchItem = @splat(.failed);
         var sink: RunSink = .{ .f = f, .first = first };
+        defer sink.aux.deinit(f.gpa);
         const in_flight = fl.now.fetchAdd(n, .acq_rel) + n;
         var peak = fl.peak.load(.monotonic);
         while (in_flight > peak) peak = fl.peak.cmpxchgWeak(peak, in_flight, .monotonic, .monotonic) orelse break;
         const t0 = nowNs();
         var times: edge.client.Pool.CallTimes = .{};
-        const ok = if (f.source.fetchRun(sc, first, results[0..n], blob, .{ .ctx = &sink, .put = RunSink.put }, &times)) |_| true else |_| false;
+        // (an edge that keeps read sets asks for them here as in the single path: the same
+        // request for every checkpoint of the call, however many the in-flight control allows)
+        const ok = if (f.source.fetchRun(sc, first, results[0..n], blob, .{ .ctx = &sink, .put = RunSink.put, .put_with = if (f.source.edge_read_sets) RunSink.putWith else null }, &times)) |_| true else |_| false;
         _ = fl.now.fetchSub(n, .acq_rel);
         // a call the stop ended: nothing to count, nothing to ask again
         if (f.stopping.load(.acquire)) return;
@@ -1258,6 +1318,22 @@ pub const Fetcher = struct {
     /// asks before it commits `seq`.
     pub fn fromCore(f: *const Fetcher, seq: u64) bool {
         return f.core_origin[seq % f.core_origin.len].load(.acquire) == seq;
+    }
+
+    /// `writeSpoolFrom` for a checkpoint spooled again from another source after its first copy
+    /// failed verification: an aux record the first copy left is removed when this one has
+    /// none, so the read sets of the copy that was refused never go with this blob. The origin
+    /// is the new copy's (`from_core`), as for any spooled blob.
+    pub fn writeSpoolAgain(f: *Fetcher, seq: u64, bytes: []const u8, aux: []const u8, from_core: bool) !void {
+        if (aux.len == 0) {
+            var nb: [48]u8 = undefined;
+            const name = std.fmt.bufPrint(&nb, "{d}.aux", .{seq}) catch unreachable;
+            f.spool.deleteFile(f.io, name) catch |e| switch (e) {
+                error.FileNotFound => {},
+                else => return e,
+            };
+        }
+        return f.writeSpoolFrom(seq, bytes, aux, from_core);
     }
 
     /// `<seq>.aux` first, then `<seq>.chk` (each written to a temporary name and renamed), so a

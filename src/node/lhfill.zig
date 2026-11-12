@@ -39,8 +39,10 @@ const types = @import("types");
 const store = @import("store");
 const lhist = @import("history");
 const nowNs = @import("source.zig").nowNs;
+const fast_start = @import("fast_start.zig");
+const builtin = @import("builtin");
 
-pub const Error = error{ CheckpointNotStored, TransactionNotStored };
+pub const Error = error{ CheckpointNotStored, TransactionNotStored, Cancelled };
 
 const ObjKey = struct { id: [32]u8, version: u64 };
 
@@ -83,6 +85,13 @@ pub const Counters = struct {
 /// copied into `arena` (nothing points into the snapshot's mappings). Null when the store does
 /// not hold the checkpoint.
 pub fn load(arena: Allocator, snap: *const store.Snapshot, seq: u64, c: *Counters) !?types.CheckpointData {
+    return loadCancel(arena, snap, seq, c, null);
+}
+
+/// `load` that gives up with `error.Cancelled` between two transactions once `cancel` is set:
+/// a stop does not wait for the rest of a large checkpoint's reads (each transaction is a few
+/// reads of the store, cold ones on a store that was just opened).
+pub fn loadCancel(arena: Allocator, snap: *const store.Snapshot, seq: u64, c: *Counters, cancel: ?*const std.atomic.Value(bool)) !?types.CheckpointData {
     const rec = (try snap.checkpointChecked(seq)) orelse return null;
     const Summary = @FieldType(types.CheckpointData, "checkpoint_summary");
     const summary = try bcs.decode(Summary, arena, try arena.dupe(u8, rec.summary_cert));
@@ -94,6 +103,7 @@ pub fn load(arena: Allocator, snap: *const store.Snapshot, seq: u64, c: *Counter
     const txs = try arena.alloc(types.CheckpointTransaction, n);
     const Tx = @FieldType(types.CheckpointTransaction, "transaction");
     for (txs, 0..) |*t, i| {
+        if (cancel) |x| if (x.load(.acquire)) return error.Cancelled;
         const dg: *const [32]u8 = switch (contents) {
             .V1 => |v| &v.transactions[i].transaction.@"0".@"0",
             .V2 => |v| &v.transactions[i].digest.transaction.@"0".@"0",
@@ -144,6 +154,9 @@ pub const Backfill = struct {
     from: u64,
     to: u64,
     out: *lhist.Index,
+    /// The node's live index (null: none, or tests): the build takes the checkpoints it
+    /// already holds from it (`lhist.Index.copyRows`) and reads the store only for the rest.
+    live: ?*lhist.Index = null,
     workers: usize,
     /// Staging persistence on (`out` has a directory).
     staged: bool = false,
@@ -154,6 +167,37 @@ pub const Backfill = struct {
     save_every_ns: u64 = 300 * std.time.ns_per_s,
     status_: std.atomic.Value(Status) = .init(.running),
     cancel: std.atomic.Value(bool) = .init(false),
+    /// A loader found its checkpoint below the store's floor (retention moved it meanwhile):
+    /// the round ends and the build goes on from the new floor (`moveUp`).
+    floor_hit: std.atomic.Value(bool) = .init(false),
+    /// Times the floor passed the build, and the checkpoints already built below it that were
+    /// dropped for it.
+    floor_moves: u32 = 0,
+    dropped: u64 = 0,
+    revouch: bool = false,
+    /// Checkpoints taken from the live index instead of the store.
+    copied: std.atomic.Value(u64) = .init(0),
+    /// The last checkpoint the store is read for before the live index takes over (the first
+    /// pass; `from - 1` when the live index covers `from`).
+    store_to: std.atomic.Value(u64) = .init(0),
+    /// Bytes the ring may hold: checkpoints loaded (decoded, with every object their
+    /// transactions changed) and not yet indexed. A loader waits while the ring holds this
+    /// much, unless its checkpoint is the next one to index (`Options.mem_bytes`).
+    budget: u64 = default_budget,
+    /// Bytes the ring holds or has reserved now, the most it ever held, and the same in slots.
+    inflight: std.atomic.Value(u64) = .init(0),
+    peak_bytes: std.atomic.Value(u64) = .init(0),
+    held: std.atomic.Value(u32) = .init(0),
+    peak_slots: std.atomic.Value(u32) = .init(0),
+    /// The largest single checkpoint loaded (bytes of its arena).
+    largest: std.atomic.Value(u64) = .init(0),
+    /// Unix ms of the timestamp of the node's newest committed checkpoint (0: none yet), the
+    /// node's own. The build waits while the node is behind the tip by it (`behindTip`).
+    tip_ms: ?*const std.atomic.Value(u64) = null,
+    paused: std.atomic.Value(bool) = .init(false),
+    /// Times the build stopped to wait for the node, and how long in all (ms).
+    pauses: std.atomic.Value(u32) = .init(0),
+    paused_ms: std.atomic.Value(u64) = .init(0),
     /// Tests: stop the build right after the `n`th save (a crash at the watermark).
     stop_after_saves: ?u32 = null,
     failure: ?anyerror = null,
@@ -177,12 +221,25 @@ pub const Backfill = struct {
         state: std.atomic.Value(u64) = .init(0),
         arena: std.heap.ArenaAllocator,
         data: types.CheckpointData = undefined,
+        /// What this slot counts for in `inflight` while it is loaded.
+        bytes: u64 = 0,
     };
     pub const default_ring = 64;
+    /// 256 MiB. Until the ring had a budget it held up to `ring` checkpoints whatever their
+    /// size, and every slot kept the memory of the largest checkpoint it had ever held: a
+    /// stretch of large checkpoints took a live 8 GB edge from 3 GiB to 6.3 GiB of anonymous
+    /// memory and all of its swap, and the node off the tip for an hour.
+    pub const default_budget: u64 = 256 << 20;
+    /// What a loader reserves before it knows its checkpoint's size.
+    const reserve: u64 = 1 << 20;
+    /// What an idle slot keeps of its arena.
+    const slot_retain: usize = 256 << 10;
     /// Ready once the build is this close to the store's committed tip (the commit path indexes
     /// the rest at the swap: about 1 ms each). While the store moves faster than the serial tail,
     /// parallel rounds close the gap instead.
     const near_tip = 64;
+    /// Checkpoints copied from the live index between two looks at the node and the clock.
+    const copy_step: u64 = 1024;
 
     pub const Options = struct {
         workers: usize = 4,
@@ -193,6 +250,13 @@ pub const Backfill = struct {
         stop_after_saves: ?u32 = null,
         /// Ring slots (tests use a small one to make slot reuse frequent).
         ring: usize = default_ring,
+        /// The live index, for the checkpoints it already holds.
+        live: ?*lhist.Index = null,
+        /// The ring's memory budget (`Backfill.budget`).
+        mem_bytes: u64 = default_budget,
+        /// The node's newest committed checkpoint's timestamp (`Backfill.tip_ms`); null: the
+        /// build never waits for the node (tests, tools).
+        tip_ms: ?*const std.atomic.Value(u64) = null,
     };
 
     /// Starts building checkpoints `from..=to` (then following the store's tip) on a thread.
@@ -218,7 +282,12 @@ pub const Backfill = struct {
             for (slots) |*s| s.arena.deinit();
             gpa.free(slots);
         }
-        b.* = .{ .gpa = gpa, .io = io, .st = st, .lo = from, .from = begin, .to = to, .out = out, .workers = @max(1, o.workers), .slots = slots, .staged = o.staging != null, .resumed_at = resumed, .save_every_ns = o.save_every_ns, .stop_after_saves = o.stop_after_saves };
+        b.* = .{ .gpa = gpa, .io = io, .st = st, .lo = from, .from = begin, .to = to, .out = out, .live = o.live, .budget = @max(o.mem_bytes, 1), .tip_ms = o.tip_ms, .workers = @max(1, o.workers), .slots = slots, .staged = o.staging != null, .resumed_at = resumed, .save_every_ns = o.save_every_ns, .stop_after_saves = o.stop_after_saves };
+        // Its low end is the store's lowest checkpoint (the caller's `from`, or an earlier
+        // one for a resumed staging index): a floor the node can read back after an unclean
+        // stop (`floorWitness`).
+        out.vouchLow();
+        b.store_to.store(b.storeEnd(begin, to), .monotonic);
         b.next.store(begin, .monotonic);
         b.started_ns = nowNs();
         b.last_save_ns = b.started_ns;
@@ -261,16 +330,156 @@ pub const Backfill = struct {
         b.status_.store(.failed, .release);
     }
 
+    /// The round in progress ends: a stop, a failure, or the floor passed a loader.
     fn stopped(b: *const Backfill) bool {
-        return b.cancel.load(.acquire) or b.status() == .failed;
+        return b.cancel.load(.acquire) or b.status() == .failed or b.floor_hit.load(.acquire);
+    }
+
+    /// Tells the build to stop without waiting for it (`destroy` joins it). The loaders see it
+    /// between two transactions of the checkpoint they are loading.
+    pub fn requestStop(b: *Backfill) void {
+        b.cancel.store(true, .release);
+    }
+
+    /// The store's lowest checkpoint is above `seq` now.
+    fn floorAbove(b: *Backfill, seq: u64) bool {
+        var snap = b.st.snapshot();
+        defer snap.release();
+        const low = snap.lowestAvailable() orelse return false;
+        return low > seq;
+    }
+
+    /// A loader could not load `seq`. Pruned underneath it (the checkpoint or one of its
+    /// transactions is below the store's floor now) is not a failure: the build's start moves
+    /// up. Anything else is.
+    fn loadFailed(b: *Backfill, seq: u64, e: anyerror) void {
+        if (e == error.Cancelled) return;
+        if ((e == error.CheckpointNotStored or e == error.TransactionNotStored) and b.floorAbove(seq)) {
+            b.floor_hit.store(true, .release);
+            return;
+        }
+        b.fail(e);
+    }
+
+    /// After a round the floor ended: the checkpoint to go on from, the store's lowest. What
+    /// was built below it cannot join it (the checkpoints between are gone), so the output
+    /// starts again there (`lhist.Index` restarts at a hole); it was all below the floor, where
+    /// the node would have pruned it after the swap anyway.
+    fn moveUp(b: *Backfill) !u64 {
+        var snap = b.st.snapshot();
+        defer snap.release();
+        const low = snap.lowestAvailable() orelse return error.CheckpointNotStored;
+        b.floor_hit.store(false, .release);
+        const was = b.out.indexedLo();
+        if (b.out.indexedHi()) |hi| {
+            // (the floor passed a checkpoint that was not loaded yet, so it is above the output)
+            if (hi + 1 >= low) return hi + 1;
+            b.dropped += hi + 1 - was.?;
+        }
+        b.floor_moves += 1;
+        b.lo = low;
+        b.revouch = true;
+        if (!@import("builtin").is_test) std.log.info("history: backfill: the store's lowest checkpoint moved up to {d} under the build (retention); going on from there, {d} checkpoints built below it are dropped", .{ low, b.dropped });
+        return low;
+    }
+
+    /// The last checkpoint of `from..=to` the store must be read for: up to the live index's
+    /// low end when that lies in the range (the rest is copied from it), else `to`.
+    fn storeEnd(b: *Backfill, from: u64, to: u64) u64 {
+        const lv = b.live orelse return to;
+        const lo = lv.indexedLo() orelse return to;
+        const hi = lv.indexedHi() orelse return to;
+        if (hi < from) return to;
+        return if (lo > from) @min(to, lo - 1) else from -| 1;
     }
 
     fn pause(b: *const Backfill) void {
         b.io.sleep(.fromMicroseconds(50), .awake) catch {};
     }
 
+    /// Background work: the lowest CPU priority, and on Linux the idle I/O class (honoured by
+    /// the BFQ and CFQ schedulers; the budget and `yieldToNode` are what bound it elsewhere).
+    fn lowPriority() void {
+        if (builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            // PRIO_PROCESS with id 0 is the calling thread on Linux (nice is per thread)
+            _ = linux.syscall3(.setpriority, 0, 0, 19);
+            // IOPRIO_WHO_PROCESS = 1, this thread; class IDLE = 3, in the top 3 bits of 16
+            _ = linux.syscall3(.ioprio_set, 1, 0, 3 << 13);
+        }
+    }
+
+    /// The node is behind the tip: its newest committed checkpoint is older than
+    /// `fast_start.catchup_lag_ms` (10 s), or was and is not back within `tip_lag_ms` (3 s),
+    /// or it has committed none yet (a start: the follower catches up first). Read off the
+    /// wall clock, not off commits: a node the build itself has starved commits nothing.
+    fn behindTip(b: *Backfill) bool {
+        const p = b.tip_ms orelse return false;
+        const ts = p.load(.monotonic);
+        const was = b.paused.load(.monotonic);
+        const now_ms: u64 = @intCast(@max(0, @divTrunc(std.Io.Clock.real.now(b.io).toNanoseconds(), std.time.ns_per_ms)));
+        const is = ts == 0 or fast_start.behind(was, now_ms -| ts);
+        if (is != was) b.paused.store(is, .monotonic);
+        return is;
+    }
+
+    /// Waits for as long as the node is behind the tip (or until the build is told to stop).
+    /// The follower's reads and writes come first: this is what keeps a slow disk's backfill
+    /// from taking the node off the tip.
+    fn yieldToNode(b: *Backfill) void {
+        if (!b.behindTip()) return;
+        _ = b.pauses.fetchAdd(1, .monotonic);
+        const t0 = nowNs();
+        while (!b.cancel.load(.acquire) and b.status() != .failed and b.behindTip()) b.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        _ = b.paused_ms.fetchAdd((nowNs() - t0) / std.time.ns_per_ms, .monotonic);
+    }
+
+    fn noteMax(a: *std.atomic.Value(u64), v: u64) void {
+        _ = a.fetchMax(v, .monotonic);
+    }
+
+    /// Takes room in the ring for checkpoint `seq` (`reserve` bytes, until its size is known).
+    /// Waits while the ring is at its budget, unless nothing is held or `seq` is the next
+    /// checkpoint to index (the consumer waits for it: it must load whatever the ring holds).
+    /// False: the round ended.
+    fn admit(b: *Backfill, seq: u64) bool {
+        while (true) {
+            if (b.stopped()) return false;
+            const cur = b.inflight.load(.acquire);
+            if (cur == 0 or cur + reserve <= b.budget or seq == b.consumed.load(.acquire)) {
+                if (b.inflight.cmpxchgWeak(cur, cur + reserve, .acq_rel, .acquire) != null) continue;
+                noteMax(&b.peak_bytes, cur + reserve);
+                _ = b.peak_slots.fetchMax(b.held.fetchAdd(1, .acq_rel) + 1, .monotonic);
+                return true;
+            }
+            b.pause();
+        }
+    }
+
+    /// Gives back what `admit` and the load took for a slot.
+    fn release(b: *Backfill, bytes: u64) void {
+        _ = b.inflight.fetchSub(bytes, .acq_rel);
+        _ = b.held.fetchSub(1, .acq_rel);
+    }
+
+    /// What the ring's slots keep allocated now (call with the build at rest: tests).
+    pub fn ringBytes(b: *Backfill) u64 {
+        var n: u64 = 0;
+        for (b.slots) |*s| n += s.arena.queryCapacity();
+        return n;
+    }
+
+    pub const slot_retain_bytes = slot_retain;
+
+    /// Heap the build holds: the ring, and the open segment of the index it builds.
+    pub fn memoryBytes(b: *Backfill) u64 {
+        return b.inflight.load(.monotonic) + b.out.memoryBytes();
+    }
+
     fn worker(b: *Backfill) void {
+        lowPriority();
         while (!b.stopped()) {
+            b.yieldToNode();
             const seq = b.next.fetchAdd(1, .monotonic);
             if (seq > b.to) return;
             const slot = &b.slots[@intCast((seq - b.from) % b.slots.len)];
@@ -278,19 +487,32 @@ pub const Backfill = struct {
                 if (b.stopped()) return;
                 b.pause();
             }
+            if (!b.admit(seq)) return;
             std.debug.assert(slot.state.load(.acquire) == 0);
-            _ = slot.arena.reset(.retain_capacity);
+            _ = slot.arena.reset(.{ .retain_with_limit = slot_retain });
             var snap = b.st.snapshot();
             defer snap.release();
-            const cp = load(slot.arena.allocator(), &snap, seq, &b.counters) catch |e| return b.fail(e);
-            slot.data = cp orelse return b.fail(error.CheckpointNotStored);
+            const cp = loadCancel(slot.arena.allocator(), &snap, seq, &b.counters, &b.cancel) catch |e| {
+                b.release(reserve);
+                return b.loadFailed(seq, e);
+            };
+            slot.data = cp orelse {
+                b.release(reserve);
+                return b.loadFailed(seq, error.CheckpointNotStored);
+            };
+            // the reservation becomes the checkpoint's real size
+            const used: u64 = slot.arena.queryCapacity();
+            slot.bytes = @max(used, reserve);
+            if (used > reserve) noteMax(&b.peak_bytes, b.inflight.fetchAdd(used - reserve, .acq_rel) + (used - reserve));
+            noteMax(&b.largest, used);
             slot.state.store(seq + 1, .release);
         }
     }
 
     fn main(b: *Backfill) void {
+        lowPriority();
         b.build() catch |e| return b.fail(e);
-        if (b.stopped()) return;
+        if (b.cancel.load(.acquire) or b.status() == .failed) return;
         b.build_ns = nowNs() - b.started_ns;
         b.status_.store(.ready, .release);
     }
@@ -298,6 +520,7 @@ pub const Backfill = struct {
     /// Saves the staging state (the durable watermark); a failed save only costs progress.
     fn save(b: *Backfill) void {
         if (!b.staged) return;
+        b.out.vouchLow();
         b.out.saveStaging() catch |e| {
             std.log.warn("history: backfill staging save: {s} (the build goes on; a restart resumes from the previous save)", .{@errorName(e)});
             return;
@@ -316,7 +539,14 @@ pub const Backfill = struct {
         b.to = to;
         b.next.store(from, .monotonic);
         b.consumed.store(from, .release);
-        for (b.slots) |*s| s.state.store(0, .release);
+        // (a round that ended early may have left loaded slots: the loaders are joined)
+        for (b.slots) |*s| {
+            s.state.store(0, .release);
+            s.bytes = 0;
+            _ = s.arena.reset(.{ .retain_with_limit = slot_retain });
+        }
+        b.inflight.store(0, .release);
+        b.held.store(0, .release);
         var threads: std.ArrayList(std.Thread) = .empty;
         defer threads.deinit(b.gpa);
         defer for (threads.items) |t| t.join();
@@ -341,8 +571,18 @@ pub const Backfill = struct {
                 b.fail(e);
                 return e;
             };
+            if (b.revouch) {
+                // the output started again at the store's lowest checkpoint (`moveUp`)
+                b.out.vouchLow();
+                b.revouch = false;
+            }
             _ = b.counters.checkpoints.fetchAdd(1, .monotonic);
             _ = b.counters.txs.fetchAdd(slot.data.transactions.len, .monotonic);
+            // indexed: its memory goes back now, not when a loader next comes to the slot
+            const held_bytes = slot.bytes;
+            slot.bytes = 0;
+            _ = slot.arena.reset(.{ .retain_with_limit = slot_retain });
+            b.release(held_bytes);
             slot.state.store(0, .release);
             b.consumed.store(seq + 1, .release);
             if (b.staged and nowNs() -| b.last_save_ns >= b.save_every_ns) {
@@ -352,16 +592,57 @@ pub const Backfill = struct {
         }
     }
 
+    /// The whole build. From the store: what no index holds (with a live index that covers the
+    /// upper part of the window, only the checkpoints below its low end). From the live index:
+    /// everything it holds from there on, read a segment at a time from its own files. Then
+    /// parallel rounds from the store up to its moving tip until close to it; the commit path
+    /// takes the last few at the swap.
     fn build(b: *Backfill) !void {
-        try b.round(b.from, b.to);
-        if (b.stopped()) return;
-        // Parallel rounds up to the store's moving tip until close to it; the commit path takes
-        // the last few at the swap.
-        while (!b.stopped()) {
+        var next = b.from;
+        var first = true;
+        while (true) {
+            if (b.cancel.load(.acquire) or b.status() == .failed) return;
+            // In steps, so the copy too waits for a node that is behind and saves on time.
+            if (b.live) |lv| while (true) {
+                b.yieldToNode();
+                if (b.cancel.load(.acquire)) return;
+                const got = try b.out.copyRows(lv, next, next +| (copy_step - 1), &b.cancel);
+                _ = b.copied.fetchAdd(got - next, .monotonic);
+                if (got != next and b.revouch) {
+                    b.out.vouchLow();
+                    b.revouch = false;
+                }
+                const done = got < next +| copy_step;
+                next = got;
+                if (b.cancel.load(.acquire)) return;
+                if (b.staged and nowNs() -| b.last_save_ns >= b.save_every_ns) {
+                    b.save();
+                    if (b.cancel.load(.acquire)) return;
+                }
+                if (done) break;
+            };
             const tip = b.st.committed() orelse break;
-            const hi = b.out.indexedHi() orelse b.lo -| 1;
-            if (tip <= hi + near_tip) break;
-            try b.round(hi + 1, tip);
+            // The first pass covers the range asked for, however short; after it the build
+            // is ready once it is close to the tip.
+            const target = if (first) b.to else tip;
+            if (!first and tip < next + near_tip) break;
+            const hi = b.storeEnd(next, target);
+            first = false;
+            if (hi < next) {
+                // the live index holds `next` after all (it grew, or the copy was cut short)
+                if (target < next) break;
+                continue;
+            }
+            b.store_to.store(hi, .monotonic);
+            try b.round(next, hi);
+            if (b.floor_hit.load(.acquire)) {
+                next = try b.moveUp();
+                first = true;
+                if (next > b.to) b.to = next;
+                continue;
+            }
+            if (b.cancel.load(.acquire) or b.status() == .failed) return;
+            next = hi + 1;
         }
         if (!b.stopped()) b.save();
     }
@@ -376,13 +657,24 @@ pub const Backfill = struct {
         defer arena.deinit();
         var s = (b.out.indexedHi() orelse b.lo -| 1) + 1;
         while (s <= upto) : (s += 1) try addFromStore(b.out, b.st, s, &arena, &b.counters);
+        b.out.vouchLow();
         b.out.detachDir();
         return b.out;
     }
 
+    /// `destroy` for a build nobody needs any more (the index covers the store without it):
+    /// nothing is saved.
+    pub fn discard(b: *Backfill) void {
+        b.requestStop();
+        if (b.thread) |t| t.join();
+        b.thread = null;
+        b.staged = false;
+        b.destroy();
+    }
+
     /// Stops the build (if running) and frees everything.
     pub fn destroy(b: *Backfill) void {
-        b.cancel.store(true, .release);
+        b.requestStop();
         if (b.thread) |t| t.join();
         b.thread = null;
         // An interrupted build (shutdown) keeps its progress for the next start.
@@ -393,3 +685,173 @@ pub const Backfill = struct {
         b.gpa.destroy(b);
     }
 };
+
+/// The checkpoint floor the node had given its store before it stopped, as the ledger-history
+/// index kept it. The store makes its floors durable with its next meta write only (a live-table
+/// flush or an age-out, store.zig `setFloors`): after an unclean stop its floor, and with it its
+/// lowest checkpoint, comes back lower, over checkpoints retention had already passed. The index
+/// is pruned to the store's lowest checkpoint at every retention tick and that prune is durable
+/// when it returns; a backfill's staging index begins at the store's lowest checkpoint. Either
+/// low end is therefore a floor the store had reached (`lhist.Index.lowIsFloor`, `peekFloor`).
+/// Null: nothing vouches for a floor (an index that only began where it begins, or none).
+pub fn floorWitness(io: std.Io, live: *lhist.Index, staging: ?[]const u8) ?u64 {
+    var w: ?u64 = if (live.lowIsFloor()) live.indexedLo() else null;
+    if (staging) |d| if (lhist.Index.peekFloor(io, d)) |s| {
+        w = @max(w orelse 0, s);
+    };
+    return w;
+}
+
+/// Gives the store the checkpoint floor `floorWitness` holds when the store's lowest checkpoint
+/// `lowest` is below it (and the witness is a checkpoint the store has: not above `tip`).
+/// Before the follower runs (`setFloors` is the writer's). Returns the floor restored, null
+/// when there was nothing to restore. Only the checkpoint floor: the object floor has no
+/// witness and retention raises it again by itself.
+pub fn restoreFloor(st: *store.Store, io: std.Io, live: *lhist.Index, staging: ?[]const u8, lowest: u64, tip: u64) !?u64 {
+    const w = floorWitness(io, live, staging) orelse return null;
+    if (w <= lowest or w > tip) return null;
+    _ = try st.setFloors(.{ .cp_pruned = w - 1 });
+    return w;
+}
+
+/// What the ledger-history index lacks of the store's window `lowest..=tip`.
+pub const Gap = struct {
+    /// Checkpoints the store serves and the index does not hold: `from..=to` (none: `to < from`).
+    from: u64,
+    to: u64,
+
+    pub fn count(g: Gap) u64 {
+        return if (g.to < g.from) 0 else g.to - g.from + 1;
+    }
+};
+
+/// The index's gap below its low end (an empty index: the whole window). The index never ends
+/// below the store's tip (its record is durable before the store commits the checkpoint).
+pub fn gapOf(live: *lhist.Index, lowest: u64, tip: u64) Gap {
+    const lo = live.indexedLo() orelse return .{ .from = lowest, .to = tip };
+    return .{ .from = lowest, .to = @min(tip, lo -| 1) };
+}
+
+/// The operator's switch (`--no-history-backfill`, ZUI_LH_BACKFILL=0): false means no backfill
+/// is ever started. The index then serves what it holds; the node says what is not indexed.
+pub fn enabled(flag: bool, env: ?[]const u8) bool {
+    if (!flag) return false;
+    const v = env orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false"));
+}
+
+/// What a backfill's staging directory holds on disk.
+pub const StagingUse = struct { bytes: u64 = 0, files: u64 = 0 };
+
+/// Bytes and files under the staging directory `dir` (`CURRENT`, `g<gen>/`). Zero when there is
+/// none. Reads directory entries and file sizes only.
+pub fn stagingUse(io: std.Io, dir: []const u8) StagingUse {
+    var u: StagingUse = .{};
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return u;
+    defer d.close(io);
+    useOf(io, d, &u, 0);
+    return u;
+}
+
+fn useOf(io: std.Io, d: std.Io.Dir, u: *StagingUse, depth: u8) void {
+    var it = d.iterate();
+    while (it.next(io) catch return) |e| switch (e.kind) {
+        .directory => if (depth < 2) {
+            var sub = d.openDir(io, e.name, .{ .iterate = true }) catch continue;
+            defer sub.close(io);
+            useOf(io, sub, u, depth + 1);
+        },
+        else => {
+            const st = d.statFile(io, e.name, .{ .follow_symlinks = false }) catch continue;
+            u.bytes += st.size;
+            u.files += 1;
+        },
+    };
+}
+
+pub const Removed = struct {
+    bytes: u64 = 0,
+    files: u64 = 0,
+    /// The directory is gone (or was never there). False: `stop` ended the removal, or `err`.
+    done: bool = false,
+    err: ?anyerror = null,
+};
+
+/// Removes the staging directory `dir`: the state of a build nobody will resume (the index
+/// covers the store without it, the backfill is switched off or gave up, or it was adopted).
+/// A build that was killed or abandoned leaves up to a whole window of index files there
+/// (10 GiB were found beside an 11 GiB index). `CURRENT` goes first, so a removal that does
+/// not finish leaves a directory the index opens as empty and clears (`lhist.Index` drops
+/// generations `CURRENT` does not name) and that is no floor witness. `stop` is looked at
+/// before every file.
+pub fn removeStaging(io: std.Io, dir: []const u8, stop: ?*const std.atomic.Value(bool)) Removed {
+    var r: Removed = .{};
+    if (stop) |x| if (x.load(.acquire)) return r;
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch |e| {
+        if (e == error.FileNotFound) r.done = true else r.err = e;
+        return r;
+    };
+    if (d.statFile(io, "CURRENT", .{ .follow_symlinks = false })) |st| {
+        d.deleteFile(io, "CURRENT") catch |e| {
+            d.close(io);
+            r.err = e;
+            return r;
+        };
+        r.bytes += st.size;
+        r.files += 1;
+    } else |_| {}
+    const emptied = removeIn(io, d, &r, stop, 0);
+    d.close(io);
+    if (!emptied) return r;
+    std.Io.Dir.cwd().deleteDir(io, dir) catch |e| {
+        r.err = e;
+        return r;
+    };
+    r.done = true;
+    return r;
+}
+
+/// True once `d` is empty.
+fn removeIn(io: std.Io, d: std.Io.Dir, r: *Removed, stop: ?*const std.atomic.Value(bool), depth: u8) bool {
+    // A pass deletes what it reads; a second pass sees what a first one may have skipped.
+    var pass: u8 = 0;
+    while (pass < 8) : (pass += 1) {
+        var seen: u64 = 0;
+        var it = d.iterate();
+        while (it.next(io) catch |e| {
+            r.err = e;
+            return false;
+        }) |e| {
+            if (stop) |x| if (x.load(.acquire)) return false;
+            seen += 1;
+            if (e.kind == .directory) {
+                if (depth >= 2) {
+                    r.err = error.Unexpected;
+                    return false;
+                }
+                var sub = d.openDir(io, e.name, .{ .iterate = true }) catch |err| {
+                    r.err = err;
+                    return false;
+                };
+                const ok = removeIn(io, sub, r, stop, depth + 1);
+                sub.close(io);
+                if (!ok) return false;
+                d.deleteDir(io, e.name) catch |err| {
+                    r.err = err;
+                    return false;
+                };
+            } else {
+                const size: u64 = if (d.statFile(io, e.name, .{ .follow_symlinks = false })) |st| st.size else |_| 0;
+                d.deleteFile(io, e.name) catch |err| {
+                    r.err = err;
+                    return false;
+                };
+                r.bytes += size;
+                r.files += 1;
+            }
+        }
+        if (seen == 0) return true;
+    }
+    r.err = error.Unexpected;
+    return false;
+}

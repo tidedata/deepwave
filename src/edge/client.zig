@@ -38,6 +38,8 @@ pub const Error = error{
 } || Allocator.Error;
 
 pub const feature_edge_feed: u64 = 1 << 32;
+/// The core sends read sets with its feed when asked (request flag READ_SETS; docs/EDGE.md 12).
+pub const feature_feed_read_sets: u64 = 1 << 33;
 /// One response (a checkpoint feed, or a dictionary) never needs more; a core cannot make an edge
 /// buffer more than this per request.
 const response_max: usize = 96 << 20;
@@ -201,8 +203,7 @@ pub const Conn = struct {
         var wait: u64 = @as(u64, @intCast(wait_ms)) * std.time.ns_per_ms;
         if (cl.c.nextTimeout()) |t| wait = @min(wait, t -| now);
         const block = wait >= std.time.ns_per_ms;
-        if (block) cl.us.setWait(wait);
-        var n = cl.rx.recv(&cl.us, block);
+        var n = cl.rx.recvWait(&cl.us, if (block) wait else 0);
         while (n > 0) {
             now = nowNs(cl.io);
             for (0..n) |i| {
@@ -395,10 +396,16 @@ pub const Conn = struct {
     /// The feed of `seq`: null when the server does not hold it yet. Frames are decoded with
     /// `dicts` (a dictionary the server named in hello).
     pub fn getFeed(cl: *Conn, a: Allocator, seq: u64, want: ?*const dict.Dictionary, zstd_ok: bool) Error!?[]u8 {
+        return cl.getFeedFlags(a, seq, want, zstd_ok, 0);
+    }
+
+    /// `getFeed` with more request flags (`proto.flag_read_sets`: only to a server whose hello
+    /// has `feature_feed_read_sets`; any other answers BAD_REQUEST to it).
+    pub fn getFeedFlags(cl: *Conn, a: Allocator, seq: u64, want: ?*const dict.Dictionary, zstd_ok: bool, more_flags: u64) Error!?[]u8 {
         var b: [12]u8 = undefined;
         std.mem.writeInt(u64, b[0..8], seq, .little);
         std.mem.writeInt(u32, b[8..12], if (want) |d| d.id else 0, .little);
-        const resp = try cl.request(a, .get_checkpoint_feed, if (zstd_ok) proto.flag_zstd_ok else 0, &b);
+        const resp = try cl.request(a, .get_checkpoint_feed, (if (zstd_ok) proto.flag_zstd_ok else 0) | more_flags, &b);
         const r = proto.parseResponse(resp) orelse return error.BadResponse;
         if (r.status == @intFromEnum(proto.Code.pruned)) return error.Pruned;
         if (r.status != 0) return error.Server;
@@ -427,13 +434,84 @@ pub const Fail = struct {
     progress_ns: u64 = 0,
 };
 
+/// What a core sent with a checkpoint beyond its blob (`Pool.fetchBlobWith`).
+pub const Extra = struct {
+    /// The core was asked for the checkpoint's read sets (it advertises them and the pool wants
+    /// them). False: it was not, and `lists` is null.
+    asked: bool = false,
+    /// One loaded runtime object list per transaction (edgewire feed.zig `ReadSets`, each in
+    /// sui-node's form); null: not asked, or the core holds none for this checkpoint. The slices
+    /// and the lists live in the allocator given to the fetch.
+    lists: ?[]const []const u8 = null,
+};
+
+/// Re-asks of one checkpoint's read sets at most (node reask.zig `schedule_ms`).
+pub const read_sets_attempts = 5;
+
+/// Why the re-ask gave a checkpoint up (it stays forwarded): `zui_edge_read_sets_gave_up{reason}`.
+pub const ReadSetsGaveUp = enum(u8) {
+    /// The core that served the feed answered `present` 0 at every attempt.
+    unsettled,
+    /// As `unsettled`, but the last "none" came from another core than the one that served the
+    /// feed (its own connections were busy or gone): that core may not hold the mark yet.
+    other_core,
+    /// Never asked: more than the window under the cores' highest when the feed came.
+    window,
+    /// No free pool connection until the attempts' time was over.
+    no_conn,
+    /// Lists came, but did not become a mark: they failed a check against the stored
+    /// checkpoint (`History.planLate`: mismatch, rejected, incomplete, gone), or the late write
+    /// dropped them (`zui_readset_late_dropped`).
+    dropped,
+    /// The calls failed until the attempts' time was over, the checkpoint was not committed
+    /// here in that time, the list was full, or planning the lists failed.
+    @"error",
+
+    pub const count = @typeInfo(ReadSetsGaveUp).@"enum".field_names.len;
+};
+
 pub const Stats = struct {
+    /// Feeds asked for with read sets, and those that came with them.
+    read_sets_asked: Atomic(u64) = .init(0),
+    read_sets_held: Atomic(u64) = .init(0),
+    /// The re-ask of a checkpoint that came without its read sets (`fetchReadSets`, node
+    /// reask.zig): requests sent. The checkpoints it settled (by the attempt whose lists were
+    /// written with the mark) and those it gave up (by why) are `read_sets_settled` and
+    /// `read_sets_gave_up`, rendered with labels (`renderReadSets`).
+    read_sets_reasked: Atomic(u64) = .init(0),
+    read_sets_settled: [read_sets_attempts]Atomic(u64) = @splat(.init(0)),
+    read_sets_gave_up: [ReadSetsGaveUp.count]Atomic(u64) = @splat(.init(0)),
     requests: Atomic(u64) = .init(0),
     failovers: Atomic(u64) = .init(0),
     wire_bytes: Atomic(u64) = .init(0),
     raw_bytes: Atomic(u64) = .init(0),
     blob_bytes: Atomic(u64) = .init(0),
     errors: Atomic(u64) = .init(0),
+
+    /// The labelled re-ask counters: `zui_edge_read_sets_settled{attempt="1".."5"}` and
+    /// `zui_edge_read_sets_gave_up{reason}`. (Every other field is a plain counter.)
+    pub fn renderReadSets(st: *const Stats, w: *Io.Writer) Io.Writer.Error!void {
+        try w.writeAll("# TYPE zui_edge_read_sets_settled counter\n");
+        for (&st.read_sets_settled, 1..) |*c, k| try w.print("zui_edge_read_sets_settled{{attempt=\"{d}\"}} {d}\n", .{ k, c.load(.monotonic) });
+        try w.writeAll("# TYPE zui_edge_read_sets_gave_up counter\n");
+        for (&st.read_sets_gave_up, 0..) |*c, k| try w.print("zui_edge_read_sets_gave_up{{reason=\"{s}\"}} {d}\n", .{ @tagName(@as(ReadSetsGaveUp, @enumFromInt(k))), c.load(.monotonic) });
+    }
+
+    pub fn gaveUp(st: *Stats, why: ReadSetsGaveUp) void {
+        _ = st.read_sets_gave_up[@intFromEnum(why)].fetchAdd(1, .monotonic);
+    }
+
+    pub fn gaveUpTotal(st: *const Stats) u64 {
+        var n: u64 = 0;
+        for (&st.read_sets_gave_up) |*c| n += c.load(.monotonic);
+        return n;
+    }
+
+    pub fn settledTotal(st: *const Stats) u64 {
+        var n: u64 = 0;
+        for (&st.read_sets_settled) |*c| n += c.load(.monotonic);
+        return n;
+    }
 };
 
 /// The cores an edge follows and a few connections to them. Thread safe: every fetching thread
@@ -465,6 +543,9 @@ pub const Pool = struct {
     dicts_mu: std.atomic.Mutex = .unlocked,
     dicts: std.ArrayList(*dict.Dictionary) = .empty,
     use_zstd: bool = true,
+    /// Ask a core that advertises read sets for them (`fetchBlobWith` with an `Extra`). False:
+    /// never asked; every request is the feed of before. Set before the first request.
+    read_sets: bool = false,
     connect_timeout_ms: u64 = 5_000,
     /// `Conn.stall_ms` of every connection the pool opens (0: off). Set before the first request.
     stall_ms: u64 = 0,
@@ -736,6 +817,14 @@ pub const Pool = struct {
     /// time left, a request with no response byte by then fails, and no new try starts after it.
     /// A response under way is not cut at `by` (see `stall_ms`).
     pub fn fetchBlobBy(p: *Pool, a: Allocator, seq: u64, out: *std.ArrayList(u8), by: u64, fail: ?*Fail) Error!Result {
+        return p.fetchBlobWith(a, seq, out, by, fail, null);
+    }
+
+    /// `fetchBlobBy` that also asks for the checkpoint's read sets when `extra` is given, the
+    /// pool wants them (`read_sets`) and the core in use advertises them; `extra` says what came.
+    /// A core that does not advertise them is asked exactly as before.
+    pub fn fetchBlobWith(p: *Pool, a: Allocator, seq: u64, out: *std.ArrayList(u8), by: u64, fail: ?*Fail, extra: ?*Extra) Error!Result {
+        if (extra) |x| x.* = .{};
         const s = try p.acquire();
         defer release(s);
         var last: Error = error.NoCores;
@@ -767,7 +856,8 @@ pub const Pool = struct {
             defer if (s.conn == c) {
                 c.first_byte_by = no_deadline;
             };
-            const got = c.getFeed(a, seq, s.dict, p.use_zstd) catch |e| if (e == error.Pruned) {
+            const ask_rs = extra != null and p.read_sets and c.hello.features & feature_feed_read_sets != 0;
+            const got = c.getFeedFlags(a, seq, s.dict, p.use_zstd, if (ask_rs) proto.flag_read_sets else 0) catch |e| if (e == error.Pruned) {
                 // the core's answer, not a bad link: no failover counted; another core may hold it
                 missing += 1;
                 pruned += 1;
@@ -808,19 +898,37 @@ pub const Pool = struct {
             _ = p.stats.raw_bytes.fetchAdd(raw.len, .monotonic);
             // A feed that does not decode, or names another checkpoint, is that core's fault: the
             // next core gets the request.
-            var f = feed.decode(a, raw) catch {
+            // (with read sets asked for, a list out of sui-node's form is such a feed too)
+            var lists: ?[][]const u8 = null;
+            var f: feed.Feed = undefined;
+            if (ask_rs) {
+                const w = feed.decodeWithReadSets(a, raw) catch {
+                    last = error.BadData;
+                    p.drop(s);
+                    continue;
+                };
+                f = w.feed;
+                lists = w.read_sets.lists;
+            } else f = feed.decode(a, raw) catch {
                 last = error.BadData;
                 p.drop(s);
                 continue;
             };
             defer f.deinit(a);
+            errdefer if (lists) |l| a.free(l);
             if (f.seq != seq) {
+                if (lists) |l| a.free(l);
                 last = error.BadData;
                 p.drop(s);
                 continue;
             }
             out.clearRetainingCapacity();
             feed.toBlob(out, p.gpa, &f) catch return error.OutOfMemory;
+            if (ask_rs) {
+                _ = p.stats.read_sets_asked.fetchAdd(1, .monotonic);
+                if (lists != null) _ = p.stats.read_sets_held.fetchAdd(1, .monotonic);
+                extra.?.* = .{ .asked = true, .lists = lists };
+            }
             _ = p.stats.blob_bytes.fetchAdd(out.items.len, .monotonic);
             const e = &p.served[seq % served_n];
             e.core.store(s.idx, .monotonic);
@@ -856,6 +964,12 @@ pub const Pool = struct {
     pub const Sink = struct {
         ctx: *anyopaque,
         put: *const fn (ctx: *anyopaque, seq: u64, blob: []const u8) void,
+        /// A sink that takes read sets: called in place of `put`, with what the core sent beyond
+        /// the blob (`Extra`; lists valid during the call). Only a sink that gives this makes a
+        /// pipelined call ask for read sets, and only of a core that advertises them with a pool
+        /// that wants them (`read_sets`): the same three conditions as `fetchBlobWith`. Null:
+        /// every request of the call is the feed of before.
+        put_with: ?*const fn (ctx: *anyopaque, seq: u64, blob: []const u8, extra: Extra) void = null,
     };
 
     /// Fetches the checkpoints `first .. first + results.len` as one pipelined call on one
@@ -876,13 +990,18 @@ pub const Pool = struct {
         if (p.gone(p.reap(s), by)) return error.Closed;
         if (s.conn == null) try p.open(a, s, 0, by);
         const c = s.conn.?;
+        // Read sets are asked of every request of the call or of none: what is asked depends on
+        // the sink, the pool and this connection's hello, never on how many requests the caller
+        // (the in-flight control) put in the call.
+        const ask_rs = sink.put_with != null and p.read_sets and c.hello.features & feature_feed_read_sets != 0;
+        const flags: u64 = (if (p.use_zstd) proto.flag_zstd_ok else 0) | (if (ask_rs) proto.flag_read_sets else 0);
         const ps = try a.alloc(Conn.Piped, results.len);
         for (ps, 0..) |*q, k| {
             var b: [12]u8 = undefined;
             std.mem.writeInt(u64, b[0..8], first + k, .little);
             std.mem.writeInt(u32, b[8..12], if (s.dict) |d| d.id else 0, .little);
             var req: std.ArrayList(u8) = .empty;
-            try proto.encodeRequest(&req, a, .get_checkpoint_feed, if (p.use_zstd) proto.flag_zstd_ok else 0, &b);
+            try proto.encodeRequest(&req, a, .get_checkpoint_feed, flags, &b);
             q.* = .{ .req = req.items };
         }
         _ = p.stats.requests.fetchAdd(results.len, .monotonic);
@@ -920,8 +1039,17 @@ pub const Pool = struct {
                 else => continue,
             };
             _ = p.stats.raw_bytes.fetchAdd(raw.len, .monotonic);
-            var f = feed.decode(a, raw) catch continue;
+            // A feed that does not decode (with read sets asked for: or whose lists are out of
+            // sui-node's form) stays `failed`: the single path asks again and gives the verdict.
+            var lists: ?[][]const u8 = null;
+            var f: feed.Feed = undefined;
+            if (ask_rs) {
+                const w = feed.decodeWithReadSets(a, raw) catch continue;
+                f = w.feed;
+                lists = w.read_sets.lists;
+            } else f = feed.decode(a, raw) catch continue;
             defer f.deinit(a);
+            defer if (lists) |l| a.free(l);
             if (f.seq != seq) continue;
             out.clearRetainingCapacity();
             feed.toBlob(out, p.gpa, &f) catch return error.OutOfMemory;
@@ -931,8 +1059,119 @@ pub const Pool = struct {
             e.seq.store(seq, .release);
             p.noteHighest(seq);
             res.* = .ok;
-            sink.put(sink.ctx, seq, out.items);
+            if (ask_rs) {
+                _ = p.stats.read_sets_asked.fetchAdd(1, .monotonic);
+                if (lists != null) _ = p.stats.read_sets_held.fetchAdd(1, .monotonic);
+            }
+            if (sink.put_with) |put| put(sink.ctx, seq, out.items, .{ .asked = ask_rs, .lists = lists }) else sink.put(sink.ctx, seq, out.items);
         }
+    }
+
+    /// What a re-ask for a checkpoint's read sets brought (`fetchReadSets`).
+    pub const ReadSetsAnswer = union(enum) {
+        /// The core holds them now: one list per transaction (sui-node's form, checked by the
+        /// decode) and the checkpoint's contents as the core sent them (BCS CheckpointContents,
+        /// for the caller to compare with the stored ones). Owned by the call's allocator.
+        held: struct { contents: []const u8, lists: []const []const u8 },
+        /// The core answered without them (`present` 0): still not final there. `other_core`:
+        /// the answer came from another core than the one asked for (`fetchReadSets` `core`).
+        none: struct { other_core: bool = false },
+        /// No connection was free: nothing was asked (the fetch threads come first).
+        busy,
+        /// The call failed, the core does not advertise read sets, or it does not hold the
+        /// checkpoint any more.
+        failed,
+    };
+
+    /// The core that served checkpoint `seq` (null: unknown, or the entry was reused since).
+    pub fn servedBy(p: *const Pool, seq: u64) ?u32 {
+        const e = &p.served[seq % served_n];
+        if (e.seq.load(.acquire) != seq) return null;
+        return e.core.load(.monotonic);
+    }
+
+    /// Asks again for the read sets of checkpoint `seq`, which came without them (docs/EDGE.md
+    /// 12.7). The wire has no request for the lists alone (no zui/1 method returns them), so
+    /// this is `get_checkpoint_feed` with READ_SETS once more and the feed itself is dropped:
+    /// one extra feed per such checkpoint. The lowest priority call on the pool, like
+    /// `fetchSummaries`: it takes a connection only when one is free and never waits in front of
+    /// a fetch thread; one try, no failover, no verdict about the core. On the core it is one
+    /// more request of this connection's share of the feed queue (a refused one is `failed`).
+    ///
+    /// `core`: the core that served the feed (the one whose reconcile settles it). Asked over a
+    /// free connection to it, else over a free unconnected slot opened to it alone. A free
+    /// connection to another core is taken only with `other_ok` (the caller has met a busy pool
+    /// for a while), and a "none" from it says so (`none.other_core`). Null: any core.
+    pub fn fetchReadSets(p: *Pool, a: Allocator, seq: u64, core: ?u32, other_ok: bool, by: u64) Error!ReadSetsAnswer {
+        if (p.stopped()) return error.Closed;
+        if (!p.read_sets) return .failed;
+        const want: ?u32 = if (core) |c| (if (c < p.specs.len) c else null) else null;
+        // Slots are looked at only while held. One pass: a free one connected to `want` is
+        // taken at once; the first free unconnected one and the first free one to another core
+        // are remembered (released) and claimed again after the pass.
+        var empty: ?usize = null;
+        var other: ?usize = null;
+        const s: *Slot, const opened_to: ?u32 = pick: {
+            for (p.slots, 0..) |*x, i| {
+                if (x.busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) continue;
+                if (x.conn == null) {
+                    if (empty == null) empty = i;
+                } else if (want == null or x.idx == want.?) {
+                    break :pick .{ x, null };
+                } else if (other == null) other = i;
+                release(x);
+            }
+            if (empty) |i| if (p.slots[i].busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                if (p.slots[i].conn == null) break :pick .{ &p.slots[i], want };
+                release(&p.slots[i]);
+            };
+            if (other_ok) if (other) |i| if (p.slots[i].busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                if (p.slots[i].conn != null) break :pick .{ &p.slots[i], null };
+                release(&p.slots[i]);
+            };
+            return .busy;
+        };
+        defer release(s);
+        if (p.gone(p.reap(s), by)) return error.Closed;
+        if (s.conn == null) {
+            // to `want` alone when it is known: the other cores are excluded
+            const excl: u64 = if (opened_to) |w| (if (w < 64) ~(@as(u64, 1) << @intCast(w)) else 0) else 0;
+            p.open(a, s, excl, by) catch |err| {
+                if (p.stopped()) return error.Closed;
+                return if (err == error.OutOfMemory) error.OutOfMemory else .failed;
+            };
+        }
+        const other_core = want != null and s.idx != want.?;
+        const c = s.conn.?;
+        if (c.hello.features & feature_feed_read_sets == 0) return .failed;
+        _ = p.stats.read_sets_reasked.fetchAdd(1, .monotonic);
+        c.first_byte_by = by;
+        defer if (s.conn == c) {
+            c.first_byte_by = no_deadline;
+        };
+        const before = c.bytes_in;
+        const got = c.getFeedFlags(a, seq, s.dict, p.use_zstd, proto.flag_read_sets) catch |err| {
+            if (p.stopped()) return error.Closed;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            // a server answer (pruned, refused) leaves the connection fine; anything else not
+            if (err != error.Pruned and err != error.Server) {
+                if (c.peerShutdown()) p.shutdown_ns.store(nowNs(p.io), .monotonic);
+                c.close();
+                s.conn = null;
+            }
+            return .failed;
+        };
+        _ = p.stats.wire_bytes.fetchAdd(c.bytes_in - before, .monotonic);
+        const raw = got orelse return .failed;
+        const w = feed.decodeWithReadSets(a, raw) catch return .failed;
+        var f = w.feed;
+        defer f.deinit(a);
+        if (f.seq != seq) {
+            if (w.read_sets.lists) |l| a.free(l);
+            return .failed;
+        }
+        const lists = w.read_sets.lists orelse return .{ .none = .{ .other_core = other_core } };
+        return .{ .held = .{ .contents = f.contents, .lists = lists } };
     }
 
     /// How one checkpoint of a `fetchSummaries` call came out.

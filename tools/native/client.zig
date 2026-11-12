@@ -105,8 +105,7 @@ const Client = struct {
         var wait: u64 = @as(u64, @intCast(wait_ms)) * std.time.ns_per_ms;
         if (cl.c.nextTimeout()) |t| wait = @min(wait, t -| now);
         const block = wait >= std.time.ns_per_ms;
-        if (block) cl.us.setWait(wait);
-        var n = cl.rx.recv(&cl.us, block);
+        var n = cl.rx.recvWait(&cl.us, if (block) wait else 0);
         while (n > 0) {
             now = nowNs(cl.io);
             for (0..n) |i| {
@@ -487,6 +486,15 @@ fn pctl(v: []u64, p: usize) f64 {
 
 // ---------------------------------------------------------------- main
 
+fn helloBody(a: std.mem.Allocator, token: ?[]const u8) ![]const u8 {
+    var b: std.ArrayList(u8) = .empty;
+    const bw: proto.W = .{ .gpa = a, .out = &b };
+    try bw.str("deepwave-native");
+    try bw.int(u16, 0);
+    try bw.optBytes(token);
+    return b.items;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
@@ -504,17 +512,28 @@ pub fn main(init: std.process.Init) !u8 {
     const key = try hex32(args[3]);
     const cl = try Client.connect(gpa, io, addr, key);
     defer {
+        // say goodbye: without a CONNECTION_CLOSE the server keeps the connection, and sends
+        // probe timeouts into the void, until its idle timeout (30 s)
+        cl.c.closeApp(0);
+        cl.send(nowNs(io));
         cl.c.deinit();
         cl.sock.close(io);
         gpa.destroy(cl);
     }
+    // ZUI_NATIVE_TOKEN: the connection's API key, sent as the hello token before any other
+    // request (a node behind an access gate, docs/GATE.md). Never printed.
+    const token: ?[]const u8 = if (std.c.getenv("ZUI_NATIVE_TOKEN")) |t| std.mem.span(t) else null;
+    if (token != null and !std.mem.eql(u8, cmd, "hello")) {
+        const resp = try cl.request(a, .hello, 0, try helloBody(a, token));
+        const r = proto.parseResponse(resp) orelse return 1;
+        if (r.status != 0) {
+            try w.print("hello refused: ", .{});
+            try describe(w, resp);
+            return 1;
+        }
+    }
     if (std.mem.eql(u8, cmd, "hello")) {
-        var b: std.ArrayList(u8) = .empty;
-        const bw: proto.W = .{ .gpa = a, .out = &b };
-        try bw.str("deepwave-native");
-        try bw.int(u16, 0);
-        try bw.u8_(0);
-        const resp = try cl.request(a, .hello, 0, b.items);
+        const resp = try cl.request(a, .hello, 0, try helloBody(a, token));
         const r = proto.parseResponse(resp) orelse return 1;
         if (r.status != 0) {
             try describe(w, resp);

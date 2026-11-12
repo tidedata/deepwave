@@ -13,6 +13,7 @@ const source_mod = @import("source.zig");
 const convert = @import("convert.zig");
 const history = @import("history.zig");
 const snapshot = @import("snapshot.zig");
+const retention = @import("retention.zig");
 const execute = @import("execute.zig");
 const lhfill = @import("lhfill.zig");
 const removal_log = @import("removal_log.zig");
@@ -567,6 +568,226 @@ test "restore: a stop while the index tables are written leaves a restored store
         ix_open = false;
         try expectSameIndexTables(gpa, a, ref_dir, ix_dir, seq);
     }
+}
+
+const IndexDiff = struct {
+    /// Rows both hold, by table (key byte 0: owners, 1: balances, 2 and up: coins).
+    same: [3]u64 = @splat(0),
+    /// Rows only `got` holds, rows only `want` holds, rows whose values differ.
+    extra: [3]u64 = @splat(0),
+    missing: [3]u64 = @splat(0),
+    changed: [3]u64 = @splat(0),
+
+    fn total(d: *const IndexDiff) u64 {
+        var n: u64 = 0;
+        for (d.extra, d.missing, d.changed) |x, y, z| n += x + y + z;
+        return n;
+    }
+};
+
+/// Every row of two state indexes, compared in key order.
+fn indexDiff(a: std.mem.Allocator, want: *const index.Index, got: *const index.Index) !IndexDiff {
+    var d: IndexDiff = .{};
+    var x = try got.all(a);
+    var y = try want.all(a);
+    var ex = try x.next();
+    var ey = try y.next();
+    while (ex != null or ey != null) {
+        const ord: std.math.Order = if (ex == null) .gt else if (ey == null) .lt else std.mem.order(u8, ex.?.key, ey.?.key);
+        switch (ord) {
+            .lt => {
+                d.extra[@min(ex.?.key[0], 2)] += 1;
+                ex = try x.next();
+            },
+            .gt => {
+                d.missing[@min(ey.?.key[0], 2)] += 1;
+                ey = try y.next();
+            },
+            .eq => {
+                const t = @min(ex.?.key[0], 2);
+                if (ex.?.val.op == ey.?.val.op and std.mem.eql(u8, ex.?.val.bytes(), ey.?.val.bytes())) d.same[t] += 1 else d.changed[t] += 1;
+                ex = try x.next();
+                ey = try y.next();
+            },
+        }
+    }
+    return d;
+}
+
+const FastBuilt = struct { ix: *index.Index, missing_old: u64, replayed: u64, objects: u64 };
+
+/// A fast-start job as the node runs it: the state index built in `dir` from the restore image
+/// `img` (null: from a live-table scan), the stored checkpoints after it replayed, the handoff.
+fn fastBuild(gpa: std.mem.Allocator, st: *store.Store, dir: []const u8, img: ?fast_start.Image, tip: u64) !FastBuilt {
+    const ix = try index.Index.open(gpa, testing.io, dir, .{ .build_threads = 3, .build_mem_bytes = 16 << 20, .sync = .none });
+    errdefer {
+        ix.deinit();
+        gpa.destroy(ix);
+    }
+    var feed = index.feed.Feed.init(gpa, ix, st);
+    defer feed.deinit();
+    var j: fast_start.Job = .{ .gpa = gpa, .st = st, .image = img, .feed = &feed, .build = true };
+    try j.start();
+    while (!j.handoff.load(.acquire) and !j.done.load(.acquire)) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    if (j.failed) |e| {
+        j.shutdown();
+        return e;
+    }
+    j.onCommitted(tip);
+    if (j.failed) |e| return e;
+    try testing.expect(ix.ready.load(.acquire));
+    try testing.expectEqual(@as(?u64, tip), ix.checkpoint);
+    return .{ .ix = ix, .missing_old = feed.missing_old, .replayed = j.replayed, .objects = j.image_objects.load(.monotonic) };
+}
+
+test "fast start: the restore image is refused once the object floor has passed its checkpoint (an index built from it keeps the rows of versions the replay can no longer read)" {
+    const gpa = testing.allocator;
+    _ = corpus() orelse return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pb: [512]u8 = undefined;
+    // 16 consecutive corpus checkpoints. The store is shaped like a restored one: the state of
+    // every object they touch as it was before them is the image (compact records in segment
+    // e0, the "restored" checkpoint `at` just before the run), the first 8 checkpoints are
+    // epoch e0 + 1 and the last 8 epoch e0 + 2.
+    const first: u64 = 342451160;
+    const n_cp = 16;
+    const half = n_cp / 2;
+    const at = first - 1;
+    const tip = first + n_cp - 1;
+    const e0: u64 = 1303;
+    const ci = try gpa.create(types.CheckpointIndex);
+    defer gpa.destroy(ci);
+    ci.* = try types.CheckpointIndex.init(gpa);
+    defer ci.deinit(gpa);
+    var blobs: [n_cp][]const u8 = undefined;
+    var changes: [n_cp][]const index.Index.Change = undefined;
+    var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    var image: std.ArrayList([]const u8) = .empty;
+    var superseded: u64 = 0;
+    var removed: u64 = 0;
+    for (&blobs, &changes, 0..) |*blob, *chs, i| {
+        blob.* = try readCorpus(a, try std.fmt.bufPrint(&pb, "chk/{d}.chk", .{first + i}));
+        try types.indexCheckpointData(blob.*, ci);
+        var fst: index.feed.Stats = .{};
+        chs.* = try index.feed.changesOf(a, ci, blob.*, null, &fst);
+        for (chs.*) |c| {
+            const k = exec.objects.keyOf(c.new orelse c.old.?) catch continue;
+            const g = try seen.getOrPut(a, k.id);
+            if (g.found_existing) continue;
+            if (c.old) |raw| {
+                try image.append(a, raw);
+                if (c.new == null) removed += 1 else superseded += 1;
+            }
+        }
+    }
+    try testing.expect(image.items.len > 100 and superseded > 50);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try a.dupe(u8, try tmpPath(&tmp, &pb));
+    var cfg: store.Config = .{ .dir = try std.fs.path.join(a, &.{ base, "store" }), .max_live_objects = 1 << 16, .segment_reserve = 1 << 28, .codec = exec.objects.store_codec };
+    const h = try store.openDir(gpa, testing.io, &cfg, .{ .sync = .none });
+    defer h.io.deinit();
+    var st = h.store;
+    defer st.deinit();
+    {
+        const b = try st.begin(at, e0);
+        try b.checkpoint("restored", "c");
+        for (image.items) |raw| {
+            const k = try exec.objects.keyOf(raw);
+            try b.putBase(&k.id, k.version, &store.objectDigest(raw), raw);
+        }
+        try st.commit(b);
+    }
+    // The checkpoints as the follower stores them: summary, contents, transactions with their
+    // effects, output objects and removals. No input copies: an old version is found through
+    // the link its successor's record carries.
+    for (blobs, changes, 0..) |blob, chs, i| {
+        const cp = try bcs.decode(types.CheckpointData, a, blob[1..]);
+        const b = try st.begin(first + i, if (i < half) e0 + 1 else e0 + 2);
+        try b.checkpoint(try bcs.encodeAlloc(@TypeOf(cp.checkpoint_summary), a, &cp.checkpoint_summary), try bcs.encodeAlloc(types.CheckpointContents, a, &cp.checkpoint_contents));
+        for (cp.transactions, 0..) |*t, ti| {
+            const dg: types.ExecutionDigests = switch (cp.checkpoint_contents) {
+                .V1 => |v| v.transactions[ti],
+                .V2 => |v| v.transactions[ti].digest,
+            };
+            const ev: ?[]const u8 = if (t.events) |*e| try bcs.encodeAlloc(types.TransactionEvents, a, e) else null;
+            try b.transaction(&dg.transaction.@"0".@"0", &dg.effects.@"0".@"0", try bcs.encodeAlloc(@TypeOf(t.transaction), a, &t.transaction), try bcs.encodeAlloc(types.TransactionEffects, a, &t.effects), ev);
+        }
+        for (chs) |c| {
+            if (c.new) |raw| {
+                const k = exec.objects.keyOf(raw) catch continue;
+                try b.putObject(&k.id, k.version, &store.objectDigest(raw), raw);
+            } else if (c.old) |raw| {
+                const k = exec.objects.keyOf(raw) catch continue;
+                try b.removeObject(&k.id, k.version + 1, .deleted);
+            }
+        }
+        try st.commit(b);
+        // The end of epoch e0 + 1: a close seals the store's memtable into a run of that
+        // epoch, as a node's fills and seals within the hour. (A link still in the memtable
+        // counts as the newest epoch's and would keep every image version below readable.)
+        if (i == half - 1) {
+            try st.close();
+            st = try store.Store.open(gpa, .{ .real = h.io }, &cfg);
+        }
+    }
+    try testing.expectEqual(@as(?u64, tip), st.committed());
+    const dirs = [_][]const u8{ "ix-scan", "ix-image", "ix-late", "ix-node" };
+    var built: [dirs.len]?*index.Index = @splat(null);
+    defer for (built) |b| if (b) |ix| {
+        ix.deinit();
+        gpa.destroy(ix);
+    };
+
+    // 1. As after the restore (both floors at `at`): the image is found, and an index built
+    //    from it and the replay of the 16 checkpoints holds the rows a live-table scan gives.
+    _ = try st.setFloors(.{ .cp_pruned = at, .obj_pruned = at, .cp_epoch = e0 + 1, .obj_epoch = e0 + 1 });
+    const scan = try fastBuild(gpa, st, try std.fs.path.join(a, &.{ base, dirs[0] }), null, tip);
+    built[0] = scan.ix;
+    const img: fast_start.Image = blk: {
+        var snap = st.snapshot();
+        defer snap.release();
+        break :blk fast_start.findImage(&snap, e0) orelse return error.TestNoImage;
+    };
+    try testing.expectEqual(at, img.at);
+    const early = try fastBuild(gpa, st, try std.fs.path.join(a, &.{ base, dirs[1] }), img, tip);
+    built[1] = early.ix;
+    try testing.expectEqual(@as(u64, n_cp), early.replayed);
+    try testing.expect(early.objects >= image.items.len);
+    const d1 = try indexDiff(a, scan.ix, early.ix);
+    std.debug.print("fast start, floors at the restore: image {d} objects ({d} superseded, {d} removed in the 16 checkpoints), {d} rows, {d} differ from the live-table scan's, missing_old {d}\n", .{ image.items.len, superseded, removed, d1.same[0] + d1.same[1] + d1.same[2], d1.total(), early.missing_old });
+    try testing.expectEqual(@as(u64, 0), d1.total());
+    try testing.expectEqual(@as(u64, 0), early.missing_old);
+
+    // 2. The object floor moves past epoch e0 + 1 while its checkpoints are still held
+    //    (object versions are kept for fewer epochs than checkpoints), nothing aged. The
+    //    versions superseded in those 8 checkpoints no longer read. An index built from the
+    //    image now (what findImage allowed before) lists them from the image, and the replay,
+    //    which cannot read them, removes none of their rows.
+    _ = try st.setFloors(.{ .cp_pruned = at, .obj_pruned = first + half - 1, .cp_epoch = e0 + 1, .obj_epoch = e0 + 2 });
+    const late = try fastBuild(gpa, st, try std.fs.path.join(a, &.{ base, dirs[2] }), img, tip);
+    built[2] = late.ix;
+    const d2 = try indexDiff(a, scan.ix, late.ix);
+    std.debug.print("fast start, object floor past the image's checkpoint, index from the image: owner rows {d} stale, {d} missing, {d} wrong; balance rows {d} stale, {d} missing, {d} wrong; coin rows {d} stale, {d} missing, {d} wrong; missing_old {d}\n", .{ d2.extra[0], d2.missing[0], d2.changed[0], d2.extra[1], d2.missing[1], d2.changed[1], d2.extra[2], d2.missing[2], d2.changed[2], late.missing_old });
+    try testing.expect(late.missing_old > 0);
+    try testing.expect(d2.extra[0] > 0);
+    try testing.expect(d2.total() > 0);
+
+    // 3. So the image is refused, and the node builds from the live-table scan: the right rows.
+    const now_img: ?fast_start.Image = blk: {
+        var snap = st.snapshot();
+        defer snap.release();
+        break :blk fast_start.findImage(&snap, e0);
+    };
+    const node = try fastBuild(gpa, st, try std.fs.path.join(a, &.{ base, dirs[3] }), now_img, tip);
+    built[3] = node.ix;
+    const d3 = try indexDiff(a, scan.ix, node.ix);
+    try testing.expectEqual(@as(u64, 0), d3.total());
+    try testing.expectEqual(@as(u64, 0), node.missing_old);
+    try testing.expect(now_img == null);
 }
 
 // ------------------------------------------------------------------ source
@@ -1353,6 +1574,142 @@ test "history: a transaction's input versions stay readable after the epochs tha
     try testing.expect(snap3.objectAt(&@as([32]u8, @splat(2)), 3) == null);
     try testing.expectEqualSlices(u8, "z13", snap3.liveObject(&@as([32]u8, @splat(3))).?.bytes[40..]);
     try testing.expectEqualSlices(u8, "y13", snap3.liveObject(&@as([32]u8, @splat(2))).?.bytes[40..]);
+}
+
+/// One checkpoint of the floor test: a transaction that mutates X (id 1), reads Y (id 2) and
+/// every seventh checkpoint mutates it, with its read set written as history.onBatch does.
+const FloorCp = struct { x_in: u64, y_in: u64, y_out: bool };
+
+fn floorDigest(seq: u64) [32]u8 {
+    var d: [32]u8 = @splat(0xd1);
+    std.mem.writeInt(u64, d[0..8], seq, .little);
+    return d;
+}
+
+fn floorPayload(buf: []u8, id: u8, version: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "object {d} at version {d}, some bytes to carry", .{ id, version }) catch unreachable;
+}
+
+/// What GetCheckpoint and GetTransaction need of checkpoint `seq` for a mask with effects,
+/// balance changes or objects: its record, its transaction, and every version the transaction
+/// read or wrote (serve `collectObjects`).
+const FloorRead = enum { whole, no_objects, no_record };
+fn floorRead(snap: *const store.Snapshot, seq: u64, c: FloorCp) FloorRead {
+    if (snap.checkpoint(seq) == null) return .no_record;
+    const t = snap.transaction(&floorDigest(seq)) orelse return .no_record;
+    if (t.checkpoint != seq) return .no_record;
+    var pb: [64]u8 = undefined;
+    const keys = [_]struct { id: u8, v: u64, on: bool }{
+        .{ .id = 1, .v = c.x_in, .on = true },
+        .{ .id = 1, .v = seq, .on = true },
+        .{ .id = 2, .v = c.y_in, .on = true },
+        .{ .id = 2, .v = seq, .on = c.y_out },
+    };
+    for (keys) |k| {
+        if (!k.on) continue;
+        const raw = snap.objectNear(&@as([32]u8, @splat(k.id)), k.v, t.loc) orelse return .no_objects;
+        if (!std.mem.eql(u8, floorPayload(&pb, k.id, k.v), raw[40..])) return .no_objects;
+    }
+    return .whole;
+}
+
+test "retention: the served floor is the higher of the two pruners' (sui-node's RPC reader); every checkpoint from it up answers with its transactions' objects, the checkpoint floor alone does not" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |age_on| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var pb: [512]u8 = undefined;
+        var cfg: store.Config = .{ .dir = try tmpPath(&tmp, &pb), .max_live_objects = 1 << 10, .segment_reserve = 1 << 20, .codec = .{ .key = tKey }, .clean_record_bytes = 64, .chunk_bytes = 16 << 10, .age_lag_checkpoints = 0 };
+        const h = try store.openDir(gpa, testing.io, &cfg, .{ .sync = .none });
+        defer h.io.deinit();
+        defer h.store.deinit();
+        const st = h.store;
+        var buf: [64]u8 = undefined;
+        // A formal snapshot restored at S = 500, the end of epoch 5: the live set as compact
+        // records and the end-of-epoch checkpoint, marked pruned (snapshot.zig restore).
+        {
+            const b = try st.begin(500, 5);
+            try putLive(b, true, 1, 500, floorPayload(&buf, 1, 500));
+            try putLive(b, true, 2, 500, floorPayload(&buf, 2, 500));
+            for (0..100) |i| try putLive(b, true, @intCast(100 + i), 3, "filler-object");
+            try b.checkpoint("s500", "c");
+            try b.highestPruned(500);
+            try st.commit(b);
+        }
+        // Epochs 6, 7 and 8 followed since, 20 checkpoints each (501..560).
+        var cps: [561]FloorCp = undefined;
+        var x: u64 = 500;
+        var y: u64 = 500;
+        for (501..561) |seq| {
+            const epoch = 6 + (seq - 501) / 20;
+            const b = try st.begin(seq, epoch);
+            try b.checkpoint("s", "c");
+            try b.transaction(&floorDigest(seq), &@as([32]u8, @splat(7)), "tx", "fx", null);
+            const y_out = seq % 7 == 0;
+            cps[seq] = .{ .x_in = x, .y_in = y, .y_out = y_out };
+            _ = try histInput(st, b, 1, x, true, floorPayload(&buf, 1, x));
+            _ = try histInput(st, b, 2, y, y_out, floorPayload(&buf, 2, y));
+            try putLive(b, false, 1, seq, floorPayload(&buf, 1, seq));
+            x = seq;
+            if (y_out) {
+                try putLive(b, false, 2, seq, floorPayload(&buf, 2, seq));
+                y = seq;
+            }
+            try st.commit(b);
+        }
+        {
+            var snap = st.snapshot();
+            defer snap.release();
+            // Nothing pruned since the restore: both floors are S + 1.
+            try testing.expectEqual(@as(?u64, 501), snapshot.lowestAvailable(&snap, 5));
+            try testing.expectEqual(@as(?u64, 501), snapshot.lowestServed(&snap, 5));
+            for (501..561) |seq| try testing.expectEqual(FloorRead.whole, floorRead(&snap, seq, cps[seq]));
+        }
+        // The pruners' marks as smoothing leaves them in epoch 8 at the defaults (checkpoints 2
+        // epochs, objects 1): the checkpoint mark inside epoch 6, the objects mark inside epoch
+        // 7. The floors' epochs as retentionTick computes them.
+        const marks: retention.Marks = .{ .checkpoints = 510, .objects = 530 };
+        var cp_epoch: u64 = 0;
+        var obj_epoch: u64 = 0;
+        {
+            var snap = st.snapshot();
+            defer snap.release();
+            const HeldOf = struct {
+                fn epochOf(ctx: *anyopaque, seq: u64) ?u64 {
+                    const sn: *const store.Snapshot = @ptrCast(@alignCast(ctx));
+                    return if (sn.checkpointHeld(seq)) |r| r.epoch else null;
+                }
+            };
+            const held: retention.Held = .{ .ctx = &snap, .epoch_of = HeldOf.epochOf };
+            cp_epoch = retention.floorEpoch(held, marks.checkpoints + 1, 501, 560, 8);
+            obj_epoch = retention.floorEpoch(held, marks.objects + 1, 501, 560, 8);
+        }
+        try testing.expectEqual(@as(u64, 6), cp_epoch);
+        try testing.expectEqual(@as(u64, 7), obj_epoch);
+        const rep = try st.setFloors(.{ .cp_pruned = marks.checkpoints, .obj_pruned = marks.objects, .cp_epoch = cp_epoch, .obj_epoch = obj_epoch });
+        try testing.expectEqual(@as(u64, 1), rep.segments_aged); // the restore's segment
+        if (age_on) {
+            try st.flushIndex();
+            _ = try st.ageAll();
+        }
+        // Cleaning runs too (the dense restored segment stays).
+        var steps: usize = 0;
+        while (!(try st.cleanStep(1 << 16)).idle) : (steps += 1) try testing.expect(steps < 1000);
+        var snap = st.snapshot();
+        defer snap.release();
+        // State sync's floor: the checkpoint pruner's. The RPC floor: the objects pruner's.
+        try testing.expectEqual(@as(?u64, 511), snapshot.lowestAvailable(&snap, 5));
+        try testing.expectEqual(@as(?u64, 531), snapshot.lowestServed(&snap, 5));
+        // The invariant: every checkpoint at or above the served floor is whole.
+        for (531..561) |seq| try testing.expectEqual(FloorRead.whole, floorRead(&snap, seq, cps[seq]));
+        // Between the checkpoint floor and the object window (epoch 6): records read, objects
+        // do not. This is what GetServiceInfo promised and GetCheckpoint answered INTERNAL for.
+        for (511..521) |seq| try testing.expectEqual(FloorRead.no_objects, floorRead(&snap, seq, cps[seq]));
+        try testing.expectEqual(FloorRead.no_record, floorRead(&snap, 510, cps[510]));
+        // The partially pruned epoch below the floor (521..530): whole while nothing was freed
+        // (deepwave hides whole segments), not promised.
+        if (!age_on) for (521..531) |seq| try testing.expectEqual(FloorRead.whole, floorRead(&snap, seq, cps[seq]));
+    }
 }
 
 test "snapshot: a snapshot-started store reports lowest available S + 1, like sui-node" {
@@ -4930,4 +5287,482 @@ fn rsCachedRepairBody(_: void, env: *RsEnv) anyerror!void {
 
 test "p2p reconcile: a list repaired within the recheck time drops the cached GetCheckpoint response before it is served ahead of the store; a fix of another checkpoint leaves it there" {
     try rsWith({}, rsCachedRepairBody);
+}
+
+/// A store of twelve corpus checkpoints (342456120..) and their blobs, for the backfill tests.
+const LhWorld = struct {
+    arena: std.heap.ArenaAllocator,
+    tmp: testing.TmpDir,
+    root: []const u8 = "",
+    cfg: store.Config = undefined,
+    store_: ?*store.Store = null,
+    rio: ?*store.RealIo = null,
+    blobs: [12][]const u8 = undefined,
+    seqs: [12]u64 = undefined,
+
+    fn init(w: *LhWorld) !void {
+        w.* = .{ .arena = std.heap.ArenaAllocator.init(testing.allocator), .tmp = testing.tmpDir(.{}) };
+        errdefer w.deinit();
+        const a = w.arena.allocator();
+        for (&w.blobs, 0..) |*b, i| {
+            var nb: [64]u8 = undefined;
+            b.* = try readCorpus(a, try std.fmt.bufPrint(&nb, "chk/{d}.chk", .{342456120 + i}));
+        }
+        var pb: [512]u8 = undefined;
+        w.root = try a.dupe(u8, try tmpPath(&w.tmp, &pb));
+        w.cfg = .{ .dir = try std.fmt.allocPrint(a, "{s}/store", .{w.root}), .max_live_objects = 1 << 16, .segment_reserve = 1 << 24 };
+        try w.open();
+        for (w.blobs, &w.seqs) |b, *s| s.* = try storeBlob(w.store_.?, a, b);
+    }
+
+    fn open(w: *LhWorld) !void {
+        const h = try store.openDir(testing.allocator, testing.io, &w.cfg, .{ .sync = .none });
+        w.store_ = h.store;
+        w.rio = h.io;
+    }
+
+    /// The process dies: nothing is flushed or closed.
+    fn kill(w: *LhWorld) void {
+        if (w.store_) |x| x.deinit();
+        if (w.rio) |x| x.deinit();
+        w.store_ = null;
+        w.rio = null;
+    }
+
+    fn deinit(w: *LhWorld) void {
+        w.kill();
+        w.tmp.cleanup();
+        w.arena.deinit();
+    }
+
+    fn st(w: *LhWorld) *store.Store {
+        return w.store_.?;
+    }
+
+    fn lowest(w: *LhWorld) ?u64 {
+        var snap = w.st().snapshot();
+        defer snap.release();
+        return snap.lowestAvailable();
+    }
+
+    /// The content hash of an index of checkpoints `from..` built from the blobs.
+    fn hashFrom(w: *LhWorld, from: usize) !u64 {
+        const ix = try lhist.Index.init(testing.allocator, testing.io, null);
+        defer ix.deinit();
+        for (w.blobs[from..], w.seqs[from..]) |b, s| try ix.addCheckpoint(s, b);
+        return ix.contentHash();
+    }
+
+    fn wait(bf: *lhfill.Backfill) void {
+        while (bf.status() == .running) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+};
+
+test "ledger-history backfill: checkpoints retention prunes under the build move its start up; that is not a failure and costs no try (TransactionNotStored on two edges, three times, then silence)" {
+    const gpa = testing.allocator;
+    var w: LhWorld = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = w.arena.allocator();
+    // The node read its lowest checkpoint, then a retention tick raised the store's floor
+    // before the loaders got to the bottom of the range (cold reads at a start).
+    _ = try w.st().setFloors(.{ .cp_pruned = w.seqs[2] });
+    try testing.expectEqual(@as(?u64, w.seqs[3]), w.lowest());
+    {
+        const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[11], .{ .workers = 3 });
+        defer bf.destroy();
+        LhWorld.wait(bf);
+        try testing.expectEqual(@as(?anyerror, null), bf.failure);
+        try testing.expectEqual(lhfill.Status.ready, bf.status());
+        try testing.expectEqual(@as(u32, 1), bf.floor_moves);
+        const out = try bf.finish(w.seqs[11]);
+        try testing.expectEqual(@as(?u64, w.seqs[3]), out.indexedLo());
+        try testing.expectEqual(try w.hashFrom(3), try out.contentHash());
+        // and its low end is the store's floor: the witness of an unclean stop to come
+        try testing.expect(out.lowIsFloor());
+    }
+    // The same under a build that had rows on disk below the new floor: they cannot join what
+    // is left of the window, so the output starts again at the floor.
+    const staging = try std.fmt.allocPrint(a, "{s}/lh/backfill", .{w.root});
+    var w2: LhWorld = undefined;
+    try w2.init();
+    defer w2.deinit();
+    {
+        const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w2.st(), w2.seqs[0], w2.seqs[11], .{ .workers = 2, .staging = staging, .save_every_ns = 0, .stop_after_saves = 2 });
+        while (bf.saves < 2) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        bf.destroy();
+    }
+    _ = try w2.st().setFloors(.{ .cp_pruned = w2.seqs[7] });
+    {
+        const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w2.st(), w2.seqs[0], w2.seqs[11], .{ .workers = 2, .staging = staging });
+        defer bf.destroy();
+        try testing.expect(bf.resumed_at != null and bf.resumed_at.? < w2.seqs[8]);
+        LhWorld.wait(bf);
+        try testing.expectEqual(@as(?anyerror, null), bf.failure);
+        try testing.expectEqual(lhfill.Status.ready, bf.status());
+        try testing.expectEqual(@as(u32, 1), bf.floor_moves);
+        try testing.expect(bf.dropped >= 2);
+        const out = try bf.finish(w2.seqs[11]);
+        try testing.expectEqual(@as(?u64, w2.seqs[8]), out.indexedLo());
+        try testing.expectEqual(try w2.hashFrom(8), try out.contentHash());
+    }
+    // A checkpoint that is missing above the floor is still a failure.
+    {
+        var c: lhfill.Counters = .{};
+        var snap = w.st().snapshot();
+        defer snap.release();
+        try testing.expect((try lhfill.load(a, &snap, w.seqs[11] + 5, &c)) == null);
+    }
+}
+
+test "ledger-history: after an unclean stop the store's checkpoint floor comes back lower; the index's pruned low end gives it back, and nothing is backfilled (the whole retained window was, on two edges)" {
+    const gpa = testing.allocator;
+    var w: LhWorld = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = w.arena.allocator();
+    const hdir = try std.fmt.allocPrint(a, "{s}/lh", .{w.root});
+    const staging = try std.fmt.allocPrint(a, "{s}/lh/backfill", .{w.root});
+    const tip = w.seqs[11];
+    {
+        const live = try lhist.Index.init(gpa, testing.io, hdir);
+        defer live.deinit();
+        for (w.blobs, w.seqs) |b, s| try live.addCheckpoint(s, b);
+        // nothing to restore on a store and an index that agree
+        try testing.expectEqual(@as(?u64, null), try lhfill.restoreFloor(w.st(), testing.io, live, staging, w.lowest().?, tip));
+        // a retention tick: the store's floor in memory, the index pruned to it durably
+        _ = try w.st().setFloors(.{ .cp_pruned = w.seqs[4] });
+        try testing.expectEqual(@as(?u64, w.seqs[5]), w.lowest());
+        live.pruneBelow(w.seqs[5]);
+        try testing.expectEqual(@as(u64, 0), lhfill.gapOf(live, w.lowest().?, tip).count());
+    }
+    // kill -9 before the store's next meta write
+    w.kill();
+    try w.open();
+    const live = try lhist.Index.init(gpa, testing.io, hdir);
+    defer live.deinit();
+    // the store's floor is back where its last meta write had it: the index now begins above
+    // the store's lowest checkpoint. This is what started the backfill of the whole window.
+    const low = w.lowest().?;
+    try testing.expectEqual(w.seqs[0], low);
+    try testing.expectEqual(@as(?u64, w.seqs[5]), live.indexedLo());
+    try testing.expectEqual(@as(u64, 5), lhfill.gapOf(live, low, tip).count());
+    // the node's start: the floor the index witnessed goes back to the store
+    try testing.expectEqual(@as(?u64, w.seqs[5]), try lhfill.restoreFloor(w.st(), testing.io, live, staging, low, tip));
+    try testing.expectEqual(@as(?u64, w.seqs[5]), w.lowest());
+    try testing.expectEqual(@as(u64, 0), lhfill.gapOf(live, w.lowest().?, tip).count());
+    // an index that only began above the store's lowest checkpoint says nothing about a floor
+    const late = try lhist.Index.init(gpa, testing.io, null);
+    defer late.deinit();
+    for (w.blobs[8..], w.seqs[8..]) |b, s| try late.addCheckpoint(s, b);
+    try testing.expectEqual(@as(?u64, null), try lhfill.restoreFloor(w.st(), testing.io, late, null, w.lowest().?, tip));
+    try testing.expectEqual(@as(u64, 3), lhfill.gapOf(late, w.lowest().?, tip).count());
+}
+
+test "ledger-history backfill: with an index that covers the upper part of the window, only the checkpoints below it are read from the store; the rest is copied from the index (2 checkpoints a second from a cold store, for 525,000)" {
+    const gpa = testing.allocator;
+    var w: LhWorld = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = w.arena.allocator();
+    const staging = try std.fmt.allocPrint(a, "{s}/lh/backfill", .{w.root});
+    // the live index began at the fifth checkpoint and follows the tip
+    const live = try lhist.Index.init(gpa, testing.io, null);
+    defer live.deinit();
+    for (w.blobs[4..11], w.seqs[4..11]) |b, s| try live.addCheckpoint(s, b);
+    try testing.expectEqual(@as(u64, 4), lhfill.gapOf(live, w.seqs[0], w.seqs[10]).count());
+    const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[10], .{ .workers = 2, .staging = staging, .live = live });
+    defer bf.destroy();
+    try testing.expectEqual(w.seqs[3], bf.store_to.load(.monotonic));
+    LhWorld.wait(bf);
+    try testing.expectEqual(lhfill.Status.ready, bf.status());
+    // four from the store, seven from the index: none of those was read from the store again
+    try testing.expectEqual(@as(u64, 4), bf.counters.checkpoints.load(.monotonic));
+    try testing.expectEqual(@as(u64, 7), bf.copied.load(.monotonic));
+    // the commit path: the twelfth is indexed by the live index, the build catches up and is equal
+    const out = try bf.finish(w.seqs[10]);
+    try testing.expectEqual(@as(?u64, w.seqs[0]), out.indexedLo());
+    try testing.expectEqual(@as(?u64, w.seqs[10]), out.indexedHi());
+    const want = try lhist.Index.init(gpa, testing.io, null);
+    defer want.deinit();
+    for (w.blobs[0..11], w.seqs[0..11]) |b, s| try want.addCheckpoint(s, b);
+    try testing.expectEqual(try want.contentHash(), try out.contentHash());
+}
+
+test "ledger-history backfill: a stop ends a load between two transactions, and a stopped build resumes after the checkpoint it had saved" {
+    const gpa = testing.allocator;
+    var w: LhWorld = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = w.arena.allocator();
+    var c: lhfill.Counters = .{};
+    {
+        var snap = w.st().snapshot();
+        defer snap.release();
+        var stop: std.atomic.Value(bool) = .init(true);
+        try testing.expectError(error.Cancelled, lhfill.loadCancel(a, &snap, w.seqs[0], &c, &stop));
+        stop.store(false, .release);
+        try testing.expect((try lhfill.loadCancel(a, &snap, w.seqs[0], &c, &stop)) != null);
+    }
+    const staging = try std.fmt.allocPrint(a, "{s}/lh/backfill", .{w.root});
+    var through: ?u64 = null;
+    {
+        // stopped at once: whatever it had built is saved by the stop, nothing is half-written
+        const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[11], .{ .workers = 2, .staging = staging, .ring = 2 });
+        bf.requestStop();
+        const t0 = source_mod.nowNs();
+        through = bf.out.indexedHi();
+        bf.destroy();
+        try testing.expect((source_mod.nowNs() - t0) / std.time.ns_per_ms < 2000);
+    }
+    {
+        const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[11], .{ .workers = 2, .staging = staging });
+        defer bf.destroy();
+        // the next start goes on after the last checkpoint the stopped build had
+        if (bf.resumed_at) |r| try testing.expect(through == null or r >= through.? + 1);
+        LhWorld.wait(bf);
+        try testing.expectEqual(lhfill.Status.ready, bf.status());
+        const out = try bf.finish(w.seqs[11]);
+        try testing.expectEqual(try w.hashFrom(0), try out.contentHash());
+    }
+}
+
+test "ledger-history backfill: the ring holds loaded checkpoints up to a byte budget, not a count, and gives their memory back once indexed (3 GiB to 6.3 GiB and all the swap of a live edge)" {
+    const gpa = testing.allocator;
+    var w: LhWorld = undefined;
+    try w.init();
+    defer w.deinit();
+    // The smallest budget: a loader may load only when the ring holds nothing, or when its
+    // checkpoint is the next one to index. Eight loaders and a ring of 64 never hold more than
+    // those two, where they used to fill the ring.
+    {
+        const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[11], .{ .workers = 8, .mem_bytes = 1 });
+        defer bf.destroy();
+        LhWorld.wait(bf);
+        try testing.expectEqual(lhfill.Status.ready, bf.status());
+        const largest = bf.largest.load(.monotonic);
+        std.debug.print("ledger-history backfill ring, budget 1 byte, 8 loaders: at most {d} checkpoints and {d} KiB held at once; the largest of the 12 corpus checkpoints is {d} KiB loaded; the idle ring keeps {d} KiB\n", .{ bf.peak_slots.load(.monotonic), bf.peak_bytes.load(.monotonic) >> 10, largest >> 10, bf.ringBytes() >> 10 });
+        try testing.expect(bf.peak_slots.load(.monotonic) <= 2);
+        try testing.expect(bf.peak_bytes.load(.monotonic) <= 2 * @max(largest, 1 << 20));
+        // nothing is counted as held once everything is indexed
+        try testing.expectEqual(@as(u64, 0), bf.inflight.load(.monotonic));
+        // and a slot keeps a small arena, not the largest checkpoint it ever held
+        try testing.expect(bf.ringBytes() <= bf.slots.len * lhfill.Backfill.slot_retain_bytes);
+        const out = try bf.finish(w.seqs[11]);
+        try testing.expectEqual(try w.hashFrom(0), try out.contentHash());
+    }
+    // A budget of a few checkpoints: the ring stays within it plus the one checkpoint the
+    // index is waiting for.
+    {
+        const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[11], .{ .workers = 8, .mem_bytes = 4 << 20 });
+        defer bf.destroy();
+        LhWorld.wait(bf);
+        try testing.expectEqual(lhfill.Status.ready, bf.status());
+        try testing.expect(bf.peak_bytes.load(.monotonic) <= (4 << 20) + 2 * @max(bf.largest.load(.monotonic), 1 << 20));
+        try testing.expect(bf.memoryBytes() >= bf.out.memoryBytes());
+    }
+}
+
+test "ledger-history backfill: it waits while the node is behind the tip (more than 10 s, until 3 s; or no checkpoint committed yet) and goes on when the node is back (a tip latency of 39 minutes on a live edge)" {
+    const gpa = testing.allocator;
+    var w: LhWorld = undefined;
+    try w.init();
+    defer w.deinit();
+    const now_ms: u64 = @intCast(@divTrunc(std.Io.Clock.real.now(testing.io).toNanoseconds(), std.time.ns_per_ms));
+    // the node has committed nothing yet in this run (a start): the build waits
+    var tip: std.atomic.Value(u64) = .init(0);
+    const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[11], .{ .workers = 3, .tip_ms = &tip });
+    defer bf.destroy();
+    testing.io.sleep(.fromMilliseconds(250), .awake) catch {};
+    try testing.expectEqual(lhfill.Status.running, bf.status());
+    try testing.expectEqual(@as(u64, 0), bf.counters.checkpoints.load(.monotonic));
+    try testing.expect(bf.paused.load(.monotonic));
+    // its newest checkpoint is a minute old (catch-up, or a stall): still waiting
+    tip.store(now_ms - 60_000, .monotonic);
+    testing.io.sleep(.fromMilliseconds(250), .awake) catch {};
+    try testing.expectEqual(@as(u64, 0), bf.counters.checkpoints.load(.monotonic));
+    try testing.expectEqual(@as(?u64, null), bf.out.indexedHi());
+    // 5 s behind is not back at the tip for a build that was waiting (3 s is)
+    tip.store(@as(u64, @intCast(@divTrunc(std.Io.Clock.real.now(testing.io).toNanoseconds(), std.time.ns_per_ms))) - 5_000, .monotonic);
+    testing.io.sleep(.fromMilliseconds(250), .awake) catch {};
+    try testing.expectEqual(@as(u64, 0), bf.counters.checkpoints.load(.monotonic));
+    // at the tip (a future timestamp reads as no lag): the build runs to its end
+    tip.store(now_ms + 3_600_000, .monotonic);
+    LhWorld.wait(bf);
+    try testing.expectEqual(lhfill.Status.ready, bf.status());
+    try testing.expect(bf.pauses.load(.monotonic) >= 1);
+    try testing.expect(bf.paused_ms.load(.monotonic) >= 500);
+    try testing.expect(!bf.paused.load(.monotonic));
+    const out = try bf.finish(w.seqs[11]);
+    try testing.expectEqual(try w.hashFrom(0), try out.contentHash());
+    // a stop does not wait for the node to come back either
+    var never: std.atomic.Value(u64) = .init(0);
+    const bf2 = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[11], .{ .workers = 2, .tip_ms = &never });
+    testing.io.sleep(.fromMilliseconds(50), .awake) catch {};
+    const t0 = source_mod.nowNs();
+    bf2.destroy();
+    try testing.expect((source_mod.nowNs() - t0) / std.time.ns_per_ms < 1000);
+}
+
+test "ledger-history backfill: the operator's switch (--no-history-backfill, ZUI_LH_BACKFILL=0)" {
+    try testing.expect(lhfill.enabled(true, null));
+    try testing.expect(lhfill.enabled(true, "1"));
+    try testing.expect(!lhfill.enabled(true, "0"));
+    try testing.expect(!lhfill.enabled(true, "off"));
+    try testing.expect(!lhfill.enabled(true, "false"));
+    try testing.expect(!lhfill.enabled(false, null));
+    try testing.expect(!lhfill.enabled(false, "1"));
+    const node = @import("node.zig");
+    const cfg: node.Config = .{ .dir = "", .source = .{ .dir = "" } };
+    try testing.expect(cfg.lh_backfill);
+}
+
+test "ledger-history backfill: a restart with the index a little above the store's lowest checkpoint and a staging watermark present reads only what neither holds, and a resume does not widen it to the window (a clean close did not clear the trigger; the resume reloaded 343538813..344071316)" {
+    const gpa = testing.allocator;
+    var w: LhWorld = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = w.arena.allocator();
+    const want = try w.hashFrom(0);
+    // The store serves 0..11. The live index begins at the fifth checkpoint (its low end
+    // stayed above the store's lowest after an unclean stop, and a clean close since changed
+    // nothing about that) and follows the tip.
+    const live = try lhist.Index.init(gpa, testing.io, null);
+    defer live.deinit();
+    for (w.blobs[4..], w.seqs[4..]) |b, s| try live.addCheckpoint(s, b);
+    const gap = lhfill.gapOf(live, w.seqs[0], w.seqs[11]);
+    try testing.expectEqual(@as(u64, 4), gap.count());
+    try testing.expectEqual(w.seqs[3], gap.to);
+
+    // An earlier run's build left a staging index through the seventh checkpoint: past the
+    // live index's low end, so everything missing is already there.
+    const staging = try std.fmt.allocPrint(a, "{s}/lh/backfill", .{w.root});
+    {
+        const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[6], .{ .workers = 2, .staging = staging });
+        LhWorld.wait(bf);
+        try testing.expectEqual(lhfill.Status.ready, bf.status());
+        bf.destroy();
+    }
+    {
+        const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[11], .{ .workers = 2, .staging = staging, .live = live });
+        defer bf.destroy();
+        try testing.expectEqual(@as(?u64, w.seqs[7]), bf.resumed_at);
+        // nothing is left to read from the store (the node's start line says so: 0 checkpoints)
+        try testing.expect(bf.store_to.load(.monotonic) < bf.resumed_at.?);
+        LhWorld.wait(bf);
+        try testing.expectEqual(lhfill.Status.ready, bf.status());
+        try testing.expectEqual(@as(u64, 0), bf.counters.checkpoints.load(.monotonic));
+        try testing.expectEqual(@as(u64, 5), bf.copied.load(.monotonic));
+        const out = try bf.finish(w.seqs[11]);
+        try testing.expectEqual(@as(?u64, w.seqs[0]), out.indexedLo());
+        try testing.expectEqual(want, try out.contentHash());
+    }
+    // The same with a watermark below the live index's low end: the two checkpoints between
+    // them are read from the store, no more.
+    const staging2 = try std.fmt.allocPrint(a, "{s}/lh2/backfill", .{w.root});
+    {
+        const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[1], .{ .workers = 2, .staging = staging2 });
+        LhWorld.wait(bf);
+        bf.destroy();
+    }
+    {
+        const bf = try lhfill.Backfill.startOpts(gpa, testing.io, w.st(), w.seqs[0], w.seqs[11], .{ .workers = 2, .staging = staging2, .live = live });
+        defer bf.destroy();
+        try testing.expectEqual(@as(?u64, w.seqs[2]), bf.resumed_at);
+        try testing.expectEqual(w.seqs[3], bf.store_to.load(.monotonic));
+        LhWorld.wait(bf);
+        try testing.expectEqual(lhfill.Status.ready, bf.status());
+        try testing.expectEqual(@as(u64, 2), bf.counters.checkpoints.load(.monotonic));
+        try testing.expectEqual(@as(u64, 8), bf.copied.load(.monotonic));
+        const out = try bf.finish(w.seqs[11]);
+        try testing.expectEqual(want, try out.contentHash());
+    }
+}
+
+test "ledger-history backfill: an abandoned staging directory is measured and removed whole, CURRENT first; a stop ends the removal between files and what is left opens as an empty index (10 GiB of a dead build beside an 11 GiB index)" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [512]u8 = undefined;
+    const root_dir = try tmpPath(&tmp, &pb);
+    const staging = try std.fmt.allocPrint(gpa, "{s}/lh/backfill", .{root_dir});
+    defer gpa.free(staging);
+    // nothing there: nothing to measure, nothing to remove, and that is done
+    try testing.expectEqual(@as(u64, 0), lhfill.stagingUse(testing.io, staging).bytes);
+    {
+        const r = lhfill.removeStaging(testing.io, staging, null);
+        try testing.expect(r.done and r.err == null and r.files == 0);
+    }
+    // a build's staging index, saved (a segment rotation), as a killed or abandoned build leaves it
+    const Fill = struct {
+        fn go(dir: []const u8) !void {
+            const st = try lhist.Index.openStaging(testing.allocator, testing.io, dir);
+            defer st.deinit();
+            var first_tx: u64 = 500;
+            for (0..6) |c| {
+                var digests: [40][32]u8 = undefined;
+                var evc: [40]u32 = @splat(0);
+                var txe: [40]struct { u32, u32 } = undefined;
+                for (&digests, &txe, 0..) |*d, *t, i| {
+                    d.* = @splat(0);
+                    std.mem.writeInt(u64, d[0..8], first_tx + i, .little);
+                    t.* = .{ @intCast(i % 2), @intCast(i) };
+                }
+                try st.addRows(1000 + c, first_tx, &digests, &evc, &.{ "\x01sender-a", "\x01sender-b" }, &txe, &.{});
+                first_tx += digests.len;
+            }
+            st.vouchLow();
+            try st.saveStaging();
+        }
+    };
+    try Fill.go(staging);
+    const use = lhfill.stagingUse(testing.io, staging);
+    try testing.expect(use.files >= 3 and use.bytes > 4096);
+    try testing.expectEqual(@as(?u64, 1000), lhist.Index.peekFloor(testing.io, staging));
+    // a stop that has begun: nothing is touched, the build's state is whole for the next start
+    {
+        var stop: std.atomic.Value(bool) = .init(true);
+        const r = lhfill.removeStaging(testing.io, staging, &stop);
+        try testing.expect(!r.done and r.err == null and r.files == 0);
+        try testing.expectEqual(use.bytes, lhfill.stagingUse(testing.io, staging).bytes);
+        const st = try lhist.Index.openStaging(gpa, testing.io, staging);
+        defer st.deinit();
+        try testing.expectEqual(@as(?u64, 1005), st.indexedHi());
+    }
+    // removed: every file and byte counted, the directory gone
+    {
+        var stop: std.atomic.Value(bool) = .init(false);
+        const r = lhfill.removeStaging(testing.io, staging, &stop);
+        try testing.expect(r.done and r.err == null);
+        try testing.expectEqual(use.files, r.files);
+        try testing.expectEqual(use.bytes, r.bytes);
+        try testing.expectEqual(@as(u64, 0), lhfill.stagingUse(testing.io, staging).files);
+        try testing.expectError(error.FileNotFound, Io.Dir.cwd().openDir(testing.io, staging, .{}));
+        try testing.expectEqual(@as(?u64, null), lhist.Index.peekFloor(testing.io, staging));
+    }
+    // A removal that ended after CURRENT (the first file to go): what is left is no floor
+    // witness and no watermark, and the index clears it when it opens.
+    try Fill.go(staging);
+    {
+        var d = try Io.Dir.cwd().openDir(testing.io, staging, .{});
+        defer d.close(testing.io);
+        try d.deleteFile(testing.io, "CURRENT");
+    }
+    try testing.expectEqual(@as(?u64, null), lhist.Index.peekFloor(testing.io, staging));
+    try testing.expect(lhfill.stagingUse(testing.io, staging).bytes > 4096);
+    {
+        const st = try lhist.Index.openStaging(gpa, testing.io, staging);
+        defer st.deinit();
+        try testing.expectEqual(@as(?u64, null), st.indexedHi());
+    }
+    try testing.expect(lhfill.stagingUse(testing.io, staging).bytes < use.bytes);
+    // something that is not a directory at the path (an operator's stand-in): an error, not a crash
+    const file_path = try std.fmt.allocPrint(gpa, "{s}/notdir", .{root_dir});
+    defer gpa.free(file_path);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "notdir", .data = "" });
+    {
+        const r = lhfill.removeStaging(testing.io, file_path, null);
+        try testing.expect(!r.done and r.err != null);
+        try testing.expectEqual(@as(u64, 0), lhfill.stagingUse(testing.io, file_path).bytes);
+    }
 }

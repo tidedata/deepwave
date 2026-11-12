@@ -69,7 +69,7 @@ Build steps and what they install into `zig-out/bin/`:
 Check the result:
 
 ```
-zig-out/bin/deepwave --version            # deepwave 0.1.0-<commit>
+zig-out/bin/deepwave --version            # deepwave 0.1.1-<commit12>
 zig-out/bin/deepwave --protocol-range     # supported protocol versions, sui-node's format
 zig-out/bin/deepwave --help
 ```

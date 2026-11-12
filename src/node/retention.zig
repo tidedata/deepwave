@@ -6,8 +6,14 @@
 //! at least E + N. With `smooth` (the default) each tick moves a watermark only 1/(epoch / tick)
 //! of the way to its target, so in steady state about 2.58 epochs of checkpoints and 1.58 epochs
 //! of superseded object versions are held. The checkpoint pruner never passes the objects
-//! pruner. `lowest_available_checkpoint` = checkpoint pruner's highest pruned + 1. A snapshot
-//! restore sets both watermarks to the restored end-of-epoch checkpoint S.
+//! pruner. State sync's `lowest_available_checkpoint` (GetCheckpointAvailability) is the
+//! checkpoint pruner's highest pruned + 1. The RPC surface's (GetServiceInfo, both fields, and
+//! the floor of GetCheckpoint, GetTransaction and List*) is the higher of that and the objects
+//! pruner's highest pruned + 1 (sui-rpc-api reader.rs `get_lowest_available_checkpoint`): the
+//! objects pruner's whenever objects are kept for fewer epochs, since a transaction's effects,
+//! balance changes and objects are rendered from its input and output versions
+//! (`store.Snapshot.lowestServed`). A snapshot restore sets both watermarks to the restored
+//! end-of-epoch checkpoint S.
 //!
 //! The store applies them (`store.Store.setFloors`): checkpoint data by checkpoint, object
 //! versions by whole segment (deepwave keeps a superset of sui-node's versions inside the partially

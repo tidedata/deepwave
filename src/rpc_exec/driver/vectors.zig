@@ -353,6 +353,23 @@ pub fn checkHandler(arena: Allocator, sink: Sink, seq: []const u8, data: []const
                 },
             }
             d.finish(sink, item);
+            if (case >= 20) continue;
+            // The same request on a node without an executor (no --execute-epoch-from): a reply
+            // the handler gave before the executor (recorded, Mysten's handler) is given as is;
+            // a request that reached the executor gets Status::unimplemented("no transaction
+            // executor") (derived from mod.rs, not recorded).
+            const no_item = try std.fmt.allocPrint(arena, "handler/{s}/{d}/case{d}/no-executor", .{ seq, tx_index, case });
+            const want: handler.RpcError = if (code != 0) .{ .code = code, .message = msg, .details = details } else handler.no_executor;
+            var nd: Diff = .{ .arena = arena };
+            switch (try handler.noExecutor(arena, req)) {
+                .ok => nd.note("want code {d} ({s}), got a response", .{ want.code, want.message }),
+                .err => |e| {
+                    nd.eq("code", want.code, e.code);
+                    nd.text("message", want.message, e.message);
+                    nd.bytes("details", want.details, e.details);
+                },
+            }
+            nd.finish(sink, no_item);
         }
     }
 }

@@ -50,7 +50,11 @@ pub const Service = struct {
     server_header: []const u8 = sui_node_server,
     /// Lowest checkpoint the store serves (reported by GetServiceInfo), when `lowest` is null.
     lowest_checkpoint: u64 = 0,
-    /// Live value of the same (the node refreshes it after each prune; CONTRACTS 6.8).
+    /// Live value of the same (the node refreshes it after each prune; CONTRACTS 6.8). It is
+    /// sui-rpc-api reader.rs `get_lowest_available_checkpoint`: the higher of the checkpoint
+    /// floor and the object floor (`store.Snapshot.lowestServed`), so every checkpoint from it
+    /// up answers with its transactions, effects, balance changes and objects, and everything
+    /// below is NOT_FOUND (OUT_OF_RANGE for the List* methods) whatever the mask.
     lowest: ?*const std.atomic.Value(u64) = null,
     /// An edge that passes what it does not hold to its core (src/edge/forward.zig) reports the
     /// core's lowest available checkpoint in GetServiceInfo and `x-sui-lowest-available-*`: with
@@ -62,6 +66,12 @@ pub const Service = struct {
     /// Where each transaction's `unchanged_loaded_runtime_objects` come from (CONTRACTS 6.6): the
     /// store lane's per-transaction list once it exists. Null serves an empty list.
     loaded: ?LoadedSource = null,
+    /// Which checkpoints this store holds the whole read set of (docs/EDGE.md section 12). Null
+    /// on every node that does not track it: nothing is asked. Set on an edge that keeps read
+    /// sets (its local attempt at a read that needs a transaction's object set ends with
+    /// `LocalGap.read_set_missing` for a checkpoint without one) and on a node that sends them
+    /// in its edge feed.
+    read_sets: ?ReadSetSource = null,
     /// Parsed packages by object digest (a package object never changes). Call `deinit`.
     pkg_cache: PkgCache = .{},
     /// Pre-encoded GetCheckpoint responses by (checkpoint, read_mask) (cpcache.zig); budget 0: off.
@@ -245,8 +255,28 @@ pub const LoadedSource = struct {
     get: *const fn (ctx: *const anyopaque, snap: *const store.Snapshot, digest: *const [32]u8, at: u64) []const objset.Ref,
 };
 
+/// Whether the store holds the whole, final read set of checkpoint `seq`: every transaction's
+/// loaded runtime object list as its source gave it, and every object version of every
+/// transaction's object set readable for as long as the checkpoint is.
+pub const ReadSetSource = struct {
+    ctx: *const anyopaque,
+    has: *const fn (ctx: *const anyopaque, snap: *const store.Snapshot, seq: u64) bool,
+};
+
 pub fn lowestOf(svc: *const Service) u64 {
     return if (svc.lowest) |l| l.load(.acquire) else svc.lowest_checkpoint;
+}
+
+/// The ledger-history index does not hold every checkpoint the node serves: it is empty, or it
+/// begins above the node's lowest checkpoint (a backfill under way, or one that gave up). List*
+/// then answer from the index's low end and report it as their lowest available checkpoint
+/// (lh_service.zig `below_floor`); an edge with a core upstream passes them on instead
+/// (edge/route.zig `unindexed`).
+pub fn historyGap(svc: *const Service) bool {
+    const h = svc.history orelse return false;
+    const tip = svc.store.committed() orelse return false;
+    const lo = h.indexedLo() orelse return true;
+    return lo > lowestOf(svc) and lo <= tip;
 }
 
 /// The lowest available checkpoint the node tells clients about (`Service.reported_lowest`).
@@ -264,9 +294,11 @@ pub fn reportedLowest(svc: *const Service) u64 {
 /// calling thread, which only an edge's forwarding handler does, around its local attempt: the
 /// call then ends with `error.LocalGap` before any response byte is written, and the handler
 /// passes the request to the core. Off (every other node, every other thread): nothing changes.
-pub const LocalGap = enum(u8) { none, item_missing, sig_order, object_missing, foreign_cert };
+pub const LocalGap = enum(u8) { none, item_missing, sig_order, object_missing, foreign_cert, read_set_missing };
 pub threadlocal var gap_watch: bool = false;
 pub threadlocal var gap: LocalGap = .none;
+/// With `gap` `read_set_missing`: the checkpoint whose read set was missing.
+pub threadlocal var gap_seq: u64 = 0;
 /// Set with `gap_watch` when the request's mask renders a checkpoint's quorum certificate
 /// (`Checkpoint.signature`): GetCheckpoint then asks `Service.foreign_cert` about the checkpoint
 /// it is about to answer, and ends with `foreign_cert` when its certificate is not the core's.
@@ -319,6 +351,17 @@ fn gapHit(g: LocalGap) error{LocalGap}!void {
 /// 10.3), so an edge does not answer it.
 fn gapSigOrder(m: mask.Mask, signatures: usize) error{LocalGap}!void {
     if (gap_watch and signatures > 1 and m.contains("signatures")) return gapHit(.sig_order);
+}
+
+/// A read that needs the object set of a transaction of checkpoint `seq` (`needsObjectSet`): a
+/// store that does not hold that checkpoint's whole read set (`Service.read_sets`; a store that
+/// tracks none holds none) would render an empty loaded-object list where its core has one, so
+/// an edge does not answer it.
+fn gapReadSet(svc: *const Service, snap: *const store.Snapshot, seq: u64) error{LocalGap}!void {
+    if (!gap_watch) return;
+    if (svc.read_sets) |src| if (src.has(src.ctx, snap, seq)) return;
+    gap_seq = seq;
+    return gapHit(.read_set_missing);
 }
 
 fn loadedOf(svc: *const Service, snap: *const store.Snapshot, digest: *const [32]u8, at: u64) []const objset.Ref {
@@ -937,6 +980,7 @@ fn getCheckpoint(svc: *Service, arena: Allocator, snap: *store.Snapshot, body: [
         }
         svc.cp_cache.drop(svc.gpa, want_seq, k);
     };
+    if (want_objects) try gapReadSet(svc, snap, want_seq);
     const d = try loadCheckpointData(svc, arena, snap, found, want_txs, want_objects);
     if (gap_watch) if (m.subtree("transactions")) |tm| for (d.txs) |*t| try gapSigOrder(tm, t.signatures.len);
     const budget = try arena.create(usize);
@@ -1220,6 +1264,7 @@ fn txBodyPre(svc: *const Service, arena: Allocator, w: *proto.Writer, snap: *sto
     const cert = try render_checkpoint.Cert.parse(arena, cp.summary_cert);
     var objs: std.ArrayList([]const u8) = .empty;
     if (needsObjectSet(m)) {
+        try gapReadSet(svc, snap, rec.checkpoint);
         if (pre) |got| try objs.appendSlice(arena, got) else try collectObjects(svc, arena, snap, rec, &objs, missing);
     }
     var input = try txInput(svc, arena, snap, rec);
@@ -1261,10 +1306,13 @@ fn getTransaction(svc: *const Service, arena: Allocator, snap: *store.Snapshot, 
     const cert = try render_checkpoint.Cert.parse(arena, cp.summary_cert);
     var objs: std.ArrayList([]const u8) = .empty;
     var missing: []const u8 = "";
-    if (needsObjectSet(m)) collectObjects(svc, arena, snap, rec, &objs, &missing) catch |e| {
-        if (e == error.Internal) rs.setMessage(missing);
-        return e;
-    };
+    if (needsObjectSet(m)) {
+        try gapReadSet(svc, snap, rec.checkpoint);
+        collectObjects(svc, arena, snap, rec, &objs, &missing) catch |e| {
+            if (e == error.Internal) rs.setMessage(missing);
+            return e;
+        };
+    }
     var input = try txInput(svc, arena, snap, rec);
     try gapSigOrder(m, input.signatures.len);
     const src = try arena.create(ObjSource);
@@ -1295,7 +1343,8 @@ fn getServiceInfo(svc: *Service, arena: Allocator, snap: *store.Snapshot, rs: *h
     }
     const lowest = reportedLowest(svc);
     try w.uint(6, lowest);
-    // Deprecated lowest_available_checkpoint_objects: get_service_info.rs still sets it to the same value.
+    // Deprecated lowest_available_checkpoint_objects: get_service_info.rs still sets it to the same
+    // value, which already is the higher of the checkpoint and object floors (`Service.lowest`).
     try w.uint(7, lowest);
     try w.string(8, svc.server_name);
     try rs.message(w.bytesWritten());

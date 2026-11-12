@@ -450,6 +450,10 @@ pub const Connection = struct {
     handshake_confirmed: bool = false,
     /// Validated datagram size on the current path (`max_datagram` until a probe is acked).
     mtu: usize = max_datagram,
+    /// The largest size ever validated: `mtu` goes back to 1200 on a black hole, and a
+    /// connection whose peer went away ends in probe timeouts, so `mtu` at the end of a
+    /// connection's life says little about what it ran at.
+    mtu_peak: usize = max_datagram,
     pmtu_inflight: bool = false,
     pmtu_tries: u8 = 0,
     /// Path MTU search (`cfg.pmtud`): the size being probed (0: none chosen yet), the smallest
@@ -1600,6 +1604,7 @@ pub const Connection = struct {
                         if (c.cfg.iw_mtu and m > c.mtu and c.ssthresh == std.math.maxInt(u64) and !(c.cfg.bbr and c.bbr.full_bw_reached))
                             c.cwnd += initialWindow(m) - initialWindow(c.mtu);
                         c.mtu = @max(c.mtu, m);
+                        c.mtu_peak = @max(c.mtu_peak, c.mtu);
                         c.pmtu_inflight = false;
                         if (m == c.pmtu_probe) c.pmtu_probe = 0; // passed: the search moves up
                     },
@@ -1852,6 +1857,17 @@ pub const Connection = struct {
         c.pmtu_search_at = now + pmtu_cooldown_ns;
     }
 
+    /// A 1-RTT packet larger than 1200 bytes waits for its acknowledgement (path MTU probes
+    /// apart: an unanswered probe is the search's business, not a black hole).
+    fn bigInFlight(c: *Connection) bool {
+        for (c.spaces[2].live()) |s| {
+            if (s.size <= max_datagram or !s.ack_eliciting) continue;
+            if (s.nrec == 1 and s.recs[0] == .pmtu) continue;
+            return true;
+        }
+        return false;
+    }
+
     fn ptoDuration(c: *const Connection, space: Space) u64 {
         var d = c.srtt + @max(4 * c.rttvar, 1 * ms);
         if (space == .app) d += c.peer.max_ack_delay_ms * ms;
@@ -1983,8 +1999,13 @@ pub const Connection = struct {
                 c.pto_count += 1;
                 c.ptos += 1;
                 // two probe timeouts in a row with nothing acknowledged, at a raised datagram
-                // size: the probes themselves may be what the path drops
-                if (c.cfg.pmtud and space == .app and c.pto_count >= 2 and c.mtu > max_datagram) c.pmtuBlackHole(now);
+                // size, while a full-size packet waits for its acknowledgement: the size may be
+                // what the path drops. With only small packets unanswered (the MAX_STREAMS
+                // after a response, a keep-alive, to a peer that is not reading just now or
+                // has gone) the silence says nothing about the size, and the validated size is
+                // kept: giving it up there put every connection that paused for three probe
+                // timeouts back to 1200 bytes for a minute.
+                if (c.cfg.pmtud and space == .app and c.pto_count >= 2 and c.mtu > max_datagram and c.bigInFlight()) c.pmtuBlackHole(now);
                 const sp = &c.spaces[@intFromEnum(space)];
                 sp.probe = 2;
                 if (space != .app) {
@@ -2191,7 +2212,8 @@ pub const Connection = struct {
         if (c.cfg.bbr) {
             if (can_send and sp.probe == 0 and plan.space == .app and c.rtt_initialized) {
                 // BBR's own rate, in runs of its send quantum
-                if (c.pacer.delayRate(now, c.bbr.pacing_rate, c.mtu, c.cwnd - c.bytes_in_flight, c.bbr.send_quantum)) |at| {
+                // (a sender limited by its application is not paced from an empty bucket)
+                if (c.pacer.delayBurst(now, c.bbr.pacing_rate, c.mtu, c.cwnd - c.bytes_in_flight, c.bbr.send_quantum, c.bbr.burstAllowance(c.cwnd))) |at| {
                     can_send = false;
                     c.pace_at = at;
                 }
@@ -4209,6 +4231,183 @@ test "path MTU search: two probe timeouts in a row at a raised size fall back to
         try std.testing.expectEqual(@as(u64, if (search) 1 else 0), c.pmtu_black_holes);
         if (search) try std.testing.expectEqual(now + pmtu_cooldown_ns, c.pmtu_search_at);
     }
+}
+
+test "path MTU search: probe timeouts with only small packets unanswered keep the validated size" {
+    const gpa = std.testing.allocator;
+    const c = try testEstablished(gpa);
+    defer c.deinit();
+    c.cfg.pmtud = true;
+    c.cfg.pmtu_max = 1452;
+    c.cfg.keep_alive_ms = 0;
+    c.mtu = 1452; // validated earlier on this connection
+    const id = try c.openBidi();
+    try c.streamWrite(id, "a small tail", false);
+    var out: [max_mtu]u8 = undefined;
+    var now: u64 = 1_000_000;
+    try std.testing.expect(c.pollTransmit(now, &out).? < 100);
+    // the peer is not reading: three probe timeouts in a row, each answered by nothing
+    for (0..3) |k| {
+        now = c.nextTimeout().?;
+        c.onTimeout(now);
+        try std.testing.expectEqual(@as(u32, @intCast(k + 1)), c.pto_count);
+        while (c.pollTransmit(now, &out)) |n| try std.testing.expect(n < 100);
+    }
+    try std.testing.expectEqual(@as(usize, 1452), c.mtu);
+    try std.testing.expectEqual(@as(u64, 0), c.pmtu_black_holes);
+    // a full-size packet joins the unanswered ones: the next probe timeout is a black hole
+    const big: [1400]u8 = @splat(3);
+    try c.streamWrite(id, &big, false);
+    try std.testing.expect(c.pollTransmit(now, &out).? > max_datagram);
+    now = c.nextTimeout().?;
+    c.onTimeout(now);
+    try std.testing.expectEqual(@as(usize, max_datagram), c.mtu);
+    try std.testing.expectEqual(@as(u64, 1), c.pmtu_black_holes);
+}
+
+/// What a zui/1 listener's connection has counted when it gives up on a client that connected
+/// over a path of `rtt_ns`, sent one small request, read the whole response and was then never
+/// run again: no CONNECTION_CLOSE and no further ACK (an edge pool connection nobody pumps
+/// between requests, or a process that went away). The server answers, frees the stream, which
+/// sends MAX_STREAMS, and that small frame is never acknowledged: probe timeouts double until
+/// the 30 s idle timeout. `tune` sets the listener's sender switches.
+const Abandoned = struct { pkts: u64, lost: u64, ptos: u64, mtu: usize, mtu_peak: usize, black_holes: u64 };
+
+fn abandonedAfterOneRequest(gpa: Allocator, rtt_ns: u64, tune: ?*const fn (*Config) void) !Abandoned {
+    const server_seed: [32]u8 = @splat(9);
+    const skey = (try Ed25519.KeyPair.generateDeterministic(server_seed)).public_key.toBytes();
+    var now: u64 = 1_000_000_000;
+    // the edge client's connection (src/edge/client.zig) and the listener's (listener.zig)
+    const client = try Connection.init(gpa, .{ .server_name = "zui", .identity_seed = @splat(4), .expected_peer = skey, .seed = @splat(5), .now_unix = 1_800_000_000, .alpn = &.{"zui/1"}, .max_streams_uni = 16, .max_streams_bidi = 64, .keep_alive_ms = 3_000, .pmtu_max = 1452 }, now);
+    defer client.deinit();
+    var scfg: Config = .{ .server_name = "zui", .identity_seed = server_seed, .seed = @splat(6), .now_unix = 1_800_000_000, .max_streams_bidi = 128, .max_streams_uni = 16, .max_data = 16 << 20, .max_stream_data = 1 << 20, .idle_timeout_ms = 30_000, .keep_alive_ms = 0, .alpn = &.{"zui/1"}, .client_auth = false, .max_datagram_frame_size = 65535, .pmtu_max = 1452, .handshake_timeout_ms = 5_000 };
+    if (tune) |f| f(&scfg);
+    var server: ?*Connection = null;
+    defer if (server) |s| s.deinit();
+
+    const Pkt = struct { t: u64, to_server: bool, len: u16, data: [max_mtu]u8 };
+    var link: std.ArrayList(Pkt) = .empty;
+    defer link.deinit(gpa);
+    var out: [max_mtu]u8 = undefined;
+    var req: ?u64 = null; // the client's request stream
+    var gone = false; // the client is no longer run
+    var serving: ?u64 = null;
+    var answered = false;
+    var peak: usize = 0;
+    var iter: usize = 0;
+    while (true) : (iter += 1) {
+        if (iter > 1_000_000) return error.SimRunaway;
+        var i: usize = 0;
+        while (i < link.items.len) {
+            if (link.items[i].t > now) {
+                i += 1;
+                continue;
+            }
+            var p = link.orderedRemove(i);
+            const d = p.data[0..p.len];
+            if (!p.to_server) {
+                if (!gone) client.handleDatagram(now, d);
+                continue;
+            }
+            if (server == null) {
+                const dl = d[5];
+                const sl = d[6 + dl];
+                server = try Connection.initServer(gpa, scfg, now, d[6..][0..dl], d[7 + dl ..][0..sl]);
+            }
+            server.?.handleDatagram(now, d);
+        }
+        if (server) |s| {
+            if (s.nextTimeout()) |t| if (now >= t) s.onTimeout(now);
+            if (s.isClosed()) break;
+            if (s.isEstablished()) {
+                if (s.acceptBidi()) |id| serving = id;
+                if (serving) |id| {
+                    if (!answered) {
+                        const st = s.stream(id).?;
+                        if (st.recv.complete()) {
+                            st.recv.consume(st.recv.contiguous().len);
+                            const resp: [150]u8 = @splat(0x5a);
+                            try s.streamWrite(id, &resp, true);
+                            answered = true;
+                        }
+                    } else if (s.stream(id) == null or s.streamSettled(id)) {
+                        s.streamFree(id);
+                        serving = null;
+                    }
+                }
+            }
+            while (s.pollTransmit(now, &out)) |n| {
+                var p: Pkt = .{ .t = now + rtt_ns / 2, .to_server = false, .len = @intCast(n), .data = undefined };
+                @memcpy(p.data[0..n], out[0..n]);
+                try link.append(gpa, p);
+            }
+            peak = @max(peak, s.mtu);
+        }
+        if (!gone) {
+            if (client.nextTimeout()) |t| if (now >= t) client.onTimeout(now);
+            if (client.isEstablished() and req == null) {
+                req = try client.openBidi();
+                const hello: [30]u8 = @splat(0x48);
+                try client.streamWrite(req.?, &hello, true);
+            }
+            while (client.pollTransmit(now, &out)) |n| {
+                var p: Pkt = .{ .t = now + rtt_ns / 2, .to_server = true, .len = @intCast(n), .data = undefined };
+                @memcpy(p.data[0..n], out[0..n]);
+                try link.append(gpa, p);
+            }
+            // the response is read whole: the caller has what it asked for and stops here
+            if (req) |id| if (client.stream(id).?.recv.complete()) {
+                gone = true;
+            };
+        }
+        var next: u64 = std.math.maxInt(u64);
+        for (link.items) |p| next = @min(next, p.t);
+        if (!gone) if (client.nextTimeout()) |t| {
+            next = @min(next, t);
+        };
+        if (server) |s| if (s.nextTimeout()) |t| {
+            next = @min(next, t);
+        };
+        now = if (next > now) next else now + 10_000;
+    }
+    const s = server.?;
+    try std.testing.expectEqual(peak, s.mtu_peak);
+    return .{ .pkts = s.pkts_sent, .lost = s.pkts_lost, .ptos = s.ptos, .mtu = s.mtu, .mtu_peak = s.mtu_peak, .black_holes = s.pmtu_black_holes };
+}
+
+fn tuneCoreSwitches(c: *Config) void {
+    // ZUI_NATIVE_HYSTART, _CUBIC, _PMTUD, _EARLY_SETTINGS and _BBR, from an IPv4 client
+    c.hystart = true;
+    c.cubic = true;
+    c.pmtud = true;
+    c.pmtu_max = 1472;
+    c.early_send = true;
+    c.bbr = true;
+}
+
+test "a client that stops after one request: probe timeouts to the idle timeout, the validated size kept" {
+    const gpa = std.testing.allocator;
+    // 250 ms round trip (a core and a distant edge), then 102 ms (a nearer edge). The probe
+    // timeout doubles from about 3 round trips (one sample: srtt + 4 * srtt / 2) until the
+    // idle timeout cuts the series: 5 expiries on the long path, 6 on the short one.
+    const off = try abandonedAfterOneRequest(gpa, 250 * ms, null);
+    const on = try abandonedAfterOneRequest(gpa, 250 * ms, tuneCoreSwitches);
+    const near = try abandonedAfterOneRequest(gpa, 102 * ms, tuneCoreSwitches);
+    // ZUI_NET_ABANDONED=1 prints each as the listener's line at the end of a connection
+    if (std.c.getenv("ZUI_NET_ABANDONED") != null) for ([_]Abandoned{ off, on, near }) |r|
+        std.debug.print("connection done, {d} packets sent, {d} lost, {d} PTOs, path MTU {d} (highest {d}, {d} fallbacks)\n", .{ r.pkts, r.lost, r.ptos, r.mtu, r.mtu_peak, r.black_holes });
+    try std.testing.expectEqual(@as(u64, 5), off.ptos);
+    try std.testing.expectEqual(@as(u64, 0), off.lost);
+    try std.testing.expectEqual(@as(usize, 1452), off.mtu);
+    try std.testing.expectEqual(@as(u64, 5), on.ptos);
+    try std.testing.expectEqual(@as(u64, 0), on.lost);
+    try std.testing.expectEqual(off.pkts, on.pkts);
+    // the search validated the ceiling, and unanswered MAX_STREAMS and PINGs do not undo that
+    try std.testing.expectEqual(@as(usize, 1472), on.mtu_peak);
+    try std.testing.expectEqual(@as(usize, 1472), on.mtu);
+    try std.testing.expectEqual(@as(u64, 0), on.black_holes);
+    try std.testing.expectEqual(@as(u64, 6), near.ptos);
+    try std.testing.expectEqual(@as(usize, 1472), near.mtu);
 }
 
 test "path MTU search off: one probe of pmtu_max, three tries, then 1200 for good (the old path)" {

@@ -8,13 +8,18 @@
 //!   not kept. Coins carry their balance inverted so the richest coin of a type sorts first.
 //! - balance index (`balance`): per owner a sorted map `bcs(TypeTag coin type)` -> (coin, address)
 //!   sums: address-owned `Coin<T>` objects add to `coin`, accumulator fields
-//!   (`Field<Key<Balance<T>>, U128>` under 0xacc) add to `address`. Rows that reach zero are
-//!   dropped (sui-node drops them at its next compaction; until then it lists them with balance 0).
+//!   (`Field<Key<Balance<T>>, U128>` under 0xacc) add to `address`. A row is created by a non-zero
+//!   change and stays when its sum reaches zero (a coin spent, an address balance drained, whose
+//!   accumulator field is then deleted): ListBalances lists it with balance 0, as sui-node 1.83.1
+//!   lists its merged RocksDB row (sui-rpc-store reader/indexes.rs `balance_iter` has no zero
+//!   filter), until a merge into the oldest run drops it, as sui-node's compaction filter does
+//!   (schema/balance.rs `compact`). So this table, unlike the other two, is not a function of the
+//!   live set alone: an index built from a live set has no zero rows.
 //! - coin index (`object_by_type`, restricted to the three wrapper types GetCoinInfo looks up):
 //!   `kind(1) || bcs(TypeTag coin type) || object_id(32)` for CoinMetadata<T> (0),
 //!   TreasuryCap<T> (1), RegulatedCoinMetadata<T> (2); the lowest id wins, as the node's first row.
 //!
-//! The index is a function of the live object set only, so it is built the same way from a restored
+//! The index is a function of the live object set (save the zero balance rows above), so it is built the same way from a restored
 //! live set (`insert` per object) and kept current by the commit path (`applyChanges` per
 //! checkpoint: old live state out, new state in). Readers hold `lock` shared for one request.
 const std = @import("std");
@@ -30,6 +35,7 @@ pub const conformance = @import("conformance.zig");
 pub const feed = @import("feed.zig");
 pub const lsm = @import("lsm.zig");
 pub const bulk = @import("bulk.zig");
+pub const verify = @import("verify.zig");
 
 pub const Kind = enum(u8) { address = 0, object = 1 };
 pub const CoinWrapper = enum(u8) { metadata = 0, treasury = 1, regulated = 2 };
@@ -347,7 +353,8 @@ pub const Index = struct {
         m: lsm.MergeIter,
         prefix: [33]u8,
         pub const Row = struct { key: []const u8, val: Bal };
-        /// The next (BCS coin TypeTag, balance) of the owner; zero sums are skipped.
+        /// The next (BCS coin TypeTag, balance) of the owner; a row whose sum went to zero is
+        /// returned with a zero balance (see the balance table above).
         pub fn next(it: *Balances) !?Row {
             const e = try it.m.next() orelse return null;
             if (!std.mem.startsWith(u8, e.key, &it.prefix)) return null;
@@ -456,7 +463,10 @@ fn emitBalance(arena: Allocator, emit: lsm.Emit, owner: *const [32]u8, coin_t: t
     key[0] = @intFromEnum(Table.balance);
     @memcpy(key[1..33], owner);
     @memcpy(key[33..], tk);
-    try emit.f(emit.ctx, key, lsm.Val.delta(coin, address));
+    // sui-node writes a merge operand per non-zero (coin, address) change of a transaction
+    // (balance_change.rs derive_detailed_balance_changes_2 drops zero pairs); its row then stays at a
+    // zero sum. A zero change (a zero-value coin) is the identity and creates no row.
+    try emit.f(emit.ctx, key, if (coin != 0 or address != 0) lsm.Val.held(coin, address) else lsm.Val.delta(0, 0));
 }
 
 /// `bcs(StructTag) || balance_tag || !balance BE? || id`.
@@ -580,6 +590,8 @@ test {
     _ = @import("live_test.zig");
     _ = @import("lsm_test.zig");
     _ = @import("bulk_test.zig");
+    _ = @import("verify_test.zig");
     _ = lsm;
     _ = bulk;
+    _ = verify;
 }

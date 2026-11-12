@@ -13,6 +13,8 @@ pub const profile = @import("profile.zig");
 pub const route = @import("route.zig");
 pub const forward = @import("forward.zig");
 pub const raw = @import("raw.zig");
+/// The access gate for a node that serves the public (docs/GATE.md); off without `--gate`.
+pub const gate = @import("gate/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

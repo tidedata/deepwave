@@ -175,7 +175,7 @@ const core = struct {
             rs.details(&details);
             return .not_found;
         }
-        if (eq(u8, req.path, p_object) or eq(u8, req.path, p_tx) or eq(u8, req.path, p_checkpoint)) {
+        if (eq(u8, req.path, p_object) or eq(u8, req.path, p_tx) or eq(u8, req.path, p_checkpoint) or eq(u8, req.path, p_balances)) {
             // echoes the request so a test sees the same bytes went through
             var buf: [512]u8 = undefined;
             const text = std.fmt.bufPrint(&buf, "core:{s}:{x}", .{ req.path, req.body[0..@min(req.body.len, 64)] }) catch "core";
@@ -579,6 +579,97 @@ test "a forwarded unary call returns the core's bytes, status, message and detai
     try testing.expect(std.mem.indexOf(u8, text, "zui_edge_route_guard 0\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "zui_edge_route_forward_latency_seconds_count{method=\"/sui.rpc.v2.NameService/LookupName\"} 1\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "zui_edge_route_execute_hold_seconds_count 0\n") != null);
+}
+
+/// A stand-in for the access gate: refuses by script, and records what the forwarder tells it.
+const ScriptGate = struct {
+    deny_code: u8 = 0,
+    retry_ms: ?u32 = null,
+    begins: u32 = 0,
+    ends: u32 = 0,
+    metered: u32 = 0,
+    last_outcome: ?forward.Outcome = null,
+    last_status: h2.Status = .ok,
+    ticket: u8 = 0,
+    ticket_back: bool = false,
+
+    fn begin(ctx: *anyopaque, _: *const h2.Request, rs: *h2.ResponseStream, caller: *route.Caller, scope: *forward.GateScope) void {
+        const g: *ScriptGate = @ptrCast(@alignCast(ctx));
+        g.begins += 1;
+        scope.bytes[0] = 0x5a;
+        if (g.deny_code != 0) {
+            caller.deny = .{ .code = g.deny_code, .message = "refused by the gate" };
+            rs.retry_after_ms = g.retry_ms;
+        } else caller.ticket = &g.ticket;
+    }
+    fn end(ctx: *anyopaque, scope: *forward.GateScope, status: h2.Status) void {
+        const g: *ScriptGate = @ptrCast(@alignCast(ctx));
+        std.debug.assert(scope.bytes[0] == 0x5a);
+        g.ends += 1;
+        g.last_status = status;
+    }
+    fn meter(ctx: *anyopaque, m: *const forward.Metered) void {
+        const g: *ScriptGate = @ptrCast(@alignCast(ctx));
+        g.metered += 1;
+        g.last_outcome = m.outcome;
+        g.ticket_back = m.caller.ticket == @as(?*anyopaque, &g.ticket);
+    }
+};
+
+test "an access gate in front: a refused call reaches neither the edge's store nor the core; an admitted one is metered local or forwarded" {
+    core.reset();
+    const up = try Server.start(core.handler, null);
+    defer up.stop();
+    const e = try Edge.create(plain(up.port), .{});
+    defer e.destroy();
+    e.healthy();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var gate: ScriptGate = .{};
+    e.f.gate_hook = .{ .ctx = &gate, .begin = ScriptGate.begin, .end = ScriptGate.end };
+    e.f.meter_hook = .{ .ctx = &gate, .f = ScriptGate.meter };
+
+    // admitted and answered here: the meter says local, with the gate's ticket
+    const obj = try e.unary(a, p_object, "\x0a\x030x5");
+    try testing.expectEqualStrings("local:" ++ p_object, obj.message);
+    try testing.expectEqual(forward.Outcome.local, gate.last_outcome.?);
+    try testing.expect(gate.ticket_back);
+    try testing.expectEqual(h2.Status.ok, gate.last_status);
+    // admitted and passed on: forwarded
+    _ = try e.unary(a, p_lookup, "name");
+    try testing.expectEqual(forward.Outcome.forwarded, gate.last_outcome.?);
+    try testing.expectEqual(@as(u32, 2), gate.begins);
+    try testing.expectEqual(@as(u32, 2), gate.ends);
+    try testing.expectEqual(@as(u32, 2), gate.metered);
+
+    // refused: the status and text of the gate, before routing; nobody else is asked
+    const local_calls = e.local.calls.load(.acquire);
+    const core_calls = core.calls.load(.acquire);
+    gate.deny_code = 8;
+    gate.retry_ms = 40;
+    for ([_][]const u8{ p_object, p_lookup, p_tx }) |path| {
+        const r = try e.unary(a, path, "\x0a\x01x");
+        try testing.expectEqual(@as(u8, 8), r.status);
+        try testing.expectEqualStrings("refused by the gate", r.grpc_message);
+    }
+    gate.deny_code = 16;
+    gate.retry_ms = null;
+    const ua = try e.unary(a, p_object, "\x0a\x030x5");
+    try testing.expectEqual(@as(u8, 16), ua.status);
+    gate.deny_code = 7;
+    const pd = try e.unary(a, p_object, "\x0a\x030x5");
+    try testing.expectEqual(@as(u8, 7), pd.status);
+    try testing.expectEqual(local_calls, e.local.calls.load(.acquire));
+    try testing.expectEqual(core_calls, core.calls.load(.acquire));
+    try testing.expectEqual(forward.Outcome.denied, gate.last_outcome.?);
+    try testing.expectEqual(@as(u64, 5), e.f.metrics.methods[@intFromEnum(route.Method.get_object)].denied.load(.monotonic) + e.f.metrics.methods[@intFromEnum(route.Method.lookup_name)].denied.load(.monotonic) + e.f.metrics.methods[@intFromEnum(route.Method.get_transaction)].denied.load(.monotonic));
+    // a path the edge answers itself (outside the routing table) is refused too
+    const own = try e.unary(a, "/sui.rpc.v2.LedgerService/NoSuchMethod", "");
+    try testing.expectEqual(@as(u8, 7), own.status);
+    try testing.expectEqual(local_calls, e.local.calls.load(.acquire));
+    try testing.expectEqual(gate.begins, gate.ends);
+    try testing.expectEqual(@as(u32, 8), gate.begins);
 }
 
 test "requests ahead of the edge wait for the follower, then go to the core" {
@@ -1443,9 +1534,16 @@ test "read-after-write reads: by-address reads, dynamic fields, a batch with one
     for (0..3) |_| try e.commit(null); // tip 2
 
     // nothing pending: nothing waits, the core is not asked
-    for ([_][]const u8{ p_object, p_owned, p_balance, p_balances, p_fields }) |path| {
+    for ([_][]const u8{ p_object, p_owned, p_balance, p_fields }) |path| {
         const r = try timed(e, a, path, try idReq(a, &o_gas));
         try testing.expect(r.ms < 100 and std.mem.endsWith(u8, r.reply.message, "@2"));
+    }
+    // ListBalances is the core's by policy (route.balance_lists): passed on, never the edge's answer
+    {
+        const r = try timed(e, a, p_balances, try idReq(a, &o_gas));
+        try testing.expect(r.ms < 100 and std.mem.startsWith(u8, r.reply.message, "core:" ++ p_balances));
+        try testing.expectEqual(@as(u64, 1), e.forwarded(.list_balances, .policy));
+        try testing.expectEqual(@as(u64, 0), e.servedLocal(.list_balances));
     }
     try testing.expectEqual(@as(u64, 0), e.f.metrics.raw_read_wait.n.load(.monotonic));
 
@@ -1459,7 +1557,6 @@ test "read-after-write reads: by-address reads, dynamic fields, a batch with one
         .{ .path = p_batch, .body = try batchReq(a, &.{ o_other, a_other }) },
         .{ .path = p_owned, .body = try idReq(a, &a_other) },
         .{ .path = p_balance, .body = try idReq(a, &a_other) },
-        .{ .path = p_balances, .body = try idReq(a, &a_other) },
         .{ .path = p_fields, .body = try idReq(a, &o_other) },
         // the object id of the owner address is not the address: an object read, another key
         .{ .path = p_object, .body = try idReq(a, &a_owner) },
@@ -1479,13 +1576,21 @@ test "read-after-write reads: by-address reads, dynamic fields, a batch with one
         .{ .e = e, .path = p_fields, .body = try idReq(a, &o_parent) }, // its parent's field list
         .{ .e = e, .path = p_owned, .body = try idReq(a, &a_owner) },
         .{ .e = e, .path = p_balance, .body = try idReq(a, &a_owner) },
-        .{ .e = e, .path = p_balances, .body = try idReq(a, &a_owner) },
+        .{ .e = e, .path = p_balance, .body = try idReq(a, &a_owner) }, // a second client, the same address
         .{ .e = e, .path = p_batch, .body = try batchReq(a, &.{ o_other, o_gas, a_other }) }, // one pending item
         .{ .e = e, .path = p_tx, .body = try txReq(a, &digest) },
     };
     for (&readers) |*r| r.thread = try std.Thread.spawn(.{}, Reader.run, .{r});
     sleepMs(250);
     try testing.expectEqual(@as(u32, readers.len), e.f.raw_waiters.load(.acquire));
+    // ListBalances of the pending owner does not wait here: it is passed to the core by policy
+    // (route.balance_lists) before the pending writes are looked at, and the core has executed
+    {
+        const r = try timed(e, a, p_balances, try idReq(a, &a_owner));
+        try testing.expect(r.ms < 100 and std.mem.startsWith(u8, r.reply.message, "core:" ++ p_balances));
+        try testing.expectEqual(@as(u64, 2), e.forwarded(.list_balances, .policy));
+        try testing.expectEqual(@as(u32, readers.len), e.f.raw_waiters.load(.acquire));
+    }
     try e.commit(&digest);
     for (&readers) |*r| r.thread.join();
     for (&readers) |*r| {
@@ -2179,4 +2284,511 @@ test "read-after-write reads: with the node's own ExecuteTransaction renderer, t
     }
     std.debug.print("read-after-write reads: the node's ExecuteTransaction renderer under {d} client masks without effects.bcs: {d} answered with data, stripped answer equal to the client's own in all\n", .{ compared, with_data });
     try testing.expect(with_data >= 8);
+}
+
+// ---------------------------------------------------------------- the policy settings (docs/EDGE.md 11.8)
+
+test "edge policy --edge-balance-lists: forward by default; local is the edge's own answer, waits for read-after-write like GetBalance, and a local failure still goes to the core" {
+    core.reset();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    core.effects_bcs = try someEffects(a);
+    const up = try Server.start(core.handler, null);
+    defer up.stop();
+    // the default: the core's
+    {
+        const e = try Edge.create(plain(up.port), .{ .raw = .reads });
+        defer e.destroy();
+        e.local.st = e.st;
+        e.f.source = null;
+        e.healthy();
+        for (0..3) |_| try e.commit(null);
+        const r = try e.unary(a, p_balances, try idReq(a, &a_other));
+        try testing.expect(std.mem.startsWith(u8, r.message, "core:" ++ p_balances));
+        try testing.expectEqual(@as(u64, 1), e.forwarded(.list_balances, .policy));
+        try testing.expectEqual(@as(u64, 0), e.servedLocal(.list_balances));
+        try testing.expectEqual(route.Where.forward, e.f.state().balance_lists);
+    }
+    const e = try Edge.create(plain(up.port), .{ .raw = .reads, .balance_lists = .local });
+    defer e.destroy();
+    e.local.st = e.st;
+    e.f.source = null;
+    e.healthy();
+    try e.f.start();
+    for (0..3) |_| try e.commit(null); // tip 2
+    try testing.expectEqual(route.Where.local, e.f.state().balance_lists);
+    const asked = core.calls.load(.acquire);
+    const own = try timed(e, a, p_balances, try idReq(a, &a_other));
+    try testing.expectEqualStrings("local:" ++ p_balances ++ "@2", own.reply.message);
+    try testing.expectEqual(@as(u64, 1), e.servedLocal(.list_balances));
+    try testing.expectEqual(@as(u64, 0), e.forwarded(.list_balances, .policy));
+    try testing.expectEqual(asked, core.calls.load(.acquire));
+    // read-after-write: the list of an address a pending transaction wrote to waits for the apply
+    const data = "the transaction whose balances are listed after";
+    const digest = txDigest(data);
+    _ = try e.unary(a, p_execute, try executeMasked(a, data, &.{"digest"}));
+    var reader: Reader = .{ .e = e, .path = p_balances, .body = try idReq(a, &a_owner) };
+    reader.thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    sleepMs(250);
+    try testing.expectEqual(@as(u32, 1), e.f.raw_waiters.load(.acquire));
+    try e.commit(&digest);
+    reader.thread.join();
+    try testing.expect(reader.ms >= 200 and reader.ms < 1500);
+    try testing.expectEqualStrings("local:" ++ p_balances ++ "@3", reader.message());
+    // another address meanwhile: at once (checked after the apply here; nothing is pending)
+    try testing.expect(e.f.pending.idle());
+    // a local failure (the index not ready) is not the edge's to give
+    e.local.code.store(14, .release);
+    const failed = try e.unary(a, p_balances, try idReq(a, &a_other));
+    try testing.expect(std.mem.startsWith(u8, failed.message, "core:" ++ p_balances));
+    try testing.expectEqual(@as(u64, 1), e.forwarded(.list_balances, .other));
+    try testing.expectEqual(@as(u64, 0), e.forwarded(.list_balances, .policy));
+}
+
+/// `Service.read_sets` by script: whether the checkpoint asked about holds its read set.
+const ScriptedReadSets = struct {
+    held: Atomic(bool) = .init(false),
+    asked: Atomic(u32) = .init(0),
+    last: Atomic(u64) = .init(0),
+    fn has(ctx: *const anyopaque, _: *const store.Snapshot, seq: u64) bool {
+        const s: *ScriptedReadSets = @ptrCast(@alignCast(@constCast(ctx)));
+        _ = s.asked.fetchAdd(1, .monotonic);
+        s.last.store(seq, .release);
+        return s.held.load(.acquire);
+    }
+};
+
+test "edge policy --edge-simulate: forward by default; local answers the simulation here whatever the read sets (none at the tip, none kept at all), passes gas selection, a local failure and anything during a pending transaction to the core" {
+    core.reset();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    core.effects_bcs = try someEffects(a);
+    const up = try Server.start(core.handler, null);
+    defer up.stop();
+    // SimulateTransactionRequest: transaction (1), checks (3; 1 = DISABLED), do_gas_selection (4)
+    const plain_req = "\x0a\x00";
+    const no_checks = "\x0a\x00\x18\x01";
+    const gas_sel = "\x0a\x00\x20\x01";
+    const gas_sel_no_checks = "\x0a\x00\x18\x01\x20\x01";
+    // the default: the core's, whatever the read sets
+    {
+        const e = try Edge.create(plain(up.port), .{ .raw = .reads });
+        defer e.destroy();
+        var rs: ScriptedReadSets = .{ .held = .init(true) };
+        e.svc.read_sets = .{ .ctx = &rs, .has = ScriptedReadSets.has };
+        e.local.st = e.st;
+        e.f.source = null;
+        e.healthy();
+        for (0..3) |_| try e.commit(null);
+        const r = try e.unary(a, p_simulate, plain_req);
+        try testing.expectEqualStrings("simulated", r.message);
+        try testing.expectEqual(@as(u64, 1), e.forwarded(.simulate_transaction, .policy));
+        try testing.expectEqual(@as(u32, 0), e.local.calls.load(.acquire));
+        try testing.expectEqual(@as(u32, 0), rs.asked.load(.acquire)); // not even asked
+    }
+    const e = try Edge.create(plain(up.port), .{ .raw = .reads, .simulate = .local_forward_on_miss });
+    defer e.destroy();
+    e.local.st = e.st;
+    e.f.source = null;
+    e.healthy();
+    try e.f.start();
+    for (0..3) |_| try e.commit(null); // tip 2
+    // this edge keeps no read sets: answered here all the same (a simulation reads the live
+    // state only, docs/EDGE.md 11.8)
+    try testing.expectEqual(route.Simulate.local_forward_on_miss, e.f.simulateNow());
+    try testing.expectEqualStrings("local:" ++ p_simulate ++ "@2", (try e.unary(a, p_simulate, plain_req)).message);
+    // it keeps them, and the tip checkpoint came without one (its core has not settled it):
+    // here too, and the marks are not even asked
+    var rs: ScriptedReadSets = .{};
+    e.svc.read_sets = .{ .ctx = &rs, .has = ScriptedReadSets.has };
+    try testing.expectEqualStrings("local:" ++ p_simulate ++ "@2", (try e.unary(a, p_simulate, plain_req)).message);
+    try testing.expectEqual(@as(u64, 0), e.forwarded(.simulate_transaction, .policy));
+    try testing.expectEqual(@as(u32, 0), rs.asked.load(.acquire));
+    try testing.expectEqual(@as(u64, 2), e.servedLocal(.simulate_transaction));
+    rs.held.store(true, .release);
+    const asked = core.calls.load(.acquire);
+    for ([_][]const u8{ plain_req, no_checks, gas_sel_no_checks }) |body| {
+        const r = try e.unary(a, p_simulate, body);
+        try testing.expectEqualStrings("local:" ++ p_simulate ++ "@2", r.message);
+    }
+    try testing.expectEqual(@as(u64, 5), e.servedLocal(.simulate_transaction));
+    try testing.expectEqual(asked, core.calls.load(.acquire));
+    // gas selection (with checks on) is each node's own choice: the core's
+    try testing.expectEqualStrings("simulated", (try e.unary(a, p_simulate, gas_sel)).message);
+    try testing.expectEqual(@as(u64, 1), e.forwarded(.simulate_transaction, .policy));
+    try testing.expectEqual(@as(u64, 5), e.servedLocal(.simulate_transaction));
+    // a simulation that fails here is the core's to answer, INVALID_ARGUMENT included (an input
+    // the edge holds at another version), with status details or without
+    const local_before = e.local.calls.load(.acquire);
+    for ([_]u8{ 3, 5, 12, 13, 14, 8 }, 0..) |code, i| {
+        e.local.code.store(code, .release);
+        e.local.with_details.store(i % 2 == 0, .release);
+        const r = try e.unary(a, p_simulate, plain_req);
+        try testing.expectEqual(@as(u8, 0), r.status);
+        try testing.expectEqualStrings("simulated", r.message);
+    }
+    e.local.code.store(0, .release);
+    e.local.with_details.store(true, .release);
+    try testing.expectEqual(@as(u64, 6), e.forwarded(.simulate_transaction, .negative));
+    try testing.expectEqual(local_before + 6, e.local.calls.load(.acquire));
+    try testing.expectEqual(@as(u64, 5), e.servedLocal(.simulate_transaction));
+    // a request that does not scan (do_gas_selection cut short) gets the local decode answer
+    const bad = try e.unary(a, p_simulate, "\x0a\x00\x20");
+    try testing.expect(std.mem.startsWith(u8, bad.message, "local:"));
+    // read-after-write, as GetBalance: a transaction executed through this edge and not applied
+    // here yet makes the simulations of its sender and of its gas owner wait for the apply
+    const data = "the transaction simulated after";
+    const digest = txDigest(data);
+    _ = try e.unary(a, p_execute, try executeMasked(a, data, &.{"digest"}));
+    try testing.expect(!e.f.pending.idle());
+    // a request that does not say who sends it: the core's, at once
+    const during = try timed(e, a, p_simulate, plain_req);
+    try testing.expect(during.ms < 100);
+    try testing.expectEqualStrings("simulated", during.reply.message);
+    try testing.expectEqual(@as(u64, 1), e.forwarded(.simulate_transaction, .ahead));
+    // somebody else's simulation: here, at once, from the state the edge has
+    for ([_][]const u8{ try simulateAs(a, .message, &a_other, null), try simulateAs(a, .bcs, &a_other, null) }) |body| {
+        const other = try timed(e, a, p_simulate, body);
+        try testing.expect(other.ms < 100);
+        try testing.expectEqualStrings("local:" ++ p_simulate ++ "@2", other.reply.message);
+    }
+    try testing.expectEqual(@as(u64, 0), e.f.metrics.raw_read_wait.n.load(.monotonic));
+    // the sender's own (as a message and as BCS), and one whose gas the pending address pays
+    var waiting = [_]Reader{
+        .{ .e = e, .path = p_simulate, .body = try simulateAs(a, .message, &a_owner, null) },
+        .{ .e = e, .path = p_simulate, .body = try simulateAs(a, .bcs, &a_owner, null) },
+        .{ .e = e, .path = p_simulate, .body = try simulateAs(a, .message, &a_other, &a_owner) },
+        .{ .e = e, .path = p_simulate, .body = try simulateAs(a, .bcs, &a_other, &a_owner) },
+    };
+    for (&waiting) |*r| r.thread = try std.Thread.spawn(.{}, Reader.run, .{r});
+    sleepMs(250);
+    try testing.expectEqual(@as(u32, waiting.len), e.f.raw_waiters.load(.acquire));
+    try e.commit(&digest);
+    for (&waiting) |*r| r.thread.join();
+    for (&waiting) |*r| {
+        try testing.expect(r.ms >= 200 and r.ms < 1500);
+        try testing.expectEqualStrings("local:" ++ p_simulate ++ "@3", r.message());
+    }
+    try testing.expectEqual(@as(u64, waiting.len), e.f.metrics.raw_read_wait.n.load(.monotonic));
+    var settle: u32 = 0;
+    while (!e.f.pending.idle() and settle < 2000) : (settle += 10) sleepMs(10);
+    try testing.expect(e.f.pending.idle());
+    try testing.expectEqualStrings("local:" ++ p_simulate ++ "@3", (try e.unary(a, p_simulate, plain_req)).message);
+    // the read sets stop coming: still here
+    rs.held.store(false, .release);
+    try testing.expectEqualStrings("local:" ++ p_simulate ++ "@3", (try e.unary(a, p_simulate, plain_req)).message);
+    try testing.expectEqual(@as(u64, 1), e.forwarded(.simulate_transaction, .policy));
+    try testing.expectEqual(@as(u32, 0), rs.asked.load(.acquire));
+}
+
+/// A SimulateTransactionRequest whose transaction names its sender (and gas owner): as a
+/// message (`sender`, `gas_payment.owner`) or as `bcs` (an empty programmable transaction).
+fn simulateAs(a: std.mem.Allocator, form: enum { message, bcs }, sender: *const [32]u8, gas_owner: ?*const [32]u8) ![]const u8 {
+    var w = serve.proto.Writer.init(try a.alloc(u8, 1024));
+    const tx = try w.begin(1, 200);
+    switch (form) {
+        .message => {
+            try w.string(5, try std.fmt.allocPrint(a, "0x{x}", .{sender}));
+            if (gas_owner) |o| {
+                const g = try w.begin(6, 70);
+                try w.string(2, try std.fmt.allocPrint(a, "0x{x}", .{o}));
+                try w.end(g);
+            }
+        },
+        .bcs => {
+            const td: types.TransactionData = .{ .V1 = .{
+                .kind = .{ .ProgrammableTransaction = .{ .inputs = &.{}, .commands = &.{} } },
+                .sender = .{ .@"0" = sender.* },
+                .gas_data = .{ .payment = &.{}, .owner = .{ .@"0" = (gas_owner orelse sender).* }, .price = 1000, .budget = 1_000_000 },
+                .expiration = .None,
+            } };
+            // Transaction { bcs (1): Bcs { value (2) } }
+            const b = try w.begin(1, 100);
+            try w.bytes(2, try bcs.encodeAlloc(types.TransactionData, a, &td));
+            try w.end(b);
+        },
+    }
+    try w.end(tx);
+    return w.bytesWritten();
+}
+
+test "edge policy --edge-simulate local-gas: gas selection is answered here too, with the same read-after-write and the same rule for a run that fails" {
+    core.reset();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    core.effects_bcs = try someEffects(a);
+    const up = try Server.start(core.handler, null);
+    defer up.stop();
+    const e = try Edge.create(plain(up.port), .{ .raw = .reads, .simulate = .local_gas });
+    defer e.destroy();
+    var rs: ScriptedReadSets = .{ .held = .init(true) };
+    e.svc.read_sets = .{ .ctx = &rs, .has = ScriptedReadSets.has };
+    e.local.st = e.st;
+    e.f.source = null;
+    e.healthy();
+    try e.f.start();
+    for (0..3) |_| try e.commit(null); // tip 2
+    try testing.expectEqual(route.Simulate.local_gas, e.f.simulateNow());
+    // do_gas_selection (4) with checks on, and every other shape: the edge's
+    const asked = core.calls.load(.acquire);
+    const gas_req = try std.mem.concat(a, u8, &.{ try simulateAs(a, .message, &a_other, null), "\x20\x01" });
+    for ([_][]const u8{ "\x0a\x00\x20\x01", gas_req, "\x0a\x00", "\x0a\x00\x18\x01\x20\x01" }) |body| {
+        try testing.expectEqualStrings("local:" ++ p_simulate ++ "@2", (try e.unary(a, p_simulate, body)).message);
+    }
+    try testing.expectEqual(@as(u64, 4), e.servedLocal(.simulate_transaction));
+    try testing.expectEqual(@as(u64, 0), e.forwarded(.simulate_transaction, .policy));
+    try testing.expectEqual(asked, core.calls.load(.acquire));
+    // a gas selection that fails here (no coin in the index, the index not ready) is the core's
+    for ([_]u8{ 5, 14, 3 }) |code| {
+        e.local.code.store(code, .release);
+        try testing.expectEqualStrings("simulated", (try e.unary(a, p_simulate, gas_req)).message);
+    }
+    e.local.code.store(0, .release);
+    try testing.expectEqual(@as(u64, 3), e.forwarded(.simulate_transaction, .negative));
+    // a client that just spent a coin through this edge is not offered that coin: its gas
+    // selection waits until the edge applied the transaction, another sender's does not
+    const data = "the transaction that spent the coin";
+    const digest = txDigest(data);
+    _ = try e.unary(a, p_execute, try executeMasked(a, data, &.{"digest"}));
+    const other = try timed(e, a, p_simulate, gas_req);
+    try testing.expect(other.ms < 100);
+    try testing.expectEqualStrings("local:" ++ p_simulate ++ "@2", other.reply.message);
+    var mine: Reader = .{ .e = e, .path = p_simulate, .body = try std.mem.concat(a, u8, &.{ try simulateAs(a, .message, &a_owner, null), "\x20\x01" }) };
+    mine.thread = try std.Thread.spawn(.{}, Reader.run, .{&mine});
+    sleepMs(250);
+    try testing.expectEqual(@as(u32, 1), e.f.raw_waiters.load(.acquire));
+    try e.commit(&digest);
+    mine.thread.join();
+    try testing.expect(mine.ms >= 200 and mine.ms < 1500);
+    try testing.expectEqualStrings("local:" ++ p_simulate ++ "@3", mine.message());
+    // never applied: at the bound the core answers (it has executed the transaction)
+    const e2 = try Edge.create(plain(up.port), .{ .raw = .reads, .simulate = .local_gas, .execute_wait_ms = 300 });
+    defer e2.destroy();
+    e2.svc.read_sets = .{ .ctx = &rs, .has = ScriptedReadSets.has };
+    e2.local.st = e2.st;
+    e2.f.source = null;
+    e2.healthy();
+    try e2.f.start();
+    for (0..3) |_| try e2.commit(null);
+    _ = try e2.unary(a, p_execute, try executeMasked(a, "never in a checkpoint here", &.{"digest"}));
+    const late = try timed(e2, a, p_simulate, mine.body);
+    try testing.expect(late.ms >= 200 and late.ms < 1000);
+    try testing.expectEqualStrings("simulated", late.reply.message);
+    try testing.expectEqual(@as(u64, 1), e2.forwarded(.simulate_transaction, .ahead));
+}
+
+test "edge policy --edge-simulate local-gas, keeper style: a gas selection asked after every tip checkpoint, each arriving without its read set (its core settles it later), is answered here every time; only the guard sends it to the core" {
+    core.reset();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    core.effects_bcs = try someEffects(a);
+    const up = try Server.start(core.handler, null);
+    defer up.stop();
+    const e = try Edge.create(plain(up.port), .{ .raw = .reads, .simulate = .local_gas });
+    defer e.destroy();
+    // the tip never holds its read set when the simulation comes (a p2p-built core settles a
+    // checkpoint about 0.2 s after it, the edge's re-ask later still)
+    var rs: ScriptedReadSets = .{};
+    e.svc.read_sets = .{ .ctx = &rs, .has = ScriptedReadSets.has };
+    e.local.st = e.st;
+    e.f.source = null;
+    e.healthy();
+    try e.f.start();
+    // SimulateTransactionRequest with do_gas_selection, from a keeper's address
+    const keeper_req = try std.mem.concat(a, u8, &.{ try simulateAs(a, .bcs, &a_other, null), "\x20\x01" });
+    const asked = core.calls.load(.acquire);
+    const rounds = 40;
+    var local: u64 = 0;
+    for (0..rounds) |i| {
+        try e.commit(null); // a new tip, without its read set
+        const r = try e.unary(a, p_simulate, keeper_req);
+        const want = try std.fmt.allocPrint(a, "local:" ++ p_simulate ++ "@{d}", .{i});
+        if (std.mem.eql(u8, r.message, want)) local += 1;
+    }
+    std.debug.print("edge-policy keeper style: {d} of {d} gas selections answered by the edge, each at a tip without its read set\n", .{ local, rounds });
+    try testing.expectEqual(@as(u64, rounds), local);
+    try testing.expectEqual(@as(u64, rounds), e.servedLocal(.simulate_transaction));
+    try testing.expectEqual(asked, core.calls.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), rs.asked.load(.acquire));
+    // behind its sources: the guard trips (as the tick trips it, 11.5) and the core answers
+    e.f.guard_state.store(@intFromEnum(route.GuardState.tripped), .release);
+    try testing.expectEqualStrings("simulated", (try e.unary(a, p_simulate, keeper_req)).message);
+    try testing.expectEqual(@as(u64, 1), e.forwarded(.simulate_transaction, .lag_guard));
+}
+
+test "edge policy: the start line and the environment (--edge-simulate local without the whole live set stays on forward and says so; read sets are not asked for)" {
+    var line: [640]u8 = undefined;
+    const ready: forward.PolicyStart = .{ .indexes = true, .live_set = true };
+    // defaults
+    var cfg: forward.Config = .{};
+    try testing.expectEqualStrings("edge policy: ListBalances forward; SimulateTransaction forward", forward.settlePolicies(&cfg, ready, &line));
+    try testing.expectEqual(route.Where.forward, cfg.balance_lists);
+    try testing.expectEqual(route.Simulate.forward, cfg.simulate);
+    // both local, with what simulate needs
+    cfg = .{ .balance_lists = .local, .simulate = .local_forward_on_miss };
+    const both = forward.settlePolicies(&cfg, ready, &line);
+    try testing.expect(std.mem.startsWith(u8, both, "edge policy: ListBalances local (--edge-balance-lists local: "));
+    try testing.expect(std.mem.indexOf(u8, both, "emptied to zero") != null);
+    try testing.expect(std.mem.indexOf(u8, both, "; SimulateTransaction local (--edge-simulate local: ") != null);
+    try testing.expectEqual(route.Simulate.local_forward_on_miss, cfg.simulate);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, both, "\n") + 1); // one line
+    // a store that holds only what it followed: forward
+    cfg = .{ .simulate = .local_forward_on_miss, .balance_lists = .local };
+    const no_live = forward.settlePolicies(&cfg, .{ .indexes = true, .live_set = false }, &line);
+    try testing.expect(std.mem.indexOf(u8, no_live, "SimulateTransaction forward (--edge-simulate local needs the whole live set") != null);
+    try testing.expectEqual(route.Simulate.forward, cfg.simulate);
+    try testing.expectEqual(route.Where.local, cfg.balance_lists); // the other setting is its own
+    // balance lists local on a node without the StateService index: forward, by name
+    cfg = .{ .balance_lists = .local, .simulate = .local_forward_on_miss };
+    const no_ix = forward.settlePolicies(&cfg, .{ .indexes = false, .live_set = true }, &line);
+    try testing.expect(std.mem.startsWith(u8, no_ix, "edge policy: ListBalances forward (--edge-balance-lists local needs the StateService index: --indexes; staying on forward); SimulateTransaction local ("));
+    try testing.expectEqual(route.Where.forward, cfg.balance_lists);
+    try testing.expectEqual(route.Simulate.local_forward_on_miss, cfg.simulate);
+    // local-gas: with the owner index; without it, local (gas selection to the core), by name
+    cfg = .{ .simulate = .local_gas };
+    const gas = forward.settlePolicies(&cfg, ready, &line);
+    try testing.expect(std.mem.indexOf(u8, gas, "; SimulateTransaction local-gas (--edge-simulate local-gas: ") != null);
+    try testing.expect(std.mem.indexOf(u8, gas, "without the core's proposer restriction") != null);
+    try testing.expectEqual(route.Simulate.local_gas, cfg.simulate);
+    cfg = .{ .simulate = .local_gas, .balance_lists = .local };
+    const gas_no_ix = forward.settlePolicies(&cfg, .{ .indexes = false, .live_set = true }, &line);
+    try testing.expect(std.mem.indexOf(u8, gas_no_ix, "; SimulateTransaction local (--edge-simulate local-gas needs the owner index for gas selection: --indexes; staying on local, gas selection goes to the core)") != null);
+    try testing.expectEqual(route.Simulate.local_forward_on_miss, cfg.simulate);
+    cfg = .{ .simulate = .local_gas };
+    _ = forward.settlePolicies(&cfg, .{ .indexes = true, .live_set = false }, &line);
+    try testing.expectEqual(route.Simulate.forward, cfg.simulate);
+    // the longest line fits
+    cfg = .{ .simulate = .local_gas, .balance_lists = .local };
+    try testing.expect(std.mem.indexOf(u8, forward.settlePolicies(&cfg, ready, &line), "line too long") == null);
+    try testing.expectEqual(@as(?[]const u8, null), forward.policyEnv(&cfg, null, "local-gas"));
+    try testing.expectEqual(route.Simulate.local_gas, cfg.simulate);
+    // the environment: forward | local, empty is unset, anything else is refused by name
+    cfg = .{};
+    try testing.expectEqual(@as(?[]const u8, null), forward.policyEnv(&cfg, null, null));
+    try testing.expectEqual(@as(?[]const u8, null), forward.policyEnv(&cfg, "", ""));
+    try testing.expectEqual(route.Where.forward, cfg.balance_lists);
+    try testing.expectEqual(@as(?[]const u8, null), forward.policyEnv(&cfg, "local", "local"));
+    try testing.expectEqual(route.Where.local, cfg.balance_lists);
+    try testing.expectEqual(route.Simulate.local_forward_on_miss, cfg.simulate);
+    try testing.expectEqual(@as(?[]const u8, null), forward.policyEnv(&cfg, "forward", null));
+    try testing.expectEqual(route.Where.forward, cfg.balance_lists);
+    try testing.expectEqual(route.Simulate.local_forward_on_miss, cfg.simulate);
+    try testing.expectEqualStrings("ZUI_EDGE_BALANCE_LISTS: forward | local", forward.policyEnv(&cfg, "on", null).?);
+    try testing.expectEqualStrings("ZUI_EDGE_SIMULATE: forward | local | local-gas", forward.policyEnv(&cfg, null, "1").?);
+}
+
+test "an access gate and read-after-write: a refused read never waits; an admitted one passes the gate once, waits, and is metered once as local" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    core.reset();
+    core.effects_bcs = try someEffects(a);
+    const up = try Server.start(core.handler, null);
+    defer up.stop();
+    const e = try Edge.create(plain(up.port), .{ .raw = .reads });
+    defer e.destroy();
+    e.local.st = e.st;
+    e.f.source = null;
+    e.healthy();
+    var gate: ScriptGate = .{};
+    e.f.gate_hook = .{ .ctx = &gate, .begin = ScriptGate.begin, .end = ScriptGate.end };
+    e.f.meter_hook = .{ .ctx = &gate, .f = ScriptGate.meter };
+    try e.f.start();
+    for (0..3) |_| try e.commit(null); // tip 2
+    const data = "transaction behind the gate";
+    const req = try executeMasked(a, data, &.{"digest"});
+    // the edge applies the transaction's checkpoint (3) 400 ms after the execute starts
+    var th = try std.Thread.spawn(.{}, commitLater, .{ e, 400, txDigest(data) });
+    const exec = try timed(e, a, p_execute, req);
+    try testing.expect(exec.ms < 150);
+    // the execute went to the core: that is what the meter says
+    try testing.expectEqual(forward.Outcome.forwarded, gate.last_outcome.?);
+    try testing.expectEqual(@as(u32, 1), gate.metered);
+    // a read of what it wrote, refused by the gate: answered at once, before any wait, and
+    // neither the edge's store nor the core is asked
+    const local_calls = e.local.calls.load(.acquire);
+    const core_calls = core.calls.load(.acquire);
+    gate.deny_code = 8;
+    const refused = try timed(e, a, p_object, try idReq(a, &o_gas));
+    try testing.expectEqual(@as(u8, 8), refused.reply.status);
+    try testing.expect(refused.ms < 100);
+    try testing.expectEqual(@as(u64, 0), e.f.metrics.raw_read_wait.n.load(.monotonic));
+    try testing.expectEqual(local_calls, e.local.calls.load(.acquire));
+    try testing.expectEqual(core_calls, core.calls.load(.acquire));
+    try testing.expectEqual(forward.Outcome.denied, gate.last_outcome.?);
+    // the same read admitted: the gate is asked once, at admission; the read then waits for the
+    // edge to apply the transaction and is answered here
+    gate.deny_code = 0;
+    const begins = gate.begins;
+    const read = try timed(e, a, p_object, try idReq(a, &o_gas));
+    th.join();
+    try testing.expectEqualStrings("local:" ++ p_object ++ "@3", read.reply.message);
+    try testing.expect(read.ms >= 100 and read.ms < 1500);
+    try testing.expectEqual(@as(u64, 1), e.f.metrics.raw_read_wait.n.load(.monotonic));
+    try testing.expectEqual(begins + 1, gate.begins);
+    try testing.expectEqual(gate.begins, gate.ends);
+    try testing.expectEqual(@as(u32, 3), gate.metered); // the execute, the refusal, this read: once each
+    try testing.expectEqual(forward.Outcome.local, gate.last_outcome.?);
+    try testing.expectEqual(core_calls, core.calls.load(.acquire));
+}
+
+test "an access gate and a held certificate: a read answered here because no core can be asked is metered as local, a call that fails on the way to the core as forwarded and failed" {
+    core.reset();
+    // a port nobody listens on: the core is away
+    var addr = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var l = try addr.listen(io, .{ .reuse_address = true });
+    const dead_port = l.socket.address.getPort();
+    l.deinit(io);
+    const e = try Edge.create(plain(dead_port), .{});
+    defer e.destroy();
+    e.healthy();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // the edge holds checkpoints 0..7; the certificate of 7 did not come from a core
+    for (0..8) |_| try e.commit(null);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var opened = try forward.certs_api.Certs.open(testing.allocator, io, tmp.dir, .{ .log = false });
+    defer opened.certs.deinit();
+    opened.found.deinit(testing.allocator);
+    try opened.certs.onApply(7, false, 1);
+    e.f.setCerts(opened.certs);
+    defer {
+        e.f.certs = null;
+        e.svc.foreign_cert = null;
+    }
+    var gate: ScriptGate = .{};
+    e.f.gate_hook = .{ .ctx = &gate, .begin = ScriptGate.begin, .end = ScriptGate.end };
+    e.f.meter_hook = .{ .ctx = &gate, .f = ScriptGate.meter };
+    // GetCheckpoint 7 with `signature` in its mask: the core's to answer, and the core is gone,
+    // so the edge answers with the certificate it holds
+    const cert_req = "\x08\x07\x1a\x0b\x0a\x09signature";
+    const held = try e.unary(a, p_checkpoint, cert_req);
+    try testing.expectEqual(@as(u8, 0), held.status);
+    try testing.expectEqualStrings("local:" ++ p_checkpoint, held.message);
+    try testing.expectEqual(@as(u32, 1), gate.begins);
+    try testing.expectEqual(@as(u32, 1), gate.metered);
+    try testing.expectEqual(forward.Outcome.local, gate.last_outcome.?);
+    try testing.expectEqual(h2.Status.ok, gate.last_status);
+    try testing.expectEqual(@as(u64, 1), e.servedLocal(.get_checkpoint));
+    try testing.expectEqual(@as(u64, 0), e.forwarded(.get_checkpoint, .foreign_cert));
+    // the next one does not try the core first, and is local too
+    _ = try e.unary(a, p_checkpoint, cert_req);
+    try testing.expectEqual(forward.Outcome.local, gate.last_outcome.?);
+    try testing.expectEqual(@as(u64, 2), e.servedLocal(.get_checkpoint));
+    // a call that is the core's by policy has nobody to answer it: forwarded, and failed (the
+    // gate charges a failed call nothing, so the forward weight applies only to calls the core
+    // answered)
+    sleepMs(60);
+    const lost = try e.unary(a, p_lookup, "name");
+    try testing.expectEqual(@as(u8, 14), lost.status);
+    try testing.expectEqual(forward.Outcome.forwarded, gate.last_outcome.?);
+    try testing.expectEqual(h2.Status.unavailable, gate.last_status);
+    try testing.expectEqual(@as(u32, 3), gate.metered);
+    try testing.expectEqual(gate.begins, gate.ends);
 }

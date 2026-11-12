@@ -242,6 +242,9 @@ const State = struct {
     cp_next: u64 = 0,
     tx_lo: u64 = 0,
     tx_end: u64 = 0,
+    /// `cp_lo` is a retention floor: a prune put it there, or the owner vouched for it
+    /// (`vouchLow`). False: the index only began there (a first start, a restart at a hole).
+    lo_floor: bool = false,
     chunks: std.ArrayList(Chunk) = .empty,
     sealed: std.ArrayList(Sealed) = .empty,
     frozen: std.ArrayList(*OpenSeg) = .empty,
@@ -425,7 +428,8 @@ const Meta = extern struct {
     rot_tx_end: u64 = 0,
     open_seg: u64 = 0,
     crc: u32 = 0,
-    _pad: u32 = 0,
+    /// Bit 0: `State.lo_floor`. (The field was padding, always 0, before it had a meaning.)
+    flags: u32 = 0,
 };
 
 pub const Index = struct {
@@ -538,6 +542,44 @@ pub const Index = struct {
         ix.lock.lockSharedUncancelable(ix.io);
         defer ix.lock.unlockShared(ix.io);
         return if (ix.s.nonEmpty()) ix.s.cp_next - 1 else null;
+    }
+
+    /// The low end is a retention floor (see `State.lo_floor`): the owner prunes the index only
+    /// to the lowest checkpoint its store serves, and `pruneBelow` is durable when it returns,
+    /// so a low end that came from a prune says the store's floor had reached it. The node
+    /// reads it after an unclean stop, when the store's own floor comes back lower (the store
+    /// makes its floors durable with its next meta write only).
+    pub fn lowIsFloor(ix: *Index) bool {
+        ix.lock.lockSharedUncancelable(ix.io);
+        defer ix.lock.unlockShared(ix.io);
+        return ix.s.nonEmpty() and ix.s.lo_floor;
+    }
+
+    /// The owner says the index's low end is its store's floor (a backfill started at the
+    /// store's lowest checkpoint). Durable with the next rotation or prune.
+    pub fn vouchLow(ix: *Index) void {
+        ix.lock.lockUncancelable(ix.io);
+        defer ix.lock.unlock(ix.io);
+        ix.s.lo_floor = true;
+    }
+
+    /// The durable low end of the index in `dir`, when it is a retention floor, without
+    /// opening the index (the node asks a backfill's staging directory before it decides
+    /// what to build). Null: no index there, or a low end that is not a floor. (`meta` holds
+    /// the low end as of the last prune or rotation, whichever came later; an index vouched
+    /// for and saved before it held a checkpoint reads 0, which is no floor to anyone.)
+    pub fn peekFloor(io: Io, dir: []const u8) ?u64 {
+        var r = Io.Dir.cwd().openDir(io, dir, .{}) catch return null;
+        defer r.close(io);
+        var cb: [64]u8 = undefined;
+        const txt = r.readFile(io, "CURRENT", &cb) catch return null;
+        const t = std.mem.trim(u8, txt, " \n\r\t");
+        if (t.len < 2 or t[0] != 'g') return null;
+        var d = r.openDir(io, t, .{}) catch return null;
+        defer d.close(io);
+        const m = (readMeta(io, d) catch return null) orelse return null;
+        if (m.flags & 1 == 0) return null;
+        return m.cp_lo;
     }
 
     /// Hash of the whole index content (checkpoint and transaction tables, every bucket's key and
@@ -940,10 +982,179 @@ pub const Index = struct {
         var nb: [32]u8 = undefined;
         for (src.sealed.items) |x| try ix.writeFileAtomic(d, segName(&nb, x.v.seg), x.mem);
         for (src.chunks.items) |c| try ix.writeFileAtomic(d, chunkName(&nb, c.id), c.mem);
-        var st: State = .{ .gen = gen, .started = src.started, .cp_lo = src.cp_lo, .cp_next = src.cp_next, .tx_lo = src.tx_lo, .tx_end = src.tx_end, .open = src.open, .log_n = 1 };
+        var st: State = .{ .gen = gen, .started = src.started, .cp_lo = src.cp_lo, .cp_next = src.cp_next, .tx_lo = src.tx_lo, .tx_end = src.tx_end, .lo_floor = src.lo_floor, .open = src.open, .log_n = 1 };
         if (src.open) |o| try ix.writeOpen(d, 1, o);
         st.rot = .{ .started = src.started, .cp_next = src.cp_next, .tx_end = src.tx_end, .open_seg = if (src.open) |o| o.id else src.tx_end / seg_txs };
         try ix.putMetaOf(d, &st);
+    }
+
+    // ------------------------------------------------------------------ rows from another index
+
+    /// One segment of an index turned around: per transaction its keys, copied out, so nothing
+    /// points into the source once its lock is released.
+    const Fwd = struct {
+        arena: std.heap.ArenaAllocator,
+        id: u64,
+        start: u32 = 0,
+        ntx: u32 = 0,
+        recs: []const u8 = &.{},
+        keys: []const []const u8 = &.{},
+        /// Entries of transaction `start + i`: `ents[first[i]..first[i + 1]]`.
+        first: []const u32 = &.{},
+        ents: []const Ent = &.{},
+
+        const no_event = std.math.maxInt(u32);
+        const Ent = struct { key: u32, ev: u32 };
+        const Raw = struct { off: u32, key: u32, ev: u32 };
+
+        fn destroy(f: *Fwd, gpa: Allocator) void {
+            f.arena.deinit();
+            gpa.destroy(f);
+        }
+
+        fn has(f: *const Fwd, off: u32) bool {
+            return off >= f.start and off - f.start < f.ntx;
+        }
+
+        fn add(raw: *std.ArrayList(Raw), a: Allocator, si: usize, key: u32, pos: u32) !void {
+            if (si == 0) {
+                try raw.append(a, .{ .off = pos, .key = key, .ev = no_event });
+            } else try raw.append(a, .{ .off = pos >> event_bits, .key = key, .ev = pos & ((1 << event_bits) - 1) });
+        }
+
+        /// Under the source's shared lock.
+        fn build(gpa: Allocator, ref: State.SegRef, id: u64) !*Fwd {
+            const f = try gpa.create(Fwd);
+            f.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .id = id };
+            errdefer f.destroy(gpa);
+            const a = f.arena.allocator();
+            var keys: std.ArrayList([]const u8) = .empty;
+            var raw: std.ArrayList(Raw) = .empty;
+            defer raw.deinit(gpa);
+            switch (ref) {
+                .sealed => |v| {
+                    f.start = v.start;
+                    f.ntx = v.ntx;
+                    f.recs = try a.dupe(u8, v.recs);
+                    for (&v.sp, 0..) |*sp, si| for (0..sp.keyCount()) |i| {
+                        const kid: u32 = @intCast(keys.items.len);
+                        try keys.append(a, try a.dupe(u8, sp.key(i)));
+                        const e = sp.ents(i);
+                        for (e[0]..e[1]) |j| for (sp.entBits(j)) |bit| {
+                            // event space: the bucket is the top 4 bits of the position
+                            try add(&raw, gpa, si, kid, if (si == 0) bit else (sp.erel[j] << 28) | bit);
+                        };
+                    };
+                },
+                .mem => |o| {
+                    f.start = o.start;
+                    f.ntx = o.ntx();
+                    f.recs = try a.dupe(u8, o.recs.items);
+                    for (&o.maps, 0..) |*m, si| {
+                        var it = m.iterator();
+                        while (it.next()) |kv| {
+                            const kid: u32 = @intCast(keys.items.len);
+                            try keys.append(a, try a.dupe(u8, kv.key_ptr.*));
+                            for (kv.value_ptr.items) |pos| try add(&raw, gpa, si, kid, pos);
+                        }
+                    }
+                },
+            }
+            f.keys = keys.items;
+            const first = try a.alloc(u32, @as(usize, f.ntx) + 1);
+            @memset(first, 0);
+            for (raw.items) |r| {
+                if (!f.has(r.off)) return error.Corrupt;
+                first[r.off - f.start + 1] += 1;
+            }
+            for (1..first.len) |i| first[i] += first[i - 1];
+            const ents = try a.alloc(Ent, raw.items.len);
+            const fill = try gpa.dupe(u32, first[0..f.ntx]);
+            defer gpa.free(fill);
+            for (raw.items) |r| {
+                const k = r.off - f.start;
+                ents[fill[k]] = .{ .key = r.key, .ev = r.ev };
+                fill[k] += 1;
+            }
+            f.first = first;
+            f.ents = ents;
+            return f;
+        }
+    };
+
+    /// Appends to this index the rows of checkpoints `from..` exactly as `src` holds them, up
+    /// to `to` or the last one `src` has, and returns the first checkpoint it did not copy
+    /// (`from` when `src` does not hold it: pruned since, or never indexed). Nothing is read
+    /// but `src`'s own files and memory, a segment at a time: this is how a backfill takes the
+    /// part of the window the live index already covers, instead of rebuilding it from the
+    /// store one object read at a time. `src`'s shared lock is held per checkpoint (and for
+    /// the turn-around of one segment when a checkpoint enters it), never across the append.
+    /// One caller per destination, as for every write.
+    pub fn copyRows(ix: *Index, src: *Index, from: u64, to: u64, cancel: ?*const std.atomic.Value(bool)) !u64 {
+        const gpa = ix.gpa;
+        var cache: [2]?*Fwd = .{ null, null };
+        defer for (cache) |c| if (c) |f| f.destroy(gpa);
+        var digests: std.ArrayList([32]u8) = .empty;
+        defer digests.deinit(gpa);
+        var evc: std.ArrayList(u32) = .empty;
+        defer evc.deinit(gpa);
+        const TxE = std.meta.Child(@FieldType(Record, "tx"));
+        const EvE = std.meta.Child(@FieldType(Record, "ev"));
+        var txe: std.ArrayList(TxE) = .empty;
+        defer txe.deinit(gpa);
+        var eve: std.ArrayList(EvE) = .empty;
+        defer eve.deinit(gpa);
+        var seq = from;
+        while (seq <= to) : (seq += 1) {
+            if (cancel) |c| if (c.load(.acquire)) break;
+            var first: u64 = 0;
+            var end: u64 = 0;
+            {
+                src.lock.lockSharedUncancelable(src.io);
+                defer src.lock.unlockShared(src.io);
+                const s = &src.s;
+                if (!s.nonEmpty() or seq < s.cp_lo or seq >= s.cp_next) break;
+                first = s.cpFirst(seq);
+                end = if (seq + 1 < s.cp_next) s.cpFirst(seq + 1) else s.tx_end;
+                var tx = first;
+                while (tx < end) {
+                    const sid = tx / seg_txs;
+                    if (!(cache[0] != null and cache[0].?.id == sid) and !(cache[1] != null and cache[1].?.id == sid)) {
+                        const f = try Fwd.build(gpa, s.segOf(tx) orelse return error.Corrupt, sid);
+                        // keep the newer of the two (a checkpoint spans at most two segments)
+                        if (cache[0]) |old| old.destroy(gpa);
+                        cache[0] = cache[1];
+                        cache[1] = f;
+                    }
+                    tx = (sid + 1) * seg_txs;
+                }
+            }
+            if (try ix.skipOrReset(seq)) continue;
+            digests.clearRetainingCapacity();
+            evc.clearRetainingCapacity();
+            txe.clearRetainingCapacity();
+            eve.clearRetainingCapacity();
+            var keys: Keys = .{};
+            defer keys.deinit(gpa);
+            var tx = first;
+            while (tx < end) : (tx += 1) {
+                const sid = tx / seg_txs;
+                const f = if (cache[1].?.id == sid) cache[1].? else cache[0].?;
+                const off: u32 = @intCast(tx % seg_txs);
+                if (f.id != sid or !f.has(off)) return error.Corrupt;
+                const rec = f.recs[(off - f.start) * seg.rec_len ..][0..seg.rec_len];
+                try digests.append(gpa, rec[0..32].*);
+                try evc.append(gpa, std.mem.readInt(u32, rec[32..36], .little));
+                const at: u32 = @intCast(tx - first);
+                for (f.ents[f.first[off - f.start]..f.first[off - f.start + 1]]) |e| {
+                    const kid = try keys.intern(gpa, f.keys[e.key]);
+                    if (e.ev == Fwd.no_event) try txe.append(gpa, .{ kid, at }) else try eve.append(gpa, .{ kid, at, e.ev });
+                }
+            }
+            const r: Record = .{ .seq = seq, .first_tx = first, .digests = digests.items, .ev_counts = evc.items, .keys = &keys, .tx = txe.items, .ev = eve.items };
+            try ix.addRecord(&r);
+        }
+        return seq;
     }
 
     // ------------------------------------------------------------------ pruning
@@ -976,6 +1187,7 @@ pub const Index = struct {
             defer ix.lock.unlock(ix.io);
             s.cp_lo = cut;
             s.tx_lo = floor_tx;
+            s.lo_floor = true;
             s.sealed.replaceRangeAssumeCapacity(0, nseg, &.{});
             s.chunks.replaceRangeAssumeCapacity(0, nch, &.{});
         }
@@ -1037,6 +1249,7 @@ pub const Index = struct {
             .rot_cp_next = st.rot.cp_next,
             .rot_tx_end = st.rot.tx_end,
             .open_seg = st.rot.open_seg,
+            .flags = @intFromBool(st.lo_floor),
         };
     }
 
@@ -1389,6 +1602,7 @@ pub const Index = struct {
         st.rot = .{ .started = st.started, .cp_next = m.rot_cp_next, .tx_end = m.rot_tx_end, .open_seg = m.open_seg };
         st.cp_next = m.rot_cp_next;
         st.tx_end = m.rot_tx_end;
+        st.lo_floor = m.flags & 1 != 0;
 
         var segs: std.ArrayList(u64) = .empty;
         defer segs.deinit(gpa);

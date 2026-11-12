@@ -10,7 +10,8 @@
 //! - GetCheckpointSummary: Latest (highest committed), BySequenceNumber (0 = genesis), ByDigest
 //!   (the store's checkpoint digest index). Whatever the store holds, else None.
 //! - GetCheckpointAvailability: highest committed certified summary + `lowest_available`, the
-//!   same floor GetServiceInfo reports (node.zig `lowest`).
+//!   checkpoint store's floor (node.zig `lowest`; sui-node state_sync/server.rs reads the
+//!   checkpoint store alone). GetServiceInfo reports the higher of it and the object floor.
 //! - GetCheckpointContents (V1 form; V2 contents are converted like `into_v1`) and
 //!   GetCheckpointContentsV2 for every checkpoint in [lowest, highest], found by contents digest
 //!   through `ContentsIndex`. Over 128 MiB serialized: 500 (the client pages instead).
@@ -492,7 +493,7 @@ pub const Server = struct {
     key: Ed25519.KeyPair,
     /// The follower, when the node runs one: genesis summary, push path, discovered peers.
     p2p: ?*p2p_mod.P2p = null,
-    /// The node's `lowest` (GetServiceInfo's `lowest_available_checkpoint`); when null the
+    /// The node's `lowest` (the checkpoint store's lowest available checkpoint); when null the
     /// server computes it from the store like node.zig `refreshLowest`.
     lowest: ?*const Atomic(u64) = null,
     restored_epoch: ?u64 = null,

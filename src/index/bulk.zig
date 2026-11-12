@@ -531,6 +531,11 @@ pub const Loader = struct {
     t0_ms: u64,
     rows_ms: u64 = 0,
     temp_bytes: u64 = 0,
+    /// What the phases held of the budget (`lsm.Builder.Report`).
+    lane_bytes: u64 = 0,
+    sort_bytes: Atomic(u64) = .init(0),
+    walkers: u32 = 0,
+    sort_workers: u32 = 0,
 
     // ------------------------------------------------------------ open
 
@@ -562,12 +567,22 @@ pub const Loader = struct {
         return l;
     }
 
+    /// The smallest lane buffer: below it a lane's frames are too small to compress or write well.
+    const min_staging = 256 << 10;
+
     /// The lane buffer for `lanes` producers: a fifth of the budget between them (a lane holds
     /// its rows, the same rows grouped, at worst one frame of all of them, and 8 bytes a row),
     /// at most 32 MiB and `cap`.
     fn stagingFor(l: *const Loader, lanes: usize, cap: usize) usize {
         const top = @min(32 << 20, if (cap != 0) cap else l.db.opts.build_chunk_bytes);
-        return std.math.clamp(l.budget / (5 * @max(lanes, 1)), @min(256 << 10, top), top);
+        return std.math.clamp(l.budget / (5 * @max(lanes, 1)), @min(min_staging, top), top);
+    }
+
+    /// Walkers the budget has room for: each needs five times the smallest lane buffer. More
+    /// threads than that (32 by default on a large box, a budget of a few MiB) held more in
+    /// their lanes than the budget.
+    fn walkersFor(l: *const Loader) usize {
+        return std.math.clamp(l.budget / (5 * min_staging), 1, @min(l.threads, src_parts));
     }
 
     /// A new build: the index is emptied, the manifest holds a pending build no tip matches.
@@ -891,7 +906,9 @@ pub const Loader = struct {
 
     /// Walks the source parts that are not done yet on `threads` threads, one lane each.
     fn walk(l: *Loader, src: lsm.Source) !void {
-        l.staging = l.stagingFor(l.threads, 0);
+        const nt = l.walkersFor();
+        l.walkers = @intCast(nt);
+        l.staging = l.stagingFor(nt, 0);
         const W = struct {
             l: *Loader,
             src: lsm.Source,
@@ -940,7 +957,6 @@ pub const Loader = struct {
             }
         };
         var w: W = .{ .l = l, .src = src };
-        const nt = @min(l.threads, src_parts);
         const ts = try l.gpa.alloc(?std.Thread, nt);
         defer l.gpa.free(ts);
         @memset(ts, null);
@@ -953,7 +969,11 @@ pub const Loader = struct {
     /// No row arrives any more: the lanes are freed and the rows are durable. From here a
     /// resume needs no source.
     fn seal(l: *Loader, tip: u64) !void {
-        for (l.lanes) |*ln| ln.deinit();
+        // what the lanes grew to (their buffers only grow): the read phase's share of the budget
+        for (l.lanes) |*ln| {
+            l.lane_bytes += ln.recs.capacity + ln.idx.capacity * @sizeOf(Ref) + ln.grouped.capacity + ln.zbuf.capacity + ln.arena.queryCapacity();
+            ln.deinit();
+        }
         l.st_lock.lock();
         defer l.st_lock.unlock();
         try l.cut(.sort, tip);
@@ -990,10 +1010,15 @@ pub const Loader = struct {
         const l = try open(db, rows_fn, src.at);
         defer l.destroy();
         if (l.st.phase == .rows) {
-            std.log.info("state index: partitioned build at checkpoint {d}: {d} threads, {d} MiB budget ({d} source parts done)", .{ src.at, l.threads, l.budget >> 20, l.resumed_src });
+            std.log.info("state index: partitioned build at checkpoint {d}: {d} threads ({d} read the live set), {d} MiB budget ({d} source parts done)", .{ src.at, l.threads, l.walkersFor(), l.budget >> 20, l.resumed_src });
             try l.walk(src);
+            // the source is not read again: what it held goes before the sorters allocate
+            if (src.release) |f| f(src.ctx);
             try l.seal(src.at);
-        } else std.log.info("state index: resuming the partitioned build at checkpoint {d}: rows complete, {d} of {d} ranges written", .{ src.at, l.resumed_ranges, lsm.n_ranges });
+        } else {
+            std.log.info("state index: resuming the partitioned build at checkpoint {d}: rows complete, {d} of {d} ranges written", .{ src.at, l.resumed_ranges, lsm.n_ranges });
+            if (src.release) |f| f(src.ctx);
+        }
         return l.sortAndInstall();
     }
 
@@ -1006,6 +1031,12 @@ pub const Loader = struct {
         rbuf: []u8 = &.{},
         /// Bytes `raw` and `ents` may hold together.
         cap: usize,
+        /// The most this worker's three buffers held at once.
+        peak: usize = 0,
+
+        fn note(s: *Sorter) void {
+            s.peak = @max(s.peak, s.raw.capacity + s.ents.capacity * @sizeOf(Ent) + s.rbuf.len);
+        }
 
         fn deinit(s: *Sorter) void {
             s.raw.deinit(s.l.gpa);
@@ -1046,7 +1077,7 @@ pub const Loader = struct {
                 const klen = std.mem.readInt(u16, s.raw.items[pos..][0..2], .little);
                 const op = s.raw.items[pos + 2];
                 const vlen = s.raw.items[pos + 3];
-                if (klen == 0 or op < 1 or op > 3 or vlen > lsm.max_val or pos + rec_hdr + klen + vlen > end) return error.Corrupt;
+                if (klen == 0 or op < 1 or op > 4 or vlen > lsm.max_val or pos + rec_hdr + klen + vlen > end) return error.Corrupt;
                 if (n == f.rows) return error.Corrupt;
                 s.ents.appendAssumeCapacity(.{ .cache = 0, .off = @intCast(pos), .klen = klen });
                 pos += rec_hdr + klen + vlen;
@@ -1066,7 +1097,8 @@ pub const Loader = struct {
                 var v = valOf(raw, es[i]);
                 var j = i + 1;
                 while (j < es.len and es[j].klen == es[i].klen and std.mem.eql(u8, keyOf(raw, es[j]), key)) : (j += 1) v = lsm.combine(valOf(raw, es[j]), v);
-                const zero = v.op == .delta and v.empty();
+                // a plain zero sum is the identity; a held one stays until the base run
+                const zero = v.zeroSum() and (v.op == .delta or final);
                 if (!zero and !(final and v.op == .del)) try w.add(key, v);
                 i = j;
                 k += 1;
@@ -1126,6 +1158,7 @@ pub const Loader = struct {
                 chunks += 1;
             }
             try s.add(f, hint_raw, hint_rows);
+            s.note();
             if (l.stopped()) return error.Stopped;
         }
         l.files.rio.dropCache(fd, 0, end, false);
@@ -1264,7 +1297,10 @@ pub const Loader = struct {
             err: ?anyerror = null,
             fn work(j: *@This()) void {
                 var s: Sorter = .{ .l = j.l, .cap = j.cap };
-                defer s.deinit();
+                defer {
+                    _ = j.l.sort_bytes.fetchAdd(s.peak, .monotonic);
+                    s.deinit();
+                }
                 while (!j.failed.load(.acquire)) {
                     const i = j.next.fetchAdd(1, .monotonic);
                     if (i >= j.order.len) return;
@@ -1284,6 +1320,7 @@ pub const Loader = struct {
             }
         };
         var job: Job = .{ .l = l, .order = order[0..n], .cap = cap };
+        if (n > 0) l.sort_workers = @intCast(workers);
         if (n > 0) {
             const ts = try l.gpa.alloc(?std.Thread, workers);
             defer l.gpa.free(ts);
@@ -1299,6 +1336,7 @@ pub const Loader = struct {
         const entries: u64 = if (db.runs.items.len > 0) db.runs.items[0].entries() else 0;
         const sort_ms = lsm.nowMs() - t1;
         std.log.info("state index: {d} rows in {d} tables ({d} MiB) sorted and written in {d} s by {d} workers of {d} MiB", .{ entries, if (db.runs.items.len > 0) db.runs.items[0].tables.len else 0, db.diskBytes() >> 20, sort_ms / 1000, workers, per_worker >> 20 });
+        std.log.info("state index: build memory: {d} MiB budget; the lanes of {d} walkers held {d} MiB, {d} sort workers at most {d} MiB", .{ l.budget >> 20, l.walkers, l.lane_bytes >> 20, l.sort_workers, l.sort_bytes.load(.monotonic) >> 20 });
         return .{
             .objects = st.objects,
             .entries = entries,
@@ -1310,6 +1348,10 @@ pub const Loader = struct {
             .sort_ms = sort_ms,
             .temp_bytes = l.temp_bytes,
             .sort_chunks = l.chunks.load(.monotonic),
+            .lane_bytes = l.lane_bytes,
+            .sort_bytes = l.sort_bytes.load(.monotonic),
+            .walkers = l.walkers,
+            .sort_workers = l.sort_workers,
         };
     }
 

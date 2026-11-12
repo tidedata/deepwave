@@ -28,6 +28,7 @@ pub const bump = @import("bump.zig");
 pub const memstat = @import("memstat.zig");
 pub const check = @import("check.zig");
 pub const history = @import("history.zig");
+pub const reask = @import("reask.zig");
 pub const retention = @import("retention.zig");
 pub const lhfill = @import("lhfill.zig");
 pub const history_bench = @import("history_bench.zig");
@@ -44,6 +45,7 @@ pub const network = @import("network.zig");
 pub const pkgfetch = @import("pkgfetch.zig");
 pub const rpc = @import("rpc.zig");
 pub const native_hooks = @import("native_hooks.zig");
+pub const gate = @import("gate.zig");
 
 pub const Node = node.Node;
 pub const Config = node.Config;
@@ -53,6 +55,7 @@ pub const store = @import("store");
 pub const sig = @import("sig");
 pub const gpu = @import("gpu");
 pub const serve = @import("serve");
+pub const index = @import("index");
 pub const core = @import("core");
 pub const types = @import("types");
 pub const sync = @import("sync");
@@ -64,6 +67,7 @@ test {
     _ = @import("edge_forward_tests.zig");
     _ = @import("edge_stop_tests.zig");
     _ = @import("edge_cert_tests.zig");
+    _ = @import("edge_readsets_tests.zig");
     _ = @import("rpcmetrics.zig");
     _ = @import("opsmetrics.zig");
     _ = @import("statehash.zig");
@@ -75,4 +79,5 @@ test {
     _ = @import("logout.zig");
     _ = @import("metricspush.zig");
     _ = @import("stageprof.zig");
+    _ = @import("gate_tests.zig");
 }

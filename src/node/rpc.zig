@@ -19,7 +19,8 @@
 //!   the transport router (reflection, 404s, compression, x-sui-* and /health stay the
 //!   router's); this handler only answers TransactionExecutionService paths.
 //! - native simulation: `simulator()` is the src/exec/simulate API over the same store and core.
-//! ExecuteTransaction goes to `execute` (G10, `--execute-epoch-from`), UNIMPLEMENTED without it.
+//! ExecuteTransaction goes to `execute` (G10, `--execute-epoch-from`); without it the request is
+//! validated as sui-node's full node does, then answered UNIMPLEMENTED "no transaction executor".
 const std = @import("std");
 const Io = std.Io;
 const store = @import("store");
@@ -59,7 +60,8 @@ pub const Rpc = struct {
     stop: std.atomic.Value(bool) = .init(false),
     /// The StateService owner index (gas selection); null without `--indexes`.
     ix: ?*index.Index = null,
-    /// ExecuteTransaction (rpc_exec.live.node_exec, `--execute-epoch-from`, G10); null: UNIMPLEMENTED.
+    /// ExecuteTransaction (rpc_exec.live.node_exec, `--execute-epoch-from`, G10); null: validated,
+    /// then UNIMPLEMENTED "no transaction executor".
     execute: ?h2.Handler = null,
 
     /// Initialises in place (the service, the pool and the feeder keep pointers into `r`).
@@ -192,7 +194,9 @@ pub const Rpc = struct {
         switch (route(req.path)) {
             .pool => return rpc_exec.pool.Pool.call(&r.pool, req, rs),
             .execute => {
-                const x = r.execute orelse return .unimplemented;
+                // without --execute-epoch-from the service validates the request, then answers
+                // UNIMPLEMENTED "no transaction executor" (rpc_exec driver.handler.noExecutor)
+                const x = r.execute orelse return rpc_exec.pool.Pool.call(&r.pool, req, rs);
                 return x.call(x.ctx, req, rs);
             },
             .none => return .unimplemented,

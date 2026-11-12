@@ -15,9 +15,16 @@
 //!                                               without: the raw feed. None: not held yet.
 //!                                               The response header never sets ZSTD (the frame
 //!                                               is its own envelope; spec 2.2).
+//!
+//! Read sets (docs/EDGE.md section 12). A node that keeps read sets for the feed (`read_sets`
+//! set: hello feature bit 33) accepts the request flag READ_SETS and then appends the
+//! checkpoint's `ReadSets` (edgewire feed.zig) to the raw feed, inside the same frame: each
+//! transaction's loaded runtime object list, read through the service's `loaded` source, which
+//! is the read its own sui.rpc.v2 answers use. Without the flag the bytes are the feed alone.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const store = @import("store");
+const serve = @import("serve");
 const edgewire = @import("edgewire");
 const proto = @import("proto.zig");
 const R = proto.R;
@@ -30,6 +37,9 @@ pub const Feeder = struct {
     /// The node's response dictionaries: the feed uses the checkpoint kind (dicts.zig builds it
     /// from feeds on the warm thread; requests never build it).
     dicts: *const Dicts,
+    /// The service whose read sets a feed may carry (its `loaded` and `read_sets` hooks); null:
+    /// none, hello does not advertise them and READ_SETS is an unknown flag.
+    read_sets: ?*const serve.service.Service = null,
 
     pub fn init(dicts: *const Dicts) Feeder {
         return .{ .dicts = dicts };
@@ -44,7 +54,9 @@ pub const Feeder = struct {
     /// `get_checkpoint_feed`: whole response into `out`. The response header never sets ZSTD:
     /// with `flag_zstd_ok` the body's bytes are a dict.zig frame (its own envelope).
     pub fn handle(f: *Feeder, a: Allocator, snap: *store.Snapshot, req: proto.Request, out: *std.ArrayList(u8)) !void {
-        if (req.flags & ~(proto.flag_verify | proto.flag_zstd_ok) != 0) return error.Malformed;
+        const rs_flag: u64 = if (f.read_sets != null) proto.flag_read_sets else 0;
+        if (req.flags & ~(proto.flag_verify | proto.flag_zstd_ok | rs_flag) != 0) return error.Malformed;
+        const with_rs: ?*const serve.service.Service = if (req.flags & proto.flag_read_sets != 0) f.read_sets else null;
         var r: R = .{ .b = req.body };
         const seq = try r.int(u64);
         const want_dict = try r.int(u32);
@@ -55,7 +67,7 @@ pub const Feeder = struct {
             return proto.errorResponse(out, a, .pruned, "below the lowest available checkpoint", &b);
         };
         var raw: std.ArrayList(u8) = .empty;
-        const have = assemble(a, snap, seq, &raw) catch |e| switch (e) {
+        const have = assembleWith(a, snap, seq, &raw, with_rs) catch |e| switch (e) {
             error.OutputMissing => return proto.errorResponse(out, a, .unavailable, "output object version not held", ""),
             else => return e,
         };
@@ -82,12 +94,27 @@ pub const AssembleError = error{ OutputMissing, Malformed } || Allocator.Error |
 
 /// The raw feed of `seq` into `out`; false when the checkpoint is not held. `a` is a request arena.
 pub fn assemble(a: Allocator, snap: *store.Snapshot, seq: u64, out: *std.ArrayList(u8)) AssembleError!bool {
+    return assembleWith(a, snap, seq, out, null);
+}
+
+/// `assemble`, followed by the checkpoint's read sets when `read_sets` is given (the client
+/// asked for them): the lists `svc` serves, or "none held" when its store has no final read set
+/// for this checkpoint.
+pub fn assembleWith(a: Allocator, snap: *store.Snapshot, seq: u64, out: *std.ArrayList(u8), read_sets: ?*const serve.service.Service) AssembleError!bool {
     const c = snap.checkpoint(seq) orelse return false;
     const digests = contentDigests(a, c.contents) catch return error.Malformed;
     const txs = try a.alloc(feed.TxIn, digests.len);
     var refs: std.ArrayList([72]u8) = .empty;
-    for (digests, txs) |*dg, *t| {
+    // Asked first: a read set that becomes final while the feed is assembled is not sent half.
+    const lists: ?[][]const u8 = blk: {
+        const svc = read_sets orelse break :blk null;
+        const has = svc.read_sets orelse break :blk null;
+        if (svc.loaded == null or !has.has(has.ctx, snap, seq)) break :blk null;
+        break :blk try a.alloc([]const u8, digests.len);
+    };
+    for (digests, txs, 0..) |*dg, *t, i| {
         const rec = snap.transaction(dg) orelse return error.OutputMissing;
+        if (lists) |ls| ls[i] = try loadedBytes(a, read_sets.?, snap, &rec);
         refs.clearRetainingCapacity();
         feed.outputRefs(a, rec.effects, &refs) catch return error.Malformed;
         const objs = try a.alloc([]const u8, refs.items.len);
@@ -100,7 +127,21 @@ pub fn assemble(a: Allocator, snap: *store.Snapshot, seq: u64, out: *std.ArrayLi
         t.* = .{ .tx = rec.tx, .effects = rec.effects, .events = rec.events, .objects = objs };
     }
     try feed.encode(out, a, c.seq, c.summary_cert, c.contents, txs);
+    if (read_sets != null) try feed.encodeReadSets(out, a, lists);
     return true;
+}
+
+/// A transaction's loaded runtime object list as `svc` serves it, in the stored form
+/// (`version: u64 LE ++ id` per entry).
+fn loadedBytes(a: Allocator, svc: *const serve.service.Service, snap: *const store.Snapshot, rec: *const store.TransactionRecord) Allocator.Error![]const u8 {
+    const src = svc.loaded.?;
+    const list = src.get(src.ctx, snap, rec.digest, rec.loc);
+    const out = try a.alloc(u8, list.len * feed.loaded_entry_len);
+    for (list, 0..) |r, i| {
+        std.mem.writeInt(u64, out[i * feed.loaded_entry_len ..][0..8], r.version, .little);
+        out[i * feed.loaded_entry_len + 8 ..][0..32].* = r.id;
+    }
+    return out;
 }
 
 const dispatch = @import("dispatch.zig");

@@ -95,6 +95,13 @@ pub const Options = struct {
     /// several, with commits, floor moves, cleaning (it deletes live-table entries, which moves
     /// slots) and crashes between them and between the table pass and the walk that uses it.
     age_set: bool = false,
+    /// The forced option of store-dst (`ZUI_DST_LIVE_SET`, the runner's `--live-set`): every
+    /// seed that runs the ager (`age`) runs it with the read-ahead and the live set, whatever
+    /// its family: 64 KiB of bits, or the seed's own size for a live-set seed. The draws of
+    /// `age` and deferral seeds are then not those of the default run. `set_verify`: with the
+    /// cross-check as well (`Config.age_set_verify`), for every such seed.
+    live_set: bool = false,
+    set_verify: bool = false,
     /// `pending` seeds: every crash garbles the target of the pending write (sim.zig
     /// `crash_garble_pending`). Checked as strictly as plain crash seeds: the garbled write was
     /// never acknowledged.
@@ -1067,18 +1074,26 @@ const Driver = struct {
     fn prune(d: *Driver, target: u64) !void {
         const before = d.store.?.oldest_epoch.load(.monotonic);
         if (d.opts.debug) std.debug.print("prune {d} (cur {?d}, oldest {d})\n", .{ target, d.model.cur_epoch, d.model.oldest });
-        if (d.store.?.pruneBefore(target)) |_| {
+        // A crash the store could not report counts as a crash here too. `step` leaves its
+        // crash scheduled after an acknowledged commit, and it can land in a deferred punch (the
+        // RCU poll's reclaim swallows a punch's error), in the commit before this prune or in
+        // the prune's own poll. The prune then returns success, and one with nothing to do
+        // touches no file, so nothing noticed: the check below read a crashed disk and failed
+        // the seed with "checkpoint N: Crashed" (store-dst agedefer/187 with the live set forced
+        // on). The simulated process is dead either way: recover, then judge the floor.
+        const crashed_now = if (d.store.?.pruneBefore(target)) |_| d.sim.crashed else |e| switch (e) {
+            error.Crashed => true,
+            else => return e,
+        };
+        if (!crashed_now) {
             if (target > d.model.oldest) d.model.prune(d.arena, target);
             d.res.prunes += 1;
             try d.leanRead();
-        } else |e| switch (e) {
-            error.Crashed => {
-                try d.crashed();
-                const now = d.store.?.oldest_epoch.load(.monotonic);
-                if (now == target and target > before) d.model.prune(d.arena, target) else if (now != before) return d.res.failf("prune crash: oldest {d}, expected {d} or {d}", .{ now, before, target });
-                try d.leanRecover();
-            },
-            else => return e,
+        } else {
+            try d.crashed();
+            const now = d.store.?.oldest_epoch.load(.monotonic);
+            if (now == target and target > before) d.model.prune(d.arena, target) else if (now != before) return d.res.failf("prune crash: oldest {d}, expected {d} or {d}", .{ now, before, target });
+            try d.leanRecover();
         }
         d.check(false);
     }
@@ -1220,6 +1235,14 @@ pub fn run(parent_gpa: std.mem.Allocator, opts: Options) !Result {
             if (((opts.seed *% 0x9e3779b97f4a7c15) >> 50) & 3 == 0) cfg.age_set_step_pages = 2;
         }
         if (opts.age_defer) cfg.age_defer_bytes = @as(u64, 16 << 10) << @intCast(((opts.seed *% 0x9e3779b97f4a7c15) >> 40) % 7);
+        if (opts.live_set) {
+            cfg.age_serial = false;
+            if (!opts.age_set) {
+                cfg.age_live_set = true;
+                cfg.age_set_bytes = 1 << 16;
+            }
+            if (opts.set_verify) cfg.age_set_verify = true;
+        }
     }
     // History dictionaries (chunk codec 3) small enough that every compressed seed cuts and
     // replaces several. From the seed, not `rnd`: every seed keeps its draws.
@@ -1619,6 +1642,66 @@ test "dst: live-set segment pass seeds (table passes cut by commits, cleaning an
     try std.testing.expect(tot.set_builds > 24 and tot.set_kept > 0 and tot.set_dead > 0);
     try std.testing.expect(tot.set_restarts > 0 and tot.set_inexact > 0);
     try std.testing.expectEqual(@as(u64, 0), tot.set_misses);
+}
+
+test "dst driver: a crash swallowed by a deferred punch is a crash for a prune that has nothing to do" {
+    const gpa = std.testing.allocator;
+    var res: Result = .{};
+    var prng: std.Random.DefaultPrng = .init(11);
+    const rnd = prng.random();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const opts: Options = .{ .seed = 11, .file_cap = 8 << 20 };
+    const sim = try SimIo.init(gpa, 11, .{ .torn_sectors = false }, opts.file_cap);
+    defer sim.deinit();
+    const cfg: store_mod.Config = .{
+        .max_live_objects = 4096,
+        .max_object_versions = 1 << 14,
+        .max_transactions = 1 << 13,
+        .max_checkpoints = 1 << 12,
+        .max_batch_bytes = 1 << 20,
+        .max_batch_objects = 512,
+        .max_segments = 256,
+        .index_flush_interval = 8,
+        .segment_reserve = opts.file_cap,
+        .seed = 11,
+    };
+    var d: Driver = .{ .gpa = gpa, .arena = arena, .rnd = rnd, .sim = sim, .cfg = cfg, .res = &res, .opts = &opts };
+    defer if (d.store) |s| s.deinit();
+    try d.reopen();
+    var gen = Gen.init(rnd);
+    for (0..12) |_| {
+        const cp = try gen.next(arena);
+        try d.step(&cp);
+        try std.testing.expect(res.ok);
+    }
+    // Whatever `step` left scheduled is dropped; then the disk crashes inside an operation
+    // whose error is swallowed, as the reclaim swallows a punch's: nobody is told.
+    d.sim.scheduleCrash(null);
+    if (d.sim.crashed) try d.crashed();
+    d.sim.scheduleCrash(0);
+    d.sim.syncDir() catch {};
+    try std.testing.expect(d.sim.crashed);
+    const crashes = res.crashes;
+    // Nothing to prune: the store touches no file and reports success.
+    try d.prune(d.model.oldest);
+    if (!res.ok) std.debug.print("prune after a swallowed crash: {s}\n", .{res.msg()});
+    try std.testing.expect(res.ok);
+    try std.testing.expectEqual(crashes + 1, res.crashes);
+    try std.testing.expect(!d.sim.crashed);
+}
+
+test "dst: store-dst agedefer/187 with the live set forced on (a crash in a deferred punch, then a prune with nothing to do)" {
+    // The seed as store-dst derives it (conformance.zig `runSeed`), with `--live-set`.
+    const seed = (@as(u64, 187) *% 0x9e3779b97f4a7c15 ^ 0x5eed_0001) ^ 0xdefe;
+    for ([_]bool{ false, true }) |verify| {
+        const r = try run(std.testing.allocator, .{ .seed = seed, .checkpoints = 240, .age = true, .age_defer = true, .live_set = true, .set_verify = verify });
+        if (!r.ok) std.debug.print("agedefer/187 (verify {}): {s}\n", .{ verify, r.msg() });
+        try std.testing.expect(r.ok);
+        try std.testing.expect(r.set_builds > 0 and r.crashes >= 3);
+        try std.testing.expectEqual(@as(u64, 0), r.set_misses);
+    }
 }
 
 test "dst: a seed replays bit for bit" {

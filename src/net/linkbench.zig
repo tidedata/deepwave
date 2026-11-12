@@ -30,6 +30,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const conn = @import("conn.zig");
+const cc = @import("cc.zig");
 const Connection = conn.Connection;
 const Ed25519 = std.crypto.sign.Ed25519;
 const ms = std.time.ns_per_ms;
@@ -661,6 +662,249 @@ pub fn flows(gpa: Allocator, link: Link, tunes: []const ?Tune, duration_ms: u64,
     return res;
 }
 
+/// The checkpoint feed's shape (a core feeding an edge that follows the tip): the client asks
+/// for one response of `bytes` every `every_ms`, on schedule whether or not the one before has
+/// arrived, on one connection that carries nothing else. The sender is application-limited:
+/// it has a burst to send, then nothing until the next one, and between two bursts nothing is
+/// in flight when the round trip is shorter than the interval.
+pub const FeedWork = struct {
+    seed: u64 = 1,
+    count: usize = 240,
+    bytes: usize = 300_000,
+    every_ms: u32 = 250,
+    /// Sizes vary as checkpoints do: 40 KB to 400 KB, and every sixteenth response 1 MB.
+    vary: bool = false,
+    /// Not 0: the loop that drives the server sleeps on a coarse timer. It runs when a
+    /// datagram arrives for it, and otherwise this long after it went to sleep when its
+    /// timer is due sooner (a Linux socket receive timeout at HZ=250: 4 to 8 ms for a pacing
+    /// wait of 1.25 ms). 0: at the time the connection asks for.
+    server_tick_ms: u32 = 0,
+
+    /// The first responses are small and grow by a tenth each (20 KB, 22 KB, ...) up to their
+    /// size: the connection opens its window without ever holding a backlog, so a sender that
+    /// models the path only ever sees what the application sent (a connection of a pool at
+    /// the tip). Without it the first response waits behind the initial window for some round
+    /// trips, and that backlog shows the sender the path.
+    ramp: bool = false,
+
+    fn size(w: FeedWork, k: usize) usize {
+        var n: usize = w.bytes;
+        if (w.vary) n = if (k % 16 == 15) 1_000_000 else 40_000 + @as(usize, @intCast(std.hash.Wyhash.hash(w.seed, std.mem.asBytes(&k)) % 360_000));
+        if (w.ramp and k < 48) n = @min(n, @as(usize, @intFromFloat(20_000.0 * std.math.pow(f64, 1.1, @floatFromInt(k)))));
+        return n;
+    }
+};
+
+pub const FeedResult = struct {
+    /// Server (sender) counters at the end.
+    pkts: u64 = 0,
+    lost: u64 = 0,
+    ptos: u64 = 0,
+    mtu_end: usize = 0,
+    black_holes: u64 = 0,
+    cwnd_end: u64 = 0,
+    /// The smallest window the server had when a response began, after the first quarter.
+    cwnd_min_late: u64 = std.math.maxInt(u64),
+    /// BBR only: its pacing rate (bytes per second) and state at the end.
+    pacing_rate: u64 = 0,
+    bbr_state: cc.Bbr.State = .startup,
+    /// BBR only: the largest burst that arrived whole and the bound on a burst (0: none).
+    burst_ok: u64 = 0,
+    burst_cap: u64 = 0,
+    drops_random: u64 = 0,
+    drops_queue: u64 = 0,
+};
+
+/// Runs the feed once on the edge client's receive windows. `lat[k]` is response k's delivery
+/// time: from the moment the server queued its first byte to the client holding its last (ns).
+/// One way of the path is its floor.
+pub fn feedRun(gpa: Allocator, link: Link, work: FeedWork, tune: ?Tune, lat: []u64) !FeedResult {
+    std.debug.assert(lat.len == work.count);
+    var prng = std.Random.DefaultPrng.init(work.seed);
+    const rnd = prng.random();
+    const server_seed: [32]u8 = @splat(9);
+    const skey = (try Ed25519.KeyPair.generateDeterministic(server_seed)).public_key.toBytes();
+    var cseed: [64]u8 = undefined;
+    rnd.bytes(&cseed);
+    var sseed: [64]u8 = undefined;
+    rnd.bytes(&sseed);
+    const t0: u64 = 1_000_000_000;
+    var now: u64 = t0;
+    const client = try Connection.init(gpa, .{ .server_name = "zui", .identity_seed = @splat(4), .expected_peer = skey, .seed = cseed, .now_unix = 1_800_000_000, .alpn = &.{"zui/1"}, .max_streams_uni = 16, .max_streams_bidi = 64, .keep_alive_ms = 3_000, .pmtu_max = 1452 }, now);
+    defer client.deinit();
+    var server: ?*Connection = null;
+    defer if (server) |s| s.deinit();
+    var scfg: conn.Config = .{ .server_name = "zui", .identity_seed = server_seed, .seed = sseed, .now_unix = 1_800_000_000, .max_streams_bidi = 128, .max_streams_uni = 16, .max_data = 16 << 20, .max_stream_data = 1 << 20, .idle_timeout_ms = 30_000, .keep_alive_ms = 0, .alpn = &.{"zui/1"}, .client_auth = false, .pmtu_max = 1452 };
+    if (tune) |f| f(&scfg);
+
+    var fifo: [2]Fifo = .{ .{}, .{} }; // 0: to the client, 1: to the server
+    defer for (&fifo) |*f| f.q.deinit(gpa);
+    const rate: u64 = @as(u64, link.mbit) * 125_000;
+    const queue_bytes: u64 = rate * link.queue_ms / 1000;
+    const delay: u64 = @as(u64, link.rtt_ms) * ms / 2;
+    const every: u64 = @as(u64, work.every_ms) * ms;
+    var res: FeedResult = .{};
+
+    var reqs: std.ArrayList(u64) = .empty;
+    defer reqs.deinit(gpa);
+    var answered: std.ArrayList(u64) = .empty;
+    defer answered.deinit(gpa);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    const Open = struct { id: u64, k: usize, got: usize };
+    var open: std.ArrayList(Open) = .empty;
+    defer open.deinit(gpa);
+    const queued_at = try gpa.alloc(u64, work.count);
+    defer gpa.free(queued_at);
+    var first_at: u64 = 0; // when request 0 was due (the connection is established)
+    const tick: u64 = @as(u64, work.server_tick_ms) * ms;
+    var srv_wake: u64 = 0; // `server_tick_ms`: when the server's loop next runs by itself
+    var asked: usize = 0;
+    var done: usize = 0;
+
+    var out: [1500]u8 = undefined;
+    var iter: u64 = 0;
+    while (done < work.count) : (iter += 1) {
+        if (iter > 200_000_000 or now - t0 > 7200 * sec) return error.SimRunaway;
+        var srv_rx = false;
+        for (&fifo, 0..) |*f, dir| while (f.peek()) |p| {
+            if (p.t > now) break;
+            if (!p.drop) {
+                const d = p.data[0..p.len];
+                if (dir == 0) client.handleDatagram(now, d) else {
+                    if (server == null) {
+                        const dl = d[5];
+                        const sl = d[6 + dl];
+                        server = try Connection.initServer(gpa, scfg, now, d[6..][0..dl], d[7 + dl ..][0..sl]);
+                    }
+                    server.?.handleDatagram(now, d);
+                    srv_rx = true;
+                }
+            }
+            f.pop();
+        };
+        for (0..2) |side| {
+            const is_server = side == 1;
+            const c = if (is_server) server orelse continue else client;
+            // a coarse timer: the server's loop is asleep until a datagram or its wake
+            if (is_server and tick != 0 and !srv_rx and now < srv_wake) continue;
+            if (c.nextTimeout()) |t| if (now >= t) c.onTimeout(now);
+            if (c.isClosed()) return error.SimClosed;
+            if (is_server and c.isEstablished()) {
+                while (c.acceptBidi()) |id| try reqs.append(gpa, id);
+                var k: usize = 0;
+                while (k < reqs.items.len) {
+                    const id = reqs.items[k];
+                    const s = c.stream(id) orelse {
+                        _ = reqs.swapRemove(k);
+                        continue;
+                    };
+                    if (!s.recv.complete()) {
+                        k += 1;
+                        continue;
+                    }
+                    const rq = s.recv.contiguous();
+                    if (rq.len != 8) return error.SimCorrupt;
+                    const len = std.mem.readInt(u32, rq[0..4], .little);
+                    const seq = std.mem.readInt(u32, rq[4..8], .little);
+                    if (seq >= work.count) return error.SimCorrupt;
+                    s.recv.consume(8);
+                    try payload.resize(gpa, len);
+                    fill(payload.items, 0, seq);
+                    if (seq >= work.count / 4) res.cwnd_min_late = @min(res.cwnd_min_late, c.cwnd);
+                    queued_at[seq] = now;
+                    try c.streamWrite(id, payload.items, true);
+                    try answered.append(gpa, id);
+                    _ = reqs.swapRemove(k);
+                }
+                k = 0;
+                while (k < answered.items.len) {
+                    const id = answered.items[k];
+                    if (c.stream(id) == null or c.streamSettled(id)) {
+                        c.streamFree(id);
+                        _ = answered.swapRemove(k);
+                        continue;
+                    }
+                    k += 1;
+                }
+            }
+            if (!is_server and c.isEstablished()) {
+                if (first_at == 0) first_at = now;
+                while (asked < work.count and now >= first_at + asked * every) {
+                    const id = c.openBidi() catch break; // out of stream credit: next pass
+                    var rq: [8]u8 = undefined;
+                    std.mem.writeInt(u32, rq[0..4], @intCast(work.size(asked)), .little);
+                    std.mem.writeInt(u32, rq[4..8], @intCast(asked), .little);
+                    try c.streamWrite(id, &rq, true);
+                    try open.append(gpa, .{ .id = id, .k = asked, .got = 0 });
+                    asked += 1;
+                }
+                var k: usize = 0;
+                while (k < open.items.len) {
+                    const o = &open.items[k];
+                    const s = c.stream(o.id) orelse return error.SimStreamGone;
+                    const n = s.recv.contiguous().len;
+                    o.got += n;
+                    s.recv.consume(n);
+                    if (!s.recv.complete()) {
+                        k += 1;
+                        continue;
+                    }
+                    if (o.got != work.size(o.k)) return error.SimCorrupt;
+                    lat[o.k] = now - queued_at[o.k];
+                    c.streamFree(o.id);
+                    _ = open.swapRemove(k);
+                    done += 1;
+                }
+            }
+            const f = &fifo[1 - side];
+            while (c.pollTransmit(now, &out)) |n| {
+                if (n > link.path_mtu) continue;
+                const backlog = (f.free_at -| now) * rate / sec;
+                if (backlog + n > queue_bytes) {
+                    res.drops_queue += 1;
+                    continue;
+                }
+                const depart = @max(now, f.free_at) + n * sec / rate;
+                f.free_at = depart;
+                const lost = link.loss_pm != 0 and rnd.uintLessThan(u32, 1000) < link.loss_pm;
+                if (lost) res.drops_random += 1;
+                var p: Pkt = .{ .t = depart + delay, .len = @intCast(n), .drop = lost, .data = undefined };
+                @memcpy(p.data[0..n], out[0..n]);
+                try f.q.append(gpa, p);
+            }
+            // the sleep it goes into: a timer under one tick away fires a tick from now
+            if (is_server and tick != 0) srv_wake = if (c.nextTimeout()) |t| @max(t, now + tick) else std.math.maxInt(u64);
+        }
+        var next: u64 = std.math.maxInt(u64);
+        for (&fifo) |*f| if (f.peek()) |p| {
+            next = @min(next, p.t);
+        };
+        if (client.nextTimeout()) |t| next = @min(next, t);
+        if (server) |s| if (tick != 0 and srv_wake != 0) {
+            next = @min(next, srv_wake);
+        } else if (s.nextTimeout()) |t| {
+            next = @min(next, t);
+        };
+        if (first_at != 0 and asked < work.count) next = @min(next, first_at + asked * every);
+        now = if (next > now) next else now + 10_000;
+    }
+    const sv = server.?;
+    res.pkts = sv.pkts_sent;
+    res.lost = sv.pkts_lost;
+    res.ptos = sv.ptos;
+    res.mtu_end = sv.mtu;
+    res.black_holes = sv.pmtu_black_holes;
+    res.cwnd_end = sv.cwnd;
+    if (sv.cfg.bbr) {
+        res.pacing_rate = sv.bbr.pacing_rate;
+        res.bbr_state = sv.bbr.state;
+        res.burst_ok = sv.bbr.burst_ok;
+        res.burst_cap = if (sv.bbr.burst_cap == std.math.maxInt(u64)) 0 else sv.bbr.burst_cap;
+    }
+    return res;
+}
+
 /// A server configuration under test: a name for the table and what it changes.
 pub const Variant = struct { name: []const u8, tune: ?Tune = null };
 
@@ -703,6 +947,24 @@ fn tuneAllReno(c: *conn.Config) void {
 fn tuneAllCubic(c: *conn.Config) void {
     tuneAllReno(c);
     c.cubic = true;
+}
+
+/// What the core's listener runs with ZUI_NATIVE_HYSTART, _CUBIC, _PMTUD, _EARLY_SETTINGS and
+/// _BBR set (an IPv4 client): BBR takes the place of CUBIC and HyStart++.
+fn tuneCoreSwitches(c: *conn.Config) void {
+    c.hystart = true;
+    c.cubic = true;
+    tunePmtud(c);
+    c.early_send = true;
+    c.bbr = true;
+}
+
+/// The same without BBR: CUBIC with HyStart++, unpaced, and the path MTU search.
+fn tuneCoreNoBbr(c: *conn.Config) void {
+    c.hystart = true;
+    c.cubic = true;
+    tunePmtud(c);
+    c.early_send = true;
 }
 
 pub const variants = [_]Variant{
@@ -1129,6 +1391,208 @@ pub fn smallTable(gpa: Allocator, ls: []const Link, requests: usize, seeds: u64)
         const p50 = fms(pct(lat.items, 50));
         std.debug.print("{s:<18} {s:<14} {d:>9.1} {d:>9.1} {d:>9.1} {d:>8.2} {d:>7} {d:>7} {d:>6}\n", .{ link.name, row.name, p50, fms(pct(lat.items, 99)), fms(sum / @max(lat.items.len, 1)), p50 / @as(f64, @floatFromInt(link.rtt_ms)), lost / seeds, retx / seeds, ptos / seeds });
     };
+}
+
+/// The feed table: `count` responses of 300 KB, one every 250 ms, on one connection. The time
+/// from the server queueing a response's first byte to the client holding its last, over the
+/// last three quarters of the run (the first quarter warms the window up); p50 less one way of
+/// the path (what the sender added); the sender's window, the smallest a response started with
+/// and the last; and BBR's pacing rate and state at the end.
+pub fn feedTable(gpa: Allocator, ls: []const Link, work: FeedWork, seeds: u64) !void {
+    const count = work.count;
+    if (work.server_tick_ms != 0) std.debug.print("\nthe server's loop wakes {d} ms after it went to sleep (a coarse timer):", .{work.server_tick_ms});
+    std.debug.print("\nfeed: {d} x {s}, one every {d} ms, one connection, {d} seeds: first byte queued to last byte delivered (virtual time)\n{s:<20} {s:<16} {s:>8} {s:>8} {s:>8} {s:>8} {s:>6} {s:>5} {s:>5} {s:>9} {s:>9} {s:>10} {s:<10}\n", .{ count, if (work.vary) "40 to 400 KB (1 MB every 16th)" else "300 KB", work.every_ms, seeds, "link", "variant", "p50 ms", "p90 ms", "p99 ms", "added ms", "lost", "ptos", "mtu", "cwnd min", "cwnd end", "pace Mbit", "bbr state" });
+    const rows = [_]Variant{ variants[0], variants[4], variants[5], .{ .name = "core, no bbr", .tune = tuneCoreNoBbr }, .{ .name = "bbr", .tune = tuneBbr }, .{ .name = "core switches", .tune = tuneCoreSwitches } };
+    const lat = try gpa.alloc(u64, count);
+    defer gpa.free(lat);
+    var late: std.ArrayList(u64) = .empty;
+    defer late.deinit(gpa);
+    for (ls) |link| for (rows) |row| {
+        late.clearRetainingCapacity();
+        var lost: u64 = 0;
+        var ptos: u64 = 0;
+        var mtu: usize = 0;
+        var cwnd_min: u64 = std.math.maxInt(u64);
+        var cwnd_end: u64 = 0;
+        var pace: u64 = 0;
+        var state: ?cc.Bbr.State = null;
+        var seed: u64 = 1;
+        while (seed <= seeds) : (seed += 1) {
+            var w = work;
+            w.seed = seed;
+            const r = try feedRun(gpa, link, w, row.tune, lat);
+            try late.appendSlice(gpa, lat[count / 4 ..]);
+            lost += r.lost;
+            ptos += r.ptos;
+            mtu = r.mtu_end;
+            cwnd_min = @min(cwnd_min, r.cwnd_min_late);
+            cwnd_end += r.cwnd_end;
+            pace += r.pacing_rate;
+            if (r.pacing_rate != 0) state = r.bbr_state;
+        }
+        std.mem.sort(u64, late.items, {}, std.sort.asc(u64));
+        const p50 = fms(pct(late.items, 50));
+        std.debug.print("{s:<20} {s:<16} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>6} {d:>5} {d:>5} {d:>9} {d:>9} {d:>10.1} {s:<10}\n", .{ link.name, row.name, p50, fms(pct(late.items, 90)), fms(pct(late.items, 99)), p50 - @as(f64, @floatFromInt(link.rtt_ms)) / 2, lost / seeds, ptos / seeds, mtu, cwnd_min, cwnd_end / seeds, @as(f64, @floatFromInt(pace / seeds)) * 8 / 1e6, if (state) |st| @tagName(st) else "" });
+    };
+}
+
+/// The feed, default sender against BBR, one line per case: sizes, how the connection began,
+/// the server loop's timer and the loss. First byte queued to last byte delivered over the
+/// last three quarters of each run, p50 / p90 / p99 in ms.
+pub fn feedCompare(gpa: Allocator, count: usize, seeds: u64) !void {
+    std.debug.print("\nfeed, one response every 250 ms at a 250 ms round trip, 100 Mbit, {d} responses, {d} seeds: first byte queued to last byte delivered, p50 / p90 / p99 ms\n{s:<44} {s:>26} {s:>26} {s:>10} {s:>9} {s:>6} {s:>9} {s:>9} {s:<8}\n", .{ count, seeds, "case", "default", "bbr", "pace Mbit", "cwnd min", "lost", "burst ok", "burst cap", "state" });
+    const Case = struct { name: []const u8, link: usize, work: FeedWork };
+    const cases = [_]Case{
+        .{ .name = "300 KB", .link = 0, .work = .{} },
+        .{ .name = "300 KB, loop wakes 8 ms late", .link = 0, .work = .{ .server_tick_ms = 8 } },
+        .{ .name = "40-400 KB + 1 MB", .link = 0, .work = .{ .vary = true } },
+        .{ .name = "40-400 KB + 1 MB, loop wakes 8 ms late", .link = 0, .work = .{ .vary = true, .server_tick_ms = 8 } },
+        .{ .name = "300 KB, no backlog at the start", .link = 0, .work = .{ .ramp = true } },
+        .{ .name = "300 KB, no backlog, wakes 8 ms late", .link = 0, .work = .{ .ramp = true, .server_tick_ms = 8 } },
+        .{ .name = "40-400 KB + 1 MB, no backlog", .link = 0, .work = .{ .vary = true, .ramp = true } },
+        .{ .name = "40-400 KB + 1 MB, no backlog, 8 ms late", .link = 0, .work = .{ .vary = true, .ramp = true, .server_tick_ms = 8 } },
+        .{ .name = "40-400 KB + 1 MB, no backlog, one a second", .link = 0, .work = .{ .vary = true, .ramp = true, .every_ms = 1000 } },
+        .{ .name = "300 KB, 0.1% loss", .link = 1, .work = .{} },
+        .{ .name = "40-400 KB + 1 MB, no backlog, 0.1% loss", .link = 1, .work = .{ .vary = true, .ramp = true } },
+        .{ .name = "300 KB, no backlog, 100 ms round trip", .link = 3, .work = .{ .ramp = true } },
+    };
+    const lat = try gpa.alloc(u64, count);
+    defer gpa.free(lat);
+    var late: std.ArrayList(u64) = .empty;
+    defer late.deinit(gpa);
+    for (cases) |cs| {
+        var cols: [2][3]f64 = undefined;
+        var pace: u64 = 0;
+        var cwnd_min: u64 = std.math.maxInt(u64);
+        var state: cc.Bbr.State = .startup;
+        var lost: u64 = 0;
+        var burst_ok: u64 = 0;
+        var burst_cap: u64 = 0;
+        for ([_]?Tune{ null, tuneBbr }, 0..) |tune, i| {
+            late.clearRetainingCapacity();
+            var seed: u64 = 1;
+            while (seed <= seeds) : (seed += 1) {
+                var w = cs.work;
+                w.seed = seed;
+                w.count = count;
+                const r = try feedRun(gpa, feed_links[cs.link], w, tune, lat);
+                try late.appendSlice(gpa, lat[count / 4 ..]);
+                if (i == 1) {
+                    pace += r.pacing_rate;
+                    cwnd_min = @min(cwnd_min, r.cwnd_min_late);
+                    state = r.bbr_state;
+                    lost += r.lost;
+                    burst_ok = r.burst_ok;
+                    burst_cap = r.burst_cap;
+                }
+            }
+            std.mem.sort(u64, late.items, {}, std.sort.asc(u64));
+            cols[i] = .{ fms(pct(late.items, 50)), fms(pct(late.items, 90)), fms(pct(late.items, 99)) };
+        }
+        std.debug.print("{s:<44} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>10.1} {d:>9} {d:>6} {d:>9} {d:>9} {s:<8}\n", .{ cs.name, cols[0][0], cols[0][1], cols[0][2], cols[1][0], cols[1][1], cols[1][2], @as(f64, @floatFromInt(pace / seeds)) * 8 / 1e6, cwnd_min, lost / seeds, burst_ok, burst_cap, @tagName(state) });
+    }
+}
+
+/// The feed's paths: a core to a distant edge (250 ms) and a nearer one (100 ms),
+/// clean, with the loss the core's logs show (under 0.1 percent), and the long-haul profile.
+pub const feed_links = [_]Link{
+    .{ .name = "250ms 0% 100Mbit", .rtt_ms = 250, .loss_pm = 0, .mbit = 100 },
+    .{ .name = "250ms 0.1% 100Mbit", .rtt_ms = 250, .loss_pm = 1, .mbit = 100 },
+    long_haul,
+    .{ .name = "100ms 0% 100Mbit", .rtt_ms = 100, .loss_pm = 0, .mbit = 100 },
+    .{ .name = "100ms 0.1% 100Mbit", .rtt_ms = 100, .loss_pm = 1, .mbit = 100 },
+};
+
+test "linkbench feed: periodic 300 KB responses on one connection arrive whole; the window survives the gaps" {
+    const gpa = std.testing.allocator;
+    // ZUI_NET_BENCH_FEED=1 prints the table (ZUI_NET_BENCH_FEED_N and _SEEDS override 240 and 3)
+    // ZUI_NET_BENCH_BURST=1 prints the default sender against BBR, one line per case
+    if (std.c.getenv("ZUI_NET_BENCH_BURST") != null)
+        try feedCompare(gpa, @intCast(envInt("ZUI_NET_BENCH_FEED_N", 120)), envInt("ZUI_NET_BENCH_FEED_SEEDS", 3));
+    if (std.c.getenv("ZUI_NET_BENCH_FEED") != null) {
+        const n: usize = @intCast(envInt("ZUI_NET_BENCH_FEED_N", 240));
+        const seeds = envInt("ZUI_NET_BENCH_FEED_SEEDS", 3);
+        try feedTable(gpa, &feed_links, .{ .count = n }, seeds);
+        // checkpoint-like sizes, and one connection of four (a response a second)
+        try feedTable(gpa, feed_links[0..2], .{ .count = n, .vary = true }, seeds);
+        try feedTable(gpa, feed_links[0..2], .{ .count = n, .vary = true, .every_ms = 1000 }, seeds);
+        // the same when the server's timer is a Linux socket receive timeout at HZ=250
+        try feedTable(gpa, feed_links[0..2], .{ .count = n, .server_tick_ms = 4 }, seeds);
+        try feedTable(gpa, feed_links[0..2], .{ .count = n, .server_tick_ms = 8 }, seeds);
+        try feedTable(gpa, feed_links[0..1], .{ .count = n, .vary = true, .server_tick_ms = 8 }, seeds);
+    }
+    var lat: [24]u64 = undefined;
+    for ([_]?Tune{ null, tuneCubic, tuneBbr, tuneCoreSwitches }, 0..) |tune, i| {
+        // 250 ms: the round trip is the interval, so something is always in flight
+        const far = try feedRun(gpa, feed_links[0], .{ .count = lat.len }, tune, &lat);
+        try std.testing.expectEqual(@as(u64, 0), far.black_holes);
+        // 100 ms: between two responses nothing is in flight for about 120 ms. No sender goes
+        // back to its initial window for that: the next response starts with the window the
+        // last one left (RFC 9002 section 7.8 asks an unpaced sender to; see the feed notes)
+        const near = try feedRun(gpa, feed_links[3], .{ .count = lat.len }, tune, &lat);
+        try std.testing.expectEqual(@as(u64, 0), near.black_holes);
+        if (i < 2) try std.testing.expect(near.cwnd_min_late > 2 * 14_720);
+        // and a response is there in a few round trips, not in one per window
+        for (lat[lat.len * 3 / 4 ..]) |x| try std.testing.expect(x < 2 * sec);
+    }
+    // A paced sender whose loop wakes 8 ms late (a coarse timer) still delivers a response in
+    // about the time it takes on an exact one: the pacer keeps the credit of the late wake.
+    // (With the bucket as the limit it sent at a quarter of its rate between two ACKs: 36 ms
+    // more at p50 and 230 ms more at p90 on these sizes.)
+    var exact: [96]u64 = undefined;
+    var coarse: [96]u64 = undefined;
+    _ = try feedRun(gpa, feed_links[0], .{ .count = exact.len, .vary = true }, tuneBbr, &exact);
+    _ = try feedRun(gpa, feed_links[0], .{ .count = coarse.len, .vary = true, .server_tick_ms = 8 }, tuneBbr, &coarse);
+    std.mem.sort(u64, exact[24..], {}, std.sort.asc(u64));
+    std.mem.sort(u64, coarse[24..], {}, std.sort.asc(u64));
+    if (std.c.getenv("ZUI_NET_BENCH_FEED") != null) std.debug.print("\nBBR, 40 to 400 KB every 250 ms at 250 ms: p50 {d:.1} and p90 {d:.1} ms on an exact timer, {d:.1} and {d:.1} ms when the loop wakes 8 ms late\n", .{ fms(exact[60]), fms(exact[88]), fms(coarse[60]), fms(coarse[88]) });
+    try std.testing.expect(coarse[60] <= exact[60] + 20 * ms);
+    try std.testing.expect(coarse[88] <= exact[88] + 60 * ms);
+}
+
+/// p50, p90 and p99 of one feed run's delivery times over its last three quarters (ns).
+fn feedPcts(gpa: Allocator, link: Link, work: FeedWork, tune: ?Tune) ![3]u64 {
+    const lat = try gpa.alloc(u64, work.count);
+    defer gpa.free(lat);
+    _ = try feedRun(gpa, link, work, tune, lat);
+    const late = lat[work.count / 4 ..];
+    std.mem.sort(u64, late, {}, std.sort.asc(u64));
+    return .{ pct(late, 50), pct(late, 90), pct(late, 99) };
+}
+
+test "linkbench feed: BBR delivers a periodic response as fast as the unpaced default, keeps its tail and survives loss" {
+    const gpa = std.testing.allocator;
+    // A response every 250 ms at a 250 ms round trip: 300 KB and checkpoint-like sizes, on a
+    // connection that began with a backlog and on one that never held one (the model then
+    // knows only the application's bursts), with the server's loop on an exact timer and on
+    // one that wakes 8 ms late. The sender is limited by its application throughout, so a
+    // response leaves at once (`Bbr.quiet`): no later than from the default sender, which
+    // does not pace at all.
+    for ([_]bool{ false, true }) |vary| for ([_]bool{ false, true }) |ramp| for ([_]u32{ 0, 8 }) |tick| {
+        const work: FeedWork = .{ .count = 96, .vary = vary, .ramp = ramp, .server_tick_ms = tick };
+        const def = try feedPcts(gpa, feed_links[0], work, null);
+        const bbr = try feedPcts(gpa, feed_links[0], work, tuneBbr);
+        if (bbr[0] > def[0] + 2 * ms or bbr[1] > def[1] + 2 * ms or bbr[2] > @max(def[2] + 2 * ms, def[0] + 260 * ms))
+            std.debug.print("feed vary={} ramp={} tick={d}: default {d:.1} {d:.1} {d:.1}, bbr {d:.1} {d:.1} {d:.1}\n", .{ vary, ramp, tick, fms(def[0]), fms(def[1]), fms(def[2]), fms(bbr[0]), fms(bbr[1]), fms(bbr[2]) });
+        try std.testing.expect(bbr[0] <= def[0] + 2 * ms);
+        try std.testing.expect(bbr[1] <= def[1] + 2 * ms);
+        // the tail: at most one round trip over the median, for the one burst that finds the
+        // end of the path's queue (`Bbr.burst_cap` holds the next ones under it); the default
+        // sender loses the tail of every large burst there
+        try std.testing.expect(bbr[2] <= @max(def[2] + 2 * ms, def[0] + 260 * ms));
+    };
+    // 0.1 percent loss: the default sender cannot carry this feed on one connection (it is
+    // seconds behind); BBR still delivers within a round trip at the median, and a response
+    // that lost a packet a round trip or two later
+    for ([_]bool{ false, true }) |ramp| {
+        const work: FeedWork = .{ .count = 64, .ramp = ramp };
+        const def = try feedPcts(gpa, feed_links[1], work, null);
+        const bbr = try feedPcts(gpa, feed_links[1], work, tuneBbr);
+        if (def[0] <= 2 * sec or bbr[0] > 220 * ms or bbr[1] > 420 * ms or bbr[2] > 1200 * ms)
+            std.debug.print("feed at 0.1% loss, ramp={}: default {d:.1} {d:.1} {d:.1}, bbr {d:.1} {d:.1} {d:.1}\n", .{ ramp, fms(def[0]), fms(def[1]), fms(def[2]), fms(bbr[0]), fms(bbr[1]), fms(bbr[2]) });
+        try std.testing.expect(def[0] > 2 * sec);
+        try std.testing.expect(bbr[0] <= 220 * ms and bbr[1] <= 420 * ms and bbr[2] <= 1200 * ms);
+    }
 }
 
 /// The fairness and deep-buffer link: 20 Mbit, a 50 ms round trip (a BDP of 125,000 bytes),

@@ -41,4 +41,5 @@ test {
     _ = @import("test_web.zig");
     _ = @import("test_limits.zig");
     _ = @import("test_drain.zig");
+    _ = @import("test_caller.zig");
 }

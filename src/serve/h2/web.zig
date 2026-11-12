@@ -34,6 +34,8 @@ pub const Options = struct {
     default_timeout_ns: ?u64 = 60 * std.time.ns_per_s,
     max_head: usize = 64 << 10,
     max_body: usize = 24 << 20,
+    /// The connection's peer (`conn.Request.peer`); set per connection by the runtime.
+    peer: conn.Peer = .{},
 };
 
 pub const Control = struct {
@@ -58,6 +60,8 @@ const Req = struct {
     grpc_encoding: []const u8 = "",
     timeout_ns: ?u64 = null,
     client_protocol_version: ?u64 = null,
+    api_key: []const u8 = "",
+    forwarded_for: []const u8 = "",
 };
 
 /// How one response is framed on the connection, hyper 1.11 style (proto/h1/role.rs
@@ -374,6 +378,10 @@ fn parseHead(head: []const u8) !Req {
             r.timeout_ns = meta.parseTimeout(value);
         } else if (ieql(name, "x-sui-client-protocol-version")) {
             r.client_protocol_version = meta.parseClientProtocolVersion(value);
+        } else if (ieql(name, "x-api-key")) {
+            r.api_key = value[0..@min(value.len, conn.max_api_key)];
+        } else if (ieql(name, "x-forwarded-for")) {
+            if (value.len <= conn.max_forwarded_for) r.forwarded_for = value;
         }
     }
     return r;
@@ -398,6 +406,9 @@ const Sink = struct {
     closed: bool = false,
     /// The request's metrics track (pump threads write through the sink too).
     track: ?*obs.Track = null,
+    /// `ResponseStream.retry_after_ms` of the call (a `retry-after-ms` header of a
+    /// trailers-only reply).
+    retry_after_ms: ?u32 = null,
 
     fn startHeaders(s: *Sink) !void {
         if (s.track) |t| t.status(obs.grpcLabel(.ok), meta.monoNs());
@@ -567,13 +578,14 @@ fn grpcWeb(gpa: Allocator, arena: Allocator, fd: std.c.fd_t, req: *const Req, ki
                 const tmo = if (req.timeout_ns) |a| (if (opts.default_timeout_ns) |b| @min(a, b) else a) else opts.default_timeout_ns;
                 const deadline: ?u64 = if (tmo) |t| t0 +| t else null;
                 rs.deadline_ns = deadline;
-                const r: conn.Request = .{ .path = path, .authority = "", .body = payload, .stream_id = 1, .accept = encoding, .deadline_ns = deadline, .web = true, .client_protocol_version = req.client_protocol_version };
+                const r: conn.Request = .{ .path = path, .authority = "", .body = payload, .stream_id = 1, .accept = encoding, .deadline_ns = deadline, .web = true, .client_protocol_version = req.client_protocol_version, .api_key = req.api_key, .peer = opts.peer.text(), .forwarded_for = req.forwarded_for };
                 const prev = pump.current;
                 pump.current = .{ .ctx = &ws, .attach = WebStream.attachFn };
                 status = handler.call(handler.ctx, &r, &rs);
                 pump.current = prev;
                 text = rs.msg;
                 details = rs.details_bin;
+                sink.retry_after_ms = rs.retry_after_ms;
             },
         }
     }
@@ -659,6 +671,7 @@ fn finishUnary(sink: *Sink, arena: Allocator, ct: []const u8, status: Status, te
         // the length is known, so the connection framing is `fr` (not the streamed one)
         var list: std.ArrayList(meta.Header) = .empty;
         try conn.trailersOnlyHeaders(&list, arena, ct, status, text, details, reject);
+        if (sink.retry_after_ms) |ms| try conn.retryAfterHeader(&list, arena, ms);
         if (sink.track) |t| t.status(obs.grpcLabel(status), meta.monoNs());
         try fr.statusLine(&sink.out, gpa, "200 OK");
         try hdrs(&sink.out, gpa, list.items);

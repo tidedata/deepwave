@@ -509,11 +509,165 @@ test "bulk: the build's peak allocation stays under its memory budget (the old b
     try expectSameTables(gpa, a, dirs[0], dir);
 }
 
+/// Files under `<dir>/index` whose name ends in `ext`.
+fn countFiles(dir: []const u8, ext: []const u8) usize {
+    var pb: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/index", .{dir}) catch return 0;
+    var d = std.Io.Dir.cwd().openDir(testing.io, path, .{ .iterate = true }) catch return 0;
+    defer d.close(testing.io);
+    var it = d.iterate();
+    var n: usize = 0;
+    while (it.next(testing.io) catch null) |e| {
+        if (std.mem.endsWith(u8, e.name, ext)) n += 1;
+    }
+    return n;
+}
+
+/// The live set of a store as a build source: `store.LiveScan.walkPart`, what a node without a
+/// restore image builds from (node fast_start.zig `walkLivePart`, `deepwave-tool verify-index`).
+const ScanSource = struct {
+    sc: *store.LiveScan,
+    /// `lsm.Source.release` calls, and whether any table of the index existed at the first.
+    released: u32 = 0,
+    tables_at_release: usize = 0,
+    index_dir: []const u8 = "",
+
+    /// The build reads no more: the scan's locations go before the sort.
+    fn release(ctx: *anyopaque) void {
+        const s: *ScanSource = @ptrCast(@alignCast(ctx));
+        if (s.released == 0) {
+            s.tables_at_release = countFiles(s.index_dir, ".tbl");
+            s.sc.deinit();
+        }
+        s.released += 1;
+    }
+
+    const Part = struct {
+        sink: lsm.Sink,
+        fn each(p: *Part, o: store.LiveIter.Item) anyerror!void {
+            try p.sink.f(p.sink.ctx, &o.id, o.version, o.bytes);
+        }
+    };
+    fn walk(ctx: *anyopaque, part: u32, parts: u32, sink: lsm.Sink) anyerror!void {
+        const s: *ScanSource = @ptrCast(@alignCast(ctx));
+        var p: Part = .{ .sink = sink };
+        try s.sc.walkPart(part, parts, &p, Part.each);
+    }
+};
+
+test "bulk: a build from a live-table scan of a compressed store stays under its budget while it reads (the scan held every chunk a range read)" {
+    // The read phase of the node's live-table build and of `deepwave-tool verify-index`. The build
+    // itself held its budget; the scan under it read through the store's shared chunk cache,
+    // so every decoded chunk stayed allocated until the walker's range (65,536 records) ended,
+    // and then until some thread freed it. A test machine, 2026-11-11: 152 GB of private memory in the
+    // read phase of a build with a 2 GiB budget, 32 threads, a 301 GB store.
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var counting: Counting = .{ .child = gpa };
+    const g = counting.allocator();
+    // 160,000 objects in 4 KiB chunks (about 26 MiB of live set) behind a 4 MiB chunk cache
+    var cfg: store.Config = .{
+        .max_live_objects = 1 << 19,
+        .max_object_versions = 1 << 19,
+        .max_transactions = 1024,
+        .max_checkpoints = 1024,
+        .max_batch_bytes = 4 << 20,
+        .max_batch_objects = 4096,
+        .max_segments = 64,
+        .index_flush_interval = 8,
+        .segment_reserve = 16 << 20,
+        .chunk_bytes = 4096,
+        .cache_bytes = 1,
+        .seed = 61,
+    };
+    const sim = try store.SimIo.init(g, 61, .{}, 64 << 20);
+    defer sim.deinit();
+    const st = try store.Store.open(g, .{ .sim = sim }, &cfg);
+    defer st.deinit();
+    var mem = try index.Index.init(gpa);
+    defer mem.deinit();
+    var prng = std.Random.DefaultPrng.init(61);
+    const r = prng.random();
+    const n_objs = 160_000;
+    var logical: u64 = 0;
+    {
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        var seq: u64 = 0;
+        var i: usize = 0;
+        while (i < n_objs) {
+            seq += 1;
+            _ = scratch.reset(.retain_capacity);
+            const b = try st.begin(seq, 0);
+            for (0..4000) |_| {
+                const raw = try makeObject(scratch.allocator(), r, i);
+                const obj = try bcs.decode(types.Object, scratch.allocator(), raw);
+                const mo = obj.data.Move;
+                try b.putObject(mo.contents[0..32], mo.version.@"0", &types.digest.objectDigest(raw), raw);
+                try mem.insert(raw);
+                logical += raw.len;
+                i += 1;
+            }
+            try b.checkpoint("summary", "contents");
+            try st.commit(b);
+        }
+    }
+    try testing.expect(logical > 16 << 20);
+    const budget: usize = 8 << 20;
+    const dir = try tmpDirPath(a, &tmp, "scan");
+    const ix = try index.Index.open(g, testing.io, dir, .{ .build_threads = 4, .build_mem_bytes = budget, .sync = .none });
+    defer {
+        ix.deinit();
+        g.destroy(ix);
+    }
+    var sc = try store.LiveScan.init(g, st, st.committed().? + 1);
+    var src: ScanSource = .{ .sc = &sc, .index_dir = dir };
+    defer if (src.released == 0) sc.deinit();
+    try testing.expectEqual(@as(u64, n_objs), sc.total());
+    // the scan's locations are in the base: 8 bytes a live-table entry, beside the budget
+    const scan_bytes = counting.cur.load(.monotonic);
+    const base = counting.cur.load(.monotonic);
+    counting.peak.store(base, .monotonic);
+    const decoded_into_cache = st.cache.stats.misses.load(.monotonic);
+    const rep = try lsm.Builder.runFrom(&ix.db, .{ .ctx = &src, .at = st.committed().?, .walk = ScanSource.walk, .release = ScanSource.release }, index.rowsOf);
+    const peak = counting.peak.load(.monotonic) - base;
+    // The source was told once that the read was over, before any table was written, and gave
+    // its locations back: the sort and the tables ran without them.
+    try testing.expectEqual(@as(u32, 1), src.released);
+    try testing.expectEqual(@as(usize, 0), src.tables_at_release);
+    try testing.expect(counting.cur.load(.monotonic) + 8 * n_objs <= scan_bytes + ix.db.indexMemory() + (64 << 10));
+    // what the build says it held is what it was allowed, in the read and in the sort
+    try testing.expectEqual(@as(u32, 4), rep.walkers);
+    try testing.expect(rep.sort_workers >= 1);
+    try testing.expect(rep.lane_bytes > 0 and rep.lane_bytes <= budget);
+    try testing.expect(rep.sort_bytes > 0 and rep.sort_bytes <= budget);
+    std.debug.print("bulk memory, live-table scan: lanes {d} KiB, sorters {d} KiB ({d} workers)\n", .{ rep.lane_bytes >> 10, rep.sort_bytes >> 10, rep.sort_workers });
+    // the scan decodes into its walkers' own buffers: no chunk of the live set went through
+    // the shared cache, so none waits there to be freed
+    try testing.expectEqual(decoded_into_cache, st.cache.stats.misses.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), st.chunkMemory().evicted_bytes + st.chunkMemory().kept_bytes);
+    std.debug.print("bulk memory, live-table scan: budget {d} KiB, peak {d} KiB over the open store and the scan's locations, {d} KiB of objects read, {d} rows\n", .{ budget >> 10, peak >> 10, logical >> 10, rep.entries });
+    try testing.expectEqual(@as(u64, n_objs), rep.objects);
+    // the store's allocations are counted too: reading added no more than the budget allows
+    try testing.expect(peak <= budget);
+    _ = try expectSameRows(a, &mem, ix);
+}
+
+/// `x` may hold balance rows emptied to zero by applied checkpoints (kept, as sui-node keeps them
+/// until a compaction); a build from a live set (`y`) has none. Every other row is equal.
 fn expectSameRows(a: Allocator, x: *const index.Index, y: *const index.Index) !u64 {
     var p = try x.all(a);
     var q = try y.all(a);
     var n: u64 = 0;
     while (try p.next()) |e| {
+        if (e.val.zeroSum()) {
+            try testing.expectEqual(lsm.Op.held, e.val.op);
+            continue;
+        }
         const g = (try q.next()) orelse return error.TestMissingRow;
         try testing.expectEqualSlices(u8, e.key, g.key);
         try testing.expectEqual(e.val.op, g.val.op);

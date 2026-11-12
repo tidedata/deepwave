@@ -45,6 +45,8 @@ fn wanted(selection: []const u8, s: *const harness.Suite) bool {
     return false;
 }
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
@@ -90,6 +92,16 @@ pub fn main(init: std.process.Init) !u8 {
             i += 1;
             const n = try std.fmt.parseInt(u32, args[i], 10);
             if (n > 0) opts.jobs = n;
+        } else if (has_val and std.mem.eql(u8, a, "--live-set")) {
+            // store-dst (src/store/conformance.zig `dstLiveSet`): on | verify | off. Passed on
+            // as ZUI_DST_LIVE_SET, which the suite reads.
+            i += 1;
+            var zb: [16]u8 = undefined;
+            const z = std.fmt.bufPrint(&zb, "{s}\x00", .{args[i]}) catch {
+                try stderr.print("--live-set on | verify | off\n", .{});
+                return 2;
+            };
+            _ = setenv("ZUI_DST_LIVE_SET", @ptrCast(z.ptr), 1);
         } else if (has_val and std.mem.eql(u8, a, "--bench-bytes")) {
             i += 1;
             const n = try std.fmt.parseInt(u64, args[i], 10);

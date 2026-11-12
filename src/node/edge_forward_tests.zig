@@ -33,7 +33,8 @@
 //!
 //! Needs the corpus (`$ZUI_CORPUS`); skips without it. `ZUI_EDGE_FWD_COUNT` (checkpoints,
 //! default 24) and `ZUI_EDGE_FWD_STRIDE` (every n-th transaction and object, default 3) size it;
-//! a large test machine runs it wide.
+//! a large test machine runs it wide. The read-after-write part plays the checkpoint after the window; where
+//! the corpus has none (a window to the corpus' end) that part alone is left out, with a line.
 const std = @import("std");
 const Io = std.Io;
 const testing = std.testing;
@@ -315,6 +316,15 @@ const Diff = struct {
         _ = d.arena.reset(.retain_capacity);
     }
 };
+
+/// A corpus file of checkpoint `seq`, or null when the corpus does not hold it (`fx.readSeq`
+/// skips the whole test there, which is right for the window and wrong for an optional part).
+fn readSeqHeld(a: std.mem.Allocator, dir: Io.Dir, seq: u64, ext: []const u8) !?[]u8 {
+    return fx.readSeq(a, dir, seq, ext) catch |e| switch (e) {
+        error.SkipZigTest => null,
+        else => e,
+    };
+}
 
 /// Read mask paths asked one at a time in the completeness pass: every field of the message
 /// (a path selects its whole subtree), and the paths the default masks use.
@@ -662,6 +672,75 @@ test "edge forward conformance: the grpc-v2 requests answered by a core and by a
         // GetServiceInfo still reports the core's lowest checkpoint: what a client can ask for
         try d.check(p_info, "");
     }
+    // the core's floor above the edge's: a core serves from the higher of its two floors (at
+    // sui-node's defaults the objects pruner's, a whole epoch above the checkpoint pruner's)
+    // and reports that one in both fields; the edge reports the same. From it up no mask is
+    // refused for the floor, by the edge or by its core, and the answers are equal. Below it a
+    // mask the edge cannot answer itself gets the core's NOT_FOUND (never INTERNAL), and what
+    // the edge holds itself it still serves: more than the reported floor promises, never less.
+    // (This fixture's core lacks inputs written before the window, so above the floor an object
+    // mask is OK or the fixture's own INTERNAL, see "edge-forward fixture core" below; the
+    // store and node retention tests read every checkpoint above the floor whole.)
+    {
+        const floor = first + count / 2;
+        w.core.svc.lowest_checkpoint = floor;
+        f.refreshFloor(h2.meta.monoNs());
+        defer {
+            w.core.svc.lowest_checkpoint = first;
+            f.refreshFloor(h2.meta.monoNs());
+        }
+        try testing.expectEqual(floor, service.reportedLowest(&edge_svc));
+        try d.check(p_info, "");
+        {
+            const info = try loopback.unary(d.arena.allocator(), d.edge_h, p_info, "");
+            try testing.expectEqual(@as(u8, 0), info.status);
+            var low: ?u64 = null;
+            var low_objects: ?u64 = null;
+            var r = proto.Reader.init(info.message);
+            while (try r.next()) |fld| switch (fld.number) {
+                6 => low = try proto.Reader.varintOf(fld),
+                7 => low_objects = try proto.Reader.varintOf(fld),
+                else => {},
+            };
+            try testing.expectEqual(@as(?u64, floor), low);
+            try testing.expectEqual(@as(?u64, floor), low_objects);
+        }
+        const object_masks = [_][]const u8{ "transactions.effects", "transactions.balance_changes", "transactions.effects.status,transactions.digest", "contents,transactions.effects,transactions.balance_changes" };
+        for (first..first + count) |seq| {
+            for (object_masks) |m| {
+                const body = try rq.checkpoint(seq, null, m);
+                const got = try loopback.unary(d.arena.allocator(), d.edge_h, p_checkpoint, body);
+                if (seq >= floor) {
+                    try testing.expect(got.status != 5);
+                } else {
+                    try testing.expectEqual(@as(u8, 5), got.status); // NOT_FOUND
+                    try testing.expectEqualStrings(try std.fmt.allocPrint(d.arena.allocator(), "Checkpoint {d} not found", .{seq}), got.grpc_message);
+                }
+                try d.check(p_checkpoint, body);
+            }
+            // the edge's own history: served at any height it holds
+            const own = try loopback.unary(d.arena.allocator(), d.edge_h, p_checkpoint, try rq.checkpoint(seq, null, "sequence_number,digest,summary,transactions.digest"));
+            try testing.expectEqual(@as(u8, 0), own.status);
+            d.round();
+        }
+        var i: usize = 0;
+        while (i < win.txs.items.len) : (i += stride) {
+            const t = &win.txs.items[i];
+            for ([_][]const u8{ "effects", "balance_changes", "effects.status,digest" }) |m| {
+                const body = try rq.tx(&t.digest, m);
+                const got = try loopback.unary(d.arena.allocator(), d.edge_h, p_tx, body);
+                if (t.seq >= floor) {
+                    try testing.expect(got.status != 5);
+                } else {
+                    var db: [serve.b58.max_len_32]u8 = undefined;
+                    try testing.expectEqual(@as(u8, 5), got.status);
+                    try testing.expectEqualStrings(try std.fmt.allocPrint(d.arena.allocator(), "Transaction {s} not found", .{serve.b58.encode32(&db, &t.digest)}), got.grpc_message);
+                }
+                try d.check(p_tx, body);
+            }
+            d.round();
+        }
+    }
 
     const diff_total = d.total;
     const diff_differences = d.differences;
@@ -726,16 +805,24 @@ test "edge forward conformance: the grpc-v2 requests answered by a core and by a
     // The next corpus checkpoint plays the executed transactions: its transactions are recorded
     // as an execute through the edge records them (digest and written object ids), the core
     // checkpoints it 200 ms later, and the edge gets it from the feed.
-    {
-        try f.start();
+    // A window that ends where the corpus ends (a test machine's full run) has no next checkpoint: this
+    // part is then left out, with a line saying so, and the diff's report and gate below still run.
+    raw: {
         const next = first + count;
         var scratch = std.heap.ArenaAllocator.init(testing.allocator);
         defer scratch.deinit();
         const sa = scratch.allocator();
         const ops_dir = try fx.corpusDir("vectors/store-replay/ops");
         defer ops_dir.close(io);
-        const blob = try fx.readSeq(sa, w.core.chk, next, ".chk");
-        const ops_bytes = try fx.readSeq(sa, ops_dir, next, ".ops");
+        const blob_held = try readSeqHeld(sa, w.core.chk, next, ".chk");
+        const ops_held = try readSeqHeld(sa, ops_dir, next, ".ops");
+        if (blob_held == null or ops_held == null) {
+            std.debug.print("edge-forward read-after-write: NOT RUN, the corpus has no checkpoint {d} after the window ({d}.chk {s}, {d}.ops {s}); the diff is complete without it\n", .{ next, next, if (blob_held == null) "missing" else "held", next, if (ops_held == null) "missing" else "held" });
+            break :raw;
+        }
+        const blob = blob_held.?;
+        const ops_bytes = ops_held.?;
+        try f.start();
         const cp = try store.ops.parse(sa, ops_bytes, blob);
         const now = h2.meta.monoNs();
         var written: std.ArrayList([32]u8) = .empty;

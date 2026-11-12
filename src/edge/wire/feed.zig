@@ -11,6 +11,10 @@
 //!   Feed   { seq: u64, summary: bytes, contents: bytes, txs: vector<FeedTx> }
 //!   FeedTx { tx: bytes, effects: bytes, events: Option<bytes>, objects: vector<bytes> }
 //!
+//! Only when the client asked for them (hello feature bit 33, request flag READ_SETS; docs/EDGE.md
+//! section 12) the feed is followed by the checkpoint's read sets, `ReadSets` below. A feed
+//! without them is the bytes above and nothing else, as it always was.
+//!
 //! `summary` is BCS CertifiedCheckpointSummary (summary ++ AuthorityStrongQuorumSignInfo),
 //! `tx` the BCS Transaction envelope, `events` BCS TransactionEvents, `objects` BCS Object in
 //! the order of the effects' changed objects. Nothing in a feed is trusted: the edge rebuilds
@@ -120,6 +124,17 @@ const Rd = struct {
 
 /// Decodes `b` (the whole feed, nothing after it).
 pub fn decode(gpa: Allocator, b: []const u8) Error!Feed {
+    var end: usize = 0;
+    var f = try decodeAt(gpa, b, &end);
+    if (end != b.len) {
+        f.deinit(gpa);
+        return error.Malformed;
+    }
+    return f;
+}
+
+/// Decodes the feed at the start of `b`; `end` receives where it stops.
+fn decodeAt(gpa: Allocator, b: []const u8, end: *usize) Error!Feed {
     var r: Rd = .{ .b = b };
     if (b.len < 8) return error.Malformed;
     const seq = std.mem.readInt(u64, b[0..8], .little);
@@ -148,8 +163,94 @@ pub fn decode(gpa: Allocator, b: []const u8) Error!Feed {
         t.count = @intCast(n);
         for (0..@as(usize, @intCast(n))) |_| try objs.append(gpa, try r.bytes());
     }
-    if (r.p != b.len) return error.Malformed;
+    end.* = r.p;
     return .{ .seq = seq, .summary_cert = summary, .contents = contents, .txs = txs, .objs = try objs.toOwnedSlice(gpa) };
+}
+
+// ------------------------------------------------------------------ read sets (docs/EDGE.md 12)
+//
+//   ReadSets { present: u8, loaded: [bytes; txs.len] }      `loaded` only when present = 1
+//
+// `present` 0: the serving node holds no final read set for this checkpoint (it was stored
+// without one, or its lists may still change); nothing follows. 1: one `bytes` per transaction,
+// in the feed's order: the transaction's `unchanged_loaded_runtime_objects` list as the node's
+// store keeps it, `count * (version: u64 LE ++ id: [u8; 32])` (empty: none), ids ascending.
+//
+// A list is the serving node's word: nothing certified names it (it is not in the effects). The
+// receiver checks what can be checked (`listCanonical` here; the rest against its own store,
+// node history.zig) and treats the membership itself as unproven.
+
+/// One entry of a loaded runtime object list: `version: u64 LE ++ id: [u8; 32]`.
+pub const loaded_entry_len = 40;
+
+/// Whether `list` is a loaded list in sui-node's form: whole entries, ids strictly ascending
+/// (a BTreeMap by object id: one version per id), every version a real object version (at most
+/// i64 max, Rust `SequenceNumber::MAX`).
+pub fn listCanonical(list: []const u8) bool {
+    if (list.len % loaded_entry_len != 0) return false;
+    var prev: ?*const [32]u8 = null;
+    var at: usize = 0;
+    while (at < list.len) : (at += loaded_entry_len) {
+        if (std.mem.readInt(u64, list[at..][0..8], .little) > std.math.maxInt(i64)) return false;
+        const id = list[at + 8 ..][0..32];
+        if (prev) |p| if (std.mem.order(u8, p, id) != .lt) return false;
+        prev = id;
+    }
+    return true;
+}
+
+/// Appends the read sets of a feed: `lists` null when the node holds none for the checkpoint,
+/// else one list per transaction of the feed.
+pub fn encodeReadSets(out: *std.ArrayList(u8), gpa: Allocator, lists: ?[]const []const u8) Allocator.Error!void {
+    const ls = lists orelse return out.append(gpa, 0);
+    try out.append(gpa, 1);
+    for (ls) |l| try bytes(out, gpa, l);
+}
+
+/// The read sets that followed a feed. `lists` point into the input.
+pub const ReadSets = struct {
+    /// Null: the serving node holds none for this checkpoint.
+    lists: ?[][]const u8 = null,
+
+    pub fn deinit(rs: *ReadSets, gpa: Allocator) void {
+        if (rs.lists) |l| gpa.free(l);
+        rs.lists = null;
+    }
+};
+
+pub const WithReadSets = struct {
+    feed: Feed,
+    read_sets: ReadSets,
+
+    pub fn deinit(w: *WithReadSets, gpa: Allocator) void {
+        w.feed.deinit(gpa);
+        w.read_sets.deinit(gpa);
+    }
+};
+
+/// Decodes `b`: a feed, then its read sets, nothing after them. A list that is not in sui-node's
+/// form (`listCanonical`) makes the whole answer malformed: the node that sent it is at fault.
+pub fn decodeWithReadSets(gpa: Allocator, b: []const u8) Error!WithReadSets {
+    var end: usize = 0;
+    var f = try decodeAt(gpa, b, &end);
+    errdefer f.deinit(gpa);
+    var r: Rd = .{ .b = b, .p = end };
+    switch (try r.u8_()) {
+        0 => {
+            if (r.p != b.len) return error.Malformed;
+            return .{ .feed = f, .read_sets = .{} };
+        },
+        1 => {},
+        else => return error.Malformed,
+    }
+    const lists = try gpa.alloc([]const u8, f.txs.len);
+    errdefer gpa.free(lists);
+    for (lists) |*l| {
+        l.* = try r.bytes();
+        if (!listCanonical(l.*)) return error.Malformed;
+    }
+    if (r.p != b.len) return error.Malformed;
+    return .{ .feed = f, .read_sets = .{ .lists = lists } };
 }
 
 /// Appends the checkpoint blob (`0x01 ++ BCS(CheckpointData)`) of a feed: the same bytes a source
@@ -288,4 +389,92 @@ test "feed decode refuses truncation, trailing bytes and absurd counts" {
     try bad.appendNTimes(gpa, 0, 8);
     try bad.appendSlice(gpa, &.{ 0, 0, 0xff, 0xff, 0x03 });
     try std.testing.expect(std.meta.isError(decode(gpa, bad.items)));
+}
+
+fn testEntry(buf: *[loaded_entry_len]u8, id_byte: u8, version: u64) []const u8 {
+    std.mem.writeInt(u64, buf[0..8], version, .little);
+    @memset(buf[8..40], id_byte);
+    return buf;
+}
+
+test "read sets: a feed followed by its lists round trips; without them the feed bytes are unchanged" {
+    const gpa = std.testing.allocator;
+    const txs = [_]TxIn{
+        .{ .tx = "TX0", .effects = "EFF0", .events = null, .objects = &.{"obj-a"} },
+        .{ .tx = "TX1", .effects = "EFF1", .events = "EV1", .objects = &.{} },
+    };
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(gpa);
+    try encode(&plain, gpa, 9, "SUMSIG", "CONTENTS", &txs);
+
+    var e0: [loaded_entry_len]u8 = undefined;
+    var e1: [loaded_entry_len]u8 = undefined;
+    var two: [2 * loaded_entry_len]u8 = undefined;
+    @memcpy(two[0..40], testEntry(&e0, 0x11, 7));
+    @memcpy(two[40..80], testEntry(&e1, 0x22, 3));
+    const lists = [_][]const u8{ &two, "" };
+
+    var with: std.ArrayList(u8) = .empty;
+    defer with.deinit(gpa);
+    try encode(&with, gpa, 9, "SUMSIG", "CONTENTS", &txs);
+    try std.testing.expectEqualSlices(u8, plain.items, with.items);
+    try encodeReadSets(&with, gpa, &lists);
+    // the feed part is the same bytes, the read sets follow it
+    try std.testing.expectEqualSlices(u8, plain.items, with.items[0..plain.items.len]);
+    var got = try decodeWithReadSets(gpa, with.items);
+    defer got.deinit(gpa);
+    try std.testing.expectEqual(@as(u64, 9), got.feed.seq);
+    try std.testing.expectEqual(@as(usize, 2), got.read_sets.lists.?.len);
+    try std.testing.expectEqualSlices(u8, &two, got.read_sets.lists.?[0]);
+    try std.testing.expectEqual(@as(usize, 0), got.read_sets.lists.?[1].len);
+    // a reader that did not ask for read sets refuses the longer form, and the other way round
+    try std.testing.expectError(error.Malformed, decode(gpa, with.items));
+    try std.testing.expectError(error.Malformed, decodeWithReadSets(gpa, plain.items));
+
+    // "none held" is one byte
+    var none: std.ArrayList(u8) = .empty;
+    defer none.deinit(gpa);
+    try none.appendSlice(gpa, plain.items);
+    try encodeReadSets(&none, gpa, null);
+    try std.testing.expectEqual(plain.items.len + 1, none.items.len);
+    var got0 = try decodeWithReadSets(gpa, none.items);
+    defer got0.deinit(gpa);
+    try std.testing.expect(got0.read_sets.lists == null);
+    // every truncation and any trailing byte is refused
+    for (plain.items.len..with.items.len) |n| try std.testing.expect(std.meta.isError(decodeWithReadSets(gpa, with.items[0..n])));
+    try with.append(gpa, 0);
+    try std.testing.expectError(error.Malformed, decodeWithReadSets(gpa, with.items));
+    try none.append(gpa, 0);
+    try std.testing.expectError(error.Malformed, decodeWithReadSets(gpa, none.items));
+    none.items[plain.items.len] = 2;
+    try std.testing.expectError(error.Malformed, decodeWithReadSets(gpa, none.items[0 .. plain.items.len + 1]));
+}
+
+test "read sets: a list out of sui-node's form is refused" {
+    const gpa = std.testing.allocator;
+    var a: [loaded_entry_len]u8 = undefined;
+    var b: [loaded_entry_len]u8 = undefined;
+    var two: [2 * loaded_entry_len]u8 = undefined;
+    try std.testing.expect(listCanonical(""));
+    try std.testing.expect(listCanonical(testEntry(&a, 5, 1)));
+    @memcpy(two[0..40], testEntry(&a, 5, 1));
+    @memcpy(two[40..80], testEntry(&b, 6, 1));
+    try std.testing.expect(listCanonical(&two));
+    // descending ids, a repeated id, a broken entry, a version no object can have
+    @memcpy(two[40..80], testEntry(&b, 4, 1));
+    try std.testing.expect(!listCanonical(&two));
+    @memcpy(two[40..80], testEntry(&b, 5, 2));
+    try std.testing.expect(!listCanonical(&two));
+    try std.testing.expect(!listCanonical(two[0..79]));
+    try std.testing.expect(!listCanonical(testEntry(&a, 5, std.math.maxInt(u64))));
+    try std.testing.expect(!listCanonical(testEntry(&a, 5, @as(u64, std.math.maxInt(i64)) + 1)));
+    try std.testing.expect(listCanonical(testEntry(&a, 5, std.math.maxInt(i64))));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try encode(&out, gpa, 1, "S", "C", &.{.{ .tx = "T", .effects = "E", .events = null, .objects = &.{} }});
+    @memcpy(two[0..40], testEntry(&a, 9, 1));
+    @memcpy(two[40..80], testEntry(&b, 8, 1));
+    try encodeReadSets(&out, gpa, &.{&two});
+    try std.testing.expectError(error.Malformed, decodeWithReadSets(gpa, out.items));
 }

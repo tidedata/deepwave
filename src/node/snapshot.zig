@@ -787,14 +787,28 @@ pub fn restore(gpa: std.mem.Allocator, io: Io, st: *store.Store, opts: RestoreOp
     try st.commit(fb);
 }
 
-/// GetServiceInfo `lowest_available_checkpoint` of a node store (`store.Snapshot.lowestAvailable`).
-/// `restored_epoch` (the `done` marker's epoch) covers stores restored before the restore
+/// The checkpoint store's lowest available checkpoint of a node store
+/// (`store.Snapshot.lowestAvailable`): what state sync reports. The RPC surface reports
+/// `lowestServed`. `restored_epoch` (the `done` marker's epoch) covers stores restored before the restore
 /// recorded its highest pruned checkpoint: while the restored epoch is in the window, its only
 /// checkpoint is the restored end-of-epoch one, which sui-node does not serve.
 pub fn lowestAvailable(snap: *const store.Snapshot, restored_epoch: ?u64) ?u64 {
     const l = snap.lowestAvailable() orelse return null;
     if (snap.highestPruned() == null) if (restored_epoch) |e| if (snap.checkpoint(l)) |c| if (c.epoch == e) return l + 1;
     return l;
+}
+
+/// What the RPC surface reports and serves from: GetServiceInfo `lowest_available_checkpoint`
+/// (and `_objects`), the `x-sui-lowest-available-*` headers, the floor of GetCheckpoint,
+/// GetTransaction and the List* methods. sui-node (sui-rpc-api reader.rs
+/// `get_lowest_available_checkpoint`) takes the higher of the checkpoint store's lowest available
+/// checkpoint (`lowestAvailable`, 2 epochs by default) and the objects pruner's (1 epoch): below
+/// the second a transaction's effects, balance changes and objects cannot be rendered, its input
+/// and output versions are gone. With the defaults that is always the objects pruner's.
+/// `lowestAvailable` stays the floor of state sync (GetCheckpointAvailability) and of the
+/// checkpoint records themselves.
+pub fn lowestServed(snap: *const store.Snapshot, restored_epoch: ?u64) ?u64 {
+    return snap.objectsFrom(lowestAvailable(snap, restored_epoch) orelse return null);
 }
 
 // ------------------------------------------------------------------ writer (tests and tools)

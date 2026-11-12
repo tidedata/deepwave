@@ -28,6 +28,26 @@ const index = @import("root.zig");
 /// Readers of a stored-checkpoint replay (`Feed.replayRange`): reads in flight against the store.
 pub var replay_threads: u32 = 16;
 
+/// A stored-checkpoint replay logs its running counts this often (`Feed.replayProgress`), so one
+/// that is cut off (a stop, a kill, a failed job) has still said how far it got and how many old
+/// versions it could not read.
+pub var replay_log_ms: u64 = 5_000;
+
+/// What one stored-checkpoint replay did (`Feed.replay`, `Feed.replayRange`: the old version of
+/// every changed object is read from the store), from its first checkpoint to `Feed.replayEnd`.
+pub const ReplayRun = struct {
+    checkpoints: u64 = 0,
+    first: u64 = 0,
+    last: u64 = 0,
+    /// Old versions the store did not give: their rows were not removed from the index.
+    missing_old: u64 = 0,
+    undecodable: u64 = 0,
+    last_log_ms: u64 = 0,
+};
+
+/// The operator's check for an index a replay may have left stale rows in.
+pub const check_hint = "deepwave-tool verify-index --dir DIR --scratch DIR (node stopped)";
+
 pub const Feed = struct {
     gpa: Allocator,
     ix: *index.Index,
@@ -40,6 +60,13 @@ pub const Feed = struct {
     missing_old: u64 = 0,
     /// Commits published with no prepared changes for them (the index skipped that checkpoint).
     unprepared: u64 = 0,
+    /// Stored checkpoints replayed since the process started, and what those replays could not
+    /// read or decode (`missing_old` and `undecodable` above also count the commit path).
+    replayed: u64 = 0,
+    replay_missing_old: u64 = 0,
+    replay_undecodable: u64 = 0,
+    /// The replay in progress (`replayEnd` logs it and starts the next one from zero).
+    run: ReplayRun = .{},
     /// Changes of the checkpoint between `prepare` and `publish`, in `pending_arena`.
     pending: ?struct { seq: u64, changes: []const index.Index.Change } = null,
     pending_arena: std.heap.ArenaAllocator,
@@ -54,6 +81,69 @@ pub const Feed = struct {
             c.deinit(f.gpa);
             f.gpa.destroy(c);
         }
+    }
+
+    /// The feed's counters for another thread (metrics): the writer adds with `bump`.
+    pub const Counters = struct { checkpoints: u64, missing_old: u64, undecodable: u64, unprepared: u64, replayed: u64, replay_missing_old: u64, replay_undecodable: u64 };
+
+    pub fn counters(f: *const Feed) Counters {
+        return .{
+            .checkpoints = @atomicLoad(u64, &f.checkpoints, .monotonic),
+            .missing_old = @atomicLoad(u64, &f.missing_old, .monotonic),
+            .undecodable = @atomicLoad(u64, &f.undecodable, .monotonic),
+            .unprepared = @atomicLoad(u64, &f.unprepared, .monotonic),
+            .replayed = @atomicLoad(u64, &f.replayed, .monotonic),
+            .replay_missing_old = @atomicLoad(u64, &f.replay_missing_old, .monotonic),
+            .replay_undecodable = @atomicLoad(u64, &f.replay_undecodable, .monotonic),
+        };
+    }
+
+    fn bump(p: *u64, n: u64) void {
+        if (n != 0) _ = @atomicRmw(u64, p, .Add, n, .monotonic);
+    }
+
+    /// One stored checkpoint was replayed with `stats`.
+    fn noteReplayed(f: *Feed, seq: u64, stats: Stats) void {
+        bump(&f.undecodable, stats.undecodable);
+        bump(&f.missing_old, stats.missing_old);
+        bump(&f.checkpoints, 1);
+        bump(&f.replayed, 1);
+        bump(&f.replay_missing_old, stats.missing_old);
+        bump(&f.replay_undecodable, stats.undecodable);
+        if (f.run.checkpoints == 0) {
+            f.run.first = seq;
+            f.run.last_log_ms = nowMs();
+        }
+        f.run.checkpoints += 1;
+        f.run.last = seq;
+        f.run.missing_old += stats.missing_old;
+        f.run.undecodable += stats.undecodable;
+    }
+
+    /// The running counts of the replay in progress, at most once per `replay_log_ms`.
+    fn replayProgress(f: *Feed) void {
+        const now = nowMs();
+        if (now -| f.run.last_log_ms < replay_log_ms) return;
+        f.run.last_log_ms = now;
+        const r = f.run;
+        if (r.missing_old != 0) {
+            std.log.warn("state index: replaying stored checkpoints: {d} done ({d}..{d}), missing_old {d}, undecodable {d}", .{ r.checkpoints, r.first, r.last, r.missing_old, r.undecodable });
+        } else std.log.info("state index: replaying stored checkpoints: {d} done ({d}..{d}), missing_old {d}, undecodable {d}", .{ r.checkpoints, r.first, r.last, r.missing_old, r.undecodable });
+    }
+
+    /// The end of a stored-checkpoint replay (`complete`: it reached its target; false: a stop
+    /// or an error cut it off). Logs one line with what it did, at WARN when an old version
+    /// could not be read, and returns it; nothing when no stored checkpoint was replayed. Called
+    /// by whoever drove the replay: `start` (the inline replay) and the fast-start job.
+    pub fn replayEnd(f: *Feed, complete: bool) ?ReplayRun {
+        const r = f.run;
+        f.run = .{};
+        if (r.checkpoints == 0) return null;
+        const what: []const u8 = if (complete) "replayed" else "replay cut off after";
+        if (r.missing_old != 0) {
+            std.log.warn("state index: {s} {d} stored checkpoints ({d}..{d}): missing_old {d}, undecodable {d}. The state index may hold stale rows: {d} old object versions could not be read from the store, so their rows were not removed. Check it with {s}", .{ what, r.checkpoints, r.first, r.last, r.missing_old, r.undecodable, r.missing_old, check_hint });
+        } else std.log.info("state index: {s} {d} stored checkpoints ({d}..{d}): missing_old {d}, undecodable {d}", .{ what, r.checkpoints, r.first, r.last, r.missing_old, r.undecodable });
+        return r;
     }
 
     /// The restore's per-object hook (CONTRACTS 6.8 `on_object`). ctx is the *Feed.
@@ -132,10 +222,14 @@ pub const Feed = struct {
             var seq = w + 1;
             while (seq <= t) {
                 const to = @min(t, seq + 9_999);
-                rep.replayed += try f.replayRange(&snap, seq, to, replay_threads);
+                // a failed range has still said how far the replay got
+                rep.replayed += f.replayRange(&snap, seq, to, replay_threads) catch |e| {
+                    _ = f.replayEnd(false);
+                    return e;
+                };
                 seq = to + 1;
-                std.log.info("state index: replayed {d} stored checkpoints ({d}..{d})", .{ rep.replayed, w + 1, t });
             }
+            _ = f.replayEnd(true);
         };
         rep.ms = nowMs() - t0;
         return rep;
@@ -220,14 +314,13 @@ pub const Feed = struct {
             for (workers[0..spawned]) |w| w.join();
             for (slots[0..n], 0..) |*sl, i| {
                 if (sl.err) |e| return e;
-                f.undecodable += sl.stats.undecodable;
-                f.missing_old += sl.stats.missing_old;
                 try f.ix.applyChanges(seq + i, sl.changes);
-                f.checkpoints += 1;
+                f.noteReplayed(seq + i, sl.stats);
             }
             for (slots[0..n]) |*sl| _ = sl.arena.reset(.{ .retain_with_limit = 1 << 20 });
             snap.quiesce();
             seq += n;
+            f.replayProgress();
         }
         return to - from + 1;
     }
@@ -238,10 +331,9 @@ pub const Feed = struct {
         defer tmp.deinit();
         var stats: Stats = .{};
         const changes = try changesFromStore(tmp.allocator(), snap, seq, &stats);
-        f.undecodable += stats.undecodable;
-        f.missing_old += stats.missing_old;
         try f.ix.applyChanges(seq, changes);
-        f.checkpoints += 1;
+        f.noteReplayed(seq, stats);
+        f.replayProgress();
     }
 
     /// Step 1 of one checkpoint (`CheckpointData` blob), before its batch commits: computes the
@@ -264,8 +356,8 @@ pub const Feed = struct {
         defer snap.release();
         var stats: Stats = .{};
         const changes = try changesOf(tmp_state.allocator(), ci, blob, &snap, &stats);
-        f.undecodable += stats.undecodable;
-        f.missing_old += stats.missing_old;
+        bump(&f.undecodable, stats.undecodable);
+        bump(&f.missing_old, stats.missing_old);
         try f.stage(seq, changes);
     }
 
@@ -286,16 +378,16 @@ pub const Feed = struct {
     /// with nothing prepared for `seq` (prepare failed) leaves the index where it was and counts it.
     pub fn publish(f: *Feed, seq: u64) !void {
         const p = f.pending orelse {
-            f.unprepared += 1;
+            bump(&f.unprepared, 1);
             return;
         };
         defer f.dropPending();
         if (p.seq != seq) {
-            f.unprepared += 1;
+            bump(&f.unprepared, 1);
             return;
         }
         try f.ix.applyChanges(seq, p.changes);
-        f.checkpoints += 1;
+        bump(&f.checkpoints, 1);
     }
 
     fn dropPending(f: *Feed) void {
@@ -461,4 +553,44 @@ fn objectKey(raw: []const u8) !Key {
         },
         else => return error.InvalidValue,
     }
+}
+
+test "a stored-checkpoint replay keeps its counts: the run for its log line, the totals for the metrics" {
+    const testing = std.testing;
+    var f: Feed = .{ .gpa = testing.allocator, .ix = undefined, .st = undefined, .pending_arena = .init(testing.allocator) };
+    defer f.pending_arena.deinit();
+    // (the WARN line below is expected: kept out of the test output)
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    // nothing replayed: no line
+    try testing.expect(f.replayEnd(true) == null);
+    f.noteReplayed(100, .{});
+    f.noteReplayed(101, .{ .missing_old = 2, .undecodable = 1 });
+    f.noteReplayed(102, .{ .missing_old = 1 });
+    // within `replay_log_ms` of the first checkpoint: no progress line, the run is untouched
+    f.replayProgress();
+    try testing.expectEqual(@as(u64, 3), f.run.checkpoints);
+    // cut off: the line (WARN, old versions were missing) and what it said
+    const r = f.replayEnd(false).?;
+    try testing.expectEqual(@as(u64, 3), r.checkpoints);
+    try testing.expectEqual(@as(u64, 100), r.first);
+    try testing.expectEqual(@as(u64, 102), r.last);
+    try testing.expectEqual(@as(u64, 3), r.missing_old);
+    try testing.expectEqual(@as(u64, 1), r.undecodable);
+    // the next replay starts from zero; the totals go on
+    try testing.expect(f.replayEnd(true) == null);
+    f.noteReplayed(103, .{});
+    const r2 = f.replayEnd(true).?;
+    try testing.expectEqual(@as(u64, 1), r2.checkpoints);
+    try testing.expectEqual(@as(u64, 103), r2.first);
+    try testing.expectEqual(@as(u64, 0), r2.missing_old);
+    const c = f.counters();
+    try testing.expectEqual(@as(u64, 4), c.replayed);
+    try testing.expectEqual(@as(u64, 4), c.checkpoints);
+    try testing.expectEqual(@as(u64, 3), c.replay_missing_old);
+    try testing.expectEqual(@as(u64, 3), c.missing_old);
+    try testing.expectEqual(@as(u64, 1), c.replay_undecodable);
+    try testing.expectEqual(@as(u64, 1), c.undecodable);
+    try testing.expectEqual(@as(u64, 0), c.unprepared);
 }

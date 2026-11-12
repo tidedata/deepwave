@@ -26,7 +26,8 @@ pub const EnvSource = struct {
     get: *const fn (ctx: *const anyopaque) ?root.EpochEnv,
 };
 
-/// ExecuteTransaction entry (the driver's handler); null answers UNIMPLEMENTED.
+/// ExecuteTransaction entry (the driver's handler); null validates the request and then answers
+/// UNIMPLEMENTED "no transaction executor" (`driver.handler.noExecutor`).
 pub const ExecuteFn = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque, arena: Allocator, body: []const u8) Allocator.Error!root.Reply,
@@ -89,7 +90,11 @@ fn call(ctx: *anyopaque, req: *const h2.Request, rs: *h2.ResponseStream) h2.Stat
             return .resource_exhausted;
         };
     } else if (std.mem.eql(u8, method, "ExecuteTransaction")) blk: {
-        const ex = self.execute orelse return .unimplemented;
+        // no executor: the request is validated first, as a sui-node full node does
+        const ex = self.execute orelse break :blk driver.handler.noExecutor(arena, req.body) catch {
+            rs.setMessage("out of memory");
+            return .resource_exhausted;
+        };
         break :blk ex.call(ex.ctx, arena, req.body) catch {
             rs.setMessage("out of memory");
             return .resource_exhausted;

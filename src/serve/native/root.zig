@@ -21,12 +21,16 @@ pub const fairq = @import("fairq.zig");
 pub const edgefeed = @import("edgefeed.zig");
 pub const dicts = @import("dicts.zig");
 pub const agentpass = @import("agentpass.zig");
+/// The access-gate hook (docs/GATE.md); unused unless the node sets `listener.Options.gate`.
+pub const gate = @import("gate.zig");
 
 test {
     _ = @import("certs_test.zig");
     _ = @import("tcptls_reload_test.zig");
     _ = @import("hello_test.zig");
     _ = @import("feedshare_test.zig");
+    _ = @import("feed_readsets_test.zig");
+    _ = @import("gate_test.zig");
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(listener.Listener);
     std.testing.refAllDecls(dispatch.Dispatcher);

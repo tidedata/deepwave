@@ -186,8 +186,9 @@ fn one(st: *const State, ctx: *harness.Ctx, name: []const u8) !void {
 /// The last run of consecutive `chk/<seq>.chk` files, up to `max_run` checkpoints: index A starts
 /// with every touched object's state before the run (its first input version) and follows the run
 /// through `feed.changesOf` + `applyChanges`; index B inserts every touched object's final state.
-/// Items: `feed/owners`, `feed/balances`, `feed/coins` (A == B), `feed/inputs` (every old version
-/// was in the checkpoint's object set).
+/// Items: `feed/owners`, `feed/balances`, `feed/coins` (A == B, save A's balance rows emptied to
+/// zero during the run and held, which B cannot have; no zero-sum plain delta is listed),
+/// `feed/inputs` (every old version was in the checkpoint's object set).
 const max_run = 500;
 
 fn runFeed(ctx: *harness.Ctx) !void {
@@ -254,11 +255,24 @@ fn runFeed(ctx: *harness.Ctx) !void {
     const ca = cmp_arena.allocator();
     var rows: [3]u64 = @splat(0);
     var bad: [3]u64 = @splat(0);
+    var zero_rows: u64 = 0;
+    // zero-sum plain deltas A lists (op 3): never a row, so this must stay 0
+    var plain_zero: u64 = 0;
     {
         var x = try ia.all(ca);
         var y = try ib.all(ca);
         while (true) {
-            const ex = try x.next();
+            // A keeps balance rows emptied during the run at zero, held (sui-node keeps them
+            // until a compaction); B, built from a live set, has none. Only those are skipped:
+            // anything else, a zero-sum plain delta included, is compared.
+            var ex = try x.next();
+            while (ex) |e| {
+                if (!e.val.zeroSum()) break;
+                if (e.val.op == .delta) plain_zero += 1;
+                if (!(e.val.op == .held and e.key[0] == @intFromEnum(index.Table.balance))) break;
+                zero_rows += 1;
+                ex = try x.next();
+            }
             const ey = try y.next();
             if (ex == null and ey == null) break;
             const k = if (ey) |e| e.key else ex.?.key;
@@ -271,7 +285,7 @@ fn runFeed(ctx: *harness.Ctx) !void {
             }
         }
     }
-    ctx.stderr.print("index-feed: checkpoints {d}..{d} ({d}), objects touched {d}, missing old {d}, undecodable effects {d}, owner rows {d}, balance rows {d}, coin rows {d}\n", .{ run[0], run[run.len - 1], run.len, first.count(), stats.missing_old, stats.undecodable, rows[0], rows[1], rows[2] }) catch {};
+    ctx.stderr.print("index-feed: checkpoints {d}..{d} ({d}), objects touched {d}, missing old {d}, undecodable effects {d}, owner rows {d}, balance rows {d} (+{d} emptied to zero, held; {d} zero plain deltas), coin rows {d}\n", .{ run[0], run[run.len - 1], run.len, first.count(), stats.missing_old, stats.undecodable, rows[0], rows[1], zero_rows, plain_zero, rows[2] }) catch {};
     {
         var c = ctx.check("feed/inputs");
         if (stats.missing_old != 0 or stats.undecodable != 0) c.failf("{d} old versions missing, {d} effects undecodable", .{ stats.missing_old, stats.undecodable });
@@ -280,6 +294,7 @@ fn runFeed(ctx: *harness.Ctx) !void {
     inline for (.{ "feed/owners", "feed/balances", "feed/coins" }, 0..) |name, t| {
         var c = ctx.check(name);
         if (bad[t] != 0) c.failf("rows differ (first difference in this table)", .{});
+        if (t == 1 and plain_zero != 0) c.failf("{d} zero-sum plain delta rows listed", .{plain_zero});
         _ = c.finish();
     }
 }

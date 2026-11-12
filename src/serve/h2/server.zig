@@ -294,7 +294,10 @@ pub fn serveFd(gpa: std.mem.Allocator, io: Io, fd: std.c.fd_t, opts: Options, ha
     } else {
         _ = stats.h1_conns.fetchAdd(1, .monotonic);
         defer _ = stats.h1_conns.fetchSub(1, .monotonic);
-        web.serve(gpa, fd, first[0..n], opts.web, handler, ctl);
+        // gRPC-web: the same caller facts as h2 (`conn.Request.peer`)
+        var wopts = opts.web;
+        sock.peerText(fd, &wopts.peer);
+        web.serve(gpa, fd, first[0..n], wopts, handler, ctl);
     }
 }
 
@@ -651,6 +654,7 @@ const H2 = struct {
             h.lock();
             defer h.unlock();
             // (`jobEnded`: the stream forgets the job before it is freed below)
+            if (rs.retry_after_ms) |ms| h.conn.retryAfter(job.stream_id, ms);
             const alive = if (h.closed.load(.acquire)) blk: {
                 h.conn.jobEnded(job.stream_id);
                 break :blk false;

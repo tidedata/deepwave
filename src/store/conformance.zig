@@ -399,6 +399,11 @@ fn runDst(ctx: *harness.Ctx) !void {
     defer std.Io.Dir.cwd().deleteTree(ctx.io, trace_dir) catch {};
     try std.Io.Dir.cwd().createDirPath(ctx.io, trace_dir);
     const st: DstState = .{ .dense = dense.items, .totals = &totals, .trace_dir = trace_dir };
+    switch (dstLiveSet()) {
+        .off => {},
+        .on => try ctx.stderr.print("store-dst: option live set ON (ZUI_DST_LIVE_SET): every seed that runs the ager (age/, agedefer/, ageset/) uses the read-ahead and the live-set segment pass\n", .{}),
+        .verify => try ctx.stderr.print("store-dst: option live set ON with the verify cross-check (ZUI_DST_LIVE_SET=verify): every seed that runs the ager (age/, agedefer/, ageset/) uses the read-ahead and the live-set segment pass, and looks clear bits up as well\n", .{}),
+    }
     try ctx.forEachName(names.items, &st, runSeed);
     try ctx.stderr.print("store-dst: lean traces: {d} events checked; steady: max {d} runs, max {d} live slots for {d} distinct ids\n", .{
         totals.lean_events.load(.monotonic), totals.max_runs.load(.monotonic), totals.max_slots.load(.monotonic), totals.steady_ids.load(.monotonic),
@@ -496,6 +501,20 @@ fn leanCheck(ctx: *harness.Ctx, paths: []const []const u8) !?[]const u8 {
     return try std.fmt.allocPrint(ctx.scratch(), "{s}{s}", .{ out, if (r.stderr.len > 500) r.stderr[r.stderr.len - 500 ..] else r.stderr });
 }
 
+/// The forced option of store-dst: ZUI_DST_LIVE_SET=1 (the runner's `--live-set on`) runs every
+/// seed that runs the ager (age/, agedefer/, ageset/) with the read-ahead and the live-set
+/// segment pass; ZUI_DST_LIVE_SET=verify, or ZUI_DST_SET_VERIFY=1 beside it (`--live-set
+/// verify`), with the set's cross-check as well. Unset, 0 or off: every family as it is.
+const DstLiveSet = enum { off, on, verify };
+
+fn dstLiveSet() DstLiveSet {
+    const v = std.mem.span(std.c.getenv("ZUI_DST_LIVE_SET") orelse return .off);
+    if (v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off")) return .off;
+    if (std.mem.eql(u8, v, "verify")) return .verify;
+    if (std.c.getenv("ZUI_DST_SET_VERIFY")) |x| if (x[0] != 0 and x[0] != '0') return .verify;
+    return .on;
+}
+
 fn runSeed(st: *const DstState, ctx: *harness.Ctx, name: []const u8) !void {
     const slash = std.mem.indexOfScalar(u8, name, '/').?;
     const kind = name[0..slash];
@@ -504,6 +523,9 @@ fn runSeed(st: *const DstState, ctx: *harness.Ctx, name: []const u8) !void {
     var corpus_cps: std.ArrayList(ops.Checkpoint) = .empty;
     // ZUI_DST_DEBUG=1 with -Dfilter=<seed>: the driver's step-by-step prints (dst.Options.debug).
     opts.debug = std.c.getenv("ZUI_DST_DEBUG") != null;
+    const forced = dstLiveSet();
+    opts.live_set = forced != .off;
+    opts.set_verify = forced == .verify;
     if (std.mem.eql(u8, kind, "steady")) {
         opts.steady = true;
         opts.seed ^= 0x57ea;

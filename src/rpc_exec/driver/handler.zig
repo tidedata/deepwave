@@ -70,6 +70,58 @@ pub const Executor = struct {
 /// ExecuteTransaction: `body` is the `ExecuteTransactionRequest` message, the reply is the
 /// `ExecuteTransactionResponse` message or the gRPC error tonic sends.
 pub fn executeTransaction(arena: Allocator, executor: Executor, body: []const u8) Allocator.Error!Reply {
+    const v = switch (try validate(arena, body)) {
+        .err => |e| return .{ .err = e },
+        .ok => |x| x,
+    };
+    const m = v.tree.mask();
+    const data_bcs = v.data_bcs;
+    const objects_wanted = m.contains("balance_changes") or m.contains("objects") or m.contains("effects");
+    const exec_req: ExecuteRequest = .{
+        .envelope = try envelope(arena, data_bcs, v.sigs),
+        .data_bcs = data_bcs,
+        .data = v.data,
+        .digest = types.digest.transactionDataDigest(data_bcs),
+        .signatures = v.sigs,
+        .include_events = m.contains("events"),
+        .include_input_objects = objects_wanted,
+        .include_output_objects = objects_wanted,
+    };
+    const q = switch (try executor.execute(arena, &exec_req)) {
+        .err => |e| return .{ .err = try e.toRpcError(arena) },
+        .ok => |q| q,
+    };
+    const rctx: ?*const serve.render_object.Ctx = if (executor.render) |h| h.make(h.ctx, arena, q.output_objects orelse &.{}) else null;
+    return .{ .ok = try renderWith(arena, m, &exec_req, q, rctx) };
+}
+
+/// The answer of a node that cannot execute (no `--execute-epoch-from`). sui-node's tonic
+/// service checks for an executor before anything else and answers
+/// `Status::unimplemented("no transaction executor")` (mod.rs `execute_transaction`, no
+/// details); but every sui-node full node has one (sui-node lib.rs: a fullnode's
+/// TransactionOrchestrator is its executor), and validates the request first. So a malformed
+/// request gets the full node's InvalidArgument, and a well-formed one the executor-less answer.
+pub fn noExecutor(arena: Allocator, body: []const u8) Allocator.Error!Reply {
+    return switch (try validate(arena, body)) {
+        .err => |e| .{ .err = e },
+        .ok => .{ .err = no_executor },
+    };
+}
+
+/// `tonic::Status::unimplemented("no transaction executor")`.
+pub const no_executor: RpcError = .{ .code = 12, .message = "no transaction executor" };
+
+/// A request that passed `execute_transaction`'s checks, before the executor is called.
+const Valid = struct {
+    data_bcs: []const u8,
+    data: *const types.TransactionData,
+    sigs: []const []const u8,
+    tree: mask.Tree,
+};
+
+/// `execute_transaction` up to the executor call, in its order: transaction, signature count,
+/// each signature, read_mask.
+fn validate(arena: Allocator, body: []const u8) Allocator.Error!union(enum) { ok: Valid, err: RpcError } {
     const req = parseRequest(arena, body) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Malformed => return .{ .err = try plainError(arena, 13, "failed to decode Protobuf message") },
@@ -134,26 +186,8 @@ pub fn executeTransaction(arena: Allocator, executor: Executor, body: []const u8
         }
         break :blk try mask.Tree.fromPaths(arena, paths.items);
     };
-    const m = tree.mask();
     _ = &tree;
-
-    const objects_wanted = m.contains("balance_changes") or m.contains("objects") or m.contains("effects");
-    const exec_req: ExecuteRequest = .{
-        .envelope = try envelope(arena, data_bcs, sigs),
-        .data_bcs = data_bcs,
-        .data = data,
-        .digest = types.digest.transactionDataDigest(data_bcs),
-        .signatures = sigs,
-        .include_events = m.contains("events"),
-        .include_input_objects = objects_wanted,
-        .include_output_objects = objects_wanted,
-    };
-    const q = switch (try executor.execute(arena, &exec_req)) {
-        .err => |e| return .{ .err = try e.toRpcError(arena) },
-        .ok => |q| q,
-    };
-    const rctx: ?*const serve.render_object.Ctx = if (executor.render) |h| h.make(h.ctx, arena, q.output_objects orelse &.{}) else null;
-    return .{ .ok = try renderWith(arena, m, &exec_req, q, rctx) };
+    return .{ .ok = .{ .data_bcs = data_bcs, .data = data, .sigs = sigs, .tree = tree } };
 }
 
 /// The `ExecuteTransactionResponse` for a finalized transaction.

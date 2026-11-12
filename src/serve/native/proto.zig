@@ -35,6 +35,9 @@ pub const Method = enum(u64) {
 
 pub const flag_verify: u64 = 0x1;
 pub const flag_zstd_ok: u64 = 0x2;
+/// get_checkpoint_feed only, and only on a node whose hello has feature bit 33: the feed is
+/// followed by the checkpoint's read sets (docs/EDGE.md section 12). Elsewhere an unknown flag.
+pub const flag_read_sets: u64 = 0x4;
 pub const resp_zstd: u64 = 0x1;
 pub const resp_proof: u64 = 0x2;
 

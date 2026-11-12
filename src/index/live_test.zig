@@ -431,3 +431,204 @@ test "reads are not blocked while a commit decodes its objects" {
     const lo = try e.call(ta, "ListOwnedObjects", try listBody(ta, &owner_a, &.{}));
     try testing.expectEqualSlices(u64, &.{ 6, 6 }, try versions(ta, lo.message));
 }
+
+// ---------------------------------------------------------------- balances emptied to zero
+//
+// sui-node 1.83.1 keeps a balance row whose (coin, address) sum went to zero: the merge operator
+// sums it to zero and only the compaction filter removes it later (sui-rpc-store schema/balance.rs
+// `merge`, `compact`); `balance_iter` (reader/indexes.rs) has no zero filter, so ListBalances lists
+// it, rendered by get_balance.rs `render_balance` as `balance: 0` with no coin_balance or
+// address_balance (recorded: `recorded_page`). The owner is the live case of 2026-11-10: all its SUI is an address balance,
+// and its USDC address balance was drained (the settlement then deletes the accumulator field,
+// accumulator_settlement.move).
+
+const owner_ab: [32]u8 = blk: {
+    var x: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&x, "8b7fac6ee4bd36dfff6ed0b342820d10acdc16e0ba834fc93f2203b9386f1d10") catch unreachable;
+    break :blk x;
+};
+const usdc_pkg: [32]u8 = blk: {
+    var x: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&x, "dba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7") catch unreachable;
+    break :blk x;
+};
+const sui_str = "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI";
+const usdc_str = "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC";
+/// ListBalances for `owner_ab`, page_size 50, from a public sui-node 1.83.1 on 2026-11-11, as the
+/// Sui gRPC client decoded it (proto3 JSON, not the raw message bytes): SUI as an address balance,
+/// and USDC with `balance` "0" and neither `addressBalance` nor `coinBalance` present.
+const recorded_page = @embedFile("vectors/listbalances-drained-usdc-sui-node-1.83.1.json");
+/// The recording's SUI amount; the test's state holds the same, so the whole page compares.
+const recorded_sui: u64 = 647035315152;
+
+/// `recorded_page` back to wire bytes: each entry as field 1, its fields in number order (as prost
+/// writes them), a component only when the JSON has it.
+fn recordedMessage(a: std.mem.Allocator, buf: []u8) ![]const u8 {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, recorded_page, .{});
+    var w = proto.Writer.init(buf);
+    for (v.object.get("balances").?.array.items) |b| {
+        const o = b.object;
+        const m = try w.begin(1, 128);
+        try w.string(1, o.get("coinType").?.string);
+        try w.uint(3, try std.fmt.parseInt(u64, o.get("balance").?.string, 10));
+        if (o.get("addressBalance")) |x| try w.uint(4, try std.fmt.parseInt(u64, x.string, 10));
+        if (o.get("coinBalance")) |x| try w.uint(5, try std.fmt.parseInt(u64, x.string, 10));
+        try w.end(m);
+    }
+    return w.bytesWritten();
+}
+
+test "the recorded ListBalances page has the shape this file expects" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), recorded_page, .{});
+    const items = v.object.get("balances").?.array.items;
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqualStrings(sui_str, items[0].object.get("coinType").?.string);
+    try testing.expectEqual(recorded_sui, try std.fmt.parseInt(u64, items[0].object.get("balance").?.string, 10));
+    try testing.expectEqualStrings(items[0].object.get("balance").?.string, items[0].object.get("addressBalance").?.string);
+    try testing.expect(items[0].object.get("coinBalance") == null);
+    try testing.expectEqualStrings(usdc_str, items[1].object.get("coinType").?.string);
+    try testing.expectEqualStrings("0", items[1].object.get("balance").?.string);
+    try testing.expect(items[1].object.get("addressBalance") == null);
+    try testing.expect(items[1].object.get("coinBalance") == null);
+    try testing.expectEqual(@as(usize, 2), items[1].object.count());
+}
+
+/// bcs(StructTag 0xdba3..::usdc::USDC): the coin_type half of a page token.
+const usdc_tag_bcs = usdc_pkg ++ [_]u8{4} ++ "usdc".* ++ [_]u8{4} ++ "USDC".* ++ [_]u8{0};
+
+fn usdcType() types.TypeTag {
+    return .{ .@"struct" = .{ .address = .{ .@"0" = usdc_pkg }, .module = .{ .@"0" = "usdc" }, .name = .{ .@"0" = "USDC" }, .type_args = &.{} } };
+}
+
+/// BCS(Object) of an address balance: `Field<Key<Balance<T>>, U128>` under 0xacc (null T: SUI).
+fn accField(a: std.mem.Allocator, id: [32]u8, version: u64, owner: [32]u8, t: ?types.TypeTag, value: u128) ![]const u8 {
+    const c = try a.alloc(u8, 80);
+    @memcpy(c[0..32], &id);
+    @memcpy(c[32..64], &owner);
+    std.mem.writeInt(u128, c[64..80], value, .little);
+    const o: types.Object = .{
+        .data = .{ .Move = .{ .type_ = .{ .@"0" = if (t) |x| .{ .BalanceAccumulatorField = x } else .SuiBalanceAccumulatorField }, .has_public_transfer = false, .version = .{ .@"0" = version }, .contents = c } },
+        .owner = .{ .ObjectOwner = .{ .@"0" = index.accumulator_root } },
+        .previous_transaction = .{ .@"0" = .{ .@"0" = @splat(7) } },
+        .storage_rebate = 0,
+    };
+    return bcs.encodeAlloc(types.Object, a, &o);
+}
+
+/// BCS(Object) of a `Coin<T>` owned by `owner`.
+fn typedCoin(a: std.mem.Allocator, id: [32]u8, version: u64, balance: u64, owner: [32]u8, t: types.TypeTag) ![]const u8 {
+    const c = try a.alloc(u8, 40);
+    @memcpy(c[0..32], &id);
+    std.mem.writeInt(u64, c[32..40], balance, .little);
+    const o: types.Object = .{
+        .data = .{ .Move = .{ .type_ = .{ .@"0" = .{ .Coin = t } }, .has_public_transfer = true, .version = .{ .@"0" = version }, .contents = c } },
+        .owner = .{ .AddressOwner = .{ .@"0" = owner } },
+        .previous_transaction = .{ .@"0" = .{ .@"0" = @splat(7) } },
+        .storage_rebate = 0,
+    };
+    return bcs.encodeAlloc(types.Object, a, &o);
+}
+
+fn listBalancesBody(a: std.mem.Allocator, owner: *const [32]u8, page_size: ?u32, token: ?[]const u8) ![]const u8 {
+    const buf = try a.alloc(u8, 512);
+    var w = proto.Writer.init(buf);
+    try w.string(1, try hexAddr(a, owner));
+    if (page_size) |n| try w.uint(2, n);
+    if (token) |t| try w.bytes(3, t);
+    return w.bytesWritten();
+}
+
+fn getBalanceBody(a: std.mem.Allocator, owner: *const [32]u8, coin_type: []const u8) ![]const u8 {
+    const buf = try a.alloc(u8, 512);
+    var w = proto.Writer.init(buf);
+    try w.string(1, try hexAddr(a, owner));
+    try w.string(2, coin_type);
+    return w.bytesWritten();
+}
+
+/// `Balance { coin_type = 1, balance = 3, address_balance = 4 (if != 0), coin_balance = 5 (if != 0) }`
+/// as field `field`, written field by field from render_balance (not through state.zig).
+fn wantBalance(w: *proto.Writer, field: u32, coin_type: []const u8, coin_half: u64, address: u64) !void {
+    const m = try w.begin(field, 128);
+    try w.string(1, coin_type);
+    try w.uint(3, coin_half + address);
+    if (address != 0) try w.uint(4, address);
+    if (coin_half != 0) try w.uint(5, coin_half);
+    try w.end(m);
+}
+
+test "ListBalances lists a coin type emptied to zero with balance 0, as sui-node's uncompacted row" {
+    var e: Env = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const sui_field = try accField(a, addr(0xf1), 9, owner_ab, null, recorded_sui);
+    const usdc_field = try accField(a, addr(0xf2), 9, owner_ab, usdcType(), 2_500_000);
+    try e.ix.insert(sui_field);
+    try e.ix.insert(usdc_field);
+    // a second owner whose USDC was a coin object, spent whole
+    const owner_b = addr(0xb2);
+    const usdc_coin = try typedCoin(a, addr(0xc9), 4, 100, owner_b, usdcType());
+    try e.ix.insert(usdc_coin);
+    e.ix.checkpoint = 1;
+    // the settlement drains and deletes the USDC accumulator field; owner B's coin is destroyed
+    try e.ix.applyChanges(2, &.{ .{ .old = usdc_field, .new = null }, .{ .old = usdc_coin, .new = null } });
+
+    var arena_state = std.heap.ArenaAllocator.init(e.gpa);
+    defer arena_state.deinit();
+    const ta = arena_state.allocator();
+    const buf = try ta.alloc(u8, 4096);
+
+    // full page: SUI (address balance only), then USDC at 0; no next_page_token. Recorded
+    // (decoded JSON, transcoded back); the derived bytes say the same.
+    {
+        const rep = try e.call(ta, "ListBalances", try listBalancesBody(ta, &owner_ab, 50, null));
+        try testing.expectEqual(@as(u8, 0), rep.status);
+        try testing.expectEqualSlices(u8, try recordedMessage(ta, buf), rep.message);
+        var w = proto.Writer.init(try ta.alloc(u8, 4096));
+        try wantBalance(&w, 1, sui_str, 0, recorded_sui);
+        try wantBalance(&w, 1, usdc_str, 0, 0);
+        try testing.expectEqualSlices(u8, w.bytesWritten(), rep.message);
+    }
+    // page_size 1: SUI and a token naming USDC (BCS PageToken { owner, coin_type: StructTag })
+    const token = owner_ab ++ usdc_tag_bcs;
+    {
+        const rep = try e.call(ta, "ListBalances", try listBalancesBody(ta, &owner_ab, 1, null));
+        try testing.expectEqual(@as(u8, 0), rep.status);
+        var w = proto.Writer.init(buf);
+        try wantBalance(&w, 1, sui_str, 0, recorded_sui);
+        try w.bytes(2, &token);
+        try testing.expectEqualSlices(u8, w.bytesWritten(), rep.message);
+    }
+    {
+        const rep = try e.call(ta, "ListBalances", try listBalancesBody(ta, &owner_ab, 1, &token));
+        try testing.expectEqual(@as(u8, 0), rep.status);
+        var w = proto.Writer.init(buf);
+        try wantBalance(&w, 1, usdc_str, 0, 0);
+        try testing.expectEqualSlices(u8, w.bytesWritten(), rep.message);
+    }
+    // owner B: the spent coin's type at 0
+    {
+        const rep = try e.call(ta, "ListBalances", try listBalancesBody(ta, &owner_b, null, null));
+        try testing.expectEqual(@as(u8, 0), rep.status);
+        var w = proto.Writer.init(buf);
+        try wantBalance(&w, 1, usdc_str, 0, 0);
+        try testing.expectEqualSlices(u8, w.bytesWritten(), rep.message);
+    }
+    // GetBalance: an emptied type and a never-held type answer alike (unwrap_or_default)
+    for ([_][]const u8{ usdc_str, "0x3::never::HELD" }, [_][]const u8{ usdc_str, "0x0000000000000000000000000000000000000000000000000000000000000003::never::HELD" }) |ask, canon| {
+        const rep = try e.call(ta, "GetBalance", try getBalanceBody(ta, &owner_ab, ask));
+        try testing.expectEqual(@as(u8, 0), rep.status);
+        var w = proto.Writer.init(buf);
+        try wantBalance(&w, 1, canon, 0, 0);
+        try testing.expectEqualSlices(u8, w.bytesWritten(), rep.message);
+    }
+    // a zero-value coin received at the tip creates no row (no non-zero change: no merge operand)
+    const owner_c = addr(0xb3);
+    try e.ix.applyChanges(3, &.{.{ .old = null, .new = try typedCoin(a, addr(0xca), 5, 0, owner_c, usdcType()) }});
+    const rep = try e.call(ta, "ListBalances", try listBalancesBody(ta, &owner_c, null, null));
+    try testing.expectEqual(@as(u8, 0), rep.status);
+    try testing.expectEqual(@as(usize, 0), rep.message.len);
+}

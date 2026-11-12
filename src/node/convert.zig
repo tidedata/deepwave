@@ -689,6 +689,94 @@ pub const Aux = struct {
     }
 };
 
+/// An aux record of loaded runtime object lists and nothing else: what an edge that keeps read
+/// sets spools beside a checkpoint (history.zig `onBatchEdge`, docs/EDGE.md section 12).
+/// `lists[i]` is transaction i's list in the stored form, `version: u64 LE ++ id` per entry
+/// (edgewire feed.zig `ReadSets`). `out` is replaced.
+pub fn auxOfLists(out: *std.ArrayList(u8), gpa: std.mem.Allocator, lists: []const []const u8) !void {
+    out.clearRetainingCapacity();
+    try out.appendSlice(gpa, aux_magic);
+    try putUleb(out, gpa, lists.len);
+    for (lists) |l| {
+        if (l.len % 40 != 0) return error.Malformed;
+        try putUleb(out, gpa, l.len / 40);
+        var at: usize = 0;
+        while (at < l.len) : (at += 40) {
+            try out.appendSlice(gpa, l[at + 8 ..][0..32]);
+            try out.appendSlice(gpa, l[at..][0..8]);
+            try out.append(gpa, 0);
+        }
+    }
+    try putUleb(out, gpa, 0);
+}
+
+/// Cuts the aux record in `aux` down to its loaded lists: the record `auxOfLists` writes for the
+/// same lists (no objects, no reference digests), so an edge spools the same bytes whether a
+/// checkpoint's read sets came with a core's feed or from the archive. `arena` is scratch.
+pub fn auxListsOnly(aux: *std.ArrayList(u8), gpa: std.mem.Allocator, arena: std.mem.Allocator) !void {
+    const x = try Aux.parse(arena, aux.items);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, aux_magic);
+    try putUleb(&out, arena, x.loaded.len);
+    for (x.loaded) |l| {
+        try putUleb(&out, arena, l.len);
+        for (l) |r| {
+            try out.appendSlice(arena, &r.id);
+            var vb: [8]u8 = undefined;
+            std.mem.writeInt(u64, &vb, r.version, .little);
+            try out.appendSlice(arena, &vb);
+            try out.append(arena, 0);
+        }
+    }
+    try putUleb(&out, arena, 0);
+    aux.clearRetainingCapacity();
+    try aux.appendSlice(gpa, out.items);
+}
+
+test "aux records of lists only: from stored lists and cut from a full record are the same bytes" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // a full record: two transactions (two entries with and without a digest; none), one object
+    var full: std.ArrayList(u8) = .empty;
+    defer full.deinit(gpa);
+    try full.appendSlice(gpa, aux_magic);
+    try putUleb(&full, gpa, 2);
+    try putUleb(&full, gpa, 2);
+    try full.appendSlice(gpa, &@as([32]u8, @splat(0x11)));
+    try full.appendSlice(gpa, &.{ 7, 0, 0, 0, 0, 0, 0, 0 });
+    try full.append(gpa, 1);
+    try full.appendSlice(gpa, &@as([32]u8, @splat(0xdd)));
+    try full.appendSlice(gpa, &@as([32]u8, @splat(0x22)));
+    try full.appendSlice(gpa, &.{ 3, 1, 0, 0, 0, 0, 0, 0 });
+    try full.append(gpa, 0);
+    try putUleb(&full, gpa, 0);
+    try putUleb(&full, gpa, 1);
+    try putUleb(&full, gpa, 5);
+    try full.appendSlice(gpa, "OBJ_X");
+    try auxListsOnly(&full, gpa, arena);
+
+    var l0: [80]u8 = undefined;
+    std.mem.writeInt(u64, l0[0..8], 7, .little);
+    @memset(l0[8..40], 0x11);
+    std.mem.writeInt(u64, l0[40..48], 259, .little);
+    @memset(l0[48..80], 0x22);
+    var made: std.ArrayList(u8) = .empty;
+    defer made.deinit(gpa);
+    try auxOfLists(&made, gpa, &.{ &l0, "" });
+    try std.testing.expectEqualSlices(u8, made.items, full.items);
+
+    const x = try Aux.parse(arena, made.items);
+    try std.testing.expectEqual(@as(usize, 2), x.loaded.len);
+    try std.testing.expectEqual(@as(usize, 2), x.loaded[0].len);
+    try std.testing.expectEqual(@as(u64, 259), x.loaded[0][1].version);
+    try std.testing.expectEqual(@as(?[32]u8, null), x.loaded[0][0].digest);
+    try std.testing.expectEqual(@as(usize, 0), x.loaded[1].len);
+    try std.testing.expectEqual(@as(usize, 0), x.objects.len);
+    try std.testing.expectError(error.Malformed, auxOfLists(&made, gpa, &.{l0[0..79]}));
+}
+
 /// Decompresses an archive `<seq>.binpb.zst` file. Caller frees.
 /// The frame content size of a single zstd frame (RFC 8878 3.1.1.1), or null when the header
 /// does not record it (streamed frames) or the input is not a zstd frame.

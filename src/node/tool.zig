@@ -11,6 +11,7 @@
 //!   (none; sui-node checks at runtime) verify-store
 //!   expensive state-root check         state-hash
 //!   expensive SUI conservation check   sui-conservation
+//!   (none; rpc-store indexes)          verify-index
 //!   db-tool prune-objects/-checkpoints prune
 //!   db-tool compact                    prune (segment cleaning is deepwave's compaction)
 //!   state-snapshot-write-config        snapshot-write
@@ -50,6 +51,19 @@ const usage =
     \\                                            (the node's first check); --save records this result there
     \\  snapshot-write --out DIR [--epoch E] [--threads N] [--compression zstd|none]
     \\                                            formal snapshot epoch_E/ (Mysten format) from the store
+    \\  verify-index --scratch DIR [--threads N] [--build-mem-mb M] [--keep-scratch]
+    \\                                            the StateService index (DIR/state-index) against a second one built
+    \\                                            in SCRATCH/verify-index from the store's live set at the index's
+    \\                                            checkpoint: every row compared; the first 20 stale, missing and
+    \\                                            differing rows printed, then one line per owner and type affected
+    \\                                            ("affected", list, owner, type; tab separated). Says first whether
+    \\                                            the last stop was clean. Exit 0 identical, 1 different, 3 not checked.
+    \\                                            Writes nothing to state-index and closes the store without a flush.
+    \\                                            Private memory: about 10 GiB on mainnet (what the open store
+    \\                                            holds + 8 bytes per live-table entry + M (2048) MiB + 256 MiB,
+    \\                                            printed before the build); RSS reads higher by the mapped
+    \\                                            store files (page cache); both peaks are printed at the end.
+    \\                                            Refuses when less is available. Scratch disk: twice the index + 1 GiB
     \\  prune --retention-epochs N                move the history window and clean aged segments now
     \\  db-checkpoint --out DIR                   consistent copy of the node directory (hard links + clones)
     \\  restore-db --from DIR                     DIR (a db-checkpoint) becomes the node directory --dir
@@ -72,6 +86,11 @@ const Args = struct {
     out: ?[]const u8 = null,
     from: ?[]const u8 = null,
     threads: u32 = 8,
+    /// --threads was given (verify-index: else one build thread per CPU).
+    threads_set: bool = false,
+    scratch: ?[]const u8 = null,
+    build_mem_mb: u64 = 2048,
+    keep_scratch: bool = false,
     retention: ?u32 = null,
     compression: node.snapshot.Compression = .zstd,
     show_bcs: bool = false,
@@ -97,6 +116,10 @@ fn parseArgs(args: []const []const u8) !Args {
             a.live = true;
             continue;
         }
+        if (std.mem.eql(u8, k, "--keep-scratch")) {
+            a.keep_scratch = true;
+            continue;
+        }
         i += 1;
         if (i >= args.len) return error.MissingValue;
         if (std.mem.eql(u8, k, "--dir")) {
@@ -119,6 +142,11 @@ fn parseArgs(args: []const []const u8) !Args {
             a.from = v;
         } else if (std.mem.eql(u8, k, "--threads")) {
             a.threads = try std.fmt.parseInt(u32, v, 10);
+            a.threads_set = true;
+        } else if (std.mem.eql(u8, k, "--scratch")) {
+            a.scratch = v;
+        } else if (std.mem.eql(u8, k, "--build-mem-mb")) {
+            a.build_mem_mb = try std.fmt.parseInt(u64, v, 10);
         } else if (std.mem.eql(u8, k, "--retention-epochs")) {
             a.retention = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, k, "--compression")) {
@@ -139,9 +167,20 @@ const Opened = struct {
         o.rio.deinit();
         dbc.unlock(o.lock_fd);
     }
+
+    /// Closes without the clean-close flush (no run sealed, no live-table flush, no meta
+    /// write): the store directory stays as the open left it. For a command that only reads.
+    fn abandon(o: *Opened) void {
+        o.st.deinit();
+        o.rio.deinit();
+        dbc.unlock(o.lock_fd);
+    }
 };
 
-fn openNode(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u8, retention: ?u32, verify_index: bool) !Opened {
+/// `scan`: the command reads the live set once and looks nothing up (verify-index): a small
+/// decoded-chunk cache (the scan decodes into its walkers' own buffers and leaves it alone)
+/// and no copy of the runs' key filters in memory, so its private memory is what it prints.
+fn openNode(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u8, retention: ?u32, verify_index: bool, scan: bool) !Opened {
     const fd = try dbc.lock(dir);
     errdefer dbc.unlock(fd);
     var restored: ?u64 = null;
@@ -159,6 +198,10 @@ fn openNode(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []con
     // Checking every live-table page at open reads the whole table (35 GB on mainnet); readers
     // check record checksums anyway. verify-store asks for it.
     scfg.verify_index_on_open = verify_index;
+    if (scan) {
+        scfg.cache_bytes = 256 << 20;
+        scfg.run_filters_resident = false;
+    }
     const cfg_ptr = try arena.create(store.Config);
     cfg_ptr.* = scfg;
     const o = try store.openDir(gpa, io, cfg_ptr, .{ .sync = .data });
@@ -186,7 +229,7 @@ pub fn main(init: std.process.Init) !u8 {
         const dir = a.dir orelse return usageErr("restore-db: --dir is required");
         const rep = try dbc.copyTree(gpa, io, from, dir);
         try w.print("restored {s} -> {s}: {d} sealed segments linked ({d} MiB), {d} files cloned ({d} MiB), {d} copied ({d} MiB) in {d} ms\n", .{ from, dir, rep.linked, rep.linked_bytes >> 20, rep.cloned, rep.cloned_bytes >> 20, rep.copied, rep.copied_bytes >> 20, rep.ms });
-        var o = try openNode(gpa, io, arena, dir, null, false);
+        var o = try openNode(gpa, io, arena, dir, null, false, false);
         defer o.close();
         try w.print("store opens: committed checkpoint {?d}, epoch {?d}; start deepwave run --dir {s} to follow from there\n", .{ o.st.committed(), o.st.currentEpoch(), dir });
         return 0;
@@ -196,7 +239,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "db-checkpoint")) {
         const out = a.out orelse return usageErr("db-checkpoint: --out is required");
         // Open (recovery) and close cleanly so the copy needs no replay; keep the lock while copying.
-        var o = try openNode(gpa, io, arena, dir, null, false);
+        var o = try openNode(gpa, io, arena, dir, null, false, false);
         const c = o.st.committed();
         const e = o.st.currentEpoch();
         o.st.close() catch |err| {
@@ -210,7 +253,22 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
-    var o = openNode(gpa, io, arena, dir, a.retention, std.mem.eql(u8, cmd, "verify-store")) catch |e| {
+    if (std.mem.eql(u8, cmd, "verify-index")) {
+        const scratch = a.scratch orelse return usageErr("verify-index: --scratch is required");
+        // a read-only check must not create a store where there is none (the open would)
+        Io.Dir.cwd().access(io, try std.fs.path.join(arena, &.{ dir, "store", "meta" }), .{}) catch {
+            try w.print("no store at {s} (not a node directory)\nverdict: NOT CHECKED\n", .{dir});
+            return 3;
+        };
+        var o = openNode(gpa, io, arena, dir, null, false, true) catch |e| {
+            if (e == error.NodeRunning) std.log.err("{s} is in use (node/LOCK): stop deepwave first", .{dir});
+            return e;
+        };
+        defer o.abandon();
+        return verifyIndex(gpa, io, arena, w, &o, a, dir, scratch);
+    }
+
+    var o = openNode(gpa, io, arena, dir, a.retention, std.mem.eql(u8, cmd, "verify-store"), false) catch |e| {
         if (e == error.NodeRunning) std.log.err("{s} is in use (node/LOCK): stop deepwave first", .{dir});
         return e;
     };
@@ -406,6 +464,23 @@ fn verifyStore(gpa: std.mem.Allocator, w: *Io.Writer, o: *Opened, a: Args) !u8 {
         bad += lbad;
     }
     return if (bad == 0) 0 else 1;
+}
+
+/// The StateService index of the node directory against a second one built from the store's
+/// live set at the same checkpoint (index/verify.zig). The serving index is opened read-only,
+/// the store is closed without a flush, and the second index lives and dies in
+/// `<scratch>/verify-index`.
+fn verifyIndex(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, w: *Io.Writer, o: *Opened, a: Args, dir: []const u8, scratch: []const u8) !u8 {
+    const verify = node.index.verify;
+    var res = try verify.run(gpa, io, o.st, .{
+        .state_dir = try std.fs.path.join(arena, &.{ dir, "state-index" }),
+        .scratch = scratch,
+        .threads = if (a.threads_set) a.threads else 0,
+        .build_mem_bytes = @intCast(@max(a.build_mem_mb, 64) << 20),
+        .keep_scratch = a.keep_scratch,
+    }, w);
+    defer res.deinit();
+    return @intFromEnum(res.outcome);
 }
 
 /// The end-of-epoch checkpoint of `epoch` in the store (binary search on epochs), or the newest

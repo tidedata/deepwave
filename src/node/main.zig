@@ -50,6 +50,17 @@ const usage =
     \\                                       edges that feed other edges); off by default
     \\  --native-http-rpc                    POST /zui1/rpc on the --native-listen TCP port: zui/1 requests over HTTP/1.1 (Workers, fetch;
     \\                                       put a TLS terminator in front); never dry_run, submit, subscribe or the feed
+    \\  --gate URL                           access gate: API keys (x-api-key, the zui/1 hello token), rate limits
+    \\                                       and usage metering against the gate service at this https base URL; resolve,
+    \\                                       free and usage are appended. Needs --gate-token-file and --gate-edge-id. Off by default.
+    \\                                       http:// is taken only for a gate on this machine (localhost, 127.0.0.0/8, [::1])
+    \\  --gate-token-file FILE               this node's credential for the gate (one line, at least 24 characters), sent as a bearer token
+    \\  --gate-edge-id NAME                  this node's name at the gate (A-Z a-z 0-9 . _ -)
+    \\  --gate-dir DIR                       the free tier's last answer and the usage spool (default <dir>/node/gate)
+    \\  --gate-ca-file FILE                  PEM certificate authorities trusted for the gate connection only, beside the
+    \\                                       system roots (a gate behind a private CA)
+    \\  --gate-trusted-proxy CIDR            read the caller's address from x-forwarded-for when the peer is in CIDR (repeatable,
+    \\                                       at most 8; default none: the socket peer is the caller)
     \\  --edge-conns N                       zui/1 connections to the cores (default 4; the profile's)
     \\  --no-edge-zstd                       ask the cores for raw feeds (no zstd dictionary)
     \\  --feed-max-inflight N                most feed requests in flight at the cores in catch-up (default 16;
@@ -62,7 +73,7 @@ const usage =
     \\                                       network's public bucket (the --source http path, never S3; --net-max-mbps
     \\                                       applies), dir a local mirror. Falls back after 3 s without an answer (at once
     \\                                       on a core's shutdown notice or a hello without the feed), probes the cores
-    \\                                       twice a second and returns after 5 s healthy (docs/EDGE.md section 10). Every
+    \\                                       twice a second and returns after 5 s healthy. Every
     \\                                       checkpoint is verified whichever side served it, and stored as the core's feed
     \\                                       of it would be. One unit restores, follows by the bucket and attaches to the
     \\                                       core when it serves the feed. With http the edge also asks the network's
@@ -177,11 +188,16 @@ const usage =
     \\  RUST_LOG_FILE=PREFIX                 log to PREFIX.YYYY-MM-DD (UTC day, appended) instead of stderr
     \\  --execute-epoch-from HOST:PORT[/plain]  serve ExecuteTransaction (to validators); committee from GetEpoch there
     \\  --core-upstream HOST:PORT[/pin=HEX|/plain]  an edge's core (its sui.rpc.v2 gRPC): with --serve, requests this node
-    \\                                       cannot answer exactly are passed to it and its answer returned unchanged
-    \\                                       (docs/EDGE.md 11). TLS against the system CAs; /pin=HEX: TLS with the core's
+    \\                                       cannot answer exactly are passed to it and its answer returned unchanged.
+    \\                                       TLS against the system CAs; /pin=HEX: TLS with the core's
     \\                                       certificate SHA-256 pinned; /plain: cleartext (the default only for loopback)
     \\  --core-upstream-pin HEX              the same pin, as a flag
     \\  --edge-forward on | off              forwarding with --core-upstream (default on)
+    \\  --edge-read-sets on | off            read sets through the edge feed (default off). On an
+    \\                                       edge (--source zui1:): ask the cores for each checkpoint's loaded-object lists,
+    \\                                       keep read sets, and answer effects, balance_changes and objects here for the
+    \\                                       checkpoints that have one. On a node with read sets and --edge-feed: mark
+    \\                                       checkpoints and send their lists to edges that ask
     \\  --edge-raw hold | reads | off        read-after-write for transactions executed through this node (default reads):
     \\                                       reads: answer the execute at once; reads of what it wrote wait until this node
     \\                                       applied it; hold: hold the execute answer instead; off: neither
@@ -189,6 +205,15 @@ const usage =
     \\  --edge-execute-wait-ms N             the bound of either wait (default 2000; 0: off)
     \\  --edge-max-lag N                     checkpoints behind the core before everything is forwarded (default 5)
     \\  --edge-ahead-wait-ms N               wait for a checkpoint or object version ahead of this node before forwarding (default 300)
+    \\  --edge-balance-lists forward | local where ListBalances is answered (default forward; env ZUI_EDGE_BALANCE_LISTS).
+    \\                                       local: from this node's index; it can differ from the core's answer only in
+    \\                                       rows of coin types emptied to zero; needs --indexes
+    \\  --edge-simulate forward | local | local-gas
+    \\                                       where SimulateTransaction is answered (default forward; env ZUI_EDGE_SIMULATE).
+    \\                                       local needs the whole live set (a snapshot restore or genesis), else it stays on
+    \\                                       forward; gas selection and simulations that fail here still go to the core.
+    \\                                       local-gas: gas selection here too (needs --indexes), without the core's
+    \\                                       proposer restriction
     \\  --pending-tx-dir PATH|off       ExecuteTransaction's pending-tx log (default DIR/node/pending-tx): resubmitted after a restart
     \\  --exec-driver zui|sui-node      ExecuteTransaction's validator driver: zui (default: 3 proposers, effects with the fastest acks)
     \\                                   or sui-node (1.83.1 exactly: gas price / RGP proposers, acks without details); same responses
@@ -218,6 +243,7 @@ const usage =
     \\  --retention-epochs N                sui-node num-epochs-to-retain-for-checkpoints (default 2): checkpoints, transactions, effects, events (CONTRACTS 6.8)
     \\  --object-retention-epochs N         sui-node num-epochs-to-retain (default 1): superseded object versions
     \\  --no-compress                       write new segments uncompressed (default: zstd chunks, store/chunk.zig)
+    \\  --age-mem-mb N                      memory the ager may hold (default 256): a quarter for the set of superseded locations it remembers, half for the live set's bits, the rest for its buffers; exported as zui_store_age_mem_bytes
     \\  --age-out [on | off | defer]        background age-out: superseded versions and checkpoint data below the retention floors become holes in sealed segments, freed by hole punching. on (also the bare flag): always; defer: only while the node is within 10 s of the tip, so catch-up has the disk to itself (it still catches up in one run once 16 GiB of history wait below the checkpoint floor); off. Default off; the edge and macmini profiles set defer. ZUI_AGE_OUT=on|off|defer overrides both (1: on, or defer where that is configured; 0: off)
     \\  --chunk-cache-mb N                  decoded-chunk cache budget in MiB (default 1024)
     \\  --hw SPEC                           machine profile and path overrides (also env ZUI_HW), e.g. profile=server,sha_ni=off,pin=on;
@@ -245,6 +271,8 @@ const usage =
     \\                                       against the certified root before its MANIFEST appears
     \\  --rpc-index-dir PATH                 rpc index (with --serve; default DIR/rpc; fullnode.yaml zui.rpc-index-path)
     \\  --ledger-history-dir PATH            ledger-history index (default DIR/ledger-history; zui.ledger-history-path)
+    \\  --no-history-backfill                never build the ledger-history index for checkpoints it does not hold (also
+    \\                                       ZUI_LH_BACKFILL=0): List* then answer from where the index begins
     \\  --snapshot-write-threads N           (default half the cores, 4 to 16)
     \\  --drain-ms N                         SIGTERM: time open RPC calls and streams get to finish (default 20000)
     \\  --shutdown-timeout S                 SIGTERM: exit after S seconds even if the flush is not done (default 110)
@@ -476,6 +504,13 @@ pub fn main(init: std.process.Init) !u8 {
     var feed_max_inflight: ?u32 = null;
     var edge_zstd = true;
     var edge_fallback: ?node.node.EdgeFallbackSpec = null;
+    var gate_url: ?[]const u8 = null;
+    var gate_token_file: ?[]const u8 = null;
+    var gate_edge_id: ?[]const u8 = null;
+    var gate_dir: ?[]const u8 = null;
+    var gate_ca_file: ?[]const u8 = null;
+    var gate_proxies: [node.gate.max_proxies]edge.gate.ident.Cidr = undefined;
+    var gate_nproxies: usize = 0;
     var profile: ?edge.profile.Kind = null;
     // `--profile` sets defaults, so it is applied before any other flag (a flag still wins).
     {
@@ -498,6 +533,8 @@ pub fn main(init: std.process.Init) !u8 {
             std.log.info("profile {s}: cache budget about {d} MiB", .{ @tagName(profile.?), edge.profile.cacheBudgetMb(ps) });
         };
     }
+    // the edge's policy settings from the environment; the flags below come after and win
+    if (edge.forward.policyEnv(&cfg.edge_forward_cfg, if (std.c.getenv("ZUI_EDGE_BALANCE_LISTS")) |v| std.mem.span(v) else null, if (std.c.getenv("ZUI_EDGE_SIMULATE")) |v| std.mem.span(v) else null)) |msg| return usageErr(msg);
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -532,6 +569,20 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.edge_feed = true;
         } else if (std.mem.eql(u8, a, "--native-http-rpc")) {
             cfg.native_http_rpc = true;
+        } else if (std.mem.eql(u8, a, "--gate")) {
+            gate_url = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--gate-token-file")) {
+            gate_token_file = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--gate-edge-id")) {
+            gate_edge_id = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--gate-dir")) {
+            gate_dir = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--gate-ca-file")) {
+            gate_ca_file = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--gate-trusted-proxy")) {
+            if (gate_nproxies == gate_proxies.len) return usageErr("--gate-trusted-proxy: at most 8");
+            gate_proxies[gate_nproxies] = edge.gate.ident.Cidr.parse(try need(args, &i)) orelse return usageErr("--gate-trusted-proxy CIDR, e.g. 10.0.0.0/8 or 2001:db8::/32");
+            gate_nproxies += 1;
         } else if (std.mem.eql(u8, a, "--edge-conns")) {
             edge_conns = try std.fmt.parseInt(u32, try need(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--feed-max-inflight")) {
@@ -645,6 +696,9 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.core_upstream = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--core-upstream-pin")) {
             cfg.core_upstream_pin = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--edge-read-sets")) {
+            const v = try need(args, &i);
+            cfg.edge_read_sets = if (std.mem.eql(u8, v, "on")) true else if (std.mem.eql(u8, v, "off")) false else return usageErr("--edge-read-sets on | off");
         } else if (std.mem.eql(u8, a, "--edge-forward")) {
             const v = try need(args, &i);
             cfg.edge_forward = if (std.mem.eql(u8, v, "on")) true else if (std.mem.eql(u8, v, "off")) false else return usageErr("--edge-forward on | off");
@@ -655,6 +709,10 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, a, "--edge-raw-waiters")) {
             cfg.edge_forward_cfg.raw_max_waiters = std.fmt.parseInt(u32, try need(args, &i), 10) catch return usageErr("--edge-raw-waiters N");
             cfg.edge_raw_waiters_set = true;
+        } else if (std.mem.eql(u8, a, "--edge-balance-lists")) {
+            cfg.edge_forward_cfg.balance_lists = edge.route.parseWhere(try need(args, &i)) orelse return usageErr("--edge-balance-lists forward | local");
+        } else if (std.mem.eql(u8, a, "--edge-simulate")) {
+            cfg.edge_forward_cfg.simulate = edge.route.Simulate.parse(try need(args, &i)) orelse return usageErr("--edge-simulate forward | local | local-gas");
         } else if (std.mem.eql(u8, a, "--edge-max-lag")) {
             cfg.edge_forward_cfg.max_lag = std.fmt.parseInt(u64, try need(args, &i), 10) catch return usageErr("--edge-max-lag N (checkpoints)");
         } else if (std.mem.eql(u8, a, "--edge-ahead-wait-ms")) {
@@ -796,6 +854,8 @@ pub fn main(init: std.process.Init) !u8 {
                 cfg.age_out = m;
                 i += 1;
             };
+        } else if (std.mem.eql(u8, a, "--age-mem-mb")) {
+            cfg.store_cfg.age_mem_bytes = (try std.fmt.parseInt(u64, try need(args, &i), 10)) << 20;
         } else if (std.mem.eql(u8, a, "--hw")) {
             hw.parse(&hw_spec, try need(args, &i), &hw_fail) catch |e| return hwSpecErr(e, &hw_fail);
         } else if (std.mem.eql(u8, a, "--cp-cache-mb")) {
@@ -837,6 +897,8 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.rpc_dir = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--ledger-history-dir")) {
             cfg.history_dir = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--no-history-backfill")) {
+            cfg.lh_backfill = false;
         } else if (std.mem.eql(u8, a, "--snapshot-write")) {
             cfg.snapshot_write = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--snapshot-write-threads")) {
@@ -937,13 +999,37 @@ pub fn main(init: std.process.Init) !u8 {
         cfg.source.zui1.fallback = edge_fallback orelse if (profile != null and ps.edge_fallback) .{ .http = .{} } else .off;
         // The feed carries no input objects, so input read sets (and the package floor rows for
         // system packages upgraded in place) cannot be built from it: off, not silently partial.
-        if (cfg.read_sets) std.log.info("read sets: off (a zui1 source carries no input objects)", .{});
-        cfg.read_sets = false;
+        // With `--edge-read-sets on` the edge builds them from what its cores send with the
+        // feed and from its own store, per checkpoint, and says which checkpoints have one
+        // (docs/EDGE.md section 12); the package floor rows stay out either way.
+        if (cfg.edge_read_sets) {
+            cfg.read_sets = true;
+        } else {
+            if (cfg.read_sets) std.log.info("read sets: off (a zui1 source carries no input objects)", .{});
+            cfg.read_sets = false;
+        }
         if (cfg.poll_ms == null and profile != null) cfg.poll_ms = ps.poll_ms;
     }
 
     if (edge_fallback != null and cfg.source != .zui1) return usageErr("--edge-fallback needs --source zui1:...");
     if (feed_max_inflight != null and cfg.source != .zui1) return usageErr("--feed-max-inflight needs --source zui1:...");
+    if (gate_url) |url| {
+        var db: [std.fs.max_path_bytes]u8 = undefined;
+        const gs: node.gate.Settings = .{
+            .url = url,
+            .token_file = gate_token_file orelse "",
+            .edge_id = gate_edge_id orelse "",
+            .dir = gate_dir orelse try std.heap.page_allocator.dupe(u8, try std.fmt.bufPrint(&db, "{s}/node/gate", .{cfg.dir})),
+            .proxies = try std.heap.page_allocator.dupe(edge.gate.ident.Cidr, gate_proxies[0..gate_nproxies]),
+            .ca_file = gate_ca_file,
+        };
+        // the flags and the files they name, before the store is opened: a wrong one stops the
+        // start here, in a second, with the flag's name
+        if (node.gate.preflight(gpa, io, &gs)) |msg| return usageErr(msg);
+        cfg.gate = gs;
+    } else if (gate_token_file != null or gate_edge_id != null or gate_dir != null or gate_ca_file != null or gate_nproxies != 0) {
+        return usageErr("--gate-token-file, --gate-edge-id, --gate-dir, --gate-ca-file and --gate-trusted-proxy need --gate URL");
+    }
 
     policy_flags.install() catch |e| {
         std.log.err("start: transaction-deny-config / policy-config: {s}", .{@errorName(e)});

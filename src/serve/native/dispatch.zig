@@ -50,6 +50,9 @@ pub fn txDigest(tx_data: []const u8) [32]u8 {
 /// Hello feature bit of the edge feed (`get_checkpoint_feed`, `get_dictionary`). Bits 8..31 are
 /// reserved for subscription filter variants (8 + k), so this one sits outside that range.
 pub const feature_edge_feed_bit: u6 = 32;
+/// Hello feature bit of read sets in the edge feed (request flag `proto.flag_read_sets`,
+/// docs/EDGE.md section 12): set only by a node that serves the feed and keeps read sets for it.
+pub const feature_feed_read_sets_bit: u6 = 33;
 
 /// Methods that may block for long (execution): the listener runs them on worker threads.
 pub fn slowMethod(m: proto.Method) bool {
@@ -255,7 +258,13 @@ pub const Dispatcher = struct {
     }
 
     fn handleInner(d: *Dispatcher, a: Allocator, req: proto.Request, principal: ?Principal, out: *std.ArrayList(u8)) !void {
-        if (req.flags & ~(proto.flag_verify | proto.flag_zstd_ok) != 0) return error.Malformed;
+        // READ_SETS is a flag only where hello advertised it: the feed of a node that keeps read
+        // sets for it. Everywhere else it is an unknown flag, as before.
+        var known_flags = proto.flag_verify | proto.flag_zstd_ok;
+        if (req.method == .get_checkpoint_feed) if (d.edge) |fd| if (fd.read_sets != null) {
+            known_flags |= proto.flag_read_sets;
+        };
+        if (req.flags & ~known_flags != 0) return error.Malformed;
         const verify = req.flags & proto.flag_verify != 0;
         var r: R = .{ .b = req.body };
         var snap = d.svc.store.snapshot();
@@ -294,7 +303,10 @@ pub const Dispatcher = struct {
                 if (d.hooks.simulator != null) feat |= 1 << 3;
                 if (d.hooks.submitter != null) feat |= 1 << 4;
                 feat |= 1 << 1; // ZSTD responses (spec 2.2), with or without dictionaries
-                if (d.edge != null) feat |= @as(u64, 1) << feature_edge_feed_bit;
+                if (d.edge) |fd| {
+                    feat |= @as(u64, 1) << feature_edge_feed_bit;
+                    if (fd.read_sets != null) feat |= @as(u64, 1) << feature_feed_read_sets_bit;
+                }
                 const refusal = if (want) |wn| hello_mod.refuse(wn, &d.svc.chain_id, feat) else null;
                 _ = d.hello.record(client, cminor, if (refusal) |rf| rf.code else null, hello_mod.monoMs());
                 if (refusal) |rf| return proto.errorResponse(out, a, rf.code, rf.message, rf.detail());

@@ -27,9 +27,13 @@ const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
 const serve = @import("serve");
 const store = @import("store");
+const bcs = @import("bcs");
+const types = @import("types");
 const rpc_exec = @import("rpc_exec");
 const route = @import("route.zig");
 const certs_mod = @import("certs.zig");
+/// (for tests of the forwarder that mark certificates)
+pub const certs_api = certs_mod;
 const h2 = serve.h2;
 const service = serve.service;
 const proto = serve.proto;
@@ -316,6 +320,12 @@ pub const Metrics = struct {
     raw_reads_over_limit: Atomic(u64) = .init(0),
     raw_strip_failures: Atomic(u64) = .init(0),
     streams_closed: Atomic(u64) = .init(0),
+    /// Effects reads of a tip checkpoint whose read set a re-ask is about to bring, held for
+    /// its mark (`holdReadSet`): the time held, and how the holds ended (the mark came in time
+    /// and the read was answered here; it did not, and the read went to the core).
+    read_set_hold: Hist = .{},
+    read_set_hold_marked: Atomic(u64) = .init(0),
+    read_set_hold_forwarded: Atomic(u64) = .init(0),
 
     pub const lag_unknown = std.math.maxInt(u64);
 
@@ -344,10 +354,28 @@ pub const Metered = struct {
     upstream_error: bool = false,
 };
 
-/// A second meter beside the built-in counters (per-key accounting, later).
+/// A second meter beside the built-in counters (the access gate's per-key accounting).
 pub const MeterHook = struct {
     ctx: *anyopaque,
     f: *const fn (ctx: *anyopaque, m: *const Metered) void,
+};
+
+/// Room the access gate keeps on a call's stack between `begin` and `end`. Opaque here.
+pub const GateScope = struct {
+    bytes: [size]u8 align(16) = undefined,
+    pub const size = 512;
+};
+
+/// The access gate in front of routing (`--gate`, docs/GATE.md). `begin` runs before the
+/// request is looked at: it leaves its verdict in `caller.deny` (the policy then refuses the
+/// call, `route.gate`) or what it handed out in `caller.ticket`, and may set a retry time on
+/// `rs`. `end` runs when the call is over, with the status the client got. Between the two the
+/// call passes `Forwarder.meter` (`meter_hook`), where the gate learns whether it was answered
+/// here or forwarded.
+pub const GateHook = struct {
+    ctx: *anyopaque,
+    begin: *const fn (ctx: *anyopaque, req: *const h2.Request, rs: *h2.ResponseStream, caller: *route.Caller, scope: *GateScope) void,
+    end: *const fn (ctx: *anyopaque, scope: *GateScope, status: h2.Status) void,
 };
 
 // ---------------------------------------------------------------- the forwarder
@@ -383,10 +411,86 @@ pub const Config = struct {
     /// them). A new execute that does not fit is held instead.
     raw_max_entries: u32 = 4096,
     raw_max_keys: u32 = 1 << 16,
+    /// `--edge-balance-lists forward | local`: where ListBalances is answered (docs/EDGE.md 11.8).
+    balance_lists: route.Where = route.balance_lists,
+    /// `--edge-simulate forward | local | local-gas`: where SimulateTransaction is answered
+    /// (docs/EDGE.md 11.8).
+    simulate: route.Simulate = route.simulate,
+    /// The read-set hold (`holdReadSet`): its bound, and how far under the tip a checkpoint
+    /// may be to be held for.
+    read_set_hold_ms: u32 = read_set_hold_ms,
+    read_set_hold_near: u64 = read_set_hold_near,
 
     pub fn execMode(c: *const Config) ExecMode {
         return if (c.execute_wait_ms == 0) .off else c.raw;
     }
+};
+
+/// What the node knows at start about what the policy settings ask for beyond a flag.
+pub const PolicyStart = struct {
+    /// `--indexes`: the StateService index ListBalances is answered from.
+    indexes: bool,
+    /// The store holds the whole live set (restored from a formal snapshot, or synced from
+    /// genesis): a simulation reads live objects only, and an object that is absent must mean
+    /// it does not exist.
+    live_set: bool,
+};
+
+/// The environment's word on the policy settings (`ZUI_EDGE_BALANCE_LISTS`, `ZUI_EDGE_SIMULATE`:
+/// `forward` or `local`, and `local-gas` for the second; unset or empty leaves the default). Returns what is wrong with a value
+/// that is neither. The flags are read after it and win.
+pub fn policyEnv(cfg: *Config, balance_lists: ?[]const u8, simulate: ?[]const u8) ?[]const u8 {
+    if (balance_lists) |v| if (v.len != 0) {
+        cfg.balance_lists = route.parseWhere(v) orelse return "ZUI_EDGE_BALANCE_LISTS: forward | local";
+    };
+    if (simulate) |v| if (v.len != 0) {
+        cfg.simulate = route.Simulate.parse(v) orelse return "ZUI_EDGE_SIMULATE: forward | local | local-gas";
+    };
+    return null;
+}
+
+/// The policy settings as they stand at start, and the one line the node logs about them.
+/// A `local` without what it needs stays on forward, and the line says why.
+pub fn settlePolicies(cfg: *Config, sim: PolicyStart, line: *[640]u8) []const u8 {
+    const asked = cfg.simulate;
+    if (asked != .forward and !sim.live_set) cfg.simulate = .forward;
+    // gas selection reads the owner index: without one `local-gas` is `local`
+    if (cfg.simulate == .local_gas and !sim.indexes) cfg.simulate = .local_forward_on_miss;
+    const asked_balances = cfg.balance_lists;
+    if (asked_balances == .local and !sim.indexes) cfg.balance_lists = .forward;
+    const balances: []const u8 = if (asked_balances == .forward)
+        "forward"
+    else if (!sim.indexes)
+        "forward (--edge-balance-lists local needs the StateService index: --indexes; staying on forward)"
+    else
+        "local (--edge-balance-lists local: answered from this node's index; rows of coin types emptied to zero can differ from the core's)";
+    const simulate: []const u8 = if (asked == .forward)
+        "forward"
+    else if (!sim.live_set)
+        "forward (--edge-simulate local needs the whole live set: a store restored from a formal snapshot or synced from genesis; staying on forward)"
+    else if (asked == .local_gas and !sim.indexes)
+        "local (--edge-simulate local-gas needs the owner index for gas selection: --indexes; staying on local, gas selection goes to the core)"
+    else if (asked == .local_gas)
+        "local-gas (--edge-simulate local-gas: answered here while the edge is at the tip, gas selection included, without the core's proposer restriction; a simulation that fails here goes to the core, one whose sender or gas owner has a transaction executed through this node not applied yet waits for it)"
+    else
+        "local (--edge-simulate local: answered here while the edge is at the tip; gas selection and a simulation that fails here go to the core, one whose sender or gas owner has a transaction executed through this node not applied yet waits for it)";
+    return std.fmt.bufPrint(line, "edge policy: ListBalances {s}; SimulateTransaction {s}", .{ balances, simulate }) catch "edge policy: (line too long)";
+}
+
+/// The read-set hold's bound: 0, no read is held. Measured on an edge (2026-11-11, 12 minutes):
+/// of 524 holds 53 ended marked and 471 forwarded, with a mean hold of 77 ms before a forward
+/// that costs about 104 ms anyway. `holdReadSet` and its metrics stay; a bound above 0 turns it on.
+pub const read_set_hold_ms: u32 = 0;
+/// Only checkpoints this close under the edge's tip are held for: the ones a re-ask is about to
+/// settle. Further down a missing read set is one the re-ask gave up on, or will soon.
+pub const read_set_hold_near: u64 = 4;
+
+/// Which checkpoints have a re-ask of their read sets under way (node reask.zig): a read that
+/// needs one of them may wait a moment for its mark instead of going to the core.
+pub const ReadSetHold = struct {
+    ctx: *anyopaque,
+    /// A re-ask is due, or lists wait for the next commit group (not given up).
+    pending: *const fn (ctx: *anyopaque, seq: u64) bool,
 };
 
 /// What the node tells the guard about its sources.
@@ -422,6 +526,8 @@ pub const Forwarder = struct {
     pending: Pending,
     metrics: Metrics = .{},
     meter_hook: ?MeterHook = null,
+    /// The access gate (null: none, and `call` is what it was).
+    gate_hook: ?GateHook = null,
     /// The core's lowest available checkpoint (`floor_unknown` until first read).
     core_floor: Atomic(u64) = .init(floor_unknown),
     floor_ev: Atomic(u32) = .init(0),
@@ -439,6 +545,8 @@ pub const Forwarder = struct {
     certs: ?*certs_mod.Certs = null,
     /// `upstreamDown`. Set and cleared by every call's end (`Relay.run`).
     upstream_down: Atomic(bool) = .init(false),
+    /// The re-ask of read sets (node reask.zig); null: no read is held for a mark.
+    read_set_hold: ?ReadSetHold = null,
 
     /// A stream that renders certificates is started locally only when the newest marked
     /// checkpoint is more than this many checkpoints behind the edge's tip (and the edge is
@@ -601,7 +709,15 @@ pub const Forwarder = struct {
     }
 
     pub fn state(f: *const Forwarder) route.State {
-        return .{ .forwarding = true, .guard = f.guardState(), .tip = f.tip(), .floor = service.lowestOf(f.svc) };
+        return .{ .forwarding = true, .guard = f.guardState(), .tip = f.tip(), .floor = service.lowestOf(f.svc), .read_sets = f.svc.read_sets != null, .balance_lists = f.cfg.balance_lists };
+    }
+
+    /// `--edge-simulate` as it stands for a request arriving now: the setting itself. A local
+    /// simulation reads the edge's live state and nothing else a feed may lack (no read set,
+    /// no loaded list, no historical version: docs/EDGE.md 11.8), so it does not wait for the
+    /// tip checkpoint's read set; the freshness guard (11.5) is what keeps it at the tip.
+    pub fn simulateNow(f: *const Forwarder) route.Simulate {
+        return f.cfg.simulate;
     }
 
     /// One pass of the background work: the guard, the pending digests, the core's floor.
@@ -687,15 +803,37 @@ pub const Forwarder = struct {
 
     fn call(ctx: *anyopaque, req: *const h2.Request, rs: *h2.ResponseStream) h2.Status {
         const f = of(ctx);
+        var caller: route.Caller = .{ .api_key = req.api_key, .peer = req.peer };
+        const gh = f.gate_hook orelse return f.routeCall(req, rs, &caller);
+        // The access gate, before anything else: every path, the edge's own included.
+        var scope: GateScope = .{};
+        gh.begin(gh.ctx, req, rs, &caller, &scope);
+        const status = f.routeCall(req, rs, &caller);
+        gh.end(gh.ctx, &scope, status);
+        return status;
+    }
+
+    fn routeCall(f: *Forwarder, req: *const h2.Request, rs: *h2.ResponseStream, caller: *const route.Caller) h2.Status {
         const method = route.methodOf(req.path);
-        if (method == .own) return f.inner.call(f.inner.ctx, req, rs);
+        if (method == .own) {
+            // not routed, but refused all the same when the gate said so
+            if (route.gate(caller, method)) |x| {
+                rs.setMessage(x.message);
+                return @enumFromInt(x.code);
+            }
+            return f.inner.call(f.inner.ctx, req, rs);
+        }
         const t0 = h2.meta.monoNs();
         // the read mask's paths (slices into the request) live on the stack: no allocation on
         // the way to a local answer. A mask with more paths than fit is passed on (`scan`).
         var scratch: [2048]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&scratch);
         var facts = f.scan(fba.allocator(), method, req);
+        facts.caller = caller.*;
         var st = f.state();
+        if (method == .simulate_transaction) st.simulate = f.simulateNow();
+        // (asked of the index only for the methods that read it)
+        if (method == .list_checkpoints or method == .list_transactions or method == .list_events) st.history_gap = service.historyGap(f.svc);
         var d = route.decide(&facts, &st);
         if (d == .wait) {
             const caught = f.waitFor(d.wait, &facts, req, rs);
@@ -716,13 +854,24 @@ pub const Forwarder = struct {
                 break :sw @enumFromInt(x.code);
             },
             .local => {
-                const local = f.runLocal(&facts, req, rs);
+                var local = f.runLocal(&facts, req, rs);
                 if (local.status == .deferred or local.status == .held) break :sw local.status;
-                const why = route.afterLocal(&facts, &st, .{ .code = @intFromEnum(local.status), .has_details = rs.details_bin.len > 0, .gap = local.gap }) orelse break :sw local.status;
+                var why = route.afterLocal(&facts, &st, .{ .code = @intFromEnum(local.status), .has_details = rs.details_bin.len > 0, .gap = local.gap }) orelse break :sw local.status;
                 // nothing of the local answer may have left (a local handler writes its one
                 // message last; a gap ends it before that)
                 if (rs.messages != 0) break :sw local.status;
                 resetStatus(rs);
+                // a tip checkpoint whose read set a re-ask is about to bring: its mark is
+                // waited for a moment, then the read is tried here once more
+                if (local.gap == .read_set_missing and (method == .get_checkpoint or method == .get_transaction)) {
+                    if (f.holdReadSet(service.gap_seq, req, rs)) {
+                        local = f.runLocal(&facts, req, rs);
+                        if (local.status == .deferred or local.status == .held) break :sw local.status;
+                        why = route.afterLocal(&facts, &st, .{ .code = @intFromEnum(local.status), .has_details = rs.details_bin.len > 0, .gap = local.gap }) orelse break :sw local.status;
+                        if (rs.messages != 0) break :sw local.status;
+                        resetStatus(rs);
+                    }
+                }
                 break :sw f.forwardCert(method, why, &facts, req, rs, &m);
             },
             .forward => |why| f.forwardCert(method, why, &facts, req, rs, &m),
@@ -777,6 +926,20 @@ pub const Forwarder = struct {
         if (rs.messages == 0) resetStatus(rs);
         rs.setMessage("edge: core upstream unavailable");
         return .unavailable;
+    }
+
+    // The local handler reports its gap as serve's `LocalGap`; the routing reads it as
+    // `route.Gap`, and `runLocal` converts one to the other by its integer. So the two enums
+    // must list the same names with the same values, in the same order: checked here, so a
+    // value added to one and not the other (or added in another place) does not compile.
+    comptime {
+        const local = std.meta.fieldNames(service.LocalGap);
+        const routed = std.meta.fieldNames(route.Gap);
+        if (local.len != routed.len) @compileError("serve.service.LocalGap and edge.route.Gap must have the same values");
+        for (local, routed) |l, r| {
+            if (!std.mem.eql(u8, l, r) or @intFromEnum(@field(service.LocalGap, l)) != @intFromEnum(@field(route.Gap, r)))
+                @compileError("serve.service.LocalGap." ++ l ++ " and edge.route.Gap." ++ r ++ " differ: the two enums must match by name and value");
+        }
     }
 
     const Local = struct { status: h2.Status, gap: route.Gap };
@@ -893,6 +1056,19 @@ pub const Forwarder = struct {
                     facts.selector = true;
                 };
             },
+            .simulate_transaction => {
+                // SimulateTransactionRequest: checks (3; 1 = DISABLED), do_gas_selection (4).
+                // Gas selection is performed only with checks on (rpc_exec/simulate.zig).
+                if (f.cfg.simulate == .forward) return;
+                var checks: u64 = 0;
+                var gas_sel = false;
+                while (try r.next()) |fld| switch (fld.number) {
+                    3 => checks = try proto.Reader.varintOf(fld),
+                    4 => gas_sel = (try proto.Reader.varintOf(fld)) != 0,
+                    else => {},
+                };
+                facts.gas_selection = gas_sel and checks != 1;
+            },
             else => {},
         }
     }
@@ -930,6 +1106,45 @@ pub const Forwarder = struct {
             const left = @min(limit - spent, slice_ns);
             f.io.futexWaitTimeout(u32, &f.pending.commits.raw, seen, .{ .duration = .{ .raw = Io.Duration.fromNanoseconds(@intCast(left)), .clock = .awake } }) catch {};
         }
+    }
+
+    /// An effects read met checkpoint `seq` without its read set. When a re-ask is under way
+    /// for it and it is at the tip, waits (at most `read_set_hold_ms`, the request's deadline
+    /// and its client) for its mark, which comes with a commit: sleeps on the commit word.
+    /// True: the mark is here, and the read is answered locally. False: not held, or the mark
+    /// did not come in time; the read goes to the core as before.
+    fn holdReadSet(f: *Forwarder, seq: u64, req: *const h2.Request, rs: *h2.ResponseStream) bool {
+        const hk = f.read_set_hold orelse return false;
+        const src = f.svc.read_sets orelse return false;
+        if (f.cfg.read_set_hold_ms == 0) return false;
+        const at = f.tip() orelse return false;
+        if (seq + f.cfg.read_set_hold_near < at) return false;
+        if (!hk.pending(hk.ctx, seq)) return false;
+        // a held read keeps its serve worker: it counts against the raw-read waiters' bound
+        if (f.raw_waiters.fetchAdd(1, .acq_rel) >= f.cfg.raw_max_waiters) {
+            _ = f.raw_waiters.fetchSub(1, .acq_rel);
+            return false;
+        }
+        defer _ = f.raw_waiters.fetchSub(1, .acq_rel);
+        const t0 = h2.meta.monoNs();
+        var limit = @as(u64, f.cfg.read_set_hold_ms) * std.time.ns_per_ms;
+        if (req.deadline_ns) |dl| limit = @min(limit, dl -| t0);
+        const marked = while (true) {
+            const seen = f.pending.commits.load(.acquire);
+            {
+                var snap = f.svc.store.snapshot();
+                defer snap.release();
+                if (src.has(src.ctx, &snap, seq)) break true;
+            }
+            const spent = h2.meta.monoNs() -| t0;
+            if (spent >= limit or rs.cancelled() or f.guardState() == .tripped) break false;
+            // a commit wakes it; the slice bounds a wake that was missed
+            const left = @min(limit - spent, 10 * std.time.ns_per_ms);
+            f.io.futexWaitTimeout(u32, &f.pending.commits.raw, seen, .{ .duration = .{ .raw = Io.Duration.fromNanoseconds(@intCast(left)), .clock = .awake } }) catch {};
+        };
+        f.metrics.read_set_hold.observe(h2.meta.monoNs() -| t0);
+        _ = (if (marked) &f.metrics.read_set_hold_marked else &f.metrics.read_set_hold_forwarded).fetchAdd(1, .monotonic);
+        return marked;
     }
 
     // ------------------------------------------------------------ forwarding
@@ -1100,6 +1315,22 @@ pub const Forwarder = struct {
                     } else digest = null;
                 };
             },
+            // A simulation is a read of its sender's and its gas owner's state (their coins and
+            // balances, what gas selection picks from): keyed by those addresses, as GetBalance
+            // is by its owner. A request that does not say who they are is passed to the core
+            // while anything is pending.
+            .simulate_transaction => {
+                const who = simulateParties(req.body) orelse {
+                    _ = f.metrics.raw_reads_late.fetchAdd(1, .monotonic);
+                    return false;
+                };
+                keys_buf[0] = .{ .kind = .address, .id = who.sender };
+                n = 1;
+                if (!std.mem.eql(u8, &who.sender, &who.gas_owner)) {
+                    keys_buf[1] = .{ .kind = .address, .id = who.gas_owner };
+                    n = 2;
+                }
+            },
             else => return true,
         }
         if (n == 0 and digest == null and !more) return true;
@@ -1125,6 +1356,51 @@ pub const Forwarder = struct {
         f.metrics.raw_read_wait.observe(h2.meta.monoNs() -| now);
         if (!clear) _ = f.metrics.raw_reads_late.fetchAdd(1, .monotonic);
         return clear;
+    }
+
+    /// The sender and the gas owner of a SimulateTransactionRequest's transaction, read the way
+    /// the handler reads it: from `transaction.bcs` when it is there (TransactionData V1: kind,
+    /// sender, gas data), else from the message's `sender` and `gas_payment.owner`. Null: not
+    /// readable here.
+    fn simulateParties(body: []const u8) ?struct { sender: [32]u8, gas_owner: [32]u8 } {
+        var tx: ?[]const u8 = null;
+        var r = proto.Reader.init(body);
+        while (r.next() catch return null) |fld| if (fld.number == 1) {
+            if (tx != null) return null; // a transaction given in pieces: not looked at here
+            tx = proto.Reader.bytesOf(fld) catch return null;
+        };
+        var bcs_value: ?[]const u8 = null;
+        var sender_text: ?[]const u8 = null;
+        var owner_text: ?[]const u8 = null;
+        var t = proto.Reader.init(tx orelse return null);
+        while (t.next() catch return null) |fld| switch (fld.number) {
+            1 => {
+                var b = proto.Reader.init(proto.Reader.bytesOf(fld) catch return null);
+                while (b.next() catch return null) |g| if (g.number == 2) {
+                    bcs_value = proto.Reader.bytesOf(g) catch return null;
+                };
+            },
+            5 => sender_text = proto.Reader.stringOf(fld) catch return null,
+            6 => {
+                var g = proto.Reader.init(proto.Reader.bytesOf(fld) catch return null);
+                while (g.next() catch return null) |x| if (x.number == 2) {
+                    owner_text = proto.Reader.stringOf(x) catch return null;
+                };
+            },
+            else => {},
+        };
+        if (bcs_value) |bytes| {
+            var br = bcs.Reader.init(bytes);
+            if ((br.length() catch return null) != 0) return null; // TransactionData::V1
+            bcs.skip(types.TransactionKind, &br) catch return null;
+            const sender = (br.bytes(32) catch return null)[0..32].*;
+            bcs.skip(@FieldType(types.GasData, "payment"), &br) catch return null;
+            const owner = (br.bytes(32) catch return null)[0..32].*;
+            return .{ .sender = sender, .gas_owner = owner };
+        }
+        const sender = service.parseObjectId(sender_text orelse return null) orelse return null;
+        const owner = if (owner_text) |o| service.parseObjectId(o) orelse return null else sender;
+        return .{ .sender = sender, .gas_owner = owner };
     }
 
     /// What ends a wait on `pending` before its bound: the client left, the request's deadline,
@@ -1505,6 +1781,9 @@ pub fn renderMetrics(f: *const Forwarder, w: *Io.Writer) !void {
     try m.raw_read_wait.render(w, "zui_edge_route_raw_read_wait_seconds", "");
     try w.print("# TYPE zui_edge_route_raw_reads_late counter\nzui_edge_route_raw_reads_late {d}\n", .{m.raw_reads_late.load(.monotonic)});
     try w.print("# TYPE zui_edge_route_raw_reads_over_limit counter\nzui_edge_route_raw_reads_over_limit {d}\n", .{m.raw_reads_over_limit.load(.monotonic)});
+    try w.writeAll("# TYPE zui_edge_route_read_set_hold_seconds histogram\n");
+    try m.read_set_hold.render(w, "zui_edge_route_read_set_hold_seconds", "");
+    try w.print("# TYPE zui_edge_route_read_set_holds counter\nzui_edge_route_read_set_holds{{outcome=\"marked\"}} {d}\nzui_edge_route_read_set_holds{{outcome=\"forwarded\"}} {d}\n", .{ m.read_set_hold_marked.load(.monotonic), m.read_set_hold_forwarded.load(.monotonic) });
     try w.print("# TYPE zui_edge_route_raw_waiters gauge\nzui_edge_route_raw_waiters {d}\n", .{f.raw_waiters.load(.monotonic)});
     try w.print("# TYPE zui_edge_route_raw_pending_keys gauge\nzui_edge_route_raw_pending_keys {d}\n", .{f.pending.n_keys});
     const fl = f.core_floor.load(.monotonic);

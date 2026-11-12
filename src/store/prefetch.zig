@@ -162,7 +162,7 @@ pub const Prefetcher = struct {
     /// flight, and returns once all are in (the ager's read-ahead of live-table pages,
     /// store.zig `ageWarm`): only the page cache side effect matters. Neighbours go in one read.
     /// Returns the reads issued (0 off Linux or after a ring failure).
-    pub fn pages(p: *Prefetcher, handle: i32, page_nos: []const u64) u64 {
+    pub fn pages(p: *Prefetcher, handle: i32, page_nos: []const u64, stop: ?*const Atomic(bool)) u64 {
         if (!is_linux or p.broken or page_nos.len == 0) return 0;
         p.reqs.clearRetainingCapacity();
         for (page_nos) |pg| {
@@ -175,13 +175,19 @@ pub const Prefetcher = struct {
             }
             p.reqs.append(p.gpa, .{ .fd = handle, .off = pg * page, .len = page }) catch break;
         }
-        const n = p.drain();
+        const n = p.drainUntil(stop);
         _ = p.stats.table_reads.fetchAdd(n, .monotonic);
         return n;
     }
 
     /// Reads every distinct request, `qd` in flight. Returns the reads issued.
     fn drain(p: *Prefetcher) u64 {
+        return p.drainUntil(null);
+    }
+
+    /// `drain` that hands no further read to the ring once `stop` is set: it waits for the
+    /// reads in flight (at most `qd`) and returns. The buffers are the ring's until they are back.
+    fn drainUntil(p: *Prefetcher, stop: ?*const Atomic(bool)) u64 {
         if (!is_linux) return 0;
         std.mem.sort(Req, p.reqs.items, {}, Req.lt);
         // dedup (same fd and page start; keep the longer read)
@@ -194,13 +200,17 @@ pub const Prefetcher = struct {
             p.reqs.items[w] = q;
             w += 1;
         }
-        const reqs = p.reqs.items[0..w];
+        var reqs = p.reqs.items[0..w];
         var nfree: usize = p.qd;
         for (p.free, 0..) |*f, i| f.* = @intCast(i);
         var next: usize = 0;
         var inflight: u32 = 0;
         var cqes: [64]linux.io_uring_cqe = undefined;
         while (next < reqs.len or inflight > 0) {
+            if (stop) |x| if (x.load(.acquire)) {
+                reqs = reqs[0..next];
+                if (inflight == 0) break;
+            };
             var queued: u32 = 0;
             while (nfree > 0 and next < reqs.len) {
                 const b = p.free[nfree - 1];
@@ -264,11 +274,15 @@ test "prefetch: pages reads the given pages of a file, neighbours in one read" {
     @memset(bytes, 0x5a);
     try f.writePositionalAll(io, bytes, 0);
     // 3 and 4 are neighbours (one read), 5 would be a third page (its own read).
-    try std.testing.expectEqual(@as(u64, 6), pf.pages(f.handle, &.{ 0, 3, 4, 5, 9, 40, 41, 63 }));
+    try std.testing.expectEqual(@as(u64, 6), pf.pages(f.handle, &.{ 0, 3, 4, 5, 9, 40, 41, 63 }, null));
     try std.testing.expect(!pf.broken);
     try std.testing.expectEqual(@as(u64, 0), pf.stats.errors.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 6), pf.stats.table_reads.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 0), pf.pages(f.handle, &.{}));
+    try std.testing.expectEqual(@as(u64, 0), pf.pages(f.handle, &.{}, null));
+    // A stop set before the call: nothing is handed to the ring.
+    var stopped: Atomic(bool) = .init(true);
+    try std.testing.expectEqual(@as(u64, 0), pf.pages(f.handle, &.{ 1, 7, 20 }, &stopped));
+    try std.testing.expect(!pf.broken);
 }
 
 fn monoNs() u64 {

@@ -147,6 +147,40 @@ test "ExecuteTransaction validation replies" {
     }
 }
 
+test "ExecuteTransaction on a node that cannot execute: validated first, then no transaction executor" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixed: handler.FixedExecutor = .{ .outcome = .{ .err = .TimeoutBeforeFinality } };
+    const ex = fixed.executor();
+    const data = try txData(arena, 1000);
+    // every request that fails validation answers exactly as with an executor (sui-node's full
+    // node validates before it executes)
+    const bad = [_][]const u8{
+        "", // empty request: transaction missing
+        try requestBody(arena, data[0 .. data.len - 1], &.{}, null), // malformed, unsigned
+        try requestBody(arena, data, &.{ &ed25519_sig, &ed25519_sig, &ed25519_sig }, null),
+        try requestBody(arena, data, &.{&[_]u8{ 0x09, 0, 0 }}, null),
+        try requestBody(arena, data, &.{&ed25519_sig}, &.{"effects.nope"}),
+        &.{ 0x0a, 0x05, 0x01 }, // not protobuf
+    };
+    for (bad) |body| {
+        const want = (try handler.executeTransaction(arena, ex, body)).err;
+        const got = (try handler.noExecutor(arena, body)).err;
+        try testing.expectEqual(want.code, got.code);
+        try testing.expectEqualStrings(want.message, got.message);
+        try testing.expectEqualSlices(u8, want.details, got.details);
+        try testing.expect(want.code == 3 or want.code == 13);
+    }
+    // a well-formed request (signed or not): tonic's Status::unimplemented("no transaction executor")
+    for ([_][]const []const u8{ &.{}, &.{&ed25519_sig} }) |sigs| {
+        const got = (try handler.noExecutor(arena, try requestBody(arena, data, sigs, null))).err;
+        try testing.expectEqual(@as(u8, 12), got.code);
+        try testing.expectEqualStrings("no transaction executor", got.message);
+        try testing.expectEqual(@as(usize, 0), got.details.len);
+    }
+}
+
 test "ExecuteTransaction never sets checkpoint or timestamp, whatever the read mask asks" {
     // sui-rpc-api `execute_transaction` fills digest, transaction, signatures, effects, events,
     // balance_changes and objects only: the transaction is quorum-executed, not yet in a

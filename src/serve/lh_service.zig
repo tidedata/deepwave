@@ -2258,6 +2258,70 @@ test "List*: no index read section while frames are written; a floor raised mid-
     }
 }
 
+test "List* over an index that begins above the node's lowest checkpoint (a backfill under way or given up): a start in the unindexed range is below the earliest available, with the index's low end; no start lists from that low end with no row missing after it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const blobs = (try testCorpus(a, io)) orelse return error.SkipZigTest;
+    var seqs: [6]u64 = undefined;
+    var ntx: [6]u64 = undefined;
+    for (blobs, 0..) |b, i| {
+        const cp = try bcs.decode(types.CheckpointData, a, b[1..]);
+        seqs[i] = cp.checkpoint_summary.data.sequence_number;
+        ntx[i] = cp.transactions.len;
+    }
+    const cfg: Config = .{};
+    const Run = struct {
+        fn go(ix: *history.Index, aa: Allocator, conf: *const Config, sink: *TestSink, body: []const u8, top: u64) Err!void {
+            var mem = Mem.init();
+            defer mem.deinit();
+            const p = try parse(aa, conf, .transactions, body);
+            var c = Ctx{ .arena = aa, .mem = &mem, .svc = null, .ix = ix, .snap = null, .cfg = conf, .rs = null, .sink = .{ .ctx = sink, .send = TestSink.send, .cancelled = TestSink.cancelled }, .deadline_ns = std.math.maxInt(i64) };
+            defer c.unlock();
+            try serve(&c, .transactions, &p, top);
+        }
+    };
+    // the store serves all six checkpoints; the index holds the last three
+    const ix = try history.Index.init(gpa, io, null);
+    defer ix.deinit();
+    for (blobs[3..], seqs[3..]) |b, s| try ix.addCheckpoint(s, b);
+    ix.publish(seqs[5]);
+    // a start inside the unindexed range: OUT_OF_RANGE BELOW_EARLIEST_AVAILABLE naming the
+    // index's low end as the lowest available checkpoint (sui-node's answer below its floor),
+    // not a list that silently begins later
+    for ([_]u64{ seqs[0], seqs[1], seqs[2] }) |start| {
+        var sink: TestSink = .{ .ix = ix, .io = io };
+        try std.testing.expectError(error.Rpc, Run.go(ix, a, &cfg, &sink, try testRequest(a, start, 500, null), seqs[5]));
+        try std.testing.expectEqual(seqs[3], core.takeFailure().below_floor);
+        try std.testing.expectEqual(@as(usize, 0), sink.frames);
+    }
+    // a start at the index's low end: every transaction of the indexed checkpoints, then the terminal
+    {
+        var sink: TestSink = .{ .ix = ix, .io = io };
+        try Run.go(ix, a, &cfg, &sink, try testRequest(a, seqs[3], 500, null), seqs[5]);
+        try std.testing.expectEqual(ntx[3] + ntx[4] + ntx[5] + 1, sink.frames);
+    }
+    // no start at all: the list begins at the index's low end, as on a sui-node whose index
+    // begins there, and is whole from there on (no row of an indexed checkpoint is missing)
+    {
+        const buf = try a.alloc(u8, 64);
+        var w = proto.Writer.init(buf);
+        const m = try w.begin(1, 8);
+        try w.string(1, "digest");
+        try w.end(m);
+        const o = try w.begin(5, 4);
+        try w.uint(1, 500);
+        try w.end(o);
+        var sink: TestSink = .{ .ix = ix, .io = io };
+        try Run.go(ix, a, &cfg, &sink, w.bytesWritten(), seqs[5]);
+        try std.testing.expectEqual(ntx[3] + ntx[4] + ntx[5] + 1, sink.frames);
+    }
+}
+
 test "ListCheckpoints filtered: one item per checkpoint holding a match, in scan order, then the terminal; a sparse filter under a small budget ends SCAN_LIMIT" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

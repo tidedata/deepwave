@@ -36,6 +36,7 @@ const stream_mod = @import("stream.zig");
 const sigorder = @import("sigorder.zig");
 const p2p_mod = @import("p2p.zig");
 const reconcile_mod = @import("reconcile.zig");
+const reask_mod = @import("reask.zig");
 const p2p_serve = @import("p2p_serve.zig");
 const p2p_config = @import("p2p_config.zig");
 pub const ops = @import("ops.zig");
@@ -48,6 +49,7 @@ const exec = @import("exec");
 const rpc = @import("rpc.zig");
 const native_hooks = @import("native_hooks.zig");
 const native_pass = @import("native_pass.zig");
+const gate_mod = @import("gate.zig");
 const simulate = @import("simulate");
 const history = @import("history.zig");
 const snapshot = @import("snapshot.zig");
@@ -264,6 +266,10 @@ pub const Config = struct {
     /// `POST /zui1/rpc` on the native listen address over TCP (`--native-http-rpc`, certhttp.zig):
     /// zui/1 requests over plain HTTP for Workers and fetch callers, behind a TLS terminator.
     native_http_rpc: bool = false,
+    /// `--gate` and its flags (docs/GATE.md): API keys, rate limits and usage metering for a
+    /// node that serves the public, against an external gate service. Null: no gate, and
+    /// serving is byte for byte what it is without this field.
+    gate: ?gate_mod.Settings = null,
     metrics_addr: ?[]const u8 = null,
     /// sui-node `metrics.push-url`: POST the registry there (protobuf, snappy) every interval.
     metrics_push_url: ?[]const u8 = null,
@@ -370,6 +376,13 @@ pub const Config = struct {
     /// Store each checkpoint's read set (input object versions and loaded runtime object lists) for
     /// serve's effects/objects masks (history.zig).
     read_sets: bool = true,
+    /// Read sets through the edge feed (`--edge-read-sets on`, docs/EDGE.md section 12). On a
+    /// node with read sets that serves the feed: checkpoints are marked as they are stored and
+    /// their loaded runtime object lists go out with the feed to clients that ask. On a node
+    /// with a zui1 source: it asks its cores for them, keeps read sets built from them and its
+    /// own store, and answers effects, balance_changes and objects itself where it holds them.
+    /// Off (the default): neither, and every byte stored and sent is as before.
+    edge_read_sets: bool = false,
     /// Execute mode: a directory of `<id hex>.obj` package objects, tried before the store for
     /// packages the node has not seen in a followed checkpoint (`--packages`).
     packages_dir: ?[]const u8 = null,
@@ -423,6 +436,9 @@ pub const Config = struct {
     /// snapshot marker, spend.jsonl), these two, and --snapshot-write.
     rpc_dir: ?[]const u8 = null,
     history_dir: ?[]const u8 = null,
+    /// `--no-history-backfill` (also ZUI_LH_BACKFILL=0): never start the ledger-history backfill.
+    /// The index serves what it holds; the node says which checkpoints are not indexed.
+    lh_backfill: bool = true,
     /// 0: snapwrite.defaultThreads (half the cores, 4 to 16).
     snapshot_write_threads: u32 = 0,
 };
@@ -742,6 +758,9 @@ pub const Node = struct {
     sig_sweep: ?*sigorder.Sweep = null,
     /// Compares the read sets of p2p-built checkpoints with sui-node's and repairs them.
     reconcile: ?*reconcile_mod.Reconciler = null,
+    /// An edge that keeps read sets: asks its core again for the lists of a checkpoint that
+    /// came without them (reask.zig, docs/EDGE.md 12.7).
+    reask: ?*reask_mod.ReAsk = null,
     /// p2p state-sync follower (`--p2p`).
     p2p: ?*p2p_mod.P2p = null,
     /// State-sync/discovery server (p2p_serve.zig): inbound listener and outbound connections.
@@ -769,13 +788,37 @@ pub const Node = struct {
     /// commit path once ready (`adoptBackfill`).
     lh_fill: ?*lhfill.Backfill = null,
     lh_fill_tries: u8 = 0,
+    /// The last failure of a backfill try, for the line that says the backfill gave up.
+    lh_fill_err: ?anyerror = null,
+    /// `zui_history_backfill_state`: 0 nothing to do, 1 building, 2 gave up, 3 switched off
+    /// (`LhState`).
+    lh_state: Atomic(u8) = .init(0),
+    /// Unix ms of the newest committed checkpoint's timestamp (0: none yet in this run): the
+    /// backfill waits while the node is behind the tip by it (lhfill.zig `behindTip`).
+    lh_tip_ms: Atomic(u64) = .init(0),
+    /// The backfill's heap and whether it is waiting for the node, copied here by the commit
+    /// path for the metrics thread (`zui_history_backfill_bytes`, `_paused`).
+    lh_mem: Atomic(u64) = .init(0),
+    lh_paused: Atomic(bool) = .init(false),
+    /// Bytes the backfill's staging directory holds on disk
+    /// (`zui_history_backfill_staging_bytes`), read again by the metrics thread at most every
+    /// 30 s (`lh_staging_read_ns`, under `render_lock`) and set to 0 when it is removed.
+    lh_staging_bytes: Atomic(u64) = .init(0),
+    lh_staging_read_ns: u64 = 0,
     /// The backfill's staging directory (`<ledger-history>/backfill`, lhfill.zig "Durability"),
     /// and the live index generation that must be on disk before it may go.
     lh_staging: ?[]const u8 = null,
     lh_staging_gen: ?u64 = null,
-    /// Lowest checkpoint the store holds (GetServiceInfo `lowest_available_checkpoint`, and the
-    /// floor of GetCheckpoint/GetTransaction); refreshed after each prune (CONTRACTS 6.8).
+    /// Lowest checkpoint the store holds (sui-node's checkpoint store: state sync's
+    /// GetCheckpointAvailability, and the low end of the ledger-history index); refreshed after
+    /// each prune (CONTRACTS 6.8).
     lowest: Atomic(u64) = .init(0),
+    /// Lowest checkpoint the RPC surface reports and serves from (GetServiceInfo
+    /// `lowest_available_checkpoint`, the floor of GetCheckpoint, GetTransaction and List*):
+    /// `lowest` and the object floor, whichever is higher, as sui-node's RPC reader takes them
+    /// (`snapshot.lowestServed`). A node that writes no read sets promises no object sets at any
+    /// height (an edge: those masks go to its core), so its own floor stays `lowest`.
+    served_lowest: Atomic(u64) = .init(0),
     lowest_known: bool = false,
     /// The store's recorded highest pruned checkpoint (a snapshot restore's S), 0 when none:
     /// `last_pruned_checkpoint` until retention moves the checkpoint floor.
@@ -814,6 +857,9 @@ pub const Node = struct {
     /// or when the files change. Lives until exit (connection threads may be in a handshake).
     serve_tls_certs: ?*native.certs.Certs = null,
     native_listener: ?*native.listener.Listener = null,
+    /// `--gate`: lives until exit (like the hub: detached connection threads may still call it).
+    gate: ?*gate_mod.NodeGate = null,
+    gate_handler: serve.h2.Handler = undefined,
     native_disp: native.dispatch.Dispatcher = undefined,
     /// The WebTransport certificate and its rotation (native/certs.zig).
     native_certs: ?*native.certs.Certs = null,
@@ -967,6 +1013,8 @@ pub const Node = struct {
         // percent of the ager's time those reads may take. ZUI_AGE_DEFER_MB: what deferred
         // age-out lets the store append in catch-up before it catches up in one run.
         if (envU32("ZUI_AGE_SERIAL", 0) != 0) scfg.age_serial = true;
+        // The ager's memory (`--age-mem-mb`, ZUI_AGE_MEM_MB): pending set, live set, buffers.
+        scfg.age_mem_bytes = @as(u64, envU32("ZUI_AGE_MEM_MB", @intCast(scfg.age_mem_bytes >> 20))) << 20;
         // Segment pass with a live set (lane ager-segment-pass), off by default: one sequential
         // pass over the live table instead of a lookup per record of every aged segment.
         // ZUI_AGE_SET_MB: memory for its bits.
@@ -1004,8 +1052,9 @@ pub const Node = struct {
                 const pool = try edge.client.Pool.init(gpa, io, specs, spec.max_conns);
                 pool.chain_id = cfg.chain_id orelse cfg.network.params().chain_id;
                 pool.use_zstd = spec.zstd;
+                pool.read_sets = cfg.edge_read_sets;
                 n.edge_pool = pool;
-                n.source = .{ .gpa = gpa, .io = io, .kind = .{ .zui1 = pool } };
+                n.source = .{ .gpa = gpa, .io = io, .kind = .{ .zui1 = pool }, .edge_read_sets = cfg.edge_read_sets };
                 std.log.info("source: zui/1 from {d} core(s), {d} connection(s), zstd {s}", .{ specs.len, spec.max_conns, if (spec.zstd) "on" else "off" });
                 try n.initEdgeFallback(spec, specs, pool);
             },
@@ -1101,6 +1150,19 @@ pub const Node = struct {
             h.* = try history.History.init(gpa, io, if (direct) try cwd.openDir(io, cfg.source.dir, .{}) else n.spool_dir.?);
             n.history = h;
             n.follower.prefetch_more = .{ .ctx = n, .add = prefetchAux };
+            if (cfg.edge_read_sets) {
+                // An edge: lists from its sources, every object from its own store. Any node:
+                // the per-checkpoint mark, which is what an edge answers by and a feed sends by.
+                h.edge = cfg.source == .zui1;
+                h.mark_read_sets = true;
+                std.log.info("read sets: {s}", .{if (h.edge) "kept by this edge (--edge-read-sets): loaded lists as its sources give them, every object from its own store; a checkpoint without its whole read set is answered by the core" else "marked per checkpoint (--edge-read-sets): sent with the edge feed to clients that ask"});
+                if (h.edge) if (n.edge_pool) |pool| {
+                    const r = try gpa.create(reask_mod.ReAsk);
+                    r.* = .{ .gpa = gpa, .io = io, .pool = pool, .hist = h, .st = n.st };
+                    n.reask = r;
+                    n.source.reask = r;
+                };
+            }
         }
         if (cfg.mode == .execute) {
             const x = try gpa.create(execute.Executor);
@@ -1281,7 +1343,8 @@ pub const Node = struct {
         };
         const np = cfg.network.params();
         n.service = .{ .gpa = gpa, .store = n.st, .chain_id = cfg.chain_id orelse np.chain_id, .chain = np.chain, .chain_name = np.name, .protocol_release_max = cfg.rpc_release_max, .loaded = .{ .ctx = n, .get = loadedOf }, .cp_cache = .{ .budget = cfg.cp_cache_bytes } };
-        n.service.lowest = &n.lowest;
+        n.service.lowest = &n.served_lowest;
+        if (cfg.edge_read_sets and n.history != null) n.service.read_sets = .{ .ctx = n, .has = readSetHeld };
         if (cfg.lh_cfg) |c| n.service.lh_cfg = c;
         n.refreshLowest();
         if (tun.excessive_message_size) |m| core.p2p_metrics.excessive_message_size = m;
@@ -1365,11 +1428,15 @@ pub const Node = struct {
             if (hsnap.highestCommitted()) |tip| if (h.indexedHi()) |hi| h.publish(@min(hi, tip));
             n.ledger_history = h;
             n.service.history = h;
-            n.pruneHistory();
             n.lh_staging = try std.fs.path.join(n.anchor_arena.allocator(), &.{ hdir, "backfill" });
+            if (hsnap.highestCommitted()) |tip| n.restoreFloor(h, tip);
+            n.pruneHistory();
             if (hsnap.highestCommitted()) |tip| n.maybeBackfill(tip);
-            // The index already covers the store: a staging dir left from an adopted backfill goes.
-            if (n.lh_fill == null and n.lowest_known) n.dropStaging();
+            // No build was started that would resume from it (the index covers the store, the
+            // backfill is switched off, or it could not start): the staging directory of an
+            // earlier build, adopted, killed or abandoned, goes now. Otherwise it stayed for
+            // as long as nothing needed a backfill: up to a whole window of index files.
+            if (n.lh_fill == null) n.dropStaging("no build resumes from it at this start");
         }
         try n.exec_rpc.init(gpa, n.io, n.st, n.service.chain_id);
         if (cfg.dev_inspect_disabled) |off| n.exec_rpc.svc.engine.dev_inspect = if (off) .refused else .enabled;
@@ -1412,10 +1479,16 @@ pub const Node = struct {
             const workers: u32 = if (n.cfg.serve_opts.workers != 0) n.cfg.serve_opts.workers else serve.h2.pool.workersFor(serve.h2.pool.usableCpus());
             fcfg.raw_max_waiters = @max(1, workers / 4);
         }
+        // The policy settings (docs/EDGE.md 11.8). `--edge-simulate local` asks for more than
+        // the flag: the whole live set, else it stays on forward.
+        var policy_line: [640]u8 = undefined;
+        const policy_text = edge.forward.settlePolicies(&fcfg, .{ .indexes = n.cfg.indexes, .live_set = (n.completeFrom() catch null) != null }, &policy_line);
         const f = try edge.forward.Forwarder.create(a, n.io, &n.service, n.edge_fwd_transport.transport(), fcfg);
         f.source = .{ .ctx = n, .known_tip = fwdKnownTip, .silent_ns = fwdSilentNs, .on_fallback = fwdOnFallback };
         // reads of a certificate that is not the core's yet go to the core (route `foreign_cert`)
         if (n.edge_certs) |cv| f.setCerts(cv.certs);
+        // an effects read of a tip checkpoint a re-ask is about to settle waits for its mark
+        if (n.reask) |r| f.read_set_hold = r.holdHook();
         n.edge_fwd = f;
         const how: []const u8 = switch (ep.security) {
             .plain => "cleartext h2c",
@@ -1424,6 +1497,7 @@ pub const Node = struct {
             .pinned => "TLS, pinned key",
         };
         std.log.info("edge forwarding: on; core upstream {s}:{d} ({s}); read-after-write {s} {d} ms ({d} reads may wait at once), max lag {d} checkpoints, ahead wait {d} ms", .{ ep.host, ep.port, how, @tagName(f.cfg.execMode()), f.cfg.execute_wait_ms, f.cfg.raw_max_waiters, f.cfg.max_lag, f.cfg.ahead_wait_ms });
+        std.log.info("{s}", .{policy_text});
         if (ep.security == .plain and !(std.mem.eql(u8, ep.host, "localhost") or std.mem.startsWith(u8, ep.host, "127.") or std.mem.eql(u8, ep.host, "::1")))
             std.log.warn("edge forwarding: the upstream {s}:{d} is cleartext and not loopback: its answers are relayed unauthenticated (use TLS with a name or /pin=)", .{ ep.host, ep.port });
     }
@@ -1454,7 +1528,10 @@ pub const Node = struct {
     /// What the serve ports answer with: the forwarding handler of an edge with a core upstream,
     /// else the service's own.
     pub fn serveHandler(n: *Node) serve.h2.Handler {
-        return if (n.edge_fwd) |f| f.handler() else n.service.handler();
+        // With `--gate`, a forwarder asks the gate itself, before it routes (`gate_hook`); a
+        // node without one has the gate as a wrapper around the service.
+        if (n.edge_fwd) |f| return f.handler();
+        return if (n.gate != null) n.gate_handler else n.service.handler();
     }
 
     /// The first epoch whose start the store's live set covers in full: the epoch after a
@@ -1891,37 +1968,113 @@ pub const Node = struct {
         h.pruneBelow(n.lowest.load(.acquire)); // a no-op when nothing lies below
     }
 
+    /// After an unclean stop the store's checkpoint floor comes back as of its last meta write
+    /// (store.zig `setFloors`: floors are durable with the next live-table flush or age-out),
+    /// below the floor retention had reached; the ledger-history index was pruned to that floor
+    /// durably (lhfill.zig `floorWitness`). The node gives the store its floor back before
+    /// anything looks at the window. Until this existed every unclean stop left the index's low
+    /// end above the store's lowest checkpoint by what retention had pruned since the last
+    /// flush (a few hundred checkpoints at the tip), and the backfill then rebuilt the whole
+    /// retained window from the store to add them, while retention pruned them again.
+    fn restoreFloor(n: *Node, h: *lhist.Index, tip: u64) void {
+        if (!n.lowest_known) return;
+        const low = n.lowest.load(.acquire);
+        const w = (lhfill.restoreFloor(n.st, n.io, h, n.lh_staging, low, tip) catch |e| {
+            std.log.err("history: giving the store its checkpoint floor back: {s}", .{@errorName(e)});
+            return;
+        }) orelse return;
+        n.refreshLowest();
+        std.log.info("history: the store came back with its lowest checkpoint at {d}, below the floor {d} it had before it stopped (an unclean stop; floors are durable with a live-table flush): floor restored, {d} checkpoints that retention had already passed are not served again; lowest available is {d}", .{ low, w, w - low, n.lowest.load(.acquire) });
+    }
+
+    const LhState = enum(u8) { covered = 0, building = 1, gave_up = 2, off = 3 };
+
     /// Starts the ledger-history backfill (lhfill.zig) when the store holds retained checkpoints
-    /// below the index's low end (or the index is empty): rows for `lowest..=tip`, built on a
-    /// thread while the current index keeps serving.
+    /// below the index's low end (or the index is empty), built on a thread while the current
+    /// index keeps serving. The build reads the store only for the checkpoints no index holds
+    /// (those below the current index's low end) and takes the rest from the current index.
+    /// What triggers it: an index that is empty or begins above the store's lowest checkpoint
+    /// (a store that was followed or restored before the index existed, an index that
+    /// restarted at a hole). Not an unclean stop: `restoreFloor` takes that case away.
     fn maybeBackfill(n: *Node, tip: u64) void {
         const h = n.ledger_history orelse return;
-        if (n.lh_fill != null or !n.lowest_known or n.lh_fill_tries >= 3) return;
+        if (n.lh_fill != null or !n.lowest_known) return;
         const lowest = n.lowest.load(.acquire);
         if (tip < lowest) return;
-        if (h.indexedLo()) |lo| if (lo <= lowest) return;
+        const gap = lhfill.gapOf(h, lowest, tip);
+        if (gap.count() == 0) {
+            n.lh_state.store(@intFromEnum(LhState.covered), .release);
+            return;
+        }
+        if (!lhfill.enabled(n.cfg.lh_backfill, if (std.c.getenv("ZUI_LH_BACKFILL")) |v| std.mem.span(v) else null)) {
+            if (n.lh_state.swap(@intFromEnum(LhState.off), .acq_rel) != @intFromEnum(LhState.off))
+                std.log.warn("history: the backfill is switched off (--no-history-backfill or ZUI_LH_BACKFILL=0). The index holds {?d}..{?d}; checkpoints {d}..{d} ({d}) are in the store and not indexed: ListCheckpoints, ListTransactions and ListEvents answer from {?d}. Retention prunes the gap from below (zui_history_unindexed_checkpoints)", .{ h.indexedLo(), h.indexedHi(), gap.from, gap.to, gap.count(), h.indexedLo() });
+            return;
+        }
+        if (n.lh_fill_tries >= 3) return n.backfillGaveUp(h, gap);
         // Usable CPUs (the cgroup quota included), not the host's.
         const workers = std.math.clamp(usableCpus() / 2, 1, 12);
         n.lh_fill_tries += 1;
-        const b = lhfill.Backfill.startOpts(n.gpa, n.io, n.st, lowest, tip, .{ .workers = workers, .staging = n.lh_staging, .save_every_ns = @as(u64, envU32("ZUI_LH_SAVE_S", 300)) * std.time.ns_per_s }) catch |e| {
-            std.log.err("history: backfill: {s}", .{@errorName(e)});
-            return;
+        const b = lhfill.Backfill.startOpts(n.gpa, n.io, n.st, lowest, tip, .{ .workers = workers, .staging = n.lh_staging, .live = h, .tip_ms = &n.lh_tip_ms, .mem_bytes = @as(u64, envU32("ZUI_LH_MEM_MB", 256)) << 20, .save_every_ns = @as(u64, envU32("ZUI_LH_SAVE_S", 300)) * std.time.ns_per_s }) catch |e| {
+            // Nothing retries a build that could not start: say what stays unindexed.
+            std.log.err("history: backfill could not start: {s}", .{@errorName(e)});
+            n.lh_fill_err = e;
+            return n.backfillGaveUp(h, gap);
         };
         n.lh_fill = b;
-        if (b.resumed_at) |r| {
-            std.log.info("history: backfill resumes from its staging watermark: checkpoints {d}..{d} already indexed, loading {d}..{d} ({d} loaders); the current index (from {?d}) serves meanwhile", .{ lowest, r -| 1, r, tip, workers, h.indexedLo() });
-        } else std.log.info("history: backfilling the ledger-history index for checkpoints {d}..{d} ({d} loaders); the current index (from {?d}) serves meanwhile", .{ lowest, tip, workers, h.indexedLo() });
+        n.lh_state.store(@intFromEnum(LhState.building), .release);
+        const begin = b.resumed_at orelse lowest;
+        const store_to = b.store_to.load(.monotonic);
+        const from_store: u64 = if (store_to < begin) 0 else store_to - begin + 1;
+        std.log.info("history: backfill (try {d} of 3): the index holds {?d}..{?d}, the store serves {d}..{d}: {d} checkpoints ({d}..{d}) are not indexed. Reading {d} checkpoints from the store ({d}..{d}, {d} loaders){s}; the rest is copied from the current index, which serves meanwhile. Background work: lowest priority, at most {d} MiB of loaded checkpoints, and it waits whenever the node is more than {d} s behind the tip (ZUI_LH_BACKFILL=0 turns it off)", .{
+            n.lh_fill_tries, h.indexedLo(), h.indexedHi(), lowest, tip, gap.count(), gap.from, gap.to, from_store, begin, store_to, workers,
+            if (b.resumed_at != null) ", resuming from the staging watermark" else "",
+            b.budget >> 20, fast_start.catchup_lag_ms / 1000,
+        });
+    }
+
+    /// The backfill is not tried again in this run: says so once, with what stays unindexed.
+    /// Reads below the index's low end are answered as below the earliest available checkpoint
+    /// (lh_service.zig `below_floor`, with the index's low end), never from the gap; on an
+    /// edge with a core upstream the lists are passed to the core (edge/route.zig).
+    fn backfillGaveUp(n: *Node, h: *lhist.Index, gap: lhfill.Gap) void {
+        if (n.lh_state.swap(@intFromEnum(LhState.gave_up), .acq_rel) == @intFromEnum(LhState.gave_up)) return;
+        // (gone already after two failed tries; this is for a build that could not start)
+        n.dropStaging("the backfill gave up");
+        std.log.err("history: backfill gave up after {d} failed tries (last: {s}). The index holds {?d}..{?d}; checkpoints {d}..{d} ({d}) are in the store and NOT indexed: ListCheckpoints, ListTransactions and ListEvents answer from {?d} and report that as their lowest available checkpoint. Not tried again until the next start; retention prunes the gap from below meanwhile (zui_history_unindexed_checkpoints)", .{
+            n.lh_fill_tries, @errorName(n.lh_fill_err orelse error.Unknown), h.indexedLo(), h.indexedHi(), gap.from, gap.to, gap.count(), h.indexedLo(),
+        });
     }
 
     /// Commit path, before checkpoint `seq` is indexed: swaps a finished backfill in, caught up
-    /// to `seq - 1` (committed). A failed one is dropped and retried (at most 3 times).
+    /// to `seq - 1` (committed). A failed one is dropped and retried (at most 3 tries); one the
+    /// index no longer needs (retention passed the gap) is dropped.
     fn adoptBackfill(n: *Node, seq: u64) void {
-        const b = n.lh_fill orelse return;
+        const b = n.lh_fill orelse {
+            n.lh_mem.store(0, .monotonic);
+            n.lh_paused.store(false, .monotonic);
+            return;
+        };
         const h = n.ledger_history orelse return;
+        n.lh_mem.store(b.memoryBytes(), .monotonic);
+        n.lh_paused.store(b.paused.load(.monotonic), .monotonic);
+        if (n.lowest_known and seq > 0 and b.status() != .ready) {
+            const lowest = n.lowest.load(.acquire);
+            if (lhfill.gapOf(h, lowest, seq - 1).count() == 0) {
+                std.log.info("history: backfill no longer needed: retention moved the store's lowest checkpoint to {d}, and the index holds {?d}..{?d} (nothing unindexed); the build is dropped", .{ lowest, h.indexedLo(), h.indexedHi() });
+                b.discard();
+                n.lh_fill = null;
+                n.lh_fill_tries = 0;
+                n.lh_state.store(@intFromEnum(LhState.covered), .release);
+                n.dropStaging("its build is no longer needed");
+                return;
+            }
+        }
         switch (b.status()) {
             .running => return,
             .failed => {
-                std.log.err("history: backfill failed: {s}; retrying", .{@errorName(b.failure orelse error.Unknown)});
+                n.lh_fill_err = b.failure orelse error.Unknown;
+                std.log.err("history: backfill try {d} of 3 failed: {s} ({d} checkpoints built)", .{ n.lh_fill_tries, @errorName(n.lh_fill_err.?), b.counters.checkpoints.load(.monotonic) + b.copied.load(.monotonic) });
                 n.retryBackfill(seq);
                 return;
             },
@@ -1929,7 +2082,8 @@ pub const Node = struct {
         }
         const t0 = source_mod.nowNs();
         const out = b.finish(seq -| 1) catch |e| {
-            std.log.err("history: backfill catch-up to {d}: {s}; retrying", .{ seq -| 1, @errorName(e) });
+            n.lh_fill_err = e;
+            std.log.err("history: backfill try {d} of 3: catch-up to {d}: {s}", .{ n.lh_fill_tries, seq -| 1, @errorName(e) });
             n.retryBackfill(seq);
             return;
         };
@@ -1937,37 +2091,55 @@ pub const Node = struct {
         h.adopt(out) catch |e| {
             // The live index is unchanged (CURRENT still names its generation); build again
             // (at most 3 tries; a restart resumes from whatever staging state is left).
-            std.log.err("history: backfill adopt: {s}; building again", .{@errorName(e)});
+            n.lh_fill_err = e;
+            std.log.err("history: backfill try {d} of 3: adopt: {s}", .{ n.lh_fill_tries, @errorName(e) });
             n.retryBackfill(seq);
             return;
         };
         n.lh_staging_gen = h.generation();
         const c = &b.counters;
-        std.log.info("history: backfill done: checkpoints {?d}..{d}, {d} checkpoints and {d} transactions indexed in {d} s ({d} rounds, resumed at {?d}, {d} staging saves; {d} object versions read, {d} missing); swap {d} ms", .{
-            lo, seq -| 1, c.checkpoints.load(.monotonic), c.txs.load(.monotonic), b.build_ns / std.time.ns_per_s, b.rounds, b.resumed_at, b.saves, c.objects.load(.monotonic), c.missing_objects.load(.monotonic), (source_mod.nowNs() - t0) / std.time.ns_per_ms,
+        const lowest = n.lowest.load(.acquire);
+        const left = lhfill.gapOf(h, lowest, seq -| 1);
+        std.log.info("history: backfill done: the index holds {?d}..{d} and the store serves from {d}: {d} checkpoints unindexed. {d} checkpoints and {d} transactions read from the store, {d} checkpoints copied from the previous index, in {d} s ({d} rounds, resumed at {?d}, {d} staging saves, the floor moved {d} times; {d} object versions read, {d} missing; loaded checkpoints held at most {d} MiB, the largest one {d} MiB; waited {d} times, {d} s, for the node to be at the tip); swap {d} ms", .{
+            lo, seq -| 1, lowest, left.count(), c.checkpoints.load(.monotonic), c.txs.load(.monotonic), b.copied.load(.monotonic), b.build_ns / std.time.ns_per_s, b.rounds, b.resumed_at, b.saves, b.floor_moves, c.objects.load(.monotonic), c.missing_objects.load(.monotonic), b.peak_bytes.load(.monotonic) >> 20, b.largest.load(.monotonic) >> 20, b.pauses.load(.monotonic), b.paused_ms.load(.monotonic) / 1000, (source_mod.nowNs() - t0) / std.time.ns_per_ms,
         });
         b.destroy();
         n.lh_fill = null;
         n.lh_fill_tries = 0;
+        n.lh_fill_err = null;
+        n.lh_state.store(@intFromEnum(LhState.covered), .release);
         n.pruneHistory();
     }
 
-    /// Drops a failed backfill and starts it again (at most 3 tries, `maybeBackfill`). The first
-    /// retry resumes from the staging watermark; once that has failed too, the staging state is
-    /// deleted so the last try builds from the store's lowest (a staging state that fails the
-    /// same way on every resume would otherwise block the backfill on every start).
+    /// Drops a failed backfill and starts it again (at most 3 tries, `maybeBackfill`, which
+    /// says so when it gives up). The first retry resumes from the staging watermark; once
+    /// that has failed too, the staging state is deleted so the last try builds from the
+    /// store's lowest (a staging state that fails the same way on every resume would
+    /// otherwise block the backfill on every start).
     fn retryBackfill(n: *Node, seq: u64) void {
         if (n.lh_fill) |b| b.destroy();
         n.lh_fill = null;
-        if (n.lh_fill_tries >= 2) n.dropStaging();
+        n.lh_state.store(@intFromEnum(LhState.covered), .release);
+        if (n.lh_fill_tries >= 2) n.dropStaging("two tries failed from it");
         if (seq > 0) n.maybeBackfill(seq - 1);
     }
 
-    /// Deletes the backfill staging directory (its state now lives in the persisted index).
-    fn dropStaging(n: *Node) void {
+    /// Removes the backfill's staging directory (lhfill.zig `removeStaging`) and says what that
+    /// freed. A stop ends it between two files; the next start removes the rest.
+    fn dropStaging(n: *Node, why: []const u8) void {
         const d = n.lh_staging orelse return;
-        std.Io.Dir.cwd().deleteTree(n.io, d) catch |e| std.log.warn("history: delete {s}: {s}", .{ d, @errorName(e) });
         n.lh_staging_gen = null;
+        const t0 = source_mod.nowNs();
+        const r = lhfill.removeStaging(n.io, d, &stop_signal);
+        const took = (source_mod.nowNs() - t0) / std.time.ns_per_ms;
+        if (r.done) n.lh_staging_bytes.store(0, .monotonic);
+        if (r.err) |e| {
+            std.log.warn("history: backfill staging {s} could not be removed ({s}): {s}; {d} files, {d} MiB removed", .{ d, why, @errorName(e), r.files, r.bytes >> 20 });
+        } else if (!r.done) {
+            std.log.info("history: backfill staging: removal ended by the stop after {d} files, {d} MiB; the next start removes the rest", .{ r.files, r.bytes >> 20 });
+        } else if (r.files != 0) {
+            std.log.info("history: backfill staging removed ({s}): {d} files, {d} MiB freed in {d} ms", .{ why, r.files, r.bytes >> 20, took });
+        }
     }
 
     fn refreshLowest(n: *Node) void {
@@ -1975,6 +2147,7 @@ pub const Node = struct {
         defer snap.release();
         if (snapshot.lowestAvailable(&snap, n.restored_epoch)) |l| {
             n.lowest.store(l, .release);
+            n.served_lowest.store(if (n.cfg.read_sets) snap.objectsFrom(l) else l, .release);
             n.lowest_known = true;
             n.store_pruned.store(snap.highestPruned() orelse 0, .release);
         }
@@ -2033,6 +2206,10 @@ pub const Node = struct {
             .obj_epoch = if (m.objects > 0) retention.floorEpoch(held, m.objects + 1, low, hi, cur) else 0,
         };
         const before = n.lowest.load(.monotonic);
+        // The served floor moves first: once the store hides the versions below the new object
+        // floor, a request for a checkpoint there must already be answered NOT_FOUND, not fail
+        // on a missing input (`refreshLowest` below then sets the exact value).
+        if (n.cfg.read_sets) if (floors.obj_pruned) |hp| if (hp + 1 > n.served_lowest.load(.monotonic)) n.served_lowest.store(hp + 1, .release);
         const rep = n.st.setFloors(floors) catch |e| {
             std.log.err("retention: moving the floors (checkpoints {d}, objects {d}) failed: {s}", .{ m.checkpoints, m.objects, @errorName(e) });
             return;
@@ -2043,8 +2220,8 @@ pub const Node = struct {
         const after = n.lowest.load(.monotonic);
         if (rep.segments_aged != 0 or n.ret_ticks % 30 < ticks or (before != after and n.ret_ticks <= ticks)) {
             const aged = n.st.agedSegments();
-            std.log.info("retention: tick {d}: objects pruned to {d} (versions from epoch {d}), checkpoints pruned to {d} (epoch {d}); lowest available {d} -> {d}; {d} segments aged out in {d} ms ({d} runs dropped); {d} aged segments ({d} MiB) kept for their live objects", .{
-                n.ret_ticks, m.objects, floors.obj_epoch, m.checkpoints, floors.cp_epoch, before, after, rep.segments_aged, rep.ns / std.time.ns_per_ms, rep.runs_dropped, aged.count, aged.bytes >> 20,
+            std.log.info("retention: tick {d}: objects pruned to {d} (versions from epoch {d}), checkpoints pruned to {d} (epoch {d}); lowest available {d} -> {d}, served from {d}; {d} segments aged out in {d} ms ({d} runs dropped); {d} aged segments ({d} MiB) kept for their live objects", .{
+                n.ret_ticks, m.objects, floors.obj_epoch, m.checkpoints, floors.cp_epoch, before, after, n.served_lowest.load(.monotonic), rep.segments_aged, rep.ns / std.time.ns_per_ms, rep.runs_dropped, aged.count, aged.bytes >> 20,
             });
         }
     }
@@ -2305,6 +2482,7 @@ pub const Node = struct {
             };
         }
         if (n.fast) |j| j.tip_ts_ms.store(c.timestamp_ms, .monotonic);
+        n.lh_tip_ms.store(c.timestamp_ms, .monotonic);
         {
             var arrival: ?u64 = null;
             var archive = false;
@@ -2330,8 +2508,8 @@ pub const Node = struct {
             // Indexed before the store commit; published once committed (seq - 1 here, the tip from statusLoop).
             n.adoptBackfill(seq);
             if (n.lh_staging_gen) |g| if (h.persistedGeneration() >= g) {
-                std.log.info("history: adopted backfill persisted (generation {d}); staging removed", .{g});
-                n.dropStaging();
+                std.log.info("history: adopted backfill persisted (generation {d})", .{g});
+                n.dropStaging("the index adopted from it is durable");
             };
             h.addCheckpoint(seq, blob) catch |e| std.log.err("history: index checkpoint {d}: {s}", .{ seq, @errorName(e) });
             // The index (re)started at this checkpoint while the store holds older ones.
@@ -2515,6 +2693,16 @@ pub const Node = struct {
         }
     }
 
+    /// serve's ReadSetSource: the store holds the whole read set of checkpoint `seq` and it is
+    /// final. A checkpoint built here over p2p whose lists still wait to be compared with
+    /// sui-node's (reconcile.zig) is not: a repair may replace them.
+    fn readSetHeld(ctx: *const anyopaque, snap: *const store.Snapshot, seq: u64) bool {
+        const n: *const Node = @ptrCast(@alignCast(ctx));
+        if (!history.readSetHeld(snap, seq)) return false;
+        if (n.reconcile) |r| if (history.p2pBuilt(snap, seq) and r.isWaiting(seq)) return false;
+        return true;
+    }
+
     /// serve's LoadedSource: the stored loaded runtime object list of a transaction, read through
     /// the request's snapshot. The slice points into the store (a decoded chunk on compressed
     /// segments) and stays valid while that snapshot lives.
@@ -2602,6 +2790,7 @@ pub const Node = struct {
             try st.start();
             std.log.info("live stream from {s} (SubscribeCheckpoints over gRPC-web); the source fills gaps", .{st.base});
         }
+        if (n.reask) |r| try r.start();
         if (n.reconcile) |r| {
             try r.start();
             std.log.info("p2p read-set reconcile: {d} lists reinstalled, {d} checkpoints waiting", .{ r.stats.loaded.load(.monotonic), r.stats.pending.load(.monotonic) });
@@ -2643,6 +2832,7 @@ pub const Node = struct {
         };
         if (n.fast) |j| try j.start();
         n.resumeSnapshotWrite();
+        if (n.cfg.gate) |gs| try n.startGate(gs);
         if (n.cfg.serve_addr) |addr| try n.startServe(addr);
         if (n.cfg.serve_tls_addr) |addr| if (n.cfg.serve_addr != null) try n.startServeTls(addr);
         if (n.cfg.native_listen) |addr| try n.startNative(addr);
@@ -2715,7 +2905,7 @@ pub const Node = struct {
         var from_core = false;
         if (pool.blame(seq)) {
             // Straight from the pool: with a fallback the source might route this elsewhere.
-            const r = pool.fetchBlob(sc.arena.allocator(), seq, &blob) catch return false;
+            const r = n.source.poolFetch(pool, &sc, seq, &blob, edge.client.Pool.no_deadline, null) catch return false;
             if (r != .ok) return false;
             from_core = true;
         } else {
@@ -2723,7 +2913,9 @@ pub const Node = struct {
             const r = fb.fetchFromFallback(&n.source, &sc, seq, &blob) catch return false;
             if (r != .ok) return false;
         }
-        f.writeSpoolFrom(seq, blob.items, sc.aux.items, from_core) catch return false;
+        // (the refused copy's aux record, if it left one, must not go with this blob; the
+        // origin is this copy's)
+        f.writeSpoolAgain(seq, blob.items, sc.aux.items, from_core) catch return false;
         return true;
     }
 
@@ -2786,15 +2978,22 @@ pub const Node = struct {
         // The forwarder's threads too (a read of the core's floor may be in flight).
         if (n.edge_fwd) |f| f.requestStop();
         if (n.edge_certs) |cv| cv.requestStop();
-        stopPhase("background jobs (ledger-history backfill, epoch jobs, fast start)");
+        stopPhase("ledger-history backfill (loaders, staging save)");
         // The ledger-history backfill's loaders read the store and what the follower and
         // indexes own: cancel and join them before anything is torn down (follower.run has
         // returned, so the commit path no longer adopts it). Joined later (deinit) they read
         // freed state: SIGSEGV in lhfill.load on ~8% of SIGTERMs within the backfill.
+        // The loaders see the stop between two transactions; the save that follows makes what
+        // was built durable (one segment rotation), so the next start resumes from here.
         if (n.lh_fill) |b| {
+            const tb = source_mod.nowNs();
+            const built = b.counters.checkpoints.load(.monotonic) + b.copied.load(.monotonic);
+            const through = b.out.indexedHi();
             b.destroy();
             n.lh_fill = null;
+            std.log.info("stop: ledger-history backfill stopped and saved through checkpoint {?d} in {d} ms ({d} checkpoints built this run; the next start resumes after it)", .{ through, (source_mod.nowNs() - tb) / std.time.ns_per_ms, built });
         }
+        stopPhase("background jobs (epoch jobs, fast start)");
         n.snap_cancel.store(true, .release);
         if (n.snap_thread) |t| {
             t.join();
@@ -2818,6 +3017,7 @@ pub const Node = struct {
             n.printP2p();
         };
         if (n.reconcile) |r| r.quit();
+        if (n.reask) |r| r.requestStop();
         std.log.info("stop: p2p listener {d} ms, streams {d} ms, p2p {d} ms", .{ (t1 - t0) / std.time.ns_per_ms, (t2 - t1) / std.time.ns_per_ms, (t3 - t2) / std.time.ns_per_ms });
         // Bucket requests in flight end within ~100 ms (netguard.timed) and zui/1 calls at their
         // next turn (requestFetchStop above), so the joins below never wait on a socket.
@@ -2826,6 +3026,7 @@ pub const Node = struct {
         stopPhase("signature order sweep, read-set reconcile");
         if (n.sig_sweep) |sw| sw.join();
         if (n.reconcile) |r| r.stop();
+        if (n.reask) |r| r.stop();
         stopPhase("fetch threads");
         const tf = source_mod.nowNs();
         if (n.fetcher) |f| f.stop();
@@ -2870,6 +3071,10 @@ pub const Node = struct {
         // Every exit path (signal, --to, a fatal error) lets the calls in flight finish before
         // the store closes under them (a no-op after gracefulStop drained).
         if (n.serve_server != null) n.drainRpc(null);
+        // After the last call: what the gate counted goes to its spool (a clean stop loses
+        // nothing). Its threads end without waiting on the network (requests in flight to the
+        // gate service are canceled).
+        if (n.gate) |ng| ng.stop();
         if (n.serve_server) |*s| s.deinit(n.io);
         n.serve_server = null;
         if (n.serve_tls_server) |*s| s.deinit(n.io);
@@ -3002,6 +3207,18 @@ pub const Node = struct {
             std.log.info("p2p read-set reconcile: {d} checkpoints compared ({d} stream copies, {d} bucket copies), {d} repaired ({d} lists, {d} objects), {d} waiting", .{ x.reconciled.load(.monotonic), x.from_stream.load(.monotonic), x.from_bucket.load(.monotonic), x.repaired_checkpoints.load(.monotonic), x.repairs.load(.monotonic), x.objects_added.load(.monotonic), x.pending.load(.monotonic) });
             r.deinit();
             n.reconcile = null;
+        }
+        if (n.reask) |r| {
+            const st = &r.pool.stats;
+            const sd = &st.read_sets_settled;
+            const gu = &st.read_sets_gave_up;
+            const G = edge.client.ReadSetsGaveUp;
+            std.log.info("edge read sets asked again: {d} requests; settled by attempt {d}/{d}/{d}/{d}/{d}; given up {d} (unsettled {d}, other core {d}, window {d}, no connection {d}, dropped {d}, error {d})", .{ st.read_sets_reasked.load(.monotonic), sd[0].load(.monotonic), sd[1].load(.monotonic), sd[2].load(.monotonic), sd[3].load(.monotonic), sd[4].load(.monotonic), st.gaveUpTotal(), gu[@intFromEnum(G.unsettled)].load(.monotonic), gu[@intFromEnum(G.other_core)].load(.monotonic), gu[@intFromEnum(G.window)].load(.monotonic), gu[@intFromEnum(G.no_conn)].load(.monotonic), gu[@intFromEnum(G.dropped)].load(.monotonic), gu[@intFromEnum(G.@"error")].load(.monotonic) });
+            if (n.edge_fwd) |f| f.read_set_hold = null;
+            n.source.reask = null;
+            r.deinit();
+            n.gpa.destroy(r);
+            n.reask = null;
         }
         if (n.history) |h| {
             h.deinit();
@@ -3537,6 +3754,9 @@ pub const Node = struct {
         if (n.cfg.edge_feed) {
             const fd = try n.gpa.create(native.edgefeed.Feeder);
             fd.* = native.edgefeed.Feeder.init(ds);
+            // Read sets go out with the feed only from a node that marks them (its hello then
+            // has feature bit 33).
+            if (n.service.read_sets != null) fd.read_sets = &n.service;
             n.edge_feeder = fd;
         }
         n.edge_warm = std.Thread.spawn(.{}, edgeWarm, .{n}) catch null;
@@ -3581,11 +3801,14 @@ pub const Node = struct {
         };
         n.native_certs = certs;
         if (files != null) installReloadSignal();
-        n.native_listener = try native.listener.Listener.start(n.gpa, n.io, .{ .listen = addr, .identity_seed = id_seed, .certs = certs, .slow_worker_exit = simulate.api.releaseThreadCaches, .feed_workers = n.cfg.native_feed_workers, .feed_queue = n.cfg.native_feed_queue }, &n.native_disp);
+        n.native_listener = try native.listener.Listener.start(n.gpa, n.io, .{ .listen = addr, .identity_seed = id_seed, .certs = certs, .slow_worker_exit = simulate.api.releaseThreadCaches, .feed_workers = n.cfg.native_feed_workers, .feed_queue = n.cfg.native_feed_queue, .gate = if (n.gate) |ng| ng.nativeHook() else null }, &n.native_disp);
+        // The HTTP form of zui/1 has no gate in front of it yet: with `--gate` it stays off,
+        // so nothing a gated node serves goes around the gate.
+        if (n.gate != null and n.cfg.native_http_rpc) std.log.warn("gate: --native-http-rpc is off while --gate is on (POST /zui1/rpc is not behind the gate)", .{});
         const hash = certs.cur.sha256;
         // GET http://ADDR/native/cert-hash on TCP at the same address (CORS, for dapps in dev)
         switch (addr) {
-            .ip4 => |a4| n.native_certhttp = native.certhttp.Server.startCerts(n.gpa, a4.bytes, a4.port, certs, if (n.cfg.native_http_rpc) &n.native_disp else null) catch |e| blk: {
+            .ip4 => |a4| n.native_certhttp = native.certhttp.Server.startCerts(n.gpa, a4.bytes, a4.port, certs, if (n.cfg.native_http_rpc and n.gate == null) &n.native_disp else null) catch |e| blk: {
                 std.log.warn("zui/1: /native/cert-hash not served on tcp {s}: {s}", .{ text, @errorName(e) });
                 break :blk null;
             },
@@ -3710,6 +3933,26 @@ pub const Node = struct {
         n.serve_tls_server = try n.listenOrInherit("serve_tls", text, addr, .{ .reuse_address = true, .kernel_backlog = listen_backlog });
         try n.threads.append(n.gpa, try std.Thread.spawn(.{}, serveTlsMain, .{n}));
         std.log.info("serving sui.rpc.v2 (h2 over TLS 1.3) on {s}; cert sha256 {x}", .{ text, &n.serve_tls.cert.sha256() });
+    }
+
+    /// `--gate`: reads the credential, opens the gate directory and starts the gate's threads.
+    /// A node asked to run behind a gate does not start without one.
+    fn startGate(n: *Node, gs: gate_mod.Settings) !void {
+        // from the general-purpose allocator: it lives until exit (see the field)
+        const ng = gate_mod.NodeGate.start(std.heap.smp_allocator, n.io, gs, null) catch |e| {
+            std.log.err("gate: cannot start ({s}): --gate-token-file must hold this node's credential (at least 24 characters, one line), --gate-dir must be writable, --gate-ca-file (when given) must be a readable PEM file with a certificate", .{@errorName(e)});
+            return e;
+        };
+        if (gate_mod.loopbackHttp(gs.url)) std.log.warn("gate: the gate URL is plain http on this machine: the credential and the keys travel unencrypted over loopback (meant for a local test gate)", .{});
+        n.gate = ng;
+        n.gate_handler = ng.handler(n.service.handler());
+        // An edge that forwards: denied before routing, and counted local or forwarded at the
+        // forwarder's meter (set before any serve thread starts).
+        if (n.edge_fwd) |f| {
+            f.gate_hook = ng.forwardHook();
+            f.meter_hook = ng.meterHook();
+        }
+        std.log.info("gate: on, edge id {s}, state in {s}, {d} trusted prox{s}; keyless callers get the free tier", .{ gs.edge_id, gs.dir, gs.proxies.len, if (gs.proxies.len == 1) "y" else "ies" });
     }
 
     fn serveTlsMain(n: *Node) void {
@@ -3914,11 +4157,13 @@ pub const Node = struct {
         if (n.cfg.verify_fallback) try n.guard.render(w);
         try n.cons_stats.render(w);
         try n.follower.metrics.render(w);
+        if (n.gate) |ng| try ng.renderMetrics(w);
         try core.cpu.writeMetrics(w);
         try w.print("# TYPE zui_node_uptime_seconds gauge\nzui_node_uptime_seconds {d}\n", .{(source_mod.nowNs() - n.started_ns) / std.time.ns_per_s});
         try w.print("# TYPE zui_store_committed gauge\nzui_store_committed {d}\n", .{n.st.committed() orelse 0});
-        // Retention (CONTRACTS 6.8): sui-node's `lowest_available_checkpoint` and the pruners' marks.
-        try w.print("# TYPE zui_lowest_available_checkpoint gauge\nzui_lowest_available_checkpoint {d}\n", .{n.lowest.load(.monotonic)});
+        // Retention (CONTRACTS 6.8): sui-node's `lowest_available_checkpoint` as GetServiceInfo
+        // reports it (the higher of the two floors below, `served_lowest`) and the pruners' marks.
+        try w.print("# TYPE zui_lowest_available_checkpoint gauge\nzui_lowest_available_checkpoint {d}\n", .{n.served_lowest.load(.monotonic)});
         try w.print("# TYPE zui_store_checkpoint_floor gauge\nzui_store_checkpoint_floor {d}\n", .{n.st.cp_floor.load(.monotonic)});
         try w.print("# TYPE zui_store_object_floor gauge\nzui_store_object_floor {d}\nzui_store_object_floor_epoch {d}\nzui_store_aged_floor_epoch {d}\n", .{ n.st.obj_floor.load(.monotonic), n.st.obj_floor_epoch.load(.monotonic), n.st.oldest_epoch.load(.monotonic) });
         const p = n.latency();
@@ -3957,6 +4202,23 @@ pub const Node = struct {
         // The edge feed queue: what it holds now, and the feed requests refused, by reason (a
         // client over its share of a full queue; a full queue with nobody over a share).
         if (n.native_listener) |nl| try nl.feed_stats.render(w, "zui_native_feed");
+        // The ledger-history index against the store's window: what List* can answer, and the
+        // checkpoints the store serves that the index does not hold (0 on a healthy node).
+        if (n.ledger_history) |h| if (n.st.committed()) |tip| {
+            const gap = lhfill.gapOf(h, n.lowest.load(.acquire), tip);
+            try w.print("# TYPE zui_history_indexed_lowest gauge\nzui_history_indexed_lowest {d}\n# TYPE zui_history_indexed_highest gauge\nzui_history_indexed_highest {d}\n", .{ h.indexedLo() orelse 0, h.indexedHi() orelse 0 });
+            try w.print("# TYPE zui_history_unindexed_checkpoints gauge\nzui_history_unindexed_checkpoints {d}\n", .{if (n.lowest_known) gap.count() else 0});
+            try w.print("# HELP zui_history_backfill_state 0 nothing to do, 1 building, 2 gave up, 3 switched off\n# TYPE zui_history_backfill_state gauge\nzui_history_backfill_state {d}\n", .{n.lh_state.load(.acquire)});
+            if (n.lh_staging) |d| {
+                const now = source_mod.nowNs();
+                if (n.lh_staging_read_ns == 0 or now -| n.lh_staging_read_ns >= 30 * std.time.ns_per_s) {
+                    n.lh_staging_read_ns = now;
+                    n.lh_staging_bytes.store(lhfill.stagingUse(n.io, d).bytes, .monotonic);
+                }
+            }
+            try w.print("# HELP zui_history_backfill_staging_bytes bytes on disk in the backfill's staging directory (0 when no build is under way)\n# TYPE zui_history_backfill_staging_bytes gauge\nzui_history_backfill_staging_bytes {d}\n", .{n.lh_staging_bytes.load(.monotonic)});
+            try w.print("# HELP zui_history_backfill_bytes heap the backfill holds: loaded checkpoints not yet indexed and the open segment of the index it builds\n# TYPE zui_history_backfill_bytes gauge\nzui_history_backfill_bytes {d}\n# TYPE zui_history_backfill_paused gauge\nzui_history_backfill_paused {d}\n", .{ n.lh_mem.load(.monotonic), @intFromBool(n.lh_paused.load(.monotonic)) });
+        };
         // The WebTransport certificate: when the one presented now expires, and rotations so far.
         if (n.native_certs) |cs| {
             try w.print("# TYPE zui_native_cert_not_after_seconds gauge\nzui_native_cert_not_after_seconds {d}\n", .{cs.stats.not_after.load(.acquire)});
@@ -3977,7 +4239,15 @@ pub const Node = struct {
         // Edge source (`--source zui1:`): requests, failovers, and wire / feed / blob bytes.
         if (n.edge_pool) |ep| {
             inline for (comptime std.meta.fieldNames(edge.client.Stats)) |name| {
-                try w.print("# TYPE zui_edge_{s} counter\nzui_edge_{s} {d}\n", .{ name, name, @field(ep.stats, name).load(.monotonic) });
+                if (@TypeOf(@field(ep.stats, name)) == std.atomic.Value(u64))
+                    try w.print("# TYPE zui_edge_{s} counter\nzui_edge_{s} {d}\n", .{ name, name, @field(ep.stats, name).load(.monotonic) });
+            }
+            // the re-ask's settled{attempt} and gave_up{reason}
+            try ep.stats.renderReadSets(w);
+            // what the re-ask's late lists came to (History.planLate)
+            if (n.reask) |r| {
+                try w.writeAll("# TYPE zui_edge_read_sets_late counter\n");
+                inline for (comptime std.meta.fieldNames(history.LateOutcome), 0..) |name, i| try w.print("zui_edge_read_sets_late{{outcome=\"{s}\"}} {d}\n", .{ name, r.outcomes[i].load(.monotonic) });
             }
         }
         // Feed requests in flight at the cores (`--feed-max-inflight`): the count the controller
@@ -4016,6 +4286,14 @@ pub const Node = struct {
             }
         }
         try w.print("# TYPE zui_store_live_objects gauge\nzui_store_live_objects {d}\n", .{n.st.liveCount()});
+        // StateService index feed: old object versions it could not read (their rows were not
+        // removed: stale rows, `deepwave-tool verify-index` finds them) and effects it could not
+        // decode, on the commit path and in replays of stored checkpoints; the replays alone.
+        if (n.ix_feed) |f| {
+            const c = f.counters();
+            try w.print("# TYPE zui_state_index_feed_missing_old counter\nzui_state_index_feed_missing_old {d}\n# TYPE zui_state_index_feed_undecodable counter\nzui_state_index_feed_undecodable {d}\n# TYPE zui_state_index_feed_unprepared counter\nzui_state_index_feed_unprepared {d}\n", .{ c.missing_old, c.undecodable, c.unprepared });
+            try w.print("# TYPE zui_state_index_replay_checkpoints counter\nzui_state_index_replay_checkpoints {d}\n# TYPE zui_state_index_replay_missing_old counter\nzui_state_index_replay_missing_old {d}\n# TYPE zui_state_index_replay_undecodable counter\nzui_state_index_replay_undecodable {d}\n", .{ c.replayed, c.replay_missing_old, c.replay_undecodable });
+        }
         // Compressed segments (chunk.zig): decoded-chunk cache, and what a miss costs.
         inline for (comptime std.meta.fieldNames(@TypeOf(n.st.cache.stats))) |name| {
             try w.print("# TYPE zui_store_chunk_{s} counter\nzui_store_chunk_{s} {d}\n", .{ name, name, @field(n.st.cache.stats, name).load(.monotonic) });
@@ -4032,7 +4310,7 @@ pub const Node = struct {
             // Age-out by data type: dead records turned into holes, sidecar bytes written, old
             // frames punched (fallocate), and the superseded locations the passes still wait on.
             const ast = &n.st.age_stats;
-            inline for (.{ "steps", "groups_rewritten", "chunks_rewritten", "records_dropped", "bytes_dropped", "phys_written", "phys_punched", "pending_full", "deferred", "bulk_runs", "warm_groups", "warm_pages", "warm_uring_pages", "warm_fallback_pages", "warm_errors", "lookups", "lookups_cold", "seg_passes", "set_builds", "set_pages", "set_marked", "set_kept", "set_groups_skipped", "set_chunks_skipped", "set_dead", "set_restarts", "set_inexact", "set_misses" }) |name| {
+            inline for (.{ "steps", "groups_rewritten", "chunks_rewritten", "records_dropped", "bytes_dropped", "phys_written", "phys_punched", "pending_full", "pending_prunes", "pending_behind", "handoff_waits", "deferred", "bulk_runs", "warm_groups", "warm_pages", "warm_uring_pages", "warm_fallback_pages", "warm_errors", "lookups", "lookups_cold", "seg_passes", "set_builds", "set_pages", "set_marked", "set_kept", "set_groups_skipped", "set_chunks_skipped", "set_dead", "set_restarts", "set_inexact", "set_misses", "set_links", "link_kept" }) |name| {
                 try w.print("# TYPE zui_store_age_{s} counter\nzui_store_age_{s} {d}\n", .{ name, name, @field(ast, name).load(.monotonic) });
             }
             // Deferred age-out: 1 while the node is far behind the tip, and the logical bytes of
@@ -4042,6 +4320,11 @@ pub const Node = struct {
             });
             try w.print("# TYPE zui_store_age_pending gauge\nzui_store_age_pending {d}\n# TYPE zui_store_age_max_step_ms gauge\nzui_store_age_max_step_ms {d}\n# TYPE zui_store_age_failed gauge\nzui_store_age_failed {d}\n", .{
                 ast.pending.load(.monotonic), ast.max_step_ns.load(.monotonic) / std.time.ns_per_ms, @intFromBool(ast.failed.load(.monotonic)),
+            });
+            // The ager's memory: what it holds, the most it has held, its budget, and the two
+            // parts that grow with the work (the pending set, old directories not yet taken).
+            try w.print("# TYPE zui_store_age_mem_bytes gauge\nzui_store_age_mem_bytes {d}\n# TYPE zui_store_age_mem_max_bytes gauge\nzui_store_age_mem_max_bytes {d}\n# TYPE zui_store_age_mem_budget_bytes gauge\nzui_store_age_mem_budget_bytes {d}\n# TYPE zui_store_age_mem_pending_bytes gauge\nzui_store_age_mem_pending_bytes {d}\n# TYPE zui_store_age_mem_handoff_bytes gauge\nzui_store_age_mem_handoff_bytes {d}\n", .{
+                ast.mem.load(.monotonic), ast.mem_max.load(.monotonic), n.st.cfg.age_mem_bytes, ast.mem_pending.load(.monotonic), ast.mem_handoff.load(.monotonic),
             });
             // Time the steps held the age lock, and time spent reading ahead of them (no lock).
             try w.print("# TYPE zui_store_age_locked_ms counter\nzui_store_age_locked_ms {d}\n# TYPE zui_store_age_warm_ms counter\nzui_store_age_warm_ms {d}\n", .{

@@ -88,6 +88,24 @@ pub const Sock = struct {
         return s;
     }
 
+    /// Waits shorter than this go through `waitShort` on Linux.
+    pub const coarse_ns = 10 * std.time.ns_per_ms;
+
+    /// Linux: waits until the socket is readable or `wait_ns` have passed, on a high-resolution
+    /// timer (ppoll), and returns true; the caller then receives without blocking. A socket
+    /// receive timeout is counted in jiffies there and fires one to two jiffies after it was
+    /// set: 4 to 8 ms at HZ=250 for a wait of 1 ms, which starved the pacer (cc.zig) and made
+    /// every delayed ACK late. Returns false where SO_RCVTIMEO is exact enough (other
+    /// systems), and for long waits, which stay one syscall.
+    pub fn waitShort(s: *Sock, wait_ns: u64) bool {
+        if (!is_linux or wait_ns >= coarse_ns) return false;
+        const linux = std.os.linux;
+        var fds = [_]linux.pollfd{.{ .fd = s.fd, .events = linux.POLL.IN, .revents = 0 }};
+        var ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns) };
+        _ = linux.ppoll(&fds, 1, &ts, null);
+        return true;
+    }
+
     /// Sets the blocking receive timeout, quantised down to a few buckets so a moving timer
     /// deadline does not cost a setsockopt per loop.
     pub fn setWait(s: *Sock, wait_ns: u64) void {
@@ -225,6 +243,14 @@ pub const RxBatch = struct {
     }
     pub fn from(b: *const RxBatch, i: usize) net.IpAddress {
         return fromPosix(&b.addrs[i]);
+    }
+
+    /// `recv` that waits up to `wait_ns` for the first datagram (0: does not wait): on the
+    /// socket's receive timeout, or for a short wait on Linux on a precise timer first.
+    pub fn recvWait(b: *RxBatch, s: *Sock, wait_ns: u64) usize {
+        if (wait_ns == 0 or s.waitShort(wait_ns)) return b.recv(s, false);
+        s.setWait(wait_ns);
+        return b.recv(s, true);
     }
 
     /// Receives up to `max_batch` datagrams in one syscall. `block`: wait up to the socket's

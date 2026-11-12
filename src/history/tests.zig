@@ -244,3 +244,138 @@ test "memory over a contiguous run" {
     const bytes = ix.memoryBytes();
     std.debug.print("history memtest: {d} checkpoints, {d} txs, {d} bytes, {d} bytes/tx, {d} MB per 1M txs, {d} ms wall\n", .{ hi - lo + 1, txs, bytes, bytes / txs, bytes * 1_000_000 / txs / 1_000_000, cpu_ms });
 }
+
+test "the low end of a pruned index is a durable floor witness; an index that only began there is not" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const blobs = (try corpusChks(a, io, 6)) orelse return error.SkipZigTest;
+    var seqs: [6]u64 = undefined;
+    for (blobs, 0..) |b, i| seqs[i] = (try bcs.decode(types.CheckpointData, a, b[1..])).checkpoint_summary.data.sequence_number;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/hist", .{tmp.sub_path});
+    {
+        const ix = try root.Index.init(gpa, io, dir);
+        defer ix.deinit();
+        for (blobs[1..], seqs[1..]) |b, s| try ix.addCheckpoint(s, b);
+        // it began at the second checkpoint: that says nothing about its store's floor
+        try std.testing.expect(!ix.lowIsFloor());
+        try std.testing.expectEqual(@as(?u64, null), root.Index.peekFloor(io, dir));
+        // the owner prunes it to its store's lowest checkpoint: durable when the call returns
+        ix.pruneBelow(seqs[3]);
+        try std.testing.expect(ix.lowIsFloor());
+        try std.testing.expectEqual(@as(?u64, seqs[3]), root.Index.peekFloor(io, dir));
+    }
+    {
+        // no clean close is needed for it: reopened (as after a kill), the witness is there
+        const ix = try root.Index.init(gpa, io, dir);
+        defer ix.deinit();
+        try std.testing.expectEqual(@as(?u64, seqs[3]), ix.indexedLo());
+        try std.testing.expect(ix.lowIsFloor());
+    }
+    // a restart at a hole begins a new index: not a floor again
+    {
+        const ix = try root.Index.init(gpa, io, null);
+        defer ix.deinit();
+        try ix.addCheckpoint(seqs[0], blobs[0]);
+        ix.pruneBelow(seqs[0] + 1);
+        try ix.addCheckpoint(seqs[3], blobs[3]);
+        try std.testing.expectEqual(@as(?u64, seqs[3]), ix.indexedLo());
+        try std.testing.expect(!ix.lowIsFloor());
+    }
+    // a backfill's staging index: its owner vouches for the low end, durable with a save
+    const sdir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/staging", .{tmp.sub_path});
+    {
+        const st = try root.Index.openStaging(gpa, io, sdir);
+        defer st.deinit();
+        try std.testing.expectEqual(@as(?u64, null), root.Index.peekFloor(io, sdir));
+        for (blobs[2..5], seqs[2..5]) |b, s| try st.addCheckpoint(s, b);
+        st.vouchLow();
+        try st.saveStaging();
+        try std.testing.expectEqual(@as(?u64, seqs[2]), root.Index.peekFloor(io, sdir));
+    }
+}
+
+test "copyRows: an index that takes the part another index already has equals one built from the checkpoints (open and sealed segments)" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // corpus checkpoints: the lower two built from the checkpoints, the rest taken from a live
+    // index that began at the third
+    if (try corpusChks(a, io, 6)) |blobs| {
+        var seqs: [6]u64 = undefined;
+        for (blobs, 0..) |b, i| seqs[i] = (try bcs.decode(types.CheckpointData, a, b[1..])).checkpoint_summary.data.sequence_number;
+        const want = try root.Index.init(gpa, io, null);
+        defer want.deinit();
+        for (blobs, seqs) |b, s| try want.addCheckpoint(s, b);
+        const live = try root.Index.init(gpa, io, null);
+        defer live.deinit();
+        for (blobs[2..], seqs[2..]) |b, s| try live.addCheckpoint(s, b);
+        const out = try root.Index.init(gpa, io, null);
+        defer out.deinit();
+        // nothing to take below what the live index holds
+        try std.testing.expectEqual(seqs[0], try out.copyRows(live, seqs[0], std.math.maxInt(u64), null));
+        for (blobs[0..2], seqs[0..2]) |b, s| try out.addCheckpoint(s, b);
+        try std.testing.expectEqual(seqs[5] + 1, try out.copyRows(live, seqs[2], std.math.maxInt(u64), null));
+        try std.testing.expectEqual(try want.contentHash(), try out.contentHash());
+        // a live index pruned past the next checkpoint gives nothing (the caller's floor moved)
+        const out2 = try root.Index.init(gpa, io, null);
+        defer out2.deinit();
+        for (blobs[0..2], seqs[0..2]) |b, s| try out2.addCheckpoint(s, b);
+        live.pruneBelow(seqs[4]);
+        try std.testing.expectEqual(seqs[2], try out2.copyRows(live, seqs[2], std.math.maxInt(u64), null));
+    }
+    // synthetic rows across three segments (two sealed on disk, one open), with events, keys
+    // shared between checkpoints, and a checkpoint that spans a segment boundary
+    // (not the testing allocator: it records a stack per allocation, and these indexes make
+    // hundreds of thousands)
+    const big = std.heap.smp_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/src", .{tmp.sub_path});
+    const src = try root.Index.init(big, io, dir);
+    defer src.deinit();
+    const per: u32 = 34_000;
+    const digests = try a.alloc([32]u8, per);
+    const evc = try a.alloc(u32, per);
+    var first_tx: u64 = 1000;
+    for (0..4) |c| {
+        var txe_state = std.heap.ArenaAllocator.init(big);
+        defer txe_state.deinit();
+        const ta = txe_state.allocator();
+        var txe: std.ArrayList(struct { u32, u32 }) = .empty;
+        var eve: std.ArrayList(struct { u32, u32, u32 }) = .empty;
+        for (digests, evc, 0..) |*d, *e, i| {
+            d.* = @splat(0);
+            std.mem.writeInt(u64, d[0..8], first_tx + i, .little);
+            std.mem.writeInt(u64, d[8..16], c, .little);
+            e.* = @intCast(i % 3);
+            try txe.append(ta, .{ @intCast(i % 5), @intCast(i) });
+            if (i % 7 == 0) try txe.append(ta, .{ 5, @intCast(i) });
+            for (0..e.*) |k| try eve.append(ta, .{ @intCast(6 + (i + k) % 2), @intCast(i), @intCast(k) });
+        }
+        const keys = [_][]const u8{ "\x01sender-a", "\x01sender-b", "\x02pkg", "\x03mod", "\x04fn", "\x05rare", "\x06event-x", "\x06event-y" };
+        try src.addRows(100 + c, first_tx, digests, evc, &keys, txe.items, eve.items);
+        first_tx += per;
+    }
+    try std.testing.expect(src.segmentCount() >= 2);
+    const out = try root.Index.init(big, io, null);
+    defer out.deinit();
+    try std.testing.expectEqual(@as(u64, 104), try out.copyRows(src, 100, std.math.maxInt(u64), null));
+    try std.testing.expectEqual(try src.contentHash(), try out.contentHash());
+    // and from the middle: the copy begins where it is told to and ends where it is told to
+    const tail = try root.Index.init(big, io, null);
+    defer tail.deinit();
+    try std.testing.expectEqual(@as(u64, 103), try tail.copyRows(src, 101, 102, null));
+    try std.testing.expectEqual(@as(?u64, 101), tail.indexedLo());
+    try std.testing.expectEqual(@as(?u64, 102), tail.indexedHi());
+}

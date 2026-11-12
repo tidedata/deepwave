@@ -21,6 +21,7 @@ const cert_mod = @import("cert.zig");
 const certs_mod = @import("certs.zig");
 const jobs_mod = @import("jobs.zig");
 const fairq = @import("fairq.zig");
+const gate_mod = @import("gate.zig");
 
 pub const alpns = [_][]const u8{ proto.alpn, "h3" };
 
@@ -80,6 +81,8 @@ pub const Options = struct {
     /// trip off the first response of every new WebTransport session. Nothing else is sent
     /// early and nothing is read early. Off by default; env override ZUI_NATIVE_EARLY_SETTINGS.
     early_settings: bool = false,
+    /// Access gate (`--gate`, docs/GATE.md): asked before every request. Null: no gate code runs.
+    gate: ?gate_mod.Hook = null,
 };
 
 fn envSwitch(name: [*:0]const u8, default: bool) bool {
@@ -142,6 +145,10 @@ const ReqStream = struct {
     consumed: usize = 0,
     /// A slow method runs on a worker; the response comes back through `Listener.jobs`.
     queued: bool = false,
+    /// Access gate: the admitted request's ticket until it is settled, and when the request
+    /// began to wait for its key's lookup (ms; 0: not waiting).
+    gate: ?gate_mod.Ticket = null,
+    gate_wait_ms: u64 = 0,
 };
 
 const RelayRef = struct { channel: [32]u8, role: u1 };
@@ -190,6 +197,8 @@ const Sub = struct {
     granted: u64 = 0,
     delivered: u64 = 0,
     last_match_ms: u64 = 0,
+    /// Access gate: the subscription's ticket (its stream slot) until it ends.
+    gate: ?gate_mod.Ticket = null,
 };
 
 const CIo = struct {
@@ -220,6 +229,8 @@ const Slot = struct {
     /// Streams whose response is queued; freed once fully sent.
     answered: std.ArrayList(u64) = .empty,
     subs: std.ArrayList(Sub) = .empty,
+    /// Access gate: the connection's key (its hello or CONNECT token; owned).
+    gate_key: []u8 = &.{},
 };
 
 pub const Listener = struct {
@@ -248,6 +259,8 @@ pub const Listener = struct {
     /// I/O thread only: Retry tokens, and connections whose handshake is not finished.
     guard: net.retry.Guard = undefined,
     half_open: usize = 0,
+    /// Access gate: a request waits for its key's lookup, so the next pass comes soon.
+    gate_waiting: bool = false,
 
     pub fn start(gpa: Allocator, io: Io, opts: Options, disp: *dispatch.Dispatcher) !*Listener {
         const l = try gpa.create(Listener);
@@ -348,22 +361,32 @@ pub const Listener = struct {
 
     fn freeSlot(l: *Listener, s: *Slot) void {
         const c = s.conn;
+        // `path MTU` is the size at the end; a connection whose client went away ends in probe
+        // timeouts, so the highest size it validated and the fallbacks to 1200 are named too.
         if (c.pkts_lost != 0 or c.ptos != 0)
-            std.log.info("native: connection done, {d} packets sent, {d} lost, {d} PTOs, path MTU {d}", .{ c.pkts_sent, c.pkts_lost, c.ptos, c.mtu });
+            std.log.info("native: connection done, {d} packets sent, {d} lost, {d} PTOs, path MTU {d} (highest {d}, {d} fallbacks), srtt {d} ms, cwnd {d}", .{ c.pkts_sent, c.pkts_lost, c.ptos, c.mtu, c.mtu_peak, c.pmtu_black_holes, c.srtt / std.time.ns_per_ms, c.cwnd });
         s.conn.deinit();
         if (s.ident) |e| l.opts.certs.?.release(e);
         if (s.h3s) |*h| h.deinit();
         s.h3_streams.deinit(l.gpa);
-        for (s.reqs.values()) |*r| r.buf.deinit(l.gpa);
+        for (s.reqs.values()) |*r| {
+            l.gateSettle(r, ""); // admitted and never answered: counted, not charged
+            r.buf.deinit(l.gpa);
+        }
         s.reqs.deinit(l.gpa);
         s.answered.deinit(l.gpa);
-        for (s.subs.items) |*sb| sub.deinit(l.gpa, &sb.req);
+        for (s.subs.items) |*sb| {
+            l.gateSubClosed(sb);
+            sub.deinit(l.gpa, &sb.req);
+        }
         s.subs.deinit(l.gpa);
+        l.gpa.free(s.gate_key);
         l.gpa.destroy(s);
     }
 
-    /// One pass: block in one batched receive until a datagram or the next timer (SO_RCVTIMEO,
-    /// no poll), drain the socket in batches, run every connection, then send everything queued
+    /// One pass: block in one batched receive until a datagram or the next timer (SO_RCVTIMEO;
+    /// a timer under 10 ms away is waited for with ppoll on Linux, `udpio.Sock.waitShort`),
+    /// drain the socket in batches, run every connection, then send everything queued
     /// with one batched send per 32 datagrams. An idle request/response round trip is one
     /// receive and one send syscall.
     fn ioLoop(l: *Listener) void {
@@ -385,13 +408,16 @@ pub const Listener = struct {
                 if (sp.*.subs.items.len > 0) any_sub = true;
             }
             if (any_sub) wait_ns = @min(wait_ns, 5 * std.time.ns_per_ms);
+            if (l.gate_waiting) {
+                wait_ns = @min(wait_ns, 5 * std.time.ns_per_ms);
+                l.gate_waiting = false;
+            }
             const spinning = spin_ns != 0 and now -| last_busy < spin_ns;
             const block = !more and !spinning and wait_ns >= std.time.ns_per_ms;
             const pass = l.stats.io_passes.fetchAdd(1, .monotonic);
             if (!block) _ = l.stats.io_polls.fetchAdd(1, .monotonic);
             if (pass % 64 == 0) l.stats.io_cpu_ns.store(threadCpuNs(), .monotonic);
-            if (block) l.us.setWait(wait_ns);
-            var n = l.rx.recv(&l.us, block);
+            var n = l.rx.recvWait(&l.us, if (block) wait_ns else 0);
             if (n > 0) last_busy = now;
             if (n == 0 and spinning and !more) {
                 std.atomic.spinLoopHint();
@@ -735,6 +761,7 @@ pub const Listener = struct {
                 if (o.token) |t| if (l.disp.hooks.auth) |au| {
                     s.principal = au.check(au.ctx, t);
                 };
+                if (l.opts.gate != null) if (o.token) |t| l.gateSetKey(s, t);
             },
             .session_closed => s.conn.closeApp(0),
             .wt_data => |d| {
@@ -749,7 +776,10 @@ pub const Listener = struct {
 
     const JobCtx = struct { l: *Listener, s: *Slot };
     fn jobDone(ctx: JobCtx, id: u64, bytes: []const u8) void {
-        if (ctx.s.reqs.getPtr(id)) |r| r.queued = false;
+        if (ctx.s.reqs.getPtr(id)) |r| {
+            r.queued = false;
+            ctx.l.gateSettle(r, bytes);
+        }
         if (ctx.s.conn.stream(id) == null) return; // the client reset it
         ctx.l.respond(ctx.s, id, bytes);
     }
@@ -882,6 +912,11 @@ pub const Listener = struct {
                 }
                 return;
             }
+            if (l.opts.gate != null) {
+                if (!l.gateAdmit(s, id, r, req, a)) return;
+                // a relay is one call: counted when it attaches
+                l.gateSettle(r, &.{0});
+            }
             l.relayAttach(s, id, r, req, a);
             return;
         }
@@ -894,27 +929,37 @@ pub const Listener = struct {
                 r.done = true;
                 return;
             };
+            if (l.opts.gate != null and r.gate == null and !l.gateAdmit(s, id, r, req, a)) return;
             r.done = true;
             if (req.flags & ~(proto.flag_verify | proto.flag_zstd_ok) != 0) {
+                l.gateSubFailed(r);
                 proto.errorResponse(&out, a, .bad_request, "unknown flags", "") catch return;
                 return l.respond(s, id, out.items);
             }
             sr.verify = req.flags & proto.flag_verify != 0;
             sub.own(l.gpa, &sr) catch {
+                l.gateSubFailed(r);
                 proto.errorResponse(&out, a, .bad_request, "filter", "") catch return;
                 return l.respond(s, id, out.items);
             };
             const sid = l.startSub(s, id, sr, tip, a) orelse {
+                l.gateSubFailed(r);
                 var tmp = sr;
                 sub.deinit(l.gpa, &tmp);
                 return;
             };
+            if (r.gate) |t| {
+                // the subscription holds the ticket (its stream slot) from here on
+                l.gateSettle(r, &.{0});
+                s.subs.items[s.subs.items.len - 1].gate = t;
+            }
             r.sub = sid;
             r.consumed = (r.buf.items.len - req.body.len) + (sub.bodyLen(req.body) catch req.body.len);
             l.creditPump(s, r, sid);
             return;
         }
         if (!r.fin) return;
+        if (l.opts.gate != null and r.gate == null and !l.gateAdmit(s, id, r, req, a)) return;
         r.done = true;
         _ = l.stats.requests.fetchAdd(1, .monotonic);
         if (dispatch.slowMethod(req.method) or l.disp.offThread(req)) {
@@ -923,6 +968,7 @@ pub const Listener = struct {
                 r.queued = true;
                 return;
             }
+            l.gateSettle(r, &.{6});
             proto.errorResponse(&out, a, .rate_limited, "too many executions in flight", &.{ 0, 0, 0, 0 }) catch return;
             return l.respond(s, id, out.items);
         }
@@ -932,6 +978,7 @@ pub const Listener = struct {
                 r.queued = true;
                 return;
             }
+            l.gateSettle(r, &.{6});
             proto.errorResponse(&out, a, .rate_limited, feed_refused, &.{ 0, 0, 0, 0 }) catch return;
             return l.respond(s, id, out.items);
         }
@@ -940,7 +987,77 @@ pub const Listener = struct {
             s.principal = p;
         };
         l.disp.handle(a, req, s.principal, &out);
+        l.gateSettle(r, out.items);
         l.respond(s, id, out.items);
+    }
+
+    // ------------------------------------------------------------ access gate (Options.gate)
+
+    fn gateSetKey(l: *Listener, s: *Slot, key: []const u8) void {
+        const copy = l.gpa.dupe(u8, key[0..@min(key.len, 257)]) catch return;
+        l.gpa.free(s.gate_key);
+        s.gate_key = copy;
+    }
+
+    /// Puts a complete request to the gate. True: go on (a ticket is in `r.gate`, unless the
+    /// request is a hello, which is never charged). False: the request was refused and
+    /// answered, or its key is still being looked up and the next pass asks again.
+    fn gateAdmit(l: *Listener, s: *Slot, id: u64, r: *ReqStream, req: proto.Request, a: Allocator) bool {
+        const g = l.opts.gate.?;
+        const now = l.nowMs();
+        if (r.gate_wait_ms == 0) r.gate_wait_ms = now;
+        const may_wait = now -| r.gate_wait_ms < gate_mod.wait_ms;
+        var refusal: gate_mod.Refusal = undefined;
+        if (req.method == .hello) {
+            const token = dispatch.helloToken(req.body) orelse return true;
+            switch (g.hello(g.ctx, token, s.addr, may_wait)) {
+                .ok => {
+                    l.gateSetKey(s, token);
+                    return true;
+                },
+                .wait => {
+                    l.gate_waiting = true;
+                    return false;
+                },
+                .deny => |d| refusal = d,
+            }
+        } else switch (g.admit(g.ctx, s.gate_key, s.addr, req.method, req.body, may_wait)) {
+            .allow => |t| {
+                r.gate = t;
+                return true;
+            },
+            .wait => {
+                l.gate_waiting = true;
+                return false;
+            },
+            .deny => |d| refusal = d,
+        }
+        var out: std.ArrayList(u8) = .empty;
+        gate_mod.respond(&out, a, refusal) catch return false;
+        l.respond(s, id, out.items);
+        r.done = true;
+        return false;
+    }
+
+    /// The request of `r` was answered with `response` (a zui/1 response: status byte first).
+    fn gateSettle(l: *Listener, r: *ReqStream, response: []const u8) void {
+        const t = r.gate orelse return;
+        r.gate = null;
+        if (l.opts.gate) |g| g.settle(g.ctx, &t, response.len > 0 and response[0] == 0);
+    }
+
+    /// A subscription that was admitted and then could not start.
+    fn gateSubFailed(l: *Listener, r: *ReqStream) void {
+        var t = r.gate orelse return;
+        r.gate = null;
+        const g = l.opts.gate orelse return;
+        g.settle(g.ctx, &t, false);
+        g.stream_close(g.ctx, &t);
+    }
+
+    fn gateSubClosed(l: *Listener, sb: *Sub) void {
+        if (sb.gate) |*t| if (l.opts.gate) |g| g.stream_close(g.ctx, t);
+        sb.gate = null;
     }
 
     fn startSub(l: *Listener, s: *Slot, ctrl: u64, sr: sub.Req, tip: ?u64, a: Allocator) ?u64 {
@@ -999,6 +1116,7 @@ pub const Listener = struct {
             s.answered.append(l.gpa, sb.ctrl) catch {};
         }
         subGone(s, sb.ctrl);
+        l.gateSubClosed(&s.subs.items[i]);
         var rq = sb.req;
         sub.deinit(l.gpa, &rq);
         _ = s.subs.swapRemove(i);
@@ -1217,6 +1335,7 @@ pub const Listener = struct {
                 c.streamAbort(sb.data, code);
                 c.streamAbort(sb.ctrl, code);
                 subGone(s, sb.ctrl);
+                l.gateSubClosed(sb);
                 sub.deinit(l.gpa, &sb.req);
                 _ = s.subs.swapRemove(i);
                 continue;
@@ -1233,6 +1352,7 @@ pub const Listener = struct {
             }
             var budget: u32 = 64;
             var failed: ?anyerror = null;
+            const delivered0 = sb.delivered;
             while (budget > 0 and sb.cursor <= tip and c.streamUnsent(sb.data) < l.opts.sub_backlog) : (budget -= 1) {
                 if (sb.credit_on and sb.delivered >= sb.granted) break; // out of credit
                 // An edge: the frames of this checkpoint would carry a certificate that is not
@@ -1261,6 +1381,13 @@ pub const Listener = struct {
                 l.endSub(s, i, .unavailable, sb.cursor -| 1);
                 continue;
             }
+            if (l.opts.gate) |g| if (sb.gate) |*t| {
+                // counts the frames and asks whether the caller may keep the stream
+                if (g.stream_frames(g.ctx, t, s.gate_key, @intCast(sb.delivered - delivered0))) |refusal| {
+                    l.endSub(s, i, refusal.code, sb.cursor -| 1);
+                    continue;
+                }
+            };
             if (sb.live and sb.req.filter != .checkpoints) {
                 const now = l.nowMs();
                 if (now -| sb.last_match_ms >= heartbeat_ms) {

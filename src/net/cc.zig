@@ -30,20 +30,38 @@ const inf = std.math.maxInt(u64);
 /// and poll the socket without blocking for a timer that is due sooner: a pacer deadline a
 /// fraction of a millisecond away made the I/O thread spin until it was due, at every run. So
 /// that the longer sleep costs no rate, the bucket holds at least what the rate brings in one
-/// such wait: what built up while the thread slept leaves with the next run. (BBR's bucket is
-/// two send quanta, 2 ms of its rate, so a sleep that runs late costs it nothing either; the
-/// window-clocked senders are woken by their ACKs.)
+/// such wait: what built up while the thread slept leaves with the next run.
+///
+/// A sender that waits for the bucket and is woken late keeps what the rate brought while it
+/// was late, up to `late_max_ns` of it, on top of the bucket. A wake is late when the loop's
+/// timer is coarse: a socket receive timeout on Linux is counted in jiffies and fires one to
+/// two jiffies after it was set, 4 to 8 ms at HZ=250 for a wait of 1.25 ms. With the bucket as
+/// the limit (2 ms of BBR's rate) every such sleep threw away what the rate brought after the
+/// first 2 ms, and a paced sender ran at a quarter to a half of its rate. The credit is for a
+/// late wake only: a sender that had nothing to send, or that something else held for longer
+/// (a full window), starts from the bucket, as before.
 pub const Pacer = struct {
     tokens: u64 = 0,
     capacity: u64 = 0,
     prev: u64 = 0,
     started: bool = false,
+    /// The last answer was a time to wait for (`due`): the sender has something to send.
+    waiting: bool = false,
+    due: u64 = 0,
+    /// The last answer was "send" and nothing has left since (the sender had nothing).
+    granted: bool = false,
+    /// Bytes the bucket may hold beyond `capacity` now: the credit of a late wake, until the
+    /// sender has used it or has nothing more to send.
+    late: u64 = 0,
 
     pub const burst_interval_ns = 2 * ms;
     pub const min_burst = 10;
     pub const max_burst = 64;
     /// Shortest wait the pacer asks for: just over the millisecond the loops can sleep.
     pub const timer_ns = 1250 * std.time.ns_per_us;
+    /// A wake up to this long after the time asked for is a late timer and keeps its credit
+    /// (two jiffies at HZ=250, one at HZ=100); a later one is not.
+    pub const late_max_ns = 10 * ms;
 
     fn runFor(srtt: u64, cwnd: u64, mtu: u64) u64 {
         const w: u64 = @min(cwnd, 1 << 32);
@@ -68,35 +86,60 @@ pub const Pacer = struct {
     /// second and a run is `quantum` bytes (BBR's send quantum: 1 ms of the rate, at least two
     /// datagrams). The bucket holds at least two quanta.
     pub fn delayRate(p: *Pacer, now: u64, rate: u64, mtu: u64, room: u64, quantum: u64) ?u64 {
+        return p.delayBurst(now, rate, mtu, room, quantum, 0);
+    }
+
+    /// `delayRate` with a bucket of at least `depth` bytes (`Bbr.burstAllowance`). The bucket
+    /// still fills at `rate` only, so what leaves at once after a pause is what the rate
+    /// brought during the pause, and never more than `depth`.
+    pub fn delayBurst(p: *Pacer, now: u64, rate: u64, mtu: u64, room: u64, quantum: u64, depth: u64) ?u64 {
         const run = @max(quantum, mtu);
-        return p.wait(now, rate, mtu, room, run, 2 * run);
+        return p.waitDepth(now, rate, mtu, room, run, 2 * run, depth);
     }
 
     fn wait(p: *Pacer, now: u64, rate: u64, mtu: u64, room: u64, run: u64, min_cap: u64) ?u64 {
-        const cap: u64 = @max(min_cap, @as(u64, @intCast(@as(u128, rate) * timer_ns / sec)));
+        return p.waitDepth(now, rate, mtu, room, run, min_cap, 0);
+    }
+
+    fn waitDepth(p: *Pacer, now: u64, rate: u64, mtu: u64, room: u64, run: u64, min_cap: u64, depth: u64) ?u64 {
+        const cap: u64 = @max(min_cap, depth, @as(u64, @intCast(@as(u128, rate) * timer_ns / sec)));
         if (!p.started) {
             p.started = true;
             p.tokens = min_cap;
             p.prev = now;
         }
         p.capacity = cap;
-        p.tokens = @min(p.tokens, cap);
+        // permission that was not used: the sender had nothing to send, so no late credit
+        if (p.granted) p.late = 0;
+        p.tokens = @min(p.tokens, @max(cap, p.late));
         if (rate == 0) return null;
-        // fill first, so idle time is credited once (never more than the bucket)
+        // fill first, so idle time is credited once (never more than the bucket, except for
+        // a sender that waited for this and was woken late)
         const elapsed: u64 = @min(now -| p.prev, 2 * sec);
         const add: u64 = @intCast(@as(u128, rate) * elapsed / sec);
         if (add > 0) {
-            p.tokens = @min(p.tokens +| add, cap);
+            const lateness = now -| p.due;
+            if (p.waiting and lateness <= late_max_ns) p.late = cap + @as(u64, @intCast(@as(u128, rate) * lateness / sec));
+            p.tokens = @min(p.tokens +| add, @max(cap, p.late));
             p.prev = now;
         }
-        if (p.tokens >= mtu) return null;
+        if (p.tokens >= mtu) {
+            p.waiting = false;
+            p.granted = true;
+            return null;
+        }
+        p.waiting = true;
+        p.granted = false;
+        p.late = 0;
         const need = std.math.clamp(room, mtu, run) - p.tokens;
         const t: u64 = @intCast(@min(@as(u128, need) * sec / rate, 10 * sec));
-        return now + @max(t, timer_ns);
+        p.due = now + @max(t, timer_ns);
+        return p.due;
     }
 
     pub fn onSend(p: *Pacer, bytes: u64) void {
         p.tokens -|= bytes;
+        p.granted = false;
     }
 };
 
@@ -345,6 +388,10 @@ pub const Bbr = struct {
     pub const probe_wait_rand = 1 * sec;
     pub const reno_rounds_max = 63;
     pub const send_quantum_max = 64 << 10;
+    /// Sends closer together than this are one burst (paced runs are 1.25 ms apart or more).
+    pub const burst_gap = 1 * ms;
+    /// A burst bound is tried again after this long (as the path MTU search starts again).
+    pub const burst_cap_ttl = 600 * sec;
 
     /// What `onSent` snapshots for a packet (4.1.2.1.2); the connection keeps it with the
     /// packet and hands it back when the packet is acknowledged or lost.
@@ -356,6 +403,9 @@ pub const Bbr = struct {
         /// Bytes in flight right after this packet was sent (it included).
         tx_in_flight: u64 = 0,
         app_limited: bool = false,
+        /// A quiet sender's burst: bytes that left in one go up to and including this packet
+        /// (`burst_gap`). 0 for a sender with a backlog.
+        burst: u32 = 0,
     };
 
     /// The rate sample of one ACK (2.3 and 4.1.2.1.3).
@@ -413,6 +463,27 @@ pub const Bbr = struct {
     first_send_time: u64 = 0,
     /// Not 0: samples are application-limited until `delivered` passes this.
     app_limited: u64 = 0,
+    /// Not 0: the application itself had nothing to send (`markAppLimited`, not the mark
+    /// ProbeRTT sets on its own low rate), until `delivered` passes this. See `quiet`.
+    app_quiet: u64 = 0,
+    /// The largest flight the path delivered whole: bytes in flight when a packet left that
+    /// was acknowledged with nothing lost in between. A round with loss lowers it as it
+    /// lowers the short-term bounds.
+    carried: u64 = 0,
+    /// A quiet sender's bursts: bytes that left in one go (sends less than `burst_gap`
+    /// apart). `burst_ok` is the largest that arrived whole. `burst_cap` bounds what leaves
+    /// at once (`burstAllowance`): set when a burst lost its tail in the path's queue
+    /// (`noteBurstLoss`), lifted again `burst_cap_ttl` later.
+    burst_bytes: u64 = 0,
+    burst_last: u64 = 0,
+    burst_ok: u64 = 0,
+    burst_cap: u64 = inf,
+    burst_cap_stamp: u64 = 0,
+    /// Packets lost of the burst that left at `burst_lost_at`, and whether the current loss
+    /// round saw a burst lose its tail.
+    burst_lost_at: u64 = 0,
+    burst_lost_n: u32 = 0,
+    burst_tail_round: bool = false,
     lost: u64 = 0,
     rs: Rs = .{},
 
@@ -532,7 +603,11 @@ pub const Bbr = struct {
             b.first_send_time = now;
             b.delivered_time = now;
         }
+        if (now -| b.burst_last >= burst_gap or !b.quiet()) b.burst_bytes = 0;
+        if (b.quiet()) b.burst_bytes += size;
+        b.burst_last = now;
         return .{
+            .burst = @intCast(@min(b.burst_bytes, std.math.maxInt(u32))),
             .delivered = b.delivered,
             .delivered_time = b.delivered_time,
             .first_send_time = b.first_send_time,
@@ -547,6 +622,31 @@ pub const Bbr = struct {
     /// understate the path.
     pub fn markAppLimited(b: *Bbr, inflight: u64) void {
         b.app_limited = @max(b.delivered + inflight, 1);
+        b.app_quiet = b.app_limited;
+    }
+
+    /// The sender is limited by its application: it had window and pacing budget and nothing
+    /// to send, and what it has sent since has not been delivered past that point. Such a
+    /// sender (a response every 250 ms on a connection that is silent in between) never shows
+    /// the model the path: a rate sample cannot exceed one burst per round trip, however much
+    /// the path carries. Three things follow for it, and only for it:
+    ///   - a burst after a pause is not paced from an empty bucket (`burstAllowance`),
+    ///   - the window is not bounded below what the path has delivered whole (`carried`),
+    ///   - no ProbeRTT: the path is empty of our packets between two bursts anyway, and the
+    ///     packets that start a burst measure the round trip without a queue of ours.
+    /// A sender with a backlog is not quiet (the mark is passed with the first acknowledgement
+    /// of what it sends next, and nothing sets it again), so bulk transfers, and everything
+    /// BBR does about congestion and loss, are as they were.
+    pub fn quiet(b: *const Bbr) bool {
+        return b.app_quiet != 0;
+    }
+
+    /// The pacer's bucket for a quiet sender: one minimum round trip of the pacing rate, at
+    /// most the window, and at most what the path's queue has shown it takes in one go
+    /// (`burst_cap`). 0 otherwise (the bucket is then two send quanta).
+    pub fn burstAllowance(b: *const Bbr, cwnd: u64) u64 {
+        if (!b.quiet() or b.min_rtt == inf) return 0;
+        return @min(mulDiv(b.pacing_rate, b.min_rtt, sec), cwnd, b.burst_cap);
     }
 
     /// 4.1.2.3 InitRateSample.
@@ -558,6 +658,8 @@ pub const Bbr = struct {
     pub fn onPacketAcked(b: *Bbr, now: u64, p: Pkt, send_time: u64, pn: u64, size: u64) void {
         b.delivered += size;
         b.delivered_time = now;
+        // a burst arrived whole up to this packet (nothing lost since it left)
+        if (p.lost == b.lost and p.burst > b.burst_ok and p.burst <= b.burst_cap) b.burst_ok = p.burst;
         const rs = &b.rs;
         // IsNewestPacket
         if (!rs.has_data or send_time > b.first_send_time or (send_time == b.first_send_time and pn > rs.last_pn)) {
@@ -589,6 +691,7 @@ pub const Bbr = struct {
         }
         b.is_loss_in_round = true;
         b.loss_events_in_round += 1;
+        b.noteBurstLoss(now, p, send_time);
         if (!b.check_probe_loss) return; // not a packet sent while probing for bandwidth
         const tx = p.tx_in_flight;
         const lost = b.lost - p.lost; // lost since it was sent, this packet included
@@ -598,6 +701,31 @@ pub const Bbr = struct {
         const lost_prev = lost -| size;
         const lost_prefix = (inflight_prev -| lost_prev * loss_thresh_div) / (loss_thresh_div - 1);
         b.handleInflightTooHigh(now, p.app_limited, inflight_prev + lost_prefix, cwnd.*);
+    }
+
+    /// A packet of a quiet sender's burst (more than an initial window in one go) was lost.
+    /// From the third packet lost of one burst, past the largest burst that ever arrived whole
+    /// or with more than 2 percent of the flight lost since it left, the burst met the end of
+    /// the path's queue: what leaves at once is bounded below that size from now on. One or
+    /// two random losses inside a burst change nothing.
+    fn noteBurstLoss(b: *Bbr, now: u64, p: Pkt, send_time: u64) void {
+        if (p.burst <= b.initial_cwnd) return;
+        const same = if (send_time > b.burst_lost_at) send_time - b.burst_lost_at else b.burst_lost_at - send_time;
+        if (b.burst_lost_n == 0 or same >= burst_gap) {
+            b.burst_lost_at = send_time;
+            b.burst_lost_n = 0;
+        }
+        b.burst_lost_n += 1;
+        if (b.burst_lost_n < 3) return;
+        var cap: u64 = inf;
+        if (p.burst > b.burst_ok) cap = @max(b.burst_ok - b.burst_ok / 8, p.burst / 2);
+        if (inflightTooHigh(b.lost - p.lost, p.tx_in_flight)) cap = @min(cap, mulDiv(p.burst, beta_num, beta_den));
+        if (cap == inf) return;
+        b.burst_tail_round = true;
+        if (cap >= b.burst_cap) return;
+        b.burst_cap = cap;
+        b.burst_cap_stamp = now;
+        b.burst_ok = @min(b.burst_ok, cap);
     }
 
     /// 5.5.10.2 IsInflightTooHigh (QUIC acknowledges ranges, so the second clause never applies).
@@ -623,10 +751,13 @@ pub const Bbr = struct {
         rs.newly_acked = a.newly_acked;
         // 4.1.2.3 GenerateRateSample
         if (b.app_limited != 0 and b.delivered > b.app_limited) b.app_limited = 0;
+        if (b.app_quiet != 0 and b.delivered > b.app_quiet) b.app_quiet = 0;
+        if (b.burst_cap != inf and a.now -| b.burst_cap_stamp > burst_cap_ttl) b.burst_cap = inf;
         if (!rs.has_data) return; // nothing delivered on this ACK
         rs.interval = @max(rs.send_elapsed, rs.ack_elapsed);
         rs.delivered = b.delivered - rs.prior_delivered;
         rs.lost = b.lost - rs.prior_lost;
+        if (rs.lost == 0) b.carried = @max(b.carried, rs.tx_in_flight);
         // an interval shorter than the minimum round trip gives no reliable rate
         if (rs.interval != 0 and rs.interval >= a.min_rtt) rs.delivery_rate = mulDiv(rs.delivered, sec, rs.interval);
         // leaving loss recovery restores the window it had (5.6.4.4); the model bounds it below
@@ -673,6 +804,7 @@ pub const Bbr = struct {
         b.bw_latest = b.rs.delivery_rate;
         b.inflight_latest = b.rs.delivered;
         b.loss_events_in_round = 0;
+        b.burst_tail_round = false;
     }
 
     fn resetCongestionSignals(b: *Bbr) void {
@@ -685,6 +817,9 @@ pub const Bbr = struct {
     fn updateCongestionSignals(b: *Bbr, cwnd: u64) void {
         b.updateMaxBw();
         if (!b.loss_round_start) return; // wait until the end of the round trip
+        // a round with loss: what the path carried whole is what it delivered now, or 0.7 of
+        // what it carried before
+        if (b.is_loss_in_round) b.carried = @max(b.inflight_latest, mulDiv(b.carried, beta_num, beta_den));
         // AdaptLowerBoundsFromCongestion: once per round, and not while probing for bandwidth
         const probing = b.state == .startup or b.state == .probe_bw_refill or b.state == .probe_bw_up;
         if (!probing and b.is_loss_in_round) {
@@ -776,8 +911,10 @@ pub const Bbr = struct {
     }
 
     fn checkStartupDone(b: *Bbr) void {
-        // 5.3.1.3 CheckStartupHighLoss
-        if (!b.full_bw_reached and b.loss_round_start and b.recovery_start != null and
+        // 5.3.1.3 CheckStartupHighLoss. (Not for the tail of a quiet sender's burst in the
+        // path's queue: that says how much the queue takes in one go, which `burst_cap` now
+        // holds, not that the path cannot carry the rate.)
+        if (!b.full_bw_reached and b.loss_round_start and b.recovery_start != null and !b.burst_tail_round and
             b.loss_events_in_round >= startup_full_loss_cnt and inflightTooHigh(b.rs.lost, b.rs.tx_in_flight))
         {
             b.full_bw_reached = true;
@@ -941,7 +1078,9 @@ pub const Bbr = struct {
     }
 
     fn checkProbeRtt(b: *Bbr, a: Ack, cwnd: *u64) void {
-        if (b.state != .probe_rtt and b.min_rtt_expired and !b.idle_restart) {
+        // (not for a quiet sender: `quiet`; the expired minimum was replaced by this ACK's
+        // sample in `updateMinRtt`, and the start of the next burst lowers it again)
+        if (b.state != .probe_rtt and b.min_rtt_expired and !b.idle_restart and !b.quiet()) {
             b.saveCwnd(cwnd.*);
             // EnterProbeRTT
             b.state = .probe_rtt;
@@ -952,8 +1091,9 @@ pub const Bbr = struct {
             b.startRound();
         }
         if (b.state == .probe_rtt) {
-            // HandleProbeRTT: the low rate of this state is not the path's
-            b.markAppLimited(a.inflight);
+            // HandleProbeRTT: the low rate of this state is not the path's (nor is it the
+            // application's: `app_quiet` is not set)
+            b.app_limited = @max(b.delivered + a.inflight, 1);
             if (b.probe_rtt_done_stamp == null and a.inflight <= b.probeRttCwnd()) {
                 // hold for the duration and for at least one round
                 b.probe_rtt_done_stamp = a.now + probe_rtt_duration;
@@ -1040,6 +1180,9 @@ pub const Bbr = struct {
     fn setCwnd(b: *Bbr, a: Ack, cwnd: *u64) void {
         // UpdateMaxInflight
         b.max_inflight = b.quantizationBudget(b.bdpMultiple(b.bw, b.cwnd_gain) +| b.extra_acked);
+        // a quiet sender's model knows its own bursts, not the path: not below what the path
+        // has carried (the bounds that loss sets still apply below)
+        if (b.quiet()) b.max_inflight = @max(b.max_inflight, b.carried);
         if (b.full_bw_reached) {
             cwnd.* = @min(cwnd.* +| a.newly_acked, b.max_inflight);
         } else if (cwnd.* < b.max_inflight or b.delivered < b.initial_cwnd) {
@@ -1054,6 +1197,11 @@ pub const Bbr = struct {
             cap = b.inflight_longterm;
         } else if (b.state == .probe_rtt or b.state == .probe_bw_cruise) cap = b.inflightWithHeadroom();
         cap = @min(cap, b.inflight_shortterm);
+        // A quiet sender's losses are the tails of its bursts in the path's queue, and
+        // `burst_cap` answers those. The flight bounds would hold its next burst behind the
+        // last one's acknowledgements: not below what the path has carried in flight (which
+        // a round with loss lowers as well).
+        if (b.quiet()) cap = @max(cap, b.carried);
         cap = @max(cap, min_pipe_cwnd * b.mtu);
         cwnd.* = @min(cwnd.*, cap);
     }
@@ -1109,6 +1257,91 @@ test "pacer: a run is 2 ms of the window, 10 to 64 datagrams; the bucket holds 1
     try std.testing.expectEqual(@as(?u64, Pacer.timer_ns), p.delay(0, 20 * ms, 600_000, mtu, 600_000, 2, 1));
     try std.testing.expectEqual(@as(?u64, null), p.delay(Pacer.timer_ns, 20 * ms, 600_000, mtu, 600_000, 2, 1));
     try std.testing.expectEqual(@as(u64, 75_000), p.tokens);
+}
+
+/// Bytes a sender with unlimited data gets through the pacer in `span` at `rate`, when the loop
+/// that drives it wakes `tick` after it went to sleep, whatever wait it asked for (0: at the
+/// time asked for): a Linux socket receive timeout, counted in jiffies. A pass sends at most
+/// 64 datagrams (the listener's cap).
+fn pacedBytes(rate: u64, quantum: u64, tick: u64, span: u64, late_credit: bool) u64 {
+    var p: Pacer = .{};
+    const mtu: u64 = 1452;
+    var now: u64 = 0;
+    var sent: u64 = 0;
+    while (now < span) {
+        var k: usize = 0;
+        var at: ?u64 = null;
+        while (k < 64) : (k += 1) {
+            if (!late_credit) {
+                p.waiting = false; // the pacer as it was: the bucket bounds every credit
+            }
+            at = p.delayRate(now, rate, mtu, 1 << 30, quantum);
+            if (at != null) break;
+            p.onSend(mtu);
+            sent += mtu;
+        }
+        const t = at orelse {
+            now += 10_000; // the burst cap: the next pass follows at once
+            continue;
+        };
+        now = if (tick == 0) t else @max(t, now + tick);
+    }
+    return sent;
+}
+
+test "pacer: a loop that wakes 4 or 8 ms late still sends at the pacing rate" {
+    // BBR on a long path: 10 MB/s (80 Mbit/s), a send quantum of 1 ms of the rate
+    const rate: u64 = 10_000_000;
+    const quantum: u64 = rate / 1000;
+    const span: u64 = 2 * sec;
+    const want = rate * 2;
+    const exact = pacedBytes(rate, quantum, 0, span, true);
+    try std.testing.expect(exact * 100 >= want * 98 and exact * 100 <= want * 102);
+    // a 250 Hz kernel: the wake comes 4 to 8 ms after a 1.25 ms wait was set
+    for ([_]u64{ 4 * ms, 8 * ms }) |tick| {
+        const got = pacedBytes(rate, quantum, tick, span, true);
+        try std.testing.expect(got * 100 >= want * 97 and got * 100 <= want * 102);
+        // with the bucket (2 ms of the rate) as the limit, the rest of each sleep was lost
+        const old = pacedBytes(rate, quantum, tick, span, false);
+        try std.testing.expect(old * 100 <= want * 55);
+    }
+    // the same for a window-clocked rate far below: 1 MB/s, runs of two datagrams
+    for ([_]u64{ 0, 4 * ms, 8 * ms }) |tick| {
+        const got = pacedBytes(1_000_000, 2 * 1452, tick, span, true);
+        try std.testing.expect(got * 100 >= 2_000_000 * 97 and got * 100 <= 2_000_000 * 102);
+    }
+}
+
+test "pacer: the credit of a late wake is for a sender that waited, not for one that was idle" {
+    var p: Pacer = .{};
+    const mtu: u64 = 1200;
+    const rate: u64 = 6_000_000;
+    const quantum: u64 = 6000;
+    // drain the bucket (two quanta); the sender has more and is told to wait 1.25 ms
+    while (p.delayRate(0, rate, mtu, 1 << 20, quantum) == null) p.onSend(mtu);
+    try std.testing.expectEqual(@as(u64, 12_000), p.capacity);
+    try std.testing.expectEqual(Pacer.timer_ns, p.due);
+    // woken at 6 ms instead: the 36,000 bytes of the whole wait are there, three buckets
+    var sent: u64 = 0;
+    while (p.delayRate(6 * ms, rate, mtu, 1 << 20, quantum) == null) : (sent += 1) p.onSend(mtu);
+    try std.testing.expectEqual(@as(u64, 30), sent);
+    // called 50 ms after the time asked for: that is no late timer (a full window held the
+    // sender, say), and the bucket is the limit
+    var r = p.delayRate(56 * ms, rate, mtu, 1 << 20, quantum);
+    try std.testing.expectEqual(@as(?u64, null), r);
+    try std.testing.expectEqual(p.capacity, p.tokens);
+    while (r == null) {
+        p.onSend(mtu);
+        r = p.delayRate(56 * ms, rate, mtu, 1 << 20, quantum);
+    }
+    // woken late with nothing to send after all: the credit is there for this pass only
+    try std.testing.expectEqual(@as(?u64, null), p.delayRate(64 * ms, rate, mtu, 1 << 20, quantum));
+    try std.testing.expect(p.tokens > 3 * p.capacity);
+    try std.testing.expectEqual(@as(?u64, null), p.delayRate(64 * ms + 1000, rate, mtu, 1 << 20, quantum));
+    try std.testing.expectEqual(p.capacity, p.tokens);
+    // and a sender that was idle for a second starts from the bucket, as before
+    try std.testing.expectEqual(@as(?u64, null), p.delayRate(2 * sec, rate, mtu, 1 << 20, quantum));
+    try std.testing.expectEqual(p.capacity, p.tokens);
 }
 
 test "pacer, rate mode: runs at the rate, no wake-up under 1.25 ms; a late timer loses nothing" {
@@ -1549,6 +1782,100 @@ test "bbr ProbeRTT: ten seconds without a new minimum halve the window for 200 m
     try std.testing.expect(tp.find(.probe_rtt, i + 1) == null);
     try tp.run(x.t + 11 * sec);
     try std.testing.expect(tp.find(.probe_rtt, i + 1) != null);
+}
+
+test "bbr: a sender limited by its application gets a burst allowance and no ProbeRTT; one with a backlog neither" {
+    var tp = TestPath.init(test_rate, test_rtt, 4 * test_bdp);
+    defer tp.deinit();
+    // a bulk transfer: never quiet, the bucket is the two send quanta it was
+    try tp.run(3 * sec);
+    try std.testing.expect(!tp.b.quiet());
+    try std.testing.expectEqual(@as(u64, 0), tp.b.burstAllowance(tp.cwnd));
+    // the path delivered a flight of about a BDP and more whole
+    try std.testing.expect(tp.b.carried >= test_bdp);
+    // the application writes a tenth of the path's rate for 25 s: two minimum round-trip
+    // filter lengths, and no ProbeRTT (the path is empty of its packets most of the time)
+    tp.app_rate = test_rate / 10;
+    tp.app_from = tp.now;
+    tp.app_sent = 0;
+    const bw = tp.b.max_bw;
+    try tp.run(tp.now + 25 * sec);
+    try std.testing.expect(tp.b.quiet());
+    try std.testing.expect(tp.find(.probe_rtt, 0) == null);
+    try std.testing.expectEqual(bw, tp.b.max_bw);
+    try std.testing.expect(tp.b.min_rtt <= test_rtt + 2 * ms);
+    // what may leave at once after a pause: a minimum round trip of the pacing rate, at most
+    // the window; and the window is not under what the path carried
+    const allow = tp.b.burstAllowance(tp.cwnd);
+    try std.testing.expectEqual(@min(Bbr.mulDiv(tp.b.pacing_rate, tp.b.min_rtt, sec), tp.cwnd), allow);
+    try std.testing.expect(allow >= test_bdp * 9 / 10 and allow > 4 * tp.b.send_quantum);
+    try std.testing.expect(tp.cwnd >= tp.b.carried and tp.b.carried >= test_bdp);
+    // with a backlog again it is an ordinary BBR sender: no allowance, and ProbeRTT is back
+    tp.app_rate = 0;
+    try tp.run(tp.now + sec);
+    try std.testing.expect(!tp.b.quiet());
+    try std.testing.expectEqual(@as(u64, 0), tp.b.burstAllowance(tp.cwnd));
+    try tp.run(tp.now + 11 * sec);
+    try std.testing.expect(tp.find(.probe_rtt, 0) != null);
+}
+
+test "bbr: a quiet sender's burst that loses its tail bounds the next bursts; one random loss does not" {
+    var cwnd: u64 = 1 << 20;
+    var b = Bbr.init(0, 12_000, 1200, 1);
+    b.min_rtt = 100 * ms;
+    b.markAppLimited(0);
+    // 200 packets leave in one go
+    var pk: [200]Bbr.Pkt = undefined;
+    for (&pk, 0..) |*p, i| p.* = b.onSent(1000, i * 1200, 1200, &cwnd);
+    try std.testing.expectEqual(@as(u32, 240_000), pk[199].burst);
+    // the first 100 arrive: a burst of 120,000 bytes has arrived whole
+    b.ackBegin();
+    for (pk[0..100], 0..) |p, i| b.onPacketAcked(101 * ms, p, 1000, i, 1200);
+    try std.testing.expectEqual(@as(u64, 120_000), b.burst_ok);
+    // one packet lost further on, then a second: that can be chance
+    b.onPacketLost(102 * ms, pk[150], 1000, 1200, &cwnd);
+    b.onPacketLost(102 * ms, pk[151], 1000, 1200, &cwnd);
+    try std.testing.expectEqual(@as(u64, inf), b.burst_cap);
+    try std.testing.expect(!b.burst_tail_round);
+    // a third of the same burst, past what has arrived whole: its tail met the queue's end.
+    // The bound is seven eighths of what arrived whole (never under half the lost position).
+    b.onPacketLost(102 * ms, pk[152], 1000, 1200, &cwnd);
+    try std.testing.expectEqual(@as(u64, 105_000), b.burst_cap);
+    try std.testing.expectEqual(@as(u64, 105_000), b.burst_ok);
+    try std.testing.expect(b.burst_tail_round);
+    try std.testing.expect(b.quiet() and b.burstAllowance(cwnd) <= 105_000);
+    // a sender with a backlog has no bursts in this sense, and no allowance
+    b.app_quiet = 0;
+    try std.testing.expectEqual(@as(u32, 0), b.onSent(2 * sec, 0, 1200, &cwnd).burst);
+    try std.testing.expectEqual(@as(u64, 0), b.burstAllowance(cwnd));
+}
+
+test "pacer: a bucket with a depth lets a burst leave at once after a pause, at the rate without one" {
+    var p: Pacer = .{};
+    const mtu: u64 = 1200;
+    const rate: u64 = 2_400_000; // 2,000 datagrams a second
+    const quantum: u64 = 2400;
+    const depth: u64 = 600_000; // a quarter of a second of the rate
+    // straight after the last burst the bucket is empty, whatever its depth: the rate holds
+    while (p.delayBurst(0, rate, mtu, 1 << 30, quantum, depth) == null) p.onSend(mtu);
+    try std.testing.expect(p.delayBurst(0, rate, mtu, 1 << 30, quantum, depth) != null);
+    // a pause of 100 ms brings 240,000 bytes: 200 datagrams leave at once
+    var sent: u64 = 0;
+    while (p.delayBurst(100 * ms, rate, mtu, 1 << 30, quantum, depth) == null) : (sent += 1) p.onSend(mtu);
+    try std.testing.expectEqual(@as(u64, 200), sent);
+    // a pause of a second: the depth, not more
+    sent = 0;
+    while (p.delayBurst(1100 * ms, rate, mtu, 1 << 30, quantum, depth) == null) : (sent += 1) p.onSend(mtu);
+    try std.testing.expectEqual(@as(u64, 500), sent);
+    // the same pause without a depth (a sender with a backlog): two quanta, as before
+    sent = 0;
+    while (p.delayBurst(2100 * ms, rate, mtu, 1 << 30, quantum, 0) == null) : (sent += 1) p.onSend(mtu);
+    try std.testing.expectEqual(@as(u64, 4), sent);
+    // and when the depth goes away while the bucket is full, what it held goes with it
+    try std.testing.expectEqual(@as(?u64, null), p.delayBurst(3100 * ms, rate, mtu, 1 << 30, quantum, depth));
+    try std.testing.expectEqual(depth, p.tokens);
+    try std.testing.expectEqual(@as(?u64, null), p.delayBurst(3100 * ms, rate, mtu, 1 << 30, quantum, 0));
+    try std.testing.expectEqual(@as(u64, 2 * quantum), p.tokens);
 }
 
 test "bbr: application-limited samples do not lower the bandwidth estimate; a slower path does" {

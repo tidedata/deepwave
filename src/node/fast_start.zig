@@ -39,7 +39,8 @@ pub const Image = struct {
 };
 
 /// The restore image of a store restored from the formal snapshot of `epoch`, if its segment is
-/// still there and the store holds every checkpoint after it (the catch-up replays them).
+/// still there, the store holds every checkpoint after it (the catch-up replays them) and the
+/// object floor has not moved past it (the replay reads the versions those checkpoints consumed).
 pub fn findImage(snap: *const store.Snapshot, epoch: u64) ?Image {
     _ = snap.segmentBytes(epoch) orelse return null;
     const lo = snap.lowestCheckpoint() orelse return null;
@@ -47,6 +48,14 @@ pub fn findImage(snap: *const store.Snapshot, epoch: u64) ?Image {
     const at = if (rec.epoch == epoch) lo else if (rec.epoch == epoch + 1 and lo > 0) lo - 1 else return null;
     const avail = snap.lowestAvailable() orelse return null;
     if (avail > at + 1) return null;
+    // The object floor too: the replay removes the rows of every version superseded since
+    // `at`, and for that it reads the version. Once the object floor is past `at + 1`, versions
+    // superseded below it may no longer read (and age-out may turn their records in the image
+    // into holes while the job runs), yet the image still lists every record that is
+    // physically there: their rows would stay (stale owner rows, balances too high). The
+    // live-table scan is used then.
+    const st = snap.store;
+    if (st.obj_floor.load(.acquire) > at + 1 or st.obj_floor_epoch.load(.acquire) > epoch + 1) return null;
     return .{ .epoch = epoch, .at = at };
 }
 
@@ -170,6 +179,8 @@ pub const Job = struct {
     fn run(j: *Job) void {
         j.runInner() catch |e| {
             if (e != error.Stopped) std.log.err("fast start: index job failed: {s}; StateService and package versions stay UNAVAILABLE until a restart", .{@errorName(e)});
+            // a replay cut off here has still said what it could not read
+            if (j.feed) |f| _ = f.replayEnd(false);
             j.failed = e;
             j.done.store(true, .release);
         };
@@ -197,6 +208,9 @@ pub const Job = struct {
         j.scan = sc;
         j.live_at = at;
         std.log.info("fast start: no restore image; the live set as of checkpoint {d} from the live table ({d} entries sorted in {d} ms)", .{ at, sc.total(), (nowNs() - t0) / std.time.ns_per_ms });
+        // What this build adds to the node's memory, so a small box knows before it finds out:
+        // the scan's locations until the rows are read, the build budget until the tables are written.
+        if (j.feed) |f| std.log.info("fast start: the build from the live table holds {d} MiB for the scan (8 bytes for each of {d} live-table entries) while it reads, and up to {d} MiB of build budget (ZUI_INDEX_BUILD_MEM_MB) to its end; the scan's part is freed before the sort", .{ (sc.total() * 8) >> 20, sc.total(), f.ix.db.opts.build_mem_bytes >> 20 });
         return sc;
     }
 
@@ -216,7 +230,7 @@ pub const Job = struct {
             if (j.image) |img| {
                 std.log.info("fast start: building the state index from the restore image (segment {d}, live set at {d}){s}", .{ img.epoch, img.at, if (j.floors) " with rpc package floors" else "" });
             } else std.log.info("fast start: building the state index from the live set at {d}{s}", .{ at, if (j.floors) " with rpc package floors" else "" });
-            const rep = try j.feed.?.buildFrom(.{ .ctx = j, .at = at, .walk = walkBuild });
+            const rep = try j.feed.?.buildFrom(.{ .ctx = j, .at = at, .walk = walkBuild, .release = releaseSource });
             j.built_ms = j.msSince();
             std.log.info("fast start: state index built from {d} objects ({d} MiB read): {d} rows, {d} MiB on disk in {d} s", .{ rep.objects, j.image_bytes.load(.monotonic) >> 20, rep.entries, rep.bytes >> 20, rep.ms / 1000 });
         }
@@ -316,10 +330,14 @@ pub const Job = struct {
         const tip = @min(seq, snap.highestCommitted() orelse seq);
         _ = j.replayTo(&snap, tip) catch |e| {
             std.log.err("fast start: handoff replay to {d}: {s}", .{ tip, @errorName(e) });
+            if (j.feed) |f| _ = f.replayEnd(false);
             j.failed = e;
             j.done.store(true, .release);
             return;
         };
+        // The state index's replay of stored checkpoints ends here (the catch-up rounds and the
+        // handoff are one replay): one line with its missing_old, at WARN when it is not 0.
+        if (j.feed) |f| _ = f.replayEnd(true);
         if (j.rpc) |x| x.finishSeed(&snap, tip) catch |e| {
             std.log.err("fast start: rpc index at {d}: {s}", .{ tip, @errorName(e) });
             j.failed = e;
@@ -425,6 +443,18 @@ pub const Job = struct {
         const floors = j.floors and part < j.floored.len and !j.floored[part].load(.acquire);
         try j.walkPart(part, parts, sink, floors);
         if (floors) j.floored[part].store(true, .release);
+    }
+
+    /// `index.lsm.Source.release`: the build reads the live set no more. A live-table scan's
+    /// locations (8 bytes a live-table entry, 6 GiB on mainnet) go now, before the sort, not
+    /// after it; unless the rpc floors still have parts to walk with the scan (a resumed
+    /// build skips the parts it has, and the floors have not seen them).
+    fn releaseSource(ctx: *anyopaque) void {
+        const j: *Job = @ptrCast(@alignCast(ctx));
+        if (j.floors) for (&j.floored) |*f| {
+            if (!f.load(.acquire)) return;
+        };
+        j.dropScan();
     }
 
     fn floorPass(j: *Job) !void {

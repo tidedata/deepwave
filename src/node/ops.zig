@@ -17,7 +17,7 @@ const std = @import("std");
 const protocol = @import("protocol");
 
 /// deepwave release number. Bump on every release installed on a box.
-pub const version = "0.1.0";
+pub const version = "0.1.1";
 
 /// Prints `deepwave <version>-<sha>`, sui-node's `sui-node 1.83.1-6a567faf6de1` shape. The sha
 /// comes from the executable's build options (build.zig), so only main.zig depends on it.

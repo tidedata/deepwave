@@ -70,6 +70,9 @@ pub const Request = struct {
     /// (src/edge/route.zig `Caller`). Valid during the call. Nothing reads them yet.
     api_key: []const u8 = "",
     peer: []const u8 = "",
+    /// The request's `x-forwarded-for` metadata ("" when absent or longer than
+    /// `max_forwarded_for`): an access gate reads it only behind a proxy it trusts.
+    forwarded_for: []const u8 = "",
 };
 
 /// A peer address as text, held inline (`Conn.peer`, copied into each `Job`).
@@ -103,6 +106,9 @@ pub const ResponseStream = struct {
     /// Bidi calls: end the stream after this call with the returned status (tonic-reflection
     /// ends its response stream with OK when a request message fails to decode).
     end_stream: bool = false,
+    /// A refusal that says when to come back: sent as a `retry-after-ms` trailer of a
+    /// trailers-only reply (null: no such trailer).
+    retry_after_ms: ?u32 = null,
 
     pub const VTable = struct {
         /// One framed message: the 5-byte prefix and the (possibly compressed) payload.
@@ -259,6 +265,11 @@ pub fn statusHeaders(list: *std.ArrayList(meta.Header), arena: Allocator, status
     }
 }
 
+/// `retry-after-ms`, after the status of a trailers-only refusal (an access gate's rate limit).
+pub fn retryAfterHeader(list: *std.ArrayList(meta.Header), arena: Allocator, ms: u32) !void {
+    try list.append(arena, .{ .name = "retry-after-ms", .value = try std.fmt.allocPrint(arena, "{d}", .{ms}) });
+}
+
 /// Headers of a trailers-only reply, in tonic's order: its generated router answers an unknown
 /// method with `grpc-status` before `content-type`; a Status reply puts `content-type` first and
 /// a rejected `grpc-encoding` adds `grpc-accept-encoding: identity`.
@@ -340,6 +351,7 @@ pub const Job = struct {
     deadline_ns: ?u64,
     client_protocol_version: ?u64 = null,
     api_key: []u8 = &.{},
+    forwarded_for: []u8 = &.{},
     peer: Peer = .{},
     /// Set by the connection (under its lock) when nobody waits for the answer any more: the
     /// stream was reset or dropped, or `expireJobs` answered it at its deadline.
@@ -358,10 +370,11 @@ pub const Job = struct {
     }
 
     pub fn request(j: *const Job) Request {
-        return .{ .path = j.path, .authority = j.authority, .body = j.body, .stream_id = j.stream_id, .accept = j.encoding, .deadline_ns = j.deadline_ns, .client_protocol_version = j.client_protocol_version, .api_key = j.api_key, .peer = j.peer.text() };
+        return .{ .path = j.path, .authority = j.authority, .body = j.body, .stream_id = j.stream_id, .accept = j.encoding, .deadline_ns = j.deadline_ns, .client_protocol_version = j.client_protocol_version, .api_key = j.api_key, .peer = j.peer.text(), .forwarded_for = j.forwarded_for };
     }
     pub fn destroy(j: *Job, gpa: Allocator) void {
         gpa.free(j.api_key);
+        gpa.free(j.forwarded_for);
         gpa.free(j.path);
         gpa.free(j.authority);
         gpa.free(j.body);
@@ -388,6 +401,10 @@ pub const Stream = struct {
     client_protocol_version: ?u64 = null,
     /// `x-api-key` (`Request.api_key`); allocated only when the request carries one.
     api_key: []u8 = &.{},
+    /// `x-forwarded-for` (`Request.forwarded_for`); allocated only when the request carries one.
+    forwarded_for: []u8 = &.{},
+    /// `ResponseStream.retry_after_ms` of the call that answered this stream.
+    retry_after_ms: ?u32 = null,
     body: std.ArrayList(u8) = .empty,
     send_window: i64,
     /// Framed gRPC bytes not yet sent as DATA.
@@ -439,14 +456,18 @@ pub const Stream = struct {
         gpa.free(s.authority);
         gpa.free(s.grpc_encoding);
         gpa.free(s.api_key);
+        gpa.free(s.forwarded_for);
         s.body.deinit(gpa);
         s.out.deinit(gpa);
         if (s.trailers) |t| gpa.free(t);
     }
 };
 
-/// Longest `x-api-key` value kept (the rest is cut).
-pub const max_api_key = 256;
+/// Longest `x-api-key` value kept: one byte past the longest key an access gate takes (256),
+/// so an oversized key is still refused instead of being cut into another key.
+pub const max_api_key = 257;
+/// A longer `x-forwarded-for` list is not kept at all.
+pub const max_forwarded_for = 1024;
 
 pub const Conn = struct {
     gpa: Allocator,
@@ -918,6 +939,10 @@ pub const Conn = struct {
                 gpa.free(self.s.api_key);
                 self.s.api_key = &.{};
                 self.s.api_key = try gpa.dupe(u8, value[0..@min(value.len, max_api_key)]);
+            } else if (eql(u8, name, "x-forwarded-for")) {
+                gpa.free(self.s.forwarded_for);
+                self.s.forwarded_for = &.{};
+                if (value.len <= max_forwarded_for) self.s.forwarded_for = try gpa.dupe(u8, value);
             }
         }
     };
@@ -1046,12 +1071,15 @@ pub const Conn = struct {
         var sink: ConnSink = .{ .c = c, .s = s };
         var rs: ResponseStream = .{ .gpa = c.gpa, .impl = &sink, .vt = &ConnSink.vt, .encoding = s.encoding };
         defer rs.release();
-        const req: Request = .{ .path = s.path, .authority = s.authority, .body = payload, .stream_id = s.id, .accept = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version, .api_key = s.api_key, .peer = c.peer.text() };
+        const req: Request = .{ .path = s.path, .authority = s.authority, .body = payload, .stream_id = s.id, .accept = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version, .api_key = s.api_key, .peer = c.peer.text(), .forwarded_for = s.forwarded_for };
         const status = c.handler.call(c.handler.ctx, &req, &rs);
         switch (status) {
             .deferred => return,
             .held => return c.flush(s),
-            else => try c.setTrailersEx(s, status, rs.msg, rs.details_bin, false),
+            else => {
+                s.retry_after_ms = rs.retry_after_ms;
+                try c.setTrailersEx(s, status, rs.msg, rs.details_bin, false);
+            },
         }
     }
 
@@ -1065,7 +1093,9 @@ pub const Conn = struct {
         const body = try c.gpa.dupe(u8, payload);
         errdefer c.gpa.free(body);
         const api_key: []u8 = if (s.api_key.len > 0) try c.gpa.dupe(u8, s.api_key) else &.{};
-        j.* = .{ .stream_id = s.id, .path = path, .authority = authority, .body = body, .encoding = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version, .api_key = api_key, .peer = c.peer };
+        errdefer c.gpa.free(api_key);
+        const forwarded_for: []u8 = if (s.forwarded_for.len > 0) try c.gpa.dupe(u8, s.forwarded_for) else &.{};
+        j.* = .{ .stream_id = s.id, .path = path, .authority = authority, .body = body, .encoding = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version, .api_key = api_key, .forwarded_for = forwarded_for, .peer = c.peer };
         return j;
     }
 
@@ -1090,6 +1120,11 @@ pub const Conn = struct {
             else => try c.setTrailersEx(s, status, text, details_bin, false),
         }
         return true;
+    }
+
+    /// Before `complete`: the worker's call set `ResponseStream.retry_after_ms`.
+    pub fn retryAfter(c: *Conn, stream_id: u32, ms: u32) void {
+        if (c.streams.get(stream_id)) |s| s.retry_after_ms = ms;
     }
 
     /// The worker of `stream_id`'s job is done with it and has no answer to give (the connection
@@ -1317,6 +1352,7 @@ pub const Conn = struct {
             blk.append(arena, 0x88) catch return error.OutOfMemory; // :status 200
             const ct = if (s.web_out != .none) webContentType(s) else "application/grpc";
             trailersOnlyHeaders(&list, arena, ct, status, text, details_bin, reject_encoding) catch return error.OutOfMemory;
+            if (s.retry_after_ms) |ms| retryAfterHeader(&list, arena, ms) catch return error.OutOfMemory;
             c.commonHeaders(&list, arena, s) catch return error.OutOfMemory;
         } else if (s.web_out != .none) {
             // gRPC-web: the trailers travel as a 0x80 frame at the end of the body

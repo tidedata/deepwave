@@ -321,3 +321,65 @@ test "lsm: a build streamed by several producer threads equals inserts, survives
     try testing.expect((try y.next()) == null);
     try testing.expect(n > n_obj);
 }
+
+test "lsm: a stop ends a compaction between two entries, leaves the runs and the directory as they were, and the next settle does the same compaction" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/ix", .{tmp.sub_path});
+    defer gpa.free(dir);
+    const opts: lsm.Options = .{ .mem_bytes = 6 << 10, .max_checkpoints = 5, .ratio = 2, .max_runs = 6, .sync = .none };
+    var lock: index.RwLock = .{};
+    var db = try lsm.Db.open(gpa, testing.io, dir, opts);
+    defer db.deinit();
+    // the node's stop has begun (`stopBackground` sets the flag before it joins the thread)
+    db.stop.store(true, .release);
+    var prng = std.Random.DefaultPrng.init(5);
+    const r = prng.random();
+    var stopped: u32 = 0;
+    var seq: u64 = 0;
+    while (seq < 120) : (seq += 1) {
+        for (0..40) |_| {
+            var kb: [6]u8 = undefined;
+            r.bytes(&kb);
+            kb[0] = 0;
+            var ver: [8]u8 = undefined;
+            std.mem.writeInt(u64, &ver, seq, .little);
+            lock.lock();
+            try db.apply(&kb, lsm.Val.put(&ver));
+            lock.unlock();
+        }
+        lock.lock();
+        _ = try db.endCheckpoint(seq);
+        lock.unlock();
+        db.reclaim();
+        // flushes go on (a memtable is small); a compaction that comes due is ended at once
+        db.settle(&lock) catch |e| {
+            try testing.expectEqual(error.Stopped, e);
+            stopped += 1;
+        };
+    }
+    try testing.expect(stopped > 0);
+    try testing.expectEqual(@as(u64, 0), db.stats.compactions);
+    try testing.expect(db.runs.items.len > 2);
+    // nothing of an ended merge is left: one table file per run
+    const tables = struct {
+        fn count(d: []const u8) !usize {
+            var pb: [600]u8 = undefined;
+            var it_dir = try std.Io.Dir.cwd().openDir(testing.io, try std.fmt.bufPrint(&pb, "{s}/index", .{d}), .{ .iterate = true });
+            defer it_dir.close(testing.io);
+            var n: usize = 0;
+            var it = it_dir.iterate();
+            while (try it.next(testing.io)) |e| {
+                if (std.mem.endsWith(u8, e.name, ".tbl")) n += 1;
+            }
+            return n;
+        }
+    }.count;
+    try testing.expectEqual(db.runs.items.len, try tables(dir));
+    // without the stop the same compaction runs to its end
+    db.stop.store(false, .release);
+    try db.settle(&lock);
+    try testing.expect(db.stats.compactions > 0);
+    try testing.expectEqual(db.runs.items.len, try tables(dir));
+}

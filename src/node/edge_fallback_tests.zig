@@ -990,13 +990,13 @@ test "edge fallback: feedForm of a full blob is the blob a feed of it rebuilds t
         defer out.deinit(gpa);
         try out.appendSlice(gpa, blob);
         try sc.aux.appendSlice(gpa, "stale aux");
-        try source_mod.feedForm(gpa, &sc, &out);
+        try source_mod.feedForm(gpa, &sc, &out, false);
         try testing.expectEqualSlices(u8, want.items, out.items);
         try testing.expectEqual(@as(usize, 0), sc.aux.items.len);
         try testing.expect(out.items.len < blob.len);
 
         // idempotent
-        try source_mod.feedForm(gpa, &sc, &out);
+        try source_mod.feedForm(gpa, &sc, &out, false);
         try testing.expectEqualSlices(u8, want.items, out.items);
     }
     // the archive's order is not the effects' order: without the reordering the two ways in
@@ -1006,7 +1006,7 @@ test "edge fallback: feedForm of a full blob is the blob a feed of it rebuilds t
     var junk: std.ArrayList(u8) = .empty;
     defer junk.deinit(gpa);
     try junk.appendSlice(gpa, "\x01not a checkpoint");
-    try testing.expectError(error.BadData, source_mod.feedForm(gpa, &sc, &junk));
+    try testing.expectError(error.BadData, source_mod.feedForm(gpa, &sc, &junk, false));
 }
 
 const edge_wire = @import("edgewire");

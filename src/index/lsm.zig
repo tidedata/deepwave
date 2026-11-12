@@ -6,7 +6,10 @@
 //! - `0x00 || kind || owner(32) || bcs(StructTag) || balance_tag || !balance BE? || id` -> version
 //!   (owner index, `object_by_owner`);
 //! - `0x01 || owner(32) || bcs(TypeTag)` -> (coin i128, address i128) as merge deltas (`balance`,
-//!   summed like sui-node's merge operator; a sum of zero reads as absent);
+//!   summed like sui-node's merge operator). The balance rows are `held` deltas: a row that summed
+//!   to zero still reads as a row with balance 0, as sui-node's merged RocksDB row does, until a
+//!   merge that includes the oldest run drops it (sui-node: the `balance_compact_zero` compaction
+//!   filter, sui-rpc-store schema/balance.rs `compact`). A plain `delta` of zero is the identity;
 //! - `0x02 || wrapper kind || bcs(TypeTag) || id` -> () (`object_by_type`, the three coin wrappers).
 //!
 //! Layout (a log-structured merge tree, files under `<dir>/index/` through `store.RealIo`):
@@ -17,7 +20,8 @@
 //!   with the frozen memtable's checkpoint as the durable watermark;
 //! - runs (one or more tables with disjoint key ranges) are kept oldest first; size-tiered
 //!   compaction merges the newest runs once they reach 1/ratio of the run before them, so the run
-//!   count stays logarithmic. A merge that includes the oldest run drops deletes and zero sums.
+//!   count stays logarithmic. A merge that includes the oldest run drops deletes and zero sums
+//!   (held ones too); other merges keep deletes and held zero sums.
 //! - `meta`: two checksummed 16 KiB manifest slots written alternately (the higher valid counter
 //!   wins): runs, watermark, next table number, and the state of an unfinished bulk build.
 //!
@@ -39,7 +43,10 @@ const sorted = @import("sorted.zig");
 const root = @import("root.zig");
 const bulk = @import("bulk.zig");
 
-pub const Op = enum(u8) { put = 1, del = 2, delta = 3 };
+/// `delta`: summed into what is older; a zero sum is the identity (reads as absent). `held`: a
+/// delta whose row stays present at a zero sum until a bottom merge (see the balance table above).
+/// Combining a held delta with a plain one gives a held one.
+pub const Op = enum(u8) { put = 1, del = 2, delta = 3, held = 4 };
 pub const max_val = 32;
 
 pub const Val = struct {
@@ -62,6 +69,20 @@ pub const Val = struct {
         std.mem.writeInt(i128, v.b[16..32], b, .little);
         return v;
     }
+    pub fn held(a: i128, b: i128) Val {
+        var v = delta(a, b);
+        v.op = .held;
+        return v;
+    }
+    pub fn isDelta(v: *const Val) bool {
+        return v.op == .delta or v.op == .held;
+    }
+    /// A delta (plain or held) that sums to zero.
+    pub fn zeroSum(v: *const Val) bool {
+        if (!v.isDelta()) return false;
+        const p = v.pair();
+        return p[0] == 0 and p[1] == 0;
+    }
     pub fn pair(v: *const Val) [2]i128 {
         if (v.len != 32) return .{ 0, 0 };
         return .{ std.mem.readInt(i128, v.b[0..16], .little), std.mem.readInt(i128, v.b[16..32], .little) };
@@ -70,7 +91,8 @@ pub const Val = struct {
         if (v.len < 8) return 0;
         return std.mem.readInt(u64, v.b[0..8], .little);
     }
-    /// A delete, or a delta that sums to zero (the identity): reads as absent.
+    /// A delete, or a plain delta that sums to zero (the identity): reads as absent. A held delta
+    /// never does.
     pub fn empty(v: *const Val) bool {
         if (v.op == .del) return true;
         if (v.op == .delta) {
@@ -81,13 +103,14 @@ pub const Val = struct {
     }
 };
 
-/// `newer` over `older`: a put or delete hides what is older; a delta adds to it.
+/// `newer` over `older`: a put or delete hides what is older; a delta adds to it (held if
+/// either side is held).
 pub fn combine(newer: Val, older: Val) Val {
-    if (newer.op != .delta or older.op == .del) return newer;
+    if (!newer.isDelta() or older.op == .del) return newer;
     const x = newer.pair();
     const y = older.pair();
     var r = Val.delta(x[0] +% y[0], x[1] +% y[1]);
-    r.op = older.op;
+    r.op = if (older.op == .put) .put else if (newer.op == .held or older.op == .held) .held else .delta;
     return r;
 }
 
@@ -521,6 +544,7 @@ const TableIter = struct {
             1 => .put,
             2 => .del,
             3 => .delta,
+            4 => .held,
             else => return error.Corrupt,
         };
         const vlen = d[it.pos + 1];
@@ -686,6 +710,9 @@ pub const MergeIter = struct {
     key: std.ArrayList(u8) = .empty,
     /// Keep deletes and non-zero deltas (a merge that is not the bottom of the tree).
     keep_deletes: bool = false,
+    /// Drop held deltas that sum to zero (a merge into the bottom of the tree). Reads keep them:
+    /// such a row reads as balance 0, as sui-node's uncompacted row does.
+    drop_zero_held: bool = false,
 
     fn before(m: *const MergeIter, x: u32, y: u32) bool {
         return switch (std.mem.order(u8, m.srcs[x].key, m.srcs[y].key)) {
@@ -743,12 +770,11 @@ pub const MergeIter = struct {
             var acc = m.srcs[top].val;
             try m.popTop();
             while (m.hn > 0 and std.mem.eql(u8, m.srcs[m.heap[0]].key, m.key.items)) {
-                if (acc.op == .delta) acc = combine(acc, m.srcs[m.heap[0]].val);
+                if (acc.isDelta()) acc = combine(acc, m.srcs[m.heap[0]].val);
                 try m.popTop();
             }
-            if (acc.op == .delta) {
-                const p = acc.pair();
-                if (p[0] == 0 and p[1] == 0) continue;
+            if (acc.isDelta()) {
+                if (acc.zeroSum() and (acc.op == .delta or m.drop_zero_held)) continue;
             } else if (acc.op == .del and !m.keep_deletes) continue;
             return .{ .key = m.key.items, .val = acc };
         }
@@ -899,6 +925,11 @@ pub const Options = struct {
     /// partitions being sorted). `build_chunk_bytes` caps one lane's buffer.
     build_mem_bytes: usize = 2 << 30,
     sync: store.SyncMode = .data,
+    /// Open an existing index to read it only (`deepwave-tool verify-index` on a node's serving
+    /// index): no manifest is created, no file the manifest does not name is removed, and
+    /// nothing is flushed at close. `open` fails with error.NoIndex when there is no manifest.
+    /// The caller must not write (`apply`, a build, `startBackground`, `settle`).
+    read_only: bool = false,
 };
 
 pub const Stats = struct {
@@ -963,9 +994,18 @@ pub const Db = struct {
         errdefer gpa.destroy(m);
         m.* = .{};
         var db: Db = .{ .gpa = gpa, .opts = opts, .files = files, .rio = rio, .mem = m, .io = io };
-        errdefer db.deinitInner();
+        // Only what `loadManifest` opened: the errdefers above free the rest (`deinitInner`
+        // here freed the memtable, `files` and `rio` a second time).
+        errdefer db.dropLoaded();
         try db.loadManifest();
         return db;
+    }
+
+    /// What a failed `loadManifest` leaves open: the runs read so far and the manifest file.
+    fn dropLoaded(db: *Db) void {
+        for (db.runs.items) |r| r.destroy(db.gpa, db.files.?, false);
+        db.runs.deinit(db.gpa);
+        if (db.meta_fd) |fd| db.files.?.close(fd);
     }
 
     fn deinitInner(db: *Db) void {
@@ -1020,8 +1060,10 @@ pub const Db = struct {
 
     fn loadManifest(db: *Db) !void {
         const files = db.files.?;
+        const ro = db.opts.read_only;
         const fd = files.open(meta_name, false) catch |e| switch (e) {
             error.FileNotFound => blk: {
+                if (ro) return error.NoIndex;
                 const fd = try files.open(meta_name, true);
                 try files.rio.truncate(fd, 2 * slot_len);
                 break :blk fd;
@@ -1044,8 +1086,9 @@ pub const Db = struct {
                     best_slot = @intCast(i);
                 };
             }
-        } else try files.rio.truncate(fd, 2 * slot_len);
+        } else if (!ro) try files.rio.truncate(fd, 2 * slot_len);
         const d = best orelse {
+            if (ro) return error.NoIndex;
             try db.gc();
             return;
         };
@@ -1068,7 +1111,7 @@ pub const Db = struct {
             r.* = .{ .tables = tabs };
             try db.runs.append(db.gpa, r);
         }
-        try db.gc();
+        if (!ro) try db.gc();
     }
 
     pub fn writeManifest(db: *Db) !void {
@@ -1252,6 +1295,8 @@ pub const Db = struct {
     fn bgMain(db: *Db) void {
         while (!db.stop.load(.acquire)) {
             const did = db.step() catch |e| blk: {
+                // a compaction the stop ended: nothing was changed
+                if (e == error.Stopped) break;
                 db.stats.bg_errors += 1;
                 db.last_err = e;
                 std.log.err("state index: background: {s}", .{@errorName(e)});
@@ -1374,7 +1419,7 @@ pub const Db = struct {
         const a = arena.allocator();
         const srcs = try a.alloc(Src, rs.len);
         for (srcs, 0..) |*s, k| s.* = .{ .kind = .{ .run = RunIter.init(a, files, rs[rs.len - 1 - k]) } };
-        var m: MergeIter = .{ .a = a, .srcs = srcs, .heap = try a.alloc(u32, rs.len), .keep_deletes = from != 0 };
+        var m: MergeIter = .{ .a = a, .srcs = srcs, .heap = try a.alloc(u32, rs.len), .keep_deletes = from != 0, .drop_zero_held = from == 0 };
         try m.seek("");
         const gen = db.newGen();
         var nb: [64]u8 = undefined;
@@ -1384,7 +1429,19 @@ pub const Db = struct {
         for (rs) |r| in_bytes += r.bytes();
         {
             errdefer w.abort();
-            while (try m.next()) |e| try w.add(e.key, e.val);
+            // A merge reads every entry of its runs (the largest: the whole index, minutes on
+            // a busy disk). A stop ends it between two entries: `stopBackground` joins this
+            // thread, and until the merge looked at the flag that join was as long as the
+            // merge (the node's stop ran into its deadline in the index teardown). The runs
+            // are untouched; the next start picks the same compaction again.
+            var n: u32 = 0;
+            while (try m.next()) |e| : (n +%= 1) {
+                if (n % 1024 == 0 and db.stop.load(.acquire)) {
+                    files.remove(name);
+                    return error.Stopped;
+                }
+                try w.add(e.key, e.val);
+            }
         }
         _ = try w.finish();
         const run = try db.gpa.create(Run);
@@ -1445,6 +1502,12 @@ pub const Source = struct {
     ctx: *anyopaque,
     at: u64,
     walk: *const fn (ctx: *anyopaque, part: u32, parts: u32, sink: Sink) anyerror!void,
+    /// Called once by the partitioned build when it will not call `walk` again (every row is
+    /// in its partition files; the sort and the tables follow), from the building thread: the
+    /// source may free what it held for the walks. A live-table scan holds 8 bytes per
+    /// live-table entry (6 GiB on mainnet); kept through the sort it sat under the sorters'
+    /// share of the budget for nothing.
+    release: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 pub const Sink = struct {
@@ -1506,6 +1569,15 @@ pub const Builder = struct {
         temp_bytes: u64 = 0,
         /// Sorted chunks written for partitions larger than a worker's share of the budget.
         sort_chunks: u32 = 0,
+        /// Partitioned build: what it held of its budget (`Options.build_mem_bytes`). While
+        /// the rows arrived: the walkers' lanes at their largest, all of them at once. In the
+        /// sort: every worker's rows, row index and read buffer at their largest, added up
+        /// (an upper bound: the workers reach their largest at different times). 0: that
+        /// phase did not run in this process (a resumed build).
+        lane_bytes: u64 = 0,
+        sort_bytes: u64 = 0,
+        walkers: u32 = 0,
+        sort_workers: u32 = 0,
     };
 
     /// Builds the base run from the snapshot's live set (resuming a build of the same tip) and
@@ -1814,7 +1886,7 @@ pub const Builder = struct {
             runs[i] = .{ .tables = &one[i] };
             srcs[i] = .{ .kind = .{ .run = RunIter.init(a, files, &runs[i]) } };
         }
-        var m: MergeIter = .{ .a = a, .srcs = srcs, .heap = try a.alloc(u32, n) };
+        var m: MergeIter = .{ .a = a, .srcs = srcs, .heap = try a.alloc(u32, n), .drop_zero_held = true };
         var lo_buf: [3]u8 = undefined;
         try m.seek(rangeLo(r, &lo_buf));
         var nb: [64]u8 = undefined;
@@ -2011,7 +2083,7 @@ pub const Stream = struct {
 pub const pending_tip = std.math.maxInt(u64);
 
 /// Merges whole temp tables (equal keys: deltas add up, index 0 wins otherwise; deletes and zero
-/// sums are dropped) into `w` in key order. `stop` is checked every 64k rows.
+/// sums, held ones too, are dropped: the result is a base run) into `w` in key order. `stop` is checked every 64k rows.
 pub fn mergeTablesInto(gpa: Allocator, files: *Files, tables: []const *Table, w: *TableWriter, stop: ?*const std.atomic.Value(bool)) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -2025,7 +2097,7 @@ pub fn mergeTablesInto(gpa: Allocator, files: *Files, tables: []const *Table, w:
         runs[i] = .{ .tables = &one[i] };
         srcs[i] = .{ .kind = .{ .run = RunIter.init(a, files, &runs[i]) } };
     }
-    var m: MergeIter = .{ .a = a, .srcs = srcs, .heap = try a.alloc(u32, n) };
+    var m: MergeIter = .{ .a = a, .srcs = srcs, .heap = try a.alloc(u32, n), .drop_zero_held = true };
     try m.seek("");
     var k: u64 = 0;
     while (try m.next()) |e| {
@@ -2309,3 +2381,71 @@ test "lsm format 2: study over real tables (ZUI_LSM_STUDY_DIR)" {
     };
 }
 
+
+// ---------------------------------------------------------------------------- held deltas
+
+fn heldTestRows(db: *const Db, a: Allocator) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = try db.iter(a, "");
+    while (try it.next()) |e| try out.append(a, try std.fmt.allocPrint(a, "{s}={d}", .{ e.key[1..], e.val.pair()[0] }));
+    return out.items;
+}
+
+fn expectHeldRows(db: *const Db, a: Allocator, want: []const []const u8) !void {
+    const got = try heldTestRows(db, a);
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try std.testing.expectEqualStrings(w, g);
+}
+
+test "lsm: a held delta summed to zero reads as a row through flushes and merges, until a merge into the oldest run" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ix", .{tmp.sub_path});
+    // every checkpoint flushes; nothing compacts on its own (ratio 0)
+    const opts: Options = .{ .max_checkpoints = 1, .ratio = 0, .max_runs = 100, .sync = .none };
+    var lock: root.RwLock = .{};
+    var db = try Db.open(gpa, std.testing.io, dir, opts);
+    defer db.deinit();
+    const Step = struct { key: []const u8, val: Val };
+    const cps = [_][]const Step{
+        &.{.{ .key = "\x01z", .val = Val.held(1, 0) }},
+        &.{ .{ .key = "\x01a", .val = Val.held(5, 0) }, .{ .key = "\x01b", .val = Val.delta(7, 0) }, .{ .key = "\x01e", .val = Val.delta(3, 0) } },
+        // a: held to zero; b: a plain row (an index written before held deltas) zeroed by a held
+        // change; c: a plain zero (a zero-value coin), the identity; e: plain to zero, absent
+        &.{ .{ .key = "\x01a", .val = Val.held(-5, 0) }, .{ .key = "\x01b", .val = Val.held(-7, 0) }, .{ .key = "\x01c", .val = Val.delta(0, 0) }, .{ .key = "\x01e", .val = Val.delta(-3, 0) } },
+    };
+    for (cps, 1..) |steps, seq| {
+        lock.lock();
+        for (steps) |s| try db.apply(s.key, s.val);
+        _ = try db.endCheckpoint(seq);
+        lock.unlock();
+        db.reclaim();
+        try db.settle(&lock);
+    }
+    try std.testing.expectEqual(@as(usize, 3), db.runs.items.len);
+    try expectHeldRows(&db, a, &.{ "a=0", "b=0", "z=1" });
+    // the newer two runs merge (not the bottom): the zero rows stay, read back from the table (op 4)
+    try db.compact(1);
+    try std.testing.expectEqual(@as(usize, 2), db.runs.items.len);
+    try expectHeldRows(&db, a, &.{ "a=0", "b=0", "z=1" });
+    var it = try db.iter(a, "\x01a");
+    try std.testing.expectEqual(Op.held, (try it.next()).?.val.op);
+    // a merge into the oldest run drops them, as sui-node's compaction filter does
+    try db.compact(0);
+    try std.testing.expectEqual(@as(usize, 1), db.runs.items.len);
+    try expectHeldRows(&db, a, &.{"z=1"});
+}
+
+test "lsm: combine keeps held and plain deltas apart" {
+    try std.testing.expectEqual(Op.delta, combine(Val.delta(1, 0), Val.delta(-1, 0)).op);
+    try std.testing.expect(combine(Val.delta(1, 0), Val.delta(-1, 0)).empty());
+    try std.testing.expectEqual(Op.held, combine(Val.held(-1, 0), Val.delta(1, 0)).op);
+    try std.testing.expectEqual(Op.held, combine(Val.delta(0, 2), Val.held(0, -2)).op);
+    try std.testing.expect(!combine(Val.held(-1, 0), Val.delta(1, 0)).empty());
+    try std.testing.expect(combine(Val.held(-1, 0), Val.delta(1, 0)).zeroSum());
+    try std.testing.expectEqual(Op.put, combine(Val.held(1, 0), Val.put("v")).op);
+}
