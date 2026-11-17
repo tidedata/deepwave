@@ -1,0 +1,9 @@
+[package]
+name = "vault"
+edition = "2024.beta"
+
+[dependencies]
+Sui = { local = "../../../../sui/crates/sui-framework/packages/sui-framework" }
+
+[addresses]
+vault = "0x0"

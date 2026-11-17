@@ -34,27 +34,39 @@ pub const Result = struct {
 pub fn verifyModule(arena: Allocator, scratch: *std.heap.ArenaAllocator, cfg: *const Config, m: *const CompiledModule, natives: ?*const Natives) Allocator.Error!Result {
     var r: Result = .{};
     r.meter.enterScope(.Module);
+    try verifyInto(arena, scratch, cfg, m, natives, &r.meter, &r);
+    return r;
+}
+
+/// `verifyModule` charging `meter`, whose module scope the caller has entered (the signing path
+/// shares one meter across a transaction's packages). `Result.meter` is left unused.
+pub fn verifyModuleMetered(arena: Allocator, scratch: *std.heap.ArenaAllocator, cfg: *const Config, m: *const CompiledModule, natives: ?*const Natives, meter: *Meter) Allocator.Error!Result {
+    var r: Result = .{};
+    try verifyInto(arena, scratch, cfg, m, natives, meter, &r);
+    return r;
+}
+
+fn verifyInto(arena: Allocator, scratch: *std.heap.ArenaAllocator, cfg: *const Config, m: *const CompiledModule, natives: ?*const Natives, meter: *Meter, r: *Result) Allocator.Error!void {
     if (try check_bounds.verifyModule(arena, m, cfg.deprecate_global_storage_ops)) |e| {
         r.move = .{ .err = e, .loc = .undefined };
-        return r;
+        return;
     }
     // only index the module once the bounds check has passed (a caller may hand in a module
     // from deserializeNoCheckBounds)
     const self_name = m.identifiers[m.module_handles[m.self_module_handle_idx].name];
     var ctx: c.Ctx = .{};
-    moveVerify(&ctx, arena, scratch, cfg, m, natives, &r.meter) catch |e| switch (e) {
+    moveVerify(&ctx, arena, scratch, cfg, m, natives, meter) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Vm => {
             r.move = .{ .err = ctx.err, .loc = .{ .module = self_name } };
-            return r;
+            return;
         },
     };
-    r.sui = sui.verify(arena, scratch, &ctx, cfg, m, &r.meter) catch |e| switch (e) {
+    r.sui = sui.verify(arena, scratch, &ctx, cfg, m, meter) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        // A Rust panic/unwrap path (or a meter limit): report as an invariant violation.
+        // A Rust panic/unwrap path: report as an invariant violation.
         error.Vm => SuiError{ .kind = .InvariantViolation, .msg = "zui: unexpected verifier state" },
     };
-    return r;
 }
 
 fn moveVerify(ctx: *c.Ctx, arena: Allocator, scratch: *std.heap.ArenaAllocator, cfg: *const Config, m: *const CompiledModule, natives: ?*const Natives, meter: *Meter) c.E!void {
@@ -92,6 +104,7 @@ fn codeUnits(ctx: *c.Ctx, arena: Allocator, scratch: *std.heap.ArenaAllocator, c
 
 fn verifyFunction(ctx: *c.Ctx, scratch: *std.heap.ArenaAllocator, cfg: *const Config, m: *const CompiledModule, fidx: u16, fd: *const ff.FunctionDefinition, cache: *c.AbilityCache, name_def: *const std.AutoHashMapUnmanaged(u16, u16), meter: *Meter) c.E!usize {
     meter.enterScope(.Function);
+    meter.fun_name = m.identifiers[m.function_handles[fd.function].name];
     const code = &(fd.code orelse return 0);
     _ = scratch.reset(.retain_capacity);
     const a = scratch.allocator();

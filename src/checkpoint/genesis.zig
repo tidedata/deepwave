@@ -45,7 +45,7 @@ fn skipOptU64(r: *Reader) bcs.Error!void {
 }
 
 /// Reads (protocol_pubkey_bytes, voting_power) of each active validator.
-fn readValidators(arena: std.mem.Allocator, contents: []const u8) Error![]committee_mod.Member {
+pub fn readValidators(arena: std.mem.Allocator, contents: []const u8) Error![]committee_mod.Member {
     var r = Reader.init(contents);
     return readValidatorsAt(arena, &r);
 }

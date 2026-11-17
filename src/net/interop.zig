@@ -175,7 +175,15 @@ pub fn run(ctx: *harness.Ctx) anyerror!void {
         } else |e| c.failf("request: {s}", .{@errorName(e)});
         _ = c.finish();
     }
-    // ---- key updates we start (quinn follows): every 64 packets through a 3 MiB response
+    // ---- key updates we start (quinn follows): every 64 packets we seal. Key updates count the
+    // packets we send (the confidentiality limit is per key, RFC 9001 sections 6.1 and 6.6), and a
+    // downloader sends only ACKs, about one per receive drain: 317 packets for 9 MiB of responses
+    // on an idle rig, 22 to 50 on a loaded one, which is under one key's 64, so no update was due
+    // and the old `>= 2` failed on load alone. Each request therefore carries a 512 KiB body (Big
+    // reads only its first 8 bytes): at least 360 sealed packets per request whatever the
+    // scheduler does, so updates start during the upload and the 3 MiB response arrives under the
+    // keys quinn switched to. The ACK-only path (one PING per phase asks for the phase ACK) is
+    // covered deterministically by the conn.zig test "a side that only sends ACKs still updates".
     {
         const item = "key-update/ours";
         if (ctx.selected(item)) {
@@ -183,10 +191,11 @@ pub fn run(ctx: *harness.Ctx) anyerror!void {
             if (anemo.Peer.connect(ctx.gpa, ctx.io, addr, .{ .server_name = ss.mainnet_server_name, .expected = rust.peer_id, .key_update_pkts = 64 })) |kp| {
                 defer kp.deinit();
                 var c = ctx.check(item);
-                var size_buf: [8]u8 = undefined;
-                std.mem.writeInt(u64, &size_buf, 3 << 20, .little);
+                const body = ctx.scratch().alloc(u8, 512 << 10) catch @panic("out of memory");
+                for (body, 0..) |*x, i| x.* = @truncate(i *% 131 +% 7);
+                std.mem.writeInt(u64, body[0..8], 3 << 20, .little);
                 for (0..3) |_| {
-                    if (kp.request(ctx.scratch(), "/zui.Test/Big", &.{}, &size_buf, 60_000)) |r| {
+                    if (kp.request(ctx.scratch(), "/zui.Test/Big", &.{}, body, 60_000)) |r| {
                         c.eql("status", wire.Status.success, r.status);
                         c.eql("len", @as(usize, 3 << 20), r.body.len);
                         c.eql("body", true, bigOk(r.body));

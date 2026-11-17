@@ -6,6 +6,8 @@ pub const code_passes = @import("code_passes.zig");
 pub const refsafety = @import("refsafety.zig");
 pub const sui = @import("sui.zig");
 pub const verify = @import("verify.zig");
+pub const dependencies = @import("dependencies.zig");
+pub const signing = @import("signing.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

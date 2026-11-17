@@ -317,6 +317,21 @@ pub const EpochState = struct {
         return out.items;
     }
 
+    /// Every stored capability, copied under the store's lock first: for a thread other than
+    /// the committer (the checkpoint builder's end-of-epoch vote).
+    pub fn capabilitiesCopy(self: *const EpochState, arena: std.mem.Allocator) Error![]messages.AuthorityCapabilitiesV2 {
+        var raws: std.ArrayList([]const u8) = .empty;
+        {
+            self.store.mutex.lockUncancelable(self.store.io);
+            defer self.store.mutex.unlock(self.store.io);
+            var it = self.store.iterator(.capabilities_v2);
+            while (it.next()) |e| try raws.append(arena, try arena.dupe(u8, e.value_ptr.*));
+        }
+        const out = try arena.alloc(messages.AuthorityCapabilitiesV2, raws.items.len);
+        for (raws.items, out) |r, *o| o.* = bcs.decode(messages.AuthorityCapabilitiesV2, arena, r) catch return error.BadCapabilities;
+        return out;
+    }
+
     pub fn recordDenyConfig(self: *EpochState, cfg: *const messages.SharedTransactionDenyConfig) Error!void {
         const authority = switch (cfg.*) {
             .V1 => |v| v.authority.@"0",
@@ -490,15 +505,29 @@ pub fn chooseProtocolVersion(
     buffer_stake_bps: u64,
     caps: []const messages.AuthorityCapabilitiesV2,
 ) Error!Chosen {
-    var next = state.info.protocol_version;
-    var packages: []const ObjectRef = &.{};
     const S = struct {
         fn stake(ctx: *const anyopaque, name: *const [96]u8) u64 {
             const st: *const EpochState = @ptrCast(@alignCast(ctx));
             return st.stakeOf(name);
         }
     };
-    while (try isProtocolVersionSupported(arena, state.info.protocol_version, next + 1, advance_to_highest, state.thresholds, S.stake, state, caps, buffer_stake_bps)) |c| {
+    return chooseFor(arena, state.info.protocol_version, state.thresholds, S.stake, state, advance_to_highest, buffer_stake_bps, caps);
+}
+
+/// `chooseProtocolVersion` over any committee (stake by name).
+pub fn chooseFor(
+    arena: std.mem.Allocator,
+    current: u64,
+    thresholds: Thresholds,
+    stake_of: *const fn (ctx: *const anyopaque, name: *const [96]u8) u64,
+    ctx: *const anyopaque,
+    advance_to_highest: bool,
+    buffer_stake_bps: u64,
+    caps: []const messages.AuthorityCapabilitiesV2,
+) Error!Chosen {
+    var next = current;
+    var packages: []const ObjectRef = &.{};
+    while (try isProtocolVersionSupported(arena, current, next + 1, advance_to_highest, thresholds, stake_of, ctx, caps, buffer_stake_bps)) |c| {
         next = c.protocol_version;
         packages = c.packages;
     }

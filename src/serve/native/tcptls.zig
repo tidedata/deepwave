@@ -505,6 +505,11 @@ test "tcptls: writeSome never waits for a peer that reads nothing; the sealed re
             const st = l.accept(iox) catch return;
             const fd = st.socket.handle;
             sock.tune(fd);
+            // A fixed send buffer far below the payload: Linux autotunes it up to tcp_wmem's
+            // max (4 MiB by default), which with the peer's receive buffer holds the whole
+            // 4 MiB, so without this the socket never fills there.
+            const sndbuf: c_int = 256 << 10;
+            _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&sndbuf), @sizeOf(c_int));
             const sess = s.acceptor().accept(s, fd) orelse {
                 sock.close(fd);
                 return;
@@ -531,6 +536,9 @@ test "tcptls: writeSome never waits for a peer that reads nothing; the sealed re
     var addr: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(port) };
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
+    // and a receive buffer that cannot grow to hold it either (hosts with a large tcp_rmem)
+    const rcvbuf: c_int = 256 << 10;
+    _ = std.c.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&rcvbuf), @sizeOf(c_int));
     var rb: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
     var wb: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
     var sr = stream.reader(io, &rb);

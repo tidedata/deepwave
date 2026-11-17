@@ -8,7 +8,9 @@
 //!   and a mutability derived from how the commands use them, address-owned inputs passed where a
 //!   `0x2::transfer::Receiving<T>` parameter is expected become Receiving, coin reservation refs
 //!   are re-encoded. Gas payment refs resolve the same way and bound the default budget.
-//! - `literal` inputs (JSON values typed by the called function) answer UNIMPLEMENTED.
+//! - `literal` inputs (a `google.protobuf.Value`) become Pure inputs of the type every use of the
+//!   input agrees on (`literal.rs`: MoveCall parameter, SplitCoins amount, TransferObjects
+//!   recipient, typed MakeMoveVector element), see literal.zig.
 const std = @import("std");
 const bcs = @import("bcs");
 const types = @import("types");
@@ -19,6 +21,7 @@ const mf = @import("move_format");
 
 const state_mod = @import("state.zig");
 const checks = @import("checks.zig");
+const literal = @import("literal.zig");
 
 const Allocator = std.mem.Allocator;
 const Id = [32]u8;
@@ -57,7 +60,8 @@ const PInput = struct {
     mutable: ?bool = null,
     mutability: ?u64 = null,
     funds: ?[]const u8 = null,
-    literal: bool = false,
+    /// `literal`, decoded (every occurrence merged, as prost does).
+    literal: ?literal.Lit = null,
 };
 
 const PRef = struct { object_id: ?[]const u8 = null, version: ?u64 = null, digest: ?[]const u8 = null };
@@ -149,7 +153,7 @@ pub fn parse(arena: Allocator, msg: []const u8) DecodeError!Request {
         var commands: std.ArrayList([]const u8) = .empty;
         var pr = proto.Reader.init(ptb.items);
         while (try pr.next()) |f| switch (f.number) {
-            1 => try inputs.append(arena, try parseInput(try proto.Reader.bytesOf(f))),
+            1 => try inputs.append(arena, try parseInput(arena, try proto.Reader.bytesOf(f))),
             2 => try commands.append(arena, try proto.Reader.bytesOf(f)),
             else => {},
         };
@@ -171,8 +175,9 @@ fn parseRef(msg: []const u8) DecodeError!PRef {
     return p;
 }
 
-fn parseInput(msg: []const u8) DecodeError!PInput {
+fn parseInput(arena: Allocator, msg: []const u8) DecodeError!PInput {
     var p: PInput = .{};
+    var lit: ?std.ArrayList(u8) = null;
     var r = proto.Reader.init(msg);
     while (try r.next()) |f| switch (f.number) {
         1 => p.kind = try proto.Reader.varintOf(f),
@@ -183,9 +188,14 @@ fn parseInput(msg: []const u8) DecodeError!PInput {
         6 => p.mutable = (try proto.Reader.varintOf(f)) != 0,
         7 => p.mutability = try proto.Reader.varintOf(f),
         8 => p.funds = try proto.Reader.bytesOf(f),
-        1000 => p.literal = true,
+        1000 => {
+            const b = try proto.Reader.bytesOf(f);
+            if (lit == null) lit = .empty;
+            try lit.?.appendSlice(arena, b);
+        },
         else => {},
     };
+    if (lit) |l| p.literal = try literal.decode(arena, l.items);
     return p;
 }
 
@@ -216,17 +226,27 @@ pub fn parseSuiAddress(s: []const u8) ?Id {
 /// fastcrypto `InvalidInput`'s Display (a failed `SuiAddress::from_str`).
 pub const sui_address_parse_error = "Invalid value was given to the function";
 
-/// sui-types `ObjectID::from_str`: `decode_bytes_hex`, else `from_hex_literal` (`0x` and up to
-/// 64 digits, left padded; a bare `0x` is ObjectID zero). Every failure is
-/// `ObjectIDParseError::HexLiteralPrefixMissing` (the padded retry has no prefix).
+/// sui-types `ObjectID::from_str`: `decode_bytes_hex`, else `from_hex_literal`: a `0x` prefix
+/// required, the rest left padded with `0`s to 64 digits when shorter, and `from_str` again on the
+/// result (so a bare `0x` is ObjectID zero, `0x0x` + 64 digits parses, and so does `0xx` + 62
+/// digits, whose padding makes a new `0x` prefix). Every failure is
+/// `ObjectIDParseError::HexLiteralPrefixMissing` (the last retry has no prefix).
 pub fn parseObjectId(s: []const u8) ?Id {
-    if (parseSuiAddress(s)) |a| return a;
-    if (!std.mem.startsWith(u8, s, "0x") or s.len - 2 > 64) return null;
-    var buf: [64]u8 = @splat('0');
-    @memcpy(buf[64 - (s.len - 2) ..], s[2..]);
-    var out: Id = undefined;
-    _ = std.fmt.hexToBytes(&out, &buf) catch return null;
-    return out;
+    var buf: [64]u8 = undefined;
+    var cur = s;
+    while (true) {
+        if (parseSuiAddress(cur)) |a| return a;
+        if (!std.mem.startsWith(u8, cur, "0x")) return null;
+        const rest = cur[2..];
+        if (rest.len >= 64) {
+            cur = rest;
+            continue;
+        }
+        var next: [64]u8 = @splat('0');
+        @memcpy(next[64 - rest.len ..], rest);
+        buf = next;
+        cur = &buf;
+    }
 }
 pub const object_id_parse_error = "ObjectID hex literal must start with 0x";
 
@@ -1030,9 +1050,16 @@ fn resolveArg(arena: Allocator, state: State, pkgs: *Pkgs, uses: *const ArgUses,
         .err => |e| return .{ .err = e },
     };
     const no_obj = in.object_id == null and in.version == null and in.digest == null and in.mutable == null;
-    if (in.literal) {
-        if (in.kind == null and in.pure == null and no_obj and in.funds == null) return .{ .unimplemented = "transaction resolution of literal inputs is not supported" };
-        return invalidInput();
+    if (in.literal) |*lit| {
+        if (in.kind != null or in.pure != null or !no_obj or in.funds != null) return invalidInput();
+        const ty = switch (try literalType(arena, pkgs, uses, commands, idx)) {
+            .ok => |t| t,
+            .err => |e| return .{ .err = e },
+        };
+        return switch (try literal.encode(arena, &ty, lit)) {
+            .ok => |b| .{ .ok = .{ .Pure = b } },
+            .err => |m| .{ .err = .{ .status = .{ .code = code_invalid_argument, .message = m } } },
+        };
     }
     // Pure
     if ((in.kind == null or in.kind.? == 1) and in.pure != null and no_obj and in.funds == null) return .{ .ok = .{ .Pure = in.pure.? } };
@@ -1080,6 +1107,35 @@ fn resolveArg(arena: Allocator, state: State, pkgs: *Pkgs, uses: *const ArgUses,
         1 => .{ .err = .{ .status = .{ .code = code_invalid_argument, .message = try std.fmt.allocPrint(arena, "object {s} is object owned and cannot be used as an input", .{checks.hex(&id).s()}) } } },
         else => shared(arena, pkgs, uses, commands, idx, raw, &v),
     };
+}
+
+const TypeResult = union(enum) { ok: literal.LType, err: Error };
+
+/// `determine_literal_type`: the one type every use of input `idx` gives it, in use order (the
+/// first error wins).
+fn literalType(arena: Allocator, pkgs: *Pkgs, uses: *const ArgUses, commands: []const types.Command, idx: usize) Allocator.Error!TypeResult {
+    const invalid_use: TypeResult = .{ .err = .{ .status = .{ .code = code_invalid_argument, .message = "invalid use of literal" } } };
+    // a bug in find_arg_uses in Rust: not reached
+    const internal: TypeResult = .{ .err = .{ .status = .{ .code = code_internal, .message = "error determining type of literal" } } };
+    var found: ?literal.LType = null;
+    for (uses.of(idx)) |u| {
+        const c = &commands[u.cmd];
+        const t: literal.LType = switch (c.*) {
+            .MoveCall => |*m| if (u.pos) |pos| switch (try pkgs.param(m, pos)) {
+                .ok => |p| try literal.fromToken(arena, p.cm, p.tok),
+                .err => |e| return .{ .err = e },
+            } else return internal,
+            .TransferObjects => if (u.pos == null) .address else return invalid_use,
+            .SplitCoins => if (u.pos != null) .u64 else return invalid_use,
+            .MakeMoveVec => |*v| if (u.pos == null) return internal else if (v[0]) |*ti| try literal.fromTypeInput(arena, ti) else return .{ .err = .{ .status = .{ .code = code_invalid_argument, .message = "unable to resolve literal as an unknown type" } } },
+            .Upgrade, .MergeCoins => return invalid_use,
+            .Publish => return internal,
+        };
+        if (found) |*f| {
+            if (!f.eql(&t)) return .{ .err = .{ .status = .{ .code = code_invalid_argument, .message = "unable to resolve literal as it is used as multiple different types across commands" } } };
+        } else found = t;
+    }
+    return if (found) |t| .{ .ok = t } else .{ .err = .{ .status = .{ .code = code_invalid_argument, .message = "unable to determine type of literal" } } };
 }
 
 fn invalidInput() ArgResult {

@@ -1,5 +1,7 @@
 //! The truth vectors in `$ZUI_CORPUS/vectors/rpc-execute` (made by tools/truth/rpc-exec-driver).
-//! Missing vectors fail the test: generate them with the commands in that tool's README.
+//! Skipped when there is no corpus (`$ZUI_CORPUS` unset or not a directory), like the other
+//! corpus tests. A corpus without these vectors fails the test: generate them with the commands
+//! in that tool's README.
 const std = @import("std");
 const testing = std.testing;
 const vectors = @import("vectors.zig");
@@ -25,14 +27,14 @@ const Counter = struct {
 
 test "rpc-execute truth vectors" {
     const gpa = testing.allocator;
-    const corpus = testing.environ.getAlloc(gpa, "ZUI_CORPUS") catch {
-        std.debug.print("ZUI_CORPUS is not set: run the tests through ./zig (tools/env.sh)\n", .{});
-        return error.NoCorpus;
-    };
+    const corpus = testing.environ.getAlloc(gpa, "ZUI_CORPUS") catch return error.SkipZigTest;
     defer gpa.free(corpus);
-    var root = std.Io.Dir.openDirAbsolute(testing.io, corpus, .{}) catch |e| {
-        std.debug.print("cannot open $ZUI_CORPUS {s}: {t}\n", .{ corpus, e });
-        return e;
+    var root = std.Io.Dir.openDirAbsolute(testing.io, corpus, .{}) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return error.SkipZigTest, // no corpus on this host
+        else => {
+            std.debug.print("cannot open $ZUI_CORPUS {s}: {t}\n", .{ corpus, e });
+            return e;
+        },
     };
     defer root.close(testing.io);
     var c: Counter = .{};

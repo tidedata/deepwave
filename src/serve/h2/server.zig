@@ -18,6 +18,7 @@ const sock = @import("sock.zig");
 const meta = @import("meta.zig");
 const pump = @import("pump.zig");
 const pool_mod = @import("pool.zig");
+const tcache = @import("core").threads;
 const ns_per_s = std.time.ns_per_s;
 /// A peer that takes no bytes of a pending reply for this long is dropped (sock.writeAll's limit).
 const write_stall_ns: u64 = sock.write_stall_limit * 5 * ns_per_s;
@@ -45,7 +46,8 @@ pub const Options = struct {
     /// Stack of connection threads (HTTP/1.1 runs handlers on them; rendering a checkpoint
     /// needs a few hundred KiB) and of the h2 worker threads.
     stack_size: usize = 8 << 20,
-    /// Stack of pump threads (server streams over h2c).
+    /// Stack of pump threads (server streams over h2c). Unused: pumps run on kept threads
+    /// (core/threads.zig), whose stack is larger.
     pump_stack_size: usize = 2 << 20,
     /// Pump threads running at once, process-wide; a server stream past it ends with
     /// RESOURCE_EXHAUSTED (each pump is an OS thread).
@@ -243,6 +245,11 @@ pub fn drainThenForce(drain_ns: u64, force_ns: u64, cut: ?*const fn () bool) Dra
 
 fn spawnConn(gpa: std.mem.Allocator, io: Io, fd: std.c.fd_t, opts: Options, handler: Handler, stop: *const Atomic(bool)) void {
     _ = stats.conns.fetchAdd(1, .monotonic);
+    // a kept thread (core/threads.zig): a thread started and ended per connection mapped and
+    // unmapped its stack each time, under the mmap lock every page fault of the node waits on
+    if (opts.stack_size <= tcache.stack_size) {
+        if (tcache.spawn(connMain, .{ gpa, io, fd, opts, handler, stop })) |h| return h.detach() else |_| {}
+    }
     const t = std.Thread.spawn(.{ .stack_size = opts.stack_size }, connMain, .{ gpa, io, fd, opts, handler, stop }) catch {
         _ = stats.conns.fetchSub(1, .monotonic);
         sock.close(fd);
@@ -316,7 +323,7 @@ fn stallAfterDone() void {
 const Attached = struct {
     pump: pump.Pump,
     link: pump.Link,
-    thread: ?std.Thread = null,
+    thread: ?tcache.Handle = null,
     done: Atomic(bool) = .init(false),
     /// `pump.done` was called (exactly once: after `run`, or in place of `run`).
     released: bool = false,
@@ -496,7 +503,8 @@ const H2 = struct {
                 h.refuse(a, "too many server streams");
                 continue;
             }
-            a.thread = std.Thread.spawn(.{ .stack_size = h.opts.pump_stack_size }, pumpMain, .{a}) catch blk: {
+            // a kept thread (core/threads.zig, `spawnConn`)
+            a.thread = tcache.spawn(pumpMain, .{a}) catch blk: {
                 _ = stats.pumps.fetchSub(1, .monotonic);
                 a.done.store(true, .release);
                 h.refuse(a, "cannot start the stream");

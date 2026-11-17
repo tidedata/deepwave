@@ -154,10 +154,11 @@ pub const Job = struct {
     /// the request's snapshot is released, their memory is freed here.
     pub fn finish(j: *Job) void {
         j.stop.store(true, .release);
-        for (j.threads[0..j.n], j.arenas[0..j.n]) |t, *a| {
-            t.join();
-            a.deinit();
-        }
+        // Join every worker before freeing any arena: a slot's `vals` live in the arena of the
+        // worker that read its transaction, but its key batches are shared, so another worker
+        // can still be writing into them until it is joined (2026-11-12 SEGV in readBatch).
+        for (j.threads[0..j.n]) |t| t.join();
+        for (j.arenas[0..j.n]) |*a| a.deinit();
         _ = live.fetchSub(@intCast(j.n), .acq_rel);
         j.n = 0;
         service.prof.w_runs += j.probes[0].load(.monotonic);

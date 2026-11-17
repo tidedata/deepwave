@@ -51,6 +51,9 @@ const cache_mod = @import("cache.zig");
 const readstats = @import("readstats.zig");
 const txfix = @import("txfix.zig");
 const prefetch = @import("prefetch.zig");
+const agepend = @import("agepend.zig");
+/// Kept threads for the per-flush threads (core/threads.zig: no stack mapped per flush).
+const tcache = @import("core").threads;
 const hash = @import("hash");
 
 const Backend = io_mod.Backend;
@@ -181,9 +184,14 @@ pub const Config = struct {
     /// inaccessible reservations, so a slice read through a released snapshot faults at its first
     /// use. null: on in safety test builds or with ZUI_UAF_GUARD=1.
     uaf_guard: ?bool = null,
-    /// Superseded locations remembered between the object floor scan and the passes (at most:
+    /// Superseded locations the pending set holds in memory between the object floor scan and
+    /// the passes (the rest waits on disk, `agepend`; at most:
     /// `age_mem_bytes` holds the set to a quarter of the ager's memory, `agePendingMax`).
     age_pending_max: u64 = 1 << 23,
+    /// The pending set's buckets: 2^bits bytes of a segment each (`agepend`). Each operation
+    /// on the set costs at most one bucket (16 MiB of segment: at most a few hundred thousand
+    /// locations; tens of thousands on mainnet).
+    age_pending_bucket_bits: u6 = 24,
     /// What the ager may hold in memory, in bytes (`ageMem` measures it, `AgeStats.mem`):
     ///   - the pending set: a quarter. Its entries are capped so that the hash map, which grows
     ///     by doubling (old and new table side by side while it does), stays inside that;
@@ -214,6 +222,11 @@ pub const Config = struct {
     /// 100: no sleep).
     age_qd: u32 = 32,
     age_share_pct: u64 = 50,
+    /// Locked time a background step may take before its passes stop at the next group (the
+    /// writer's segment deletion and `agePause` wait on `age_mu`). Bytes alone (`age_budget`)
+    /// did not bound it: on an edge a step's reads and live-table lookups go to a disk the
+    /// node is writing hard, and steps of 5 to 8.75 s were seen at 8 MiB. 0: no limit.
+    age_step_ms: u64 = 200,
     /// Segment pass with a live set (lane ager-segment-pass; needs the read-ahead, so not with
     /// `age_serial`). Before the pass walks aged segments, one sequential pass over the live
     /// table marks every location the table names in them, one bit per `AgeSet.cell` bytes, in
@@ -836,16 +849,28 @@ const Ager = struct {
     cp_wait_seq: u64 = 0,
     segc: u64 = std.math.maxInt(u64),
     seg_target: u64 = 0,
-    /// Locations of records whose successor is below the object floor, and how far both
-    /// passes had come when the full set was last pruned (`agePrunePending`).
-    pending: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    pruned_at: u64 = 0,
+    /// Locations of records whose successor is below the object floor (`agepend`: bucketed
+    /// by location, in memory up to a quarter of the ager's memory, the rest on disk).
+    pending: agepend.Pending = .{},
+    /// Pending locations whose records the batch turns into holes: forgotten once it is
+    /// committed (`ageCommit`), and those of the group being planned with their chunk.
+    forget: std.ArrayList(u64) = .empty,
+    forget_grp: std.ArrayList(struct { l: u64, ci: usize }) = .empty,
+    /// This step: time in batch commits and in their syncs (`ageCommit`), and where its
+    /// passes stop for time (`AgeStepOpts.deadline_ns`; maxInt: never).
+    commit_ns: u64 = 0,
+    sync_ns: u64 = 0,
+    step_end: u64 = std.math.maxInt(u64),
     /// Finished rewrites for the writer's grace period (`ageHandoff`), and the bytes of the old
     /// directories they hold.
     handoff: std.ArrayList(*AgeDone) = .empty,
     handoff_n: std.atomic.Value(usize) = .init(0),
     handoff_bytes: std.atomic.Value(u64) = .init(0),
     g: std.ArrayList(u8) = .empty,
+    /// The segment pass's group, decoded a step at a time when the step runs out of time
+    /// (`seg_part`); swapped into `g` once whole.
+    seg_g: std.ArrayList(u8) = .empty,
+    seg_part: Store.LoadPart = .{},
     out: std.ArrayList(u8) = .empty,
     ents: std.ArrayList(chunk.Entry) = .empty,
     recs: std.ArrayList(chunk.AgeRec) = .empty,
@@ -878,9 +903,12 @@ const Ager = struct {
         a.total.deinit(gpa);
         if (a.dict) |d| zstd_c.freeCDict(d.cdict);
         a.lagq.deinit(gpa);
-        a.pending.deinit(gpa);
+        // `pending`: `Store.releaseAll` (its files need the backend).
+        a.forget.deinit(gpa);
+        a.forget_grp.deinit(gpa);
         a.handoff.deinit(gpa);
         a.g.deinit(gpa);
+        a.seg_g.deinit(gpa);
         a.out.deinit(gpa);
         a.ents.deinit(gpa);
         a.recs.deinit(gpa);
@@ -1112,14 +1140,14 @@ const FlushJob = struct {
             defer if (direct != null) be.closeDirect(dfd);
             const workers: usize = @intCast(@max(1, @min(s.cfg.flush_writers, n / flush_run_max)));
             var parts: [max_flush_writers]Part = undefined;
-            var threads: [max_flush_writers]?std.Thread = @splat(null);
+            var threads: [max_flush_writers]?tcache.Handle = @splat(null);
             const per = (n + workers - 1) / workers;
             for (0..workers) |w| {
                 const lo = @min(n, w * per);
                 const hi = @min(n, lo + per);
                 parts[w] = .{ .job = job, .lo = lo, .hi = hi, .dfd = dfd, .buffered = direct == null, .jfd = jfd, .pages_off = pages_off };
             }
-            for (0..workers) |w| threads[w] = std.Thread.spawn(.{}, Part.main, .{&parts[w]}) catch null;
+            for (0..workers) |w| threads[w] = tcache.spawn(Part.main, .{&parts[w]}) catch null;
             for (0..workers) |w| {
                 if (threads[w]) |th| th.join() else parts[w].main();
             }
@@ -1445,7 +1473,7 @@ pub const Store = struct {
     flush: ?*FlushJob = null,
     /// Dirty pages after the previous commit (pacing: pages a commit added).
     pace_prev_dirty: u64 = 0,
-    flush_thread: ?std.Thread = null,
+    flush_thread: ?tcache.Handle = null,
     meta_lock: std.atomic.Value(u32) = .init(0),
 
     /// Age-out: its state and lock (the ager thread or `ageStep`; the writer takes it to delete
@@ -1709,6 +1737,7 @@ pub const Store = struct {
         s.pend_links.deinit(gpa);
         s.xref_targets.deinit(gpa);
         s.aged.deinit(gpa);
+        s.ager.pending.deinit(gpa, s.backend, false);
         s.ager.deinit(gpa);
         gpa.free(s.clean.counts);
         gpa.free(s.buf);
@@ -1740,6 +1769,8 @@ pub const Store = struct {
     /// nothing.
     pub fn close(s: *Store) Error!void {
         s.stopAger();
+        // The pending set's runs are scratch (the next open would remove them anyway).
+        s.ager.pending.deinit(s.gpa, s.backend, true);
         if (!s.poisoned) s.closeFlush() catch |e| {
             s.deinit();
             return e;
@@ -3303,7 +3334,7 @@ pub const Store = struct {
         s.flush = job;
         s.since_flush = 0;
         if (s.cfg.background_flush and s.backend == .real) {
-            s.flush_thread = std.Thread.spawn(.{}, FlushJob.main, .{job}) catch null;
+            s.flush_thread = tcache.spawn(FlushJob.main, .{job}) catch null;
         }
     }
 
@@ -3996,6 +4027,11 @@ pub const Store = struct {
                     // (and its name is reused by the next table created).
                     .live => |tg| if (tg < m.live_tg) try s.deferFree(full) else if (tg > m.live_tg) try s.backend.remove(full),
                     .other => {
+                        // The ager's pending-set runs: scratch of the last process.
+                        if (agepend.isFileName(n)) {
+                            try s.backend.remove(full);
+                            continue;
+                        }
                         // A dir file, sidecar or age log whose segment is gone (deleted first).
                         for ([_][]const u8{ ".dir", ".side", ".age", ".zd" }) |ext| if (std.mem.endsWith(u8, n, ext)) {
                             const e = std.fmt.parseInt(u64, n[0 .. n.len - ext.len], 10) catch break;
@@ -5309,6 +5345,10 @@ pub const Store = struct {
         /// Leave the segment pass out (a bulk catch-up while the node is behind: that pass
         /// looks up every object of every aged segment, the restore image included).
         skip_seg: bool = false,
+        /// Locked time after which the passes stop at the next group (0: none). The ager
+        /// thread sets `age_step_ms`; tests and the simulation step by bytes only (a clock
+        /// in their steps would break seed replay).
+        deadline_ns: u64 = 0,
     };
 
     pub const AgeStats = struct {
@@ -5324,10 +5364,25 @@ pub const Store = struct {
         phys_punched: std.atomic.Value(u64) = .init(0),
         pending: std.atomic.Value(u64) = .init(0),
         pending_full: std.atomic.Value(u64) = .init(0),
-        /// Passes over the full pending set to drop what both passes have passed, and
+        /// Pending-set buckets dropped because both passes had left them, and
         /// superseded locations never remembered because they were behind both already.
         pending_prunes: std.atomic.Value(u64) = .init(0),
         pending_behind: std.atomic.Value(u64) = .init(0),
+        /// Pending locations forgotten because a committed rewrite made their records holes (or
+        /// a pass found them holes already): they no longer wait for the other pass.
+        pending_forgot: std.atomic.Value(u64) = .init(0),
+        /// The pending set (`agepend`): entries in memory now, its segment files and their
+        /// bytes now; entries written out and bucket writes, bucket reads back, so far; and
+        /// failures (an extent unreadable or a write that failed: fewer holes, never a wrong one).
+        pending_mem_entries: std.atomic.Value(u64) = .init(0),
+        pending_files: std.atomic.Value(u64) = .init(0),
+        pending_disk_bytes: std.atomic.Value(u64) = .init(0),
+        pending_spilled: std.atomic.Value(u64) = .init(0),
+        pending_spills: std.atomic.Value(u64) = .init(0),
+        pending_loads: std.atomic.Value(u64) = .init(0),
+        pending_disk_errors: std.atomic.Value(u64) = .init(0),
+        /// Bucket writes of a bucket a pass was in (memory held nothing else to write out).
+        pending_active_spills: std.atomic.Value(u64) = .init(0),
         /// Bytes the ager holds (`ageMem`) after its last step or read-ahead, the most it has
         /// held, and of the former the pending set and the old directories of rewrites the
         /// writer has not taken yet; and steps not started because such rewrites waited.
@@ -5337,6 +5392,19 @@ pub const Store = struct {
         mem_handoff: std.atomic.Value(u64) = .init(0),
         handoff_waits: std.atomic.Value(u64) = .init(0),
         max_step_ns: std.atomic.Value(u64) = .init(0),
+        /// Of the longest step: the most a step spent in batch commits (writes, syncs, a
+        /// directory file) and in their syncs alone; steps cut by `age_step_ms`; steps over
+        /// a second with the lock held (each logged with its breakdown).
+        max_commit_ns: std.atomic.Value(u64) = .init(0),
+        max_sync_ns: std.atomic.Value(u64) = .init(0),
+        step_cuts: std.atomic.Value(u64) = .init(0),
+        slow_steps: std.atomic.Value(u64) = .init(0),
+        /// The segment pass: logical bytes it decoded (a group cut for time and finished at
+        /// a later step counts once), group loads cut for time and resumed, and segments whose
+        /// last chunks hold no whole group (skipped to the next segment, logged).
+        seg_read: std.atomic.Value(u64) = .init(0),
+        seg_load_cuts: std.atomic.Value(u64) = .init(0),
+        seg_tails: std.atomic.Value(u64) = .init(0),
         failed: std.atomic.Value(bool) = .init(false),
         /// Deferred mode: checks that found the node behind and waited, bulk catch-ups started
         /// because the backlog passed `age_defer_bytes`, and the backlog at the last check.
@@ -5429,6 +5497,18 @@ pub const Store = struct {
 
     const AgeGroup = struct { e: u64, off: u64, len: u64, seq: u64, commit_off: u64, c: *CSeg, d: *chunk.Dir, first: usize, n: usize };
 
+    /// Where a group load stopped (`ageLoadGroupPart`).
+    const LoadPart = struct {
+        state: enum { none, cut, tail } = .none,
+        loc: u64 = no_loc,
+        d: ?*chunk.Dir = null,
+        first: usize = 0,
+        i: usize = 0,
+        p: usize = 0,
+        /// Logical bytes decoded by the last call.
+        added: u64 = 0,
+    };
+
     /// Decodes the group at logical `off` of compressed segment `e` into the ager's buffer.
     fn ageLoadGroup(s: *Store, c: *CSeg, e: u64, off: u64, end: u64) Error!?AgeGroup {
         return s.ageLoadGroupInto(&s.ager.g, c, e, off, end);
@@ -5436,18 +5516,44 @@ pub const Store = struct {
 
     /// `ageLoadGroup` into `buf` (the read-ahead decodes into its own).
     fn ageLoadGroupInto(s: *Store, buf: *std.ArrayList(u8), c: *CSeg, e: u64, off: u64, end: u64) Error!?AgeGroup {
+        var part: LoadPart = .{};
+        return s.ageLoadGroupPart(buf, &part, c, e, off, end, std.math.maxInt(u64));
+    }
+
+    /// `ageLoadGroupInto` that gives up at `deadline` (after one chunk at least: each call
+    /// gets further) and goes on where it stopped at the next call for the same group and
+    /// directory (`part`). Null with `part.state == .cut`: stopped for time; `.tail`: no
+    /// group starts here (no commit record before the end of the segment's chunks).
+    fn ageLoadGroupPart(s: *Store, buf: *std.ArrayList(u8), part: *LoadPart, c: *CSeg, e: u64, off: u64, end: u64, deadline: u64) Error!?AgeGroup {
         const d = c.dir.load(.acquire);
-        const first = d.indexAt(off) orelse return null;
+        const resume_ = part.state == .cut and part.loc == format.loc(e, off) and part.d == d;
+        part.state = .none;
+        part.added = 0;
+        const first = if (resume_) part.first else d.indexAt(off) orelse {
+            part.state = .tail;
+            return null;
+        };
         const es = d.slice();
-        buf.clearRetainingCapacity();
-        var i = first;
-        var p: usize = 0;
+        if (!resume_) buf.clearRetainingCapacity();
+        var i = if (resume_) part.i else first;
+        var p: usize = if (resume_) part.p else 0;
+        var decoded: usize = 0;
         while (true) {
-            if (i >= es.len or es[i].ls >= end) return null;
+            if (i >= es.len or es[i].ls >= end) {
+                part.state = .tail;
+                return null;
+            }
             if (buf.items.len > s.cfg.max_batch_bytes + block) return error.Corrupt;
             // A group can be tens of MiB of frames: a stop does not wait for the rest of it.
             if (s.ageStopping()) return null;
+            if (decoded > 0 and clock.now() >= deadline) {
+                part.* = .{ .state = .cut, .loc = format.loc(e, off), .d = d, .first = first, .i = i, .p = p, .added = part.added };
+                return null;
+            }
+            const before = buf.items.len;
             try s.chunkInto(c, es[i], buf);
+            part.added += buf.items.len - before;
+            decoded += 1;
             i += 1;
             const g = buf.items;
             var have_commit = false;
@@ -5523,7 +5629,7 @@ pub const Store = struct {
                 // Only a record the scan saw superseded (`pending`) or one under the
                 // whole-segment rule can go: for any other the lookup below could only say no,
                 // so it is not made (on a cold table it is a page fault per record).
-                const pend = s.ager.pending.contains(l);
+                const pend = s.ager.pending.contains(s.gpa, s.backend, l);
                 if (!pend and !seg_rule and !s.cfg.age_serial) return false;
                 // The table pass saw this record as the table's own, or a link in the window
                 // names it: it stays, no lookup.
@@ -5558,7 +5664,7 @@ pub const Store = struct {
                 const f = format.fixed(format.RemoveFixed, whole);
                 // Only a tombstone a newer record of the object replaced: a live-table rebuild
                 // must never bring an older version back.
-                const pend = s.ager.pending.contains(l);
+                const pend = s.ager.pending.contains(s.gpa, s.backend, l);
                 if (!pend and !seg_rule and !s.cfg.age_serial) return false;
                 if (s.ager.set.keeps(l, false)) {
                     s.ager.set_kept += 1;
@@ -5582,6 +5688,7 @@ pub const Store = struct {
     fn ageCollect(s: *Store, g: []const u8, commit_off: u64) void {
         const a = &s.ager;
         const behind = s.ageBehindBoth();
+        s.agePendingPrep();
         var p: usize = 0;
         var seen: u32 = 0;
         while (p < commit_off) {
@@ -5600,24 +5707,19 @@ pub const Store = struct {
                     if (prev != 0 and prev < behind) {
                         _ = s.age_stats.pending_behind.fetchAdd(1, .monotonic);
                     } else if (prev != 0) {
-                        // Full: one pass to drop what both passes have passed, and another
-                        // only once they have moved. A pass per record (as it was) is a walk
-                        // over the whole set for each record of the group, with `age_mu` held
-                        // and no end in sight when the checkpoint pass cannot move (a raw
-                        // segment in the window): 8.4M entries, thousands of records a step,
-                        // a close that waited past its deadline.
-                        const max = s.agePendingMax();
-                        if (a.pending.count() >= max and a.pruned_at != behind) s.agePrunePending();
-                        if (a.pending.count() < max) {
-                            a.pending.put(s.gpa, prev, {}) catch {};
-                        } else _ = s.age_stats.pending_full.fetchAdd(1, .monotonic);
+                        // One hash insert; past the memory cap the buckets the passes reach
+                        // last are written out whole (`agepend`), a bucket at a time. Dropped
+                        // only when memory is at its hard cap and nothing can be written.
+                        a.pending.add(s.gpa, s.backend, prev) catch {
+                            _ = s.age_stats.pending_full.fetchAdd(1, .monotonic);
+                        };
                     }
                 },
                 else => {},
             }
             p += n;
         }
-        s.age_stats.pending.store(a.pending.count(), .monotonic);
+        s.agePendingStats();
     }
 
     /// The location both the object pass and the checkpoint pass have passed (0 before the
@@ -5629,22 +5731,35 @@ pub const Store = struct {
         return @min(a.cpc, a.objc);
     }
 
-    /// Drops pending locations both passes have passed.
-    fn agePrunePending(s: *Store) void {
+    /// Before the pending set is added to: its caps (`agePendingMax`, a quarter of the ager's
+    /// memory), where the passes are (its write-out order), and the buckets both passes have
+    /// left dropped (from the front of its list: what was dropped, nothing more is walked).
+    fn agePendingPrep(s: *Store) void {
         const a = &s.ager;
-        const behind = s.ageBehindBoth();
-        a.pruned_at = behind;
-        _ = s.age_stats.pending_prunes.fetchAdd(1, .monotonic);
-        if (behind == 0) return;
-        // In place: no list of what goes (it was 8 bytes an entry on top of the set).
-        var it = a.pending.keyIterator();
-        var seen: u32 = 0;
-        while (it.next()) |k| {
-            // 8.4M entries at most: a stop does not wait for the rest of the pass.
-            seen +%= 1;
-            if (seen & 0xffff == 0 and s.ageStopping()) break;
-            if (k.* < behind) a.pending.removeByPtr(k);
-        }
+        const p = &a.pending;
+        p.bits = @intCast(@min(s.cfg.age_pending_bucket_bits, format.offset_bits));
+        p.max_entries = s.agePendingMax();
+        p.max_bytes = s.cfg.age_mem_bytes / 4;
+        p.obj_at = if (a.objc == no_loc) 0 else a.objc;
+        p.cp_at = if (a.cpc == no_loc) 0 else a.cpc;
+        const before = p.stats.pruned;
+        p.prune(s.gpa, s.backend, s.ageBehindBoth());
+        if (p.stats.pruned != before) _ = s.age_stats.pending_prunes.fetchAdd(p.stats.pruned - before, .monotonic);
+    }
+
+    /// Publishes the pending set's gauges and counters (`AgeStats.pending*`).
+    fn agePendingStats(s: *Store) void {
+        const p = &s.ager.pending;
+        const st = &s.age_stats;
+        st.pending.store(p.count(), .monotonic);
+        st.pending_mem_entries.store(p.mem_n, .monotonic);
+        st.pending_files.store(p.files.items.len, .monotonic);
+        st.pending_disk_bytes.store(p.diskBytes(), .monotonic);
+        st.pending_spilled.store(p.stats.spilled, .monotonic);
+        st.pending_spills.store(p.stats.spills, .monotonic);
+        st.pending_loads.store(p.stats.loads, .monotonic);
+        st.pending_disk_errors.store(p.stats.read_errors + p.stats.write_errors, .monotonic);
+        st.pending_active_spills.store(p.stats.active_spills, .monotonic);
     }
 
     /// Bytes of one slot of the pending set's hash map (a key and its metadata byte).
@@ -5667,10 +5782,10 @@ pub const Store = struct {
     fn ageMem(s: *Store) u64 {
         const a = &s.ager;
         const w = &a.warm;
-        const pending: u64 = @as(u64, a.pending.capacity()) * pending_slot_bytes;
+        const pending: u64 = a.pending.memBytes() + (a.forget.capacity + a.forget_grp.capacity * 2) * 8;
         const handoff = a.handoff_bytes.load(.monotonic);
         const total = pending + handoff +
-            a.lagq.capacity * @sizeOf(Lag) + a.g.capacity + a.out.capacity + w.g.capacity +
+            a.lagq.capacity * @sizeOf(Lag) + a.g.capacity + a.seg_g.capacity + a.out.capacity + w.g.capacity +
             (w.pages.capacity + w.io.capacity) * 8 + a.set.bits.len * 8 +
             (a.drop_new.capacity + a.keep_live.capacity + a.maybe.capacity + a.total.capacity + w.maybe.capacity + w.total.capacity) * 8 +
             a.changes.capacity * @sizeOf(AgeChange) + a.punch.capacity * @sizeOf(PunchRange) + a.recs.capacity * @sizeOf(chunk.AgeRec);
@@ -5697,6 +5812,20 @@ pub const Store = struct {
 
     /// Holes the dead records of group `ag` (decoded in the ager buffer) and queues the chunks
     /// worth rewriting into the batch.
+    /// The end of a punch of sidecar frames ending at `hi`: the end of `hi`'s block when the
+    /// rest of that block is padding (all zero: a frame starting there would begin with its
+    /// nonzero checksum) and already written; else `hi` (the block is shared and stays). The
+    /// start is never moved back: the frame before may end in zeros.
+    fn ageSideEnd(s: *Store, c: *const CSeg, hi: u64) u64 {
+        const up = std.mem.alignForward(u64, hi, block);
+        if (up == hi or up > c.side_tail) return hi;
+        const fd = c.side_fd orelse return hi;
+        var buf: [block]u8 = undefined;
+        const n: usize = @intCast(up - hi);
+        s.backend.read(fd, hi, buf[0..n]) catch return hi;
+        return if (std.mem.allEqual(u8, buf[0..n], 0)) up else hi;
+    }
+
     fn ageRewrite(s: *Store, snap: *const Snapshot, ag: AgeGroup, cp_ok: bool, seg_rule: bool, rep: *AgeReport) Error!void {
         const a = &s.ager;
         const g = a.g.items;
@@ -5705,6 +5834,7 @@ pub const Store = struct {
         a.keep_live.clearRetainingCapacity();
         a.drop_new.appendNTimes(s.gpa, 0, ag.n) catch return error.OutOfMemory;
         a.keep_live.appendNTimes(s.gpa, 0, ag.n) catch return error.OutOfMemory;
+        a.forget_grp.clearRetainingCapacity();
         // With a live set over this group: where can an eighth go at all? A group (rewritten
         // whole) or a chunk whose records that could go are under an eighth of what counts is
         // not rewritten whatever the lookups say, so they are not made.
@@ -5763,10 +5893,18 @@ pub const Store = struct {
                     }
                     rep.bytes_dropped += n;
                     any = true;
+                    // A pending location: forgotten once its chunk's rewrite is committed.
+                    if (kind != .checkpoint and kind != .tx and a.pending.inMem(l))
+                        a.forget_grp.append(s.gpa, .{ .l = l, .ci = ci }) catch return error.OutOfMemory;
                 } else if (h.kind != .segment) {
                     a.keep_live.items[ci] += n;
                     if (h.kind == .checkpoint or h.kind == .tx) keep_cp = true;
                 }
+            } else {
+                // A hole already (an earlier rewrite, or a restart's scan noted it again):
+                // nothing more for any pass to do there.
+                const l = format.loc(ag.e, ag.off + p);
+                if (a.pending.forget(s.gpa, l)) _ = s.age_stats.pending_forgot.fetchAdd(1, .monotonic);
             }
             p += n;
         }
@@ -5785,6 +5923,8 @@ pub const Store = struct {
         var all_main = true;
         var cz: zstd_c.Compressor = .{};
         defer cz.deinit();
+        // Whether the checkpoint pass will visit this group again (the padding below).
+        const again = a.cpc != no_loc and format.loc(ag.e, ag.off) > a.cpc;
         for (es, 0..) |en, i| {
             const take = if (whole) true else a.drop_new.items[i] > 0 and a.drop_new.items[i] * 8 >= a.drop_new.items[i] + a.keep_live.items[i];
             if (!take) continue;
@@ -5799,7 +5939,11 @@ pub const Store = struct {
             const ne = a.ents.items[0];
             a.changes.append(s.gpa, .{ .idx = ag.first + i, .ls = en.ls, .ll = en.ll, .phys = ne.phys, .bl = ne.bl, .codec = ne.codec, .old_phys = en.phys, .old_bl = en.bl }) catch return error.OutOfMemory;
             if (chunk.isSide(en.phys)) all_main = false;
-            if (!whole) a.punch.append(s.gpa, .{ .side = chunk.isSide(en.phys), .off = en.phys & ~chunk.side_bit, .len = en.span() }) catch return error.OutOfMemory;
+            if (!whole) {
+                const off = en.phys & ~chunk.side_bit;
+                const end = if (chunk.isSide(en.phys)) s.ageSideEnd(c, off + en.span()) else off + en.span();
+                a.punch.append(s.gpa, .{ .side = chunk.isSide(en.phys), .off = off, .len = end - off }) catch return error.OutOfMemory;
+            }
             rewrote += 1;
         }
         if (rewrote == 0) return;
@@ -5816,15 +5960,31 @@ pub const Store = struct {
                 same = false;
             };
             if (same) {
-                if (all_main) hi = std.mem.alignForward(u64, hi, block);
+                if (all_main) hi = std.mem.alignForward(u64, hi, block) else hi = s.ageSideEnd(c, hi);
                 a.punch.append(s.gpa, .{ .side = !all_main, .off = lo, .len = hi - lo }) catch return error.OutOfMemory;
-            } else for (es) |en| a.punch.append(s.gpa, .{ .side = chunk.isSide(en.phys), .off = en.phys & ~chunk.side_bit, .len = en.span() }) catch return error.OutOfMemory;
+            } else for (es) |en| {
+                const off = en.phys & ~chunk.side_bit;
+                const end = if (chunk.isSide(en.phys)) s.ageSideEnd(c, off + en.span()) else off + en.span();
+                a.punch.append(s.gpa, .{ .side = chunk.isSide(en.phys), .off = off, .len = end - off }) catch return error.OutOfMemory;
+            }
         }
-        // Frames that may be rewritten again end on a block, so their punch frees them whole.
-        // (Live objects alone stay put until cleaning: no padding for them.)
-        if (keep_cp) chunk.padGroup(s.gpa, &a.out, c.side_tail) catch return error.OutOfMemory;
+        // Frames that may be rewritten again end on a block, so their punch frees them whole:
+        // those with checkpoint records, and any the checkpoint pass has still to visit (on an
+        // edge the object pass keeps records superseded too late for it to know; the
+        // checkpoint pass takes them, and unpadded each rewrite left a shared block allocated
+        // at both ends of the old frames: about a fifth of the sidecar bytes in the ager soak).
+        // (Live objects alone, behind both passes, stay put until cleaning: no padding.)
+        if (keep_cp or again) chunk.padGroup(s.gpa, &a.out, c.side_tail) catch return error.OutOfMemory;
         rep.groups_rewritten += 1;
         rep.chunks_rewritten += rewrote;
+        // The pending locations this rewrite makes holes (in the chunks it takes): forgotten
+        // when the batch commits, so they stop waiting for the other pass. Before the commit
+        // the other pass may still read the old frames in this step and must find them pending.
+        for (a.forget_grp.items) |fg| {
+            const i = fg.ci;
+            const take = whole or (a.drop_new.items[i] > 0 and a.drop_new.items[i] * 8 >= a.drop_new.items[i] + a.keep_live.items[i]);
+            if (take) a.forget.append(s.gpa, fg.l) catch return error.OutOfMemory;
+        }
     }
 
     /// Whether a chunk with `maybe` bytes of records that could go out of `total` that count can
@@ -6121,8 +6281,11 @@ pub const Store = struct {
             a.mark_cp = null;
             a.mark_seg = null;
             a.side_new = false;
+            a.forget.clearRetainingCapacity();
         }
         if (a.changes.items.len == 0 and a.mark_cp == null and a.mark_seg == null) return;
+        const tc = clock.now();
+        defer a.commit_ns += clock.now() -| tc;
         var nb: [64]u8 = undefined;
         // The dir file must name every frame of the segment file before entries move away.
         if (!c.dir_sealed) {
@@ -6147,9 +6310,15 @@ pub const Store = struct {
         if (a.out.items.len > 0) {
             if (a.side_new) new_files = true;
             try s.backend.write(c.side_fd.?, c.side_tail, a.out.items);
+            const ts = clock.now();
+            defer a.sync_ns += clock.now() -| ts;
             try s.backend.sync(c.side_fd.?);
         }
-        if (new_files) try s.backend.syncDir();
+        if (new_files) {
+            const ts = clock.now();
+            defer a.sync_ns += clock.now() -| ts;
+            try s.backend.syncDir();
+        }
         const af = c.age_fd.?;
         if (c.age_cut) {
             try s.backend.truncate(af, chunk.age_header_len + c.age_n * @sizeOf(chunk.AgeRec));
@@ -6164,15 +6333,22 @@ pub const Store = struct {
             c.age_cut = true;
             return err;
         };
+        const ts = clock.now();
         s.backend.sync(af) catch |err| {
             c.age_cut = true;
             return err;
         };
+        a.sync_ns += clock.now() -| ts;
         if (s.age_debug) {
             std.debug.print("age commit e {d} cseg {d}: recs {d}..{d}, side {d}+{d}\n", .{ e, c.id, c.age_n, c.age_n + a.recs.items.len, c.side_tail, a.out.items.len });
             for (a.changes.items) |ch| std.debug.print("  ls {d} ll {d} -> {s} {d} bl {d} (was {s} {d} bl {d})\n", .{ ch.ls, ch.ll, if (chunk.isSide(ch.phys)) "side" else "main", ch.phys & ~chunk.side_bit, ch.bl, if (chunk.isSide(ch.old_phys)) "side" else "main", ch.old_phys & ~chunk.side_bit, ch.old_bl });
         }
         c.age_n += a.recs.items.len;
+        // Durable: the records the batch turns into holes need no pass any more.
+        for (a.forget.items) |l| {
+            if (a.pending.forget(s.gpa, l)) _ = s.age_stats.pending_forgot.fetchAdd(1, .monotonic);
+        }
+        a.forget.clearRetainingCapacity();
         if (a.mark_cp) |x| c.cp_done = @max(c.cp_done, x);
         if (a.mark_seg) |x| c.seg_done = @max(c.seg_done, x);
         _ = s.age_stats.phys_written.fetchAdd(a.out.items.len, .monotonic);
@@ -6349,6 +6525,7 @@ pub const Store = struct {
         a.punch.clearRetainingCapacity();
         a.mark_cp = null;
         a.mark_seg = null;
+        a.forget.clearRetainingCapacity();
         a.side_new = false;
         a.init = false;
         a.lagq.clearRetainingCapacity();
@@ -6476,6 +6653,7 @@ pub const Store = struct {
                     continue;
                 }
                 if (s.ageSetOn() and !a.set.usable(at.e, at.off)) break;
+                s.framesAhead(at.c, at.off, at.off +| @max(budget - @min(read, budget), 1 << 20));
                 const ag = (s.ageLoadGroupInto(&w.g, at.c, at.e, at.off, at.end) catch break) orelse break;
                 read += ag.len;
                 groups += 1;
@@ -6533,13 +6711,13 @@ pub const Store = struct {
             const id: [32]u8 = switch (h.kind) {
                 .object, .object_c => blk: {
                     if (h.flags & format.flag_historical != 0) continue;
-                    if (!seg_rule and !a.pending.contains(l)) continue;
+                    if (!seg_rule and !a.pending.contains(s.gpa, s.backend, l)) continue;
                     const o = s.objRec(whole) catch continue;
                     if (o.version > std.math.maxInt(i64)) continue;
                     break :blk o.id;
                 },
                 .remove => blk: {
-                    if (!seg_rule and !a.pending.contains(l)) continue;
+                    if (!seg_rule and !a.pending.contains(s.gpa, s.backend, l)) continue;
                     if (whole.len < format.header_len + @sizeOf(format.RemoveFixed)) continue;
                     break :blk format.fixed(format.RemoveFixed, whole).id;
                 },
@@ -6785,9 +6963,14 @@ pub const Store = struct {
         a.lookups = 0;
         a.lookups_cold = 0;
         a.set_kept = 0;
+        a.commit_ns = 0;
+        a.sync_ns = 0;
+        a.step_end = if (opts.deadline_ns == 0) std.math.maxInt(u64) else t0 +| opts.deadline_ns;
+        const loads0 = a.pending.stats.loads;
+        var cut = false;
 
         // 1. Supersession scan up to the object floor (any segment, the open one too).
-        while (rep.read < budget and !s.ageHalt()) {
+        while (rep.read < budget and !s.ageHalt() and !s.ageLate(&cut, rep.read)) {
             const at = s.ageCursor(&a.scan, newest + 1, false) orelse break;
             if (a.scan_wait == a.scan and a.scan_wait_seq >= obj_floor) break;
             const ag = (try s.ageLoadGroup(at.c, at.e, at.off, at.end)) orelse break;
@@ -6810,7 +6993,8 @@ pub const Store = struct {
             a.lagq.shrinkRetainingCapacity(rest);
             a.lag_head = 0;
         }
-        while (rep.read < budget and a.objc < a.obj_frontier and !s.ageHalt()) {
+        const t_scan = clock.now();
+        while (rep.read < budget and a.objc < a.obj_frontier and !s.ageHalt() and !s.ageLate(&cut, rep.read)) {
             const at = s.ageCursor(&a.objc, newest, false) orelse break;
             if (format.loc(at.e, at.off) >= a.obj_frontier) break;
             const ag = (try s.ageLoadGroup(at.c, at.e, at.off, at.end)) orelse break;
@@ -6821,7 +7005,8 @@ pub const Store = struct {
         }
         // 3. Checkpoint pass up to the checkpoint floor (sealed segments; stops at a raw one in
         // the window).
-        while (rep.read < budget and !s.ageHalt()) {
+        const t_obj = clock.now();
+        while (rep.read < budget and !s.ageHalt() and !s.ageLate(&cut, rep.read)) {
             const at = s.ageCursor(&a.cpc, newest, true) orelse break;
             if (a.cp_wait == a.cpc and a.cp_wait_seq + 1 >= cp_floor) break;
             const ag = (try s.ageLoadGroup(at.c, at.e, at.off, at.end)) orelse break;
@@ -6842,13 +7027,16 @@ pub const Store = struct {
         }
         // 4. Segment pass over the segments the object window left (once per object floor
         // epoch): the restored live set loses its superseded versions here.
+        const t_cp = clock.now();
         const target = @max(ofe, oldest);
         if (target > a.seg_target and !opts.skip_seg) {
             a.seg_target = target;
             a.segc = if (s.segAfter(null)) |f| format.loc(f, 0) else no_loc;
         }
         var set_wait = false;
-        while (!opts.skip_seg and rep.read < budget and !s.ageHalt()) {
+        var seg_groups: u64 = 0;
+        var seg_read: u64 = 0;
+        while (!opts.skip_seg and rep.read < budget and !s.ageHalt() and !s.ageLate(&cut, rep.read)) {
             const at = s.ageCursor(&a.segc, @min(a.seg_target, newest), false) orelse break;
             if (at.c.seg_done >= a.seg_target) {
                 a.segc = if (s.segAfter(at.e)) |n| format.loc(n, 0) else no_loc;
@@ -6860,8 +7048,41 @@ pub const Store = struct {
                 set_wait = true;
                 break;
             }
-            const ag = (try s.ageLoadGroup(at.c, at.e, at.off, at.end)) orelse break;
-            rep.read += ag.len;
+            // Its frames are on aged segments, cold: asked for ahead (a group's chunks then
+            // come in parallel, not a read at a time), and decoded until the step's time is
+            // up; a group cut there goes on at the next step from where it stopped.
+            {
+                const from = if (a.seg_part.state == .cut and a.seg_part.d == at.c.dir.load(.acquire) and a.seg_part.loc == format.loc(at.e, at.off)) a.seg_part.d.?.slice()[a.seg_part.i].ls else at.off;
+                s.framesAhead(at.c, from, from +| @max(budget, 1 << 20));
+            }
+            const sg = try s.ageLoadGroupPart(&a.seg_g, &a.seg_part, at.c, at.e, at.off, at.end, a.step_end);
+            rep.read += a.seg_part.added;
+            seg_read += a.seg_part.added;
+            _ = s.age_stats.seg_read.fetchAdd(a.seg_part.added, .monotonic);
+            const ag = sg orelse switch (a.seg_part.state) {
+                .cut => {
+                    cut = true;
+                    _ = s.age_stats.seg_load_cuts.fetchAdd(1, .monotonic);
+                    break;
+                },
+                .tail => {
+                    // No whole group from here to the end of the segment's chunks (a sealed
+                    // segment: nothing more will come). Nothing here can be rewritten: the
+                    // segment is done. (Before, the pass decoded the same tail at every step
+                    // and never moved on.)
+                    _ = s.age_stats.seg_tails.fetchAdd(1, .monotonic);
+                    std.log.warn("store: age-out segment pass: segment {d} has no whole group from {d} to its end {d}; going on to the next segment", .{ at.e, at.off, at.end });
+                    a.seg_part = .{};
+                    try s.ageBatchFor(at.c, at.e);
+                    a.mark_seg = a.seg_target;
+                    _ = s.age_stats.seg_passes.fetchAdd(1, .monotonic);
+                    a.segc = if (s.segAfter(at.e)) |n| format.loc(n, 0) else no_loc;
+                    continue;
+                },
+                .none => break, // stopping
+            };
+            seg_groups += 1;
+            std.mem.swap(std.ArrayList(u8), &a.g, &a.seg_g);
             try s.ageRewrite(&snap, ag, at.e < oldest, true, &rep);
             if (s.age_stop.load(.acquire)) break;
             // A pass over everything aged, once an epoch: its frames leave the page cache
@@ -6884,9 +7105,14 @@ pub const Store = struct {
             s.ageAbort();
             return rep;
         }
+        const t_seg = clock.now();
         try s.ageCommit();
+        // Buckets both passes have left go now (not only when the scan adds).
+        s.agePendingPrep();
+        s.agePendingStats();
         // The live set's table pass read this much since the last step: work, not idleness.
         // Nor is a step idle that only waited for the set (the next read-ahead builds it).
+        const set_credit = a.set.credit;
         rep.read += a.set.credit;
         a.set.credit = 0;
         if (rep.read == 0 and !set_wait) rep.idle = true;
@@ -6903,9 +7129,38 @@ pub const Store = struct {
         _ = st.set_kept.fetchAdd(a.set_kept, .monotonic);
         const ns = clock.now() -| t0;
         _ = st.locked_ns.fetchAdd(ns, .monotonic);
-        var cur = st.max_step_ns.load(.monotonic);
-        while (ns > cur) cur = st.max_step_ns.cmpxchgWeak(cur, ns, .monotonic, .monotonic) orelse break;
+        statMax(&st.max_step_ns, ns);
+        statMax(&st.max_commit_ns, a.commit_ns);
+        statMax(&st.max_sync_ns, a.sync_ns);
+        if (cut) _ = st.step_cuts.fetchAdd(1, .monotonic);
+        if (ns > std.time.ns_per_s) {
+            _ = st.slow_steps.fetchAdd(1, .monotonic);
+            const ms = std.time.ns_per_ms;
+            std.log.warn("store: age-out step held age_mu {d} ms: scan {d} ms, object pass {d} ms, checkpoint pass {d} ms, segment pass {d} ms ({d} groups, {d} KiB decoded{s}), commits {d} ms (syncs {d} ms); {d} KiB read (of it {d} KiB by the live set's table pass before the step), {d} groups scanned, {d} rewritten, {d} lookups ({d} cold), {d} pending-set buckets read", .{
+                ns / ms,                     (t_scan -| t0) / ms, (t_obj -| t_scan) / ms,  (t_cp -| t_obj) / ms,
+                (t_seg -| t_cp) / ms,        seg_groups,          seg_read >> 10,          if (a.seg_part.state == .cut) ", a group cut for time" else "",
+                a.commit_ns / ms,            a.sync_ns / ms,      rep.read >> 10,          set_credit >> 10,
+                rep.groups_scanned,          rep.groups_rewritten, a.lookups,              a.lookups_cold,
+                a.pending.stats.loads - loads0,
+            });
+        }
         return rep;
+    }
+
+    fn statMax(v: *std.atomic.Value(u64), x: u64) void {
+        var cur = v.load(.monotonic);
+        while (x > cur) cur = v.cmpxchgWeak(cur, x, .monotonic, .monotonic) orelse break;
+    }
+
+    /// The step is past its time (`AgeStepOpts.deadline_ns`): the passes stop at the next
+    /// group, as when the budget is spent; never before the step has read anything. Notes
+    /// the cut.
+    fn ageLate(s: *Store, cut: *bool, read: u64) bool {
+        if (read == 0) return false; // a step does one group (or one chunk of one) at least
+        if (s.ager.step_end == std.math.maxInt(u64)) return false;
+        if (clock.now() < s.ager.step_end) return false;
+        cut.* = true;
+        return true;
     }
 
     /// Runs age-out on a background thread (real files): bounded steps, paced to
@@ -6980,7 +7235,7 @@ pub const Store = struct {
                 s.ageNap(std.time.ns_per_ms);
                 continue;
             }
-            const opts: AgeStepOpts = .{ .skip_seg = gate == .bulk };
+            const opts: AgeStepOpts = .{ .skip_seg = gate == .bulk, .deadline_ns = s.cfg.age_step_ms * std.time.ns_per_ms };
             const t0 = clock.now();
             // The disk reads first, with no lock the writer may want: the step then runs on
             // what is in memory.

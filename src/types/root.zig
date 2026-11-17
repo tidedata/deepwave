@@ -13,6 +13,7 @@ pub const digest = @import("digest.zig");
 pub const index = @import("index.zig");
 pub const roaring = @import("roaring.zig");
 pub const layout = @import("layout.zig");
+pub const sigparse = @import("sigparse.zig");
 
 // BEGIN GENERATED EXPORTS (tools/truth/bcs-types/gen_types.py)
 pub const AccountAddress = gen.AccountAddress;
@@ -160,6 +161,7 @@ test {
     _ = @import("edge_test.zig");
     _ = @import("variants_test.zig");
     _ = @import("layout.zig");
+    _ = @import("sigparse.zig");
 }
 
 test "random values of every registry type round trip, skip and render" {

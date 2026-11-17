@@ -165,7 +165,13 @@ pub const Handler = struct {
     serve: *const fn (ctx: *anyopaque, arena: Allocator, from: *const PeerId, route: []const u8, body: []const u8) Reply,
 };
 
-pub const Reply = struct { status: wire.Status, body: []const u8 = "" };
+pub const Reply = struct {
+    status: wire.Status,
+    body: []const u8 = "",
+    /// Response headers (allocated in the arena or static). anemo's rpc server sets
+    /// `content-type` on a success; handlers that mirror it set it here (empty: none).
+    headers: []const wire.Header = &.{},
+};
 
 pub const Response = struct {
     status: wire.Status,
@@ -386,7 +392,7 @@ pub const Peer = struct {
                 else
                     .{ .status = if (std.mem.eql(u8, req.route, push_checkpoint_summary_route)) .success else .not_found };
                 p2pm.inbound.end(call, @intFromEnum(reply.status), reply.body.len);
-                const resp = try wire.encodeResponse(a, reply.status, &.{}, reply.body);
+                const resp = try wire.encodeResponse(a, reply.status, reply.headers, reply.body);
                 try p.conn.streamWrite(id, resp, true);
                 _ = p.inbound.orderedRemove(i);
                 p.answered.append(p.gpa, id) catch {};

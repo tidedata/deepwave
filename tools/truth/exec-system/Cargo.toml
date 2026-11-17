@@ -13,6 +13,8 @@ sui-types = { path = "../../sui/crates/sui-types" }
 sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
 sui-core = { path = "../../sui/crates/sui-core" }
 sui-execution = { path = "../../sui/sui-execution" }
+sui-framework = { path = "../../sui/crates/sui-framework" }
+nonempty = { version = "0.9.0", features = ["serialize"] }
 prometheus = { version = "0.14", features = ["protobuf"] }
 move-core-types = { path = "../../sui/external-crates/move/crates/move-core-types" }
 fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }

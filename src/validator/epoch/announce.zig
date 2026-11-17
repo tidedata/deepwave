@@ -33,10 +33,28 @@ pub const Announcer = struct {
     /// ProtocolVersion::MIN/MAX of this binary.
     min_version: u64 = capabilities.supported_min,
     max_version: u64 = capabilities.supported_max,
-    /// System packages this binary carries (`get_available_system_packages`); empty votes against upgrades.
+    /// System packages this binary would install (`packages.availableSystemPackages`, set by
+    /// the caller at each epoch start); empty votes against every upgrade.
     system_packages: []const messages.ObjectRef = &.{},
+    /// Whether the accumulator root object exists: sui-node lowers the announced max while the
+    /// proposed version's config enables accumulators and the root does not exist.
+    accumulator_root_exists: bool = true,
+    /// The max version of the last announcement.
+    announced_max: u64 = 0,
     /// Grows with every notification (sui-node: wall clock ms).
     generation: u64 = 0,
+
+    /// The announced max for an epoch at `current_version` (sui-node lib.rs: while
+    /// `max > current` and `ProtocolConfig::get_for_version(max).enable_accumulators()` with no
+    /// accumulator root, `max = max.prev()`).
+    pub fn maxFor(a: *const Announcer, current_version: u64) u64 {
+        var max = a.max_version;
+        while (max > current_version) {
+            const cfg = protocol.get(max, a.chain) catch break;
+            if (cfg.feature_flags.enable_accumulators and !a.accumulator_root_exists) max -= 1 else break;
+        }
+        return max;
+    }
 
     /// Builds and submits this validator's capability notification. sui-node (lib.rs, at each
     /// epoch start) sends `supported_protocol_versions.truncate_below(current)`: the versions
@@ -44,7 +62,8 @@ pub const Announcer = struct {
     pub fn announce(a: *Announcer, arena: std.mem.Allocator, submit: iface.ConsensusSubmit, tracking_id: [8]u8, now_ms: u64, current_version: u64) Error!void {
         a.generation = @max(a.generation + 1, now_ms);
         const min = @max(a.min_version, current_version);
-        const caps = capabilities.buildCapabilities(arena, a.table, a.chain, a.authority, a.generation, min, a.max_version, a.system_packages) catch return error.Capabilities;
+        a.announced_max = a.maxFor(current_version);
+        const caps = capabilities.buildCapabilities(arena, a.table, a.chain, a.authority, a.generation, min, a.announced_max, a.system_packages) catch return error.Capabilities;
         const body = try encodeCapabilities(arena, tracking_id, caps);
         submit.submit(&.{body}, .system) catch |e| return switch (e) {
             error.Overloaded => error.Overloaded,

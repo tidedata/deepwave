@@ -1214,6 +1214,8 @@ pub fn run(parent_gpa: std.mem.Allocator, opts: Options) !Result {
         cfg.chunk_bytes = rnd.intRangeAtMost(u32, 1 << 10, 32 << 10);
         cfg.age_lag_checkpoints = rnd.uintLessThan(u64, 6);
         cfg.age_pending_max = if (rnd.boolean()) 1 << 16 else rnd.intRangeAtMost(u64, 4, 64);
+        // Pending-set buckets of 1 KiB to 16 MiB (from the seed: every seed keeps its draws).
+        cfg.age_pending_bucket_bits = @intCast(10 + (opts.seed >> 5) % 15);
         cfg.age_whole_group_bytes = if (rnd.boolean()) 4 << 20 else rnd.intRangeAtMost(u64, 4096, 64 << 10);
         cfg.max_segments = 64;
         // A small decoded-chunk cache: the default 1 GiB filled up per seed (tiny chunks, every

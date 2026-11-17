@@ -21,6 +21,9 @@
 //   swap <range_start> <range_end_exclusive> good=<csv> bad=<csv> scores=<csv>
 //   final <index> <hex commit digest> [<hex BlockRef bcs>:<rejected indices csv>...]
 //                              commits the CommitFinalizer released after that commit was linearized
+//   flabels <direct commits> <indirect commits> <direct_finalize> <direct_reject>
+//           <direct_late_reject> <indirect_finalize> <indirect_reject> <direct skipped blocks>
+//                              the finalizer's metrics labels since the scenario started, per step
 //   end
 //   elect <n> <round> <offset> <authority> [<stakes csv>]   stake-based election (no csv = equal stakes of 1)
 //   swaptable <commit_index> <threshold> stakes=<csv> scores=<csv> good=<csv> bad=<csv>
@@ -268,6 +271,40 @@ fn emit_finalized(w: &mut String, subdags: &[CommittedSubDag]) {
     }
 }
 
+/// The CommitFinalizer's decision counters (its metrics labels), in the order of the `flabels`
+/// line: output commits direct / indirect; transaction status direct_finalize, direct_reject,
+/// direct_late_reject, indirect_finalize, indirect_reject; pending blocks skipped by direct
+/// finalization as outside the vote GC bound (finalizer_skipped_voting_blocks{*, "direct"}).
+fn finalizer_labels(context: &Context) -> [u64; 8] {
+    let m = &context.metrics.node_metrics;
+    let oc = |l: &str| m.finalizer_output_commits.with_label_values(&[l]).get();
+    let ts = |l: &str| m.finalizer_transaction_status.with_label_values(&[l]).get();
+    let mut skipped_direct = 0;
+    for (_, a) in context.committee.authorities() {
+        skipped_direct += m
+            .finalizer_skipped_voting_blocks
+            .with_label_values(&[a.hostname.as_str(), "direct"])
+            .get();
+    }
+    [
+        oc("direct"),
+        oc("indirect"),
+        ts("direct_finalize"),
+        ts("direct_reject"),
+        ts("direct_late_reject"),
+        ts("indirect_finalize"),
+        ts("indirect_reject"),
+        skipped_direct,
+    ]
+}
+
+/// `flabels <8 counters>`: the finalizer counters since the scenario started, after each step.
+fn emit_finalizer_labels(w: &mut String, context: &Context, base: &[u64; 8]) {
+    let now = finalizer_labels(context);
+    let d: Vec<u64> = now.iter().zip(base.iter()).map(|(a, b)| a - b).collect();
+    writeln!(w, "flabels {}", d.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")).unwrap();
+}
+
 /// Replays rounds of blocks through the harness and emits the scenario.
 async fn replay(w: &mut String, name: &str, stakes: &[u64], shuffle: bool, layers: Vec<Vec<VerifiedBlock>>) {
     let n = stakes.len();
@@ -278,6 +315,7 @@ async fn replay(w: &mut String, name: &str, stakes: &[u64], shuffle: bool, layer
         .set_shuffle_commit_blocks_for_testing(shuffle);
     let context = Arc::new(context);
     let mut h = Harness::new(context.clone());
+    let base = finalizer_labels(&context);
 
     writeln!(
         w,
@@ -307,6 +345,7 @@ async fn replay(w: &mut String, name: &str, stakes: &[u64], shuffle: bool, layer
             let fin = h.finalize(sd).await;
             emit_finalized(w, &fin);
         }
+        emit_finalizer_labels(w, &context, &base);
     }
     let table = h.leader_schedule.leader_swap_table.read();
     let range = &table.reputation_scores.commit_range;

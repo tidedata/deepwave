@@ -16,7 +16,7 @@ const store = node.store;
 const node_options = @import("node_options");
 const edge = @import("edge");
 
-/// `deepwave validator ARGS...`: validator mode lives in its own binary (the unaudited validator
+/// `deepwave validator ARGS...`: validator mode lives in its own binary (the validator
 /// modules are never linked into deepwave, docs/VALIDATOR-DESIGN.md 3); this hands over to the
 /// `deepwave-validator` installed next to this executable with the same arguments.
 fn validatorCmd(io: Io, arena: std.mem.Allocator, rest: []const []const u8) !u8 {
@@ -61,6 +61,9 @@ const usage =
     \\                                       system roots (a gate behind a private CA)
     \\  --gate-trusted-proxy CIDR            read the caller's address from x-forwarded-for when the peer is in CIDR (repeatable,
     \\                                       at most 8; default none: the socket peer is the caller)
+    \\  --gate-scope all|serve-tls           the listeners behind the gate (default all: every serve port and zui/1).
+    \\                                       serve-tls: only the --serve-tls listener; --serve and zui/1 answer as without
+    \\                                       --gate (needs --serve-tls; not with --core-upstream)
     \\  --edge-conns N                       zui/1 connections to the cores (default 4; the profile's)
     \\  --no-edge-zstd                       ask the cores for raw feeds (no zstd dictionary)
     \\  --feed-max-inflight N                most feed requests in flight at the cores in catch-up (default 16;
@@ -511,6 +514,7 @@ pub fn main(init: std.process.Init) !u8 {
     var gate_ca_file: ?[]const u8 = null;
     var gate_proxies: [node.gate.max_proxies]edge.gate.ident.Cidr = undefined;
     var gate_nproxies: usize = 0;
+    var gate_scope: ?node.gate.ListenScope = null;
     var profile: ?edge.profile.Kind = null;
     // `--profile` sets defaults, so it is applied before any other flag (a flag still wins).
     {
@@ -579,6 +583,8 @@ pub fn main(init: std.process.Init) !u8 {
             gate_dir = try need(args, &i);
         } else if (std.mem.eql(u8, a, "--gate-ca-file")) {
             gate_ca_file = try need(args, &i);
+        } else if (std.mem.eql(u8, a, "--gate-scope")) {
+            gate_scope = node.gate.ListenScope.parse(try need(args, &i)) orelse return usageErr("--gate-scope all|serve-tls");
         } else if (std.mem.eql(u8, a, "--gate-trusted-proxy")) {
             if (gate_nproxies == gate_proxies.len) return usageErr("--gate-trusted-proxy: at most 8");
             gate_proxies[gate_nproxies] = edge.gate.ident.Cidr.parse(try need(args, &i)) orelse return usageErr("--gate-trusted-proxy CIDR, e.g. 10.0.0.0/8 or 2001:db8::/32");
@@ -1022,13 +1028,19 @@ pub fn main(init: std.process.Init) !u8 {
             .dir = gate_dir orelse try std.heap.page_allocator.dupe(u8, try std.fmt.bufPrint(&db, "{s}/node/gate", .{cfg.dir})),
             .proxies = try std.heap.page_allocator.dupe(edge.gate.ident.Cidr, gate_proxies[0..gate_nproxies]),
             .ca_file = gate_ca_file,
+            .scope = gate_scope orelse .all,
         };
+        if (gs.scope == .serve_tls) {
+            if (cfg.serve_tls_addr == null or cfg.serve_addr == null) return usageErr("--gate-scope serve-tls needs --serve-tls ADDR (and --serve): the one listener the gate is on");
+            // a forwarder asks the gate for every listener at once (edge/forward.zig gate_hook)
+            if (cfg.core_upstream != null) return usageErr("--gate-scope serve-tls does not go with --core-upstream (a forwarding edge gates all its listeners)");
+        }
         // the flags and the files they name, before the store is opened: a wrong one stops the
         // start here, in a second, with the flag's name
         if (node.gate.preflight(gpa, io, &gs)) |msg| return usageErr(msg);
         cfg.gate = gs;
-    } else if (gate_token_file != null or gate_edge_id != null or gate_dir != null or gate_ca_file != null or gate_nproxies != 0) {
-        return usageErr("--gate-token-file, --gate-edge-id, --gate-dir, --gate-ca-file and --gate-trusted-proxy need --gate URL");
+    } else if (gate_token_file != null or gate_edge_id != null or gate_dir != null or gate_ca_file != null or gate_nproxies != 0 or gate_scope != null) {
+        return usageErr("--gate-token-file, --gate-edge-id, --gate-dir, --gate-ca-file, --gate-trusted-proxy and --gate-scope need --gate URL");
     }
 
     policy_flags.install() catch |e| {
@@ -1077,6 +1089,11 @@ pub fn main(init: std.process.Init) !u8 {
         const es = n.exec_rpc.env.source();
         x.setEnv(.{ .ctx = es.ctx, .get = es.get });
     }
+    if (node.node.embedder) |e| e.started(e.ctx, n) catch |err| {
+        std.log.err("embedder: {s}", .{@errorName(err)});
+        return 1;
+    };
+    defer if (node.node.embedder) |e| e.stopping(e.ctx);
     n.run() catch |e| switch (e) {
         error.Mismatch => return 3,
         else => {

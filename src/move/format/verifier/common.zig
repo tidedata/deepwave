@@ -108,6 +108,20 @@ pub const Meter = struct {
     max_pkg: ?u128 = null,
     max_mod: ?u128 = null,
     max_fun: ?u128 = null,
+    /// Scope names (`enter_scope(name, ..)`) and the add that tripped a `.sui` meter: what
+    /// `SuiVerifierMeter`'s PROGRAM_TOO_COMPLEX message reports. The package scope is never
+    /// named ("<unknown>").
+    fun_name: []const u8 = "<unknown>",
+    mod_name: []const u8 = "<unknown>",
+    trip: ?Trip = null,
+
+    pub const Trip = struct { name: []const u8, cur: u128, new: u128, max: u128 };
+
+    /// `SuiVerifierMeterBounds::add`'s message for the tripped add.
+    pub fn tripMessage(m: *const Meter, arena: Allocator) Allocator.Error!?[]const u8 {
+        const t = m.trip orelse return null;
+        return try std.fmt.allocPrint(arena, "program too complex. Ticks exceeded `{s}` will exceed limits: `{d} current + {d} new > {d} max`)", .{ t.name, t.cur, t.new, t.max });
+    }
 
     pub fn enterScope(m: *Meter, scope: Scope) void {
         switch (scope) {
@@ -141,7 +155,17 @@ pub const Meter = struct {
         switch (m.kind) {
             .record => {},
             .bound => if (max) |mx| if (new > mx) return ctx.status(.CONSTRAINT_NOT_SATISFIED),
-            .sui => if (new >= (max orelse std.math.maxInt(u128))) return ctx.status(.PROGRAM_TOO_COMPLEX),
+            .sui => {
+                const mx = max orelse std.math.maxInt(u128);
+                if (new >= mx) {
+                    m.trip = .{ .name = switch (scope) {
+                        .Function => m.fun_name,
+                        .Module => m.mod_name,
+                        else => "<unknown>",
+                    }, .cur = slot.*, .new = units, .max = mx };
+                    return ctx.status(.PROGRAM_TOO_COMPLEX);
+                }
+            },
         }
         slot.* = new;
         if (scope == .Function) {
@@ -369,4 +393,60 @@ pub fn addrFromU16(x: u16) [32]u8 {
     a[30] = @intCast(x >> 8);
     a[31] = @intCast(x & 0xff);
     return a;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Error text (move-binary-format errors.rs, 1.83.1)
+
+/// `impl Display for IndexKind`.
+pub fn indexKindName(k: ff.IndexKind) []const u8 {
+    return switch (k) {
+        .ModuleHandle => "module handle",
+        .DatatypeHandle => "datatype handle",
+        .FunctionHandle => "function handle",
+        .FieldHandle => "field handle",
+        .FriendDeclaration => "friend declaration",
+        .StructDefInstantiation => "struct instantiation",
+        .FunctionInstantiation => "function instantiation",
+        .FieldInstantiation => "field instantiation",
+        .StructDefinition => "struct definition",
+        .FunctionDefinition => "function definition",
+        .FieldDefinition => "field definition",
+        .Signature => "signature",
+        .Identifier => "identifier",
+        .AddressIdentifier => "address identifier",
+        .ConstantPool => "constant pool",
+        .LocalPool => "local pool",
+        .CodeDefinition => "code definition pool",
+        .TypeParameter => "type parameter",
+        .MemberCount => "field offset",
+        .EnumDefinition => "enum definition",
+        .EnumDefInstantiation => "enum instantiation",
+        .VariantHandle => "variant handle",
+        .VariantInstantiationHandle => "variant instantiation handle",
+        .VariantJumpTable => "jump table",
+        .VariantTag => "variant tag",
+    };
+}
+
+/// Where a finished `VMError` points (`impl Display for Location`): `UNDEFINED` or
+/// `Module ModuleId { address: <hex>, name: Identifier("<name>") }`.
+pub const ErrLoc = union(enum) {
+    undefined,
+    module: struct { addr: *const [32]u8, name: []const u8 },
+};
+
+/// `impl Display for PartialVMError` (`loc == null`) and `impl Display for VMError`.
+pub fn vmErrorDisplay(arena: Allocator, e: PartialVmError, loc: ?ErrLoc, msg: ?[]const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "{s} with status {s}", .{ if (loc == null) "PartialVMError" else "VMError", @tagName(e.major) });
+    if (e.sub_status) |s| try out.print(arena, " with sub status {d}", .{s});
+    if (loc) |l| switch (l) {
+        .undefined => try out.appendSlice(arena, " at location UNDEFINED"),
+        .module => |mid| try out.print(arena, " at location Module ModuleId {{ address: {x}, name: Identifier(\"{s}\") }}", .{ mid.addr, mid.name }),
+    };
+    if (msg) |s| try out.print(arena, " and message {s}", .{s});
+    for (e.indexSlice()) |i| try out.print(arena, " at index {d} for {s}", .{ i.idx, indexKindName(i.kind) });
+    for (e.offsetSlice()) |o| try out.print(arena, " at code offset {d} in function definition {d}", .{ o.offset, o.fdef });
+    return out.items;
 }

@@ -29,7 +29,15 @@ use sui_types::object::Object;
 use sui_types::storage::ObjectStore;
 
 mod deny_order;
+mod funds;
 mod synth;
+
+// Mysten's funds withdraw scheduler (sui-core execution_scheduler/funds_withdraw_scheduler,
+// `pub(crate)` there) compiled from its own sources, at the crate paths those sources name.
+mod accumulators {
+    pub use sui_core::accumulators::funds_read;
+}
+mod execution_scheduler;
 
 struct CheckpointStore {
     objects: HashMap<(ObjectID, SequenceNumber), Object>,
@@ -1323,7 +1331,10 @@ fn main() -> Result<()> {
         }
         Some("synth") => synth::cmd_synth(Path::new(&args[1]), Path::new(&args[2])),
         Some("scan-refs") => synth::cmd_scan_refs(Path::new(&args[1])),
+        Some("synth-limits") => synth::cmd_synth_limits(Path::new(&args[1]), Path::new(&args[2])),
+        Some("limits-units") => synth::cmd_limits_units(),
         Some("deny-snapshot") => cmd_deny_snapshot(Path::new(&args[1]), &args[2], &args[3]),
+        Some("funds-sched") => funds::cmd_funds_sched(Path::new(&args[1]), Path::new(&args[2])),
         Some("deny-order") => deny_order::cmd_deny_order(Path::new(&args[1]), Path::new(&args[2])),
         _ => bail!("usage: zui-truth-exec state-hash <corpus> <out.jsonl.zst> | bench <name> --iters N --list <file>"),
     }

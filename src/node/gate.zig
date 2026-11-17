@@ -73,6 +73,43 @@ pub const method_defs = [_]g.methods.Def{
 
 pub const max_proxies = 8;
 
+/// `--gate-scope`: which of the node's listeners the gate is in front of. `all` (the default):
+/// every serve port and the zui/1 listener. `serve_tls`: only the `--serve-tls` listener; the
+/// plain `--serve` port and zui/1 answer as on a node without `--gate` (a core whose public
+/// traffic arrives on one listener through a TLS terminator, while its other listeners carry
+/// its own edges and private clients).
+pub const ListenScope = enum {
+    all,
+    serve_tls,
+
+    pub fn parse(text: []const u8) ?ListenScope {
+        if (std.mem.eql(u8, text, "all")) return .all;
+        if (std.mem.eql(u8, text, "serve-tls")) return .serve_tls;
+        return null;
+    }
+
+    pub fn label(s: ListenScope) []const u8 {
+        return switch (s) {
+            .all => "all listeners",
+            .serve_tls => "the --serve-tls listener only",
+        };
+    }
+
+    /// Whether the gate is in front of listener `l` under this scope.
+    pub fn covers(s: ListenScope, l: Listener) bool {
+        return s == .all or l == .serve_tls;
+    }
+
+    /// What listener `l` answers with: `gated` (the gate's handler) when the scope covers it,
+    /// else `plain`, unchanged.
+    pub fn pick(s: ListenScope, l: Listener, gated: h2.Handler, plain: h2.Handler) h2.Handler {
+        return if (s.covers(l)) gated else plain;
+    }
+};
+
+/// The node's listeners that can be behind the gate.
+pub const Listener = enum { serve, serve_tls, native };
+
 /// What the `--gate*` flags say.
 pub const Settings = struct {
     url: []const u8,
@@ -84,6 +121,8 @@ pub const Settings = struct {
     /// `--gate-ca-file`: a PEM file of certificate authorities trusted for the gate connection
     /// only, in addition to the system roots (a gate behind a private CA). Null: system roots.
     ca_file: ?[]const u8 = null,
+    /// `--gate-scope`: the listeners the gate is in front of.
+    scope: ListenScope = .all,
     /// Tests only: where the gate's own log lines go (null: std.log).
     log: ?g.gate.LogSink = null,
 };

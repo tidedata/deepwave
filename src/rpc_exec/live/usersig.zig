@@ -449,8 +449,8 @@ const ZkJwks = struct {
 
 /// sui-types `get_mainnet_chain_identifier` / `get_testnet_chain_identifier` (genesis checkpoint
 /// digests): `ZkLoginEnv::Prod` there, `Test` on any other chain (authority_per_epoch_store.rs).
-const mainnet_chain_id = hexId("35834a8ac17ca48fb14ac8f99c17c98747e95dd07294ae41a46b382246a4499b");
-const testnet_chain_id = hexId("4c78adacf2a2f5ad80f27ed7d54aa69d3a78f1ca67fdef9ecf5754f5b8bb77b0");
+pub const mainnet_chain_id = hexId("35834a8ac17ca48fb14ac8f99c17c98747e95dd07294ae41a46b382246a4499b");
+pub const testnet_chain_id = hexId("4c78adacf2a2f5ad80f27ed7d54aa69d3a78f1ca67fdef9ecf5754f5b8bb77b0");
 
 fn hexId(comptime h: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
@@ -467,6 +467,23 @@ fn zkEnv(e: *const EpochEnv, jw: *const ZkJwks) zk.zklogin.Env {
         .usage = if (prod) .prod else .test_,
         // `zklogin_circuit_mode_from_flag`: 0 v1 only, 1 v2 then v1, 2 v2 only
         .mode = switch (e.cfg.feature_flags.zklogin_circuit_mode) {
+            0 => .v1_only,
+            1 => .both,
+            else => .v2_only,
+        },
+    };
+}
+
+/// The validator's `SignatureVerifier` zkLogin parameters (authority_per_epoch_store.rs:
+/// `ZkLoginEnv::Prod` on mainnet and testnet, `Test` elsewhere; `zklogin_circuit_mode`) over the
+/// epoch's JWK map.
+pub fn zkLoginEnv(chain_id: *const [32]u8, cfg: anytype, jwks: zk.zklogin.Jwks) zk.zklogin.Env {
+    const prod = std.mem.eql(u8, chain_id, &mainnet_chain_id) or std.mem.eql(u8, chain_id, &testnet_chain_id);
+    return .{
+        .keys = zkKeys(),
+        .jwks = jwks,
+        .usage = if (prod) .prod else .test_,
+        .mode = switch (cfg.feature_flags.zklogin_circuit_mode) {
             0 => .v1_only,
             1 => .both,
             else => .v2_only,

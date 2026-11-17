@@ -42,4 +42,5 @@ test {
     _ = @import("test_limits.zig");
     _ = @import("test_drain.zig");
     _ = @import("test_caller.zig");
+    _ = @import("test_threads.zig");
 }

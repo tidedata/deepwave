@@ -66,6 +66,8 @@ pub const GenesisInfo = struct {
     epoch: u64,
     protocol_version: u64,
     epoch_start_timestamp_ms: u64,
+    /// `reference_gas_price` of the genesis system state (the epoch 0 RGP).
+    reference_gas_price: u64 = 0,
     /// Sorted by the BLS protocol key (the consensus AuthorityIndex order).
     validators: []GenesisValidator,
 };
@@ -203,7 +205,7 @@ fn readGenesisInner(arena: std.mem.Allocator, blob: []const u8) !GenesisInfo {
     _ = try s.bytes(16); // storage_fund
     // SystemParametersV1 has 7 u64 fields, V2 adds min_validator_count; then extra_fields
     _ = try s.bytes(8 * @as(usize, if (version == 2) 8 else 7) + 40);
-    _ = try s.int(u64); // reference_gas_price
+    const rgp = try s.int(u64); // reference_gas_price
     const nrep = try s.length();
     for (0..nrep) |_| {
         _ = try s.bytes(32);
@@ -220,7 +222,7 @@ fn readGenesisInner(arena: std.mem.Allocator, blob: []const u8) !GenesisInfo {
             return std.mem.lessThan(u8, &a.protocol_pubkey, &b.protocol_pubkey);
         }
     }.lt);
-    return .{ .chain_id = chain_id, .epoch = epoch, .protocol_version = protocol_version, .epoch_start_timestamp_ms = start_ms, .validators = vals };
+    return .{ .chain_id = chain_id, .epoch = epoch, .protocol_version = protocol_version, .epoch_start_timestamp_ms = start_ms, .reference_gas_price = rgp, .validators = vals };
 }
 
 // ------------------------------------------------------------------ keys
@@ -233,7 +235,7 @@ fn keyText(gpa: std.mem.Allocator, io: Io, loc: ?keys.config.KeyLocation) Error!
     };
 }
 
-fn loadKeys(gpa: std.mem.Allocator, io: Io, c: *const keys.config.ValidatorConfig) Error!keys.material.KeySet {
+pub fn loadKeys(gpa: std.mem.Allocator, io: Io, c: *const keys.config.ValidatorConfig) Error!keys.material.KeySet {
     const pk = try keyText(gpa, io, c.protocol_key);
     defer {
         std.crypto.secureZero(u8, pk);
@@ -295,6 +297,10 @@ const LogSink = struct {
     own_blocks_committed: std.atomic.Value(u64) = .init(0),
     leaders_by_author: [64]std.atomic.Value(u64) = @splat(.init(0)),
     own_index: ctypes.AuthorityIndex,
+    /// The committee's epoch and the wall clock (the consensus Clock, skew included), written on
+    /// every FULL line so the harness can key commits by (epoch, index) and time their arrival.
+    epoch: u64 = 0,
+    clock: consensus.iface.Clock,
     buf: [1 << 16]u8 = undefined,
 
     fn sink(s: *LogSink) consensus.iface.CommitSink {
@@ -328,7 +334,7 @@ const LogSink = struct {
             if (r.author == s.own_index) own_blocks += 1;
         }
         w.writeAll("])\n") catch return false;
-        w.print("FULL index={d} digest={s} leader_round={d} leader_author={d} leader_digest={s} ts={d} blocks={d}\n", .{ sd.commit_ref.index, cd, sd.leader.round, sd.leader.author, ld, sd.timestamp_ms, sd.blocks.len }) catch return false;
+        w.print("FULL index={d} digest={s} leader_round={d} leader_author={d} leader_digest={s} ts={d} blocks={d} epoch={d} wall_ms={d}\n", .{ sd.commit_ref.index, cd, sd.leader.round, sd.leader.author, ld, sd.timestamp_ms, sd.blocks.len, s.epoch, s.clock.nowMs() }) catch return false;
         const out = w.buffered();
         var off: usize = 0;
         while (off < out.len) {
@@ -348,6 +354,55 @@ const LogSink = struct {
         return @intCast(s.processed.load(.acquire));
     }
 };
+
+/// Wall clock moved by a fixed offset (test fault only); the monotonic clock is untouched, as
+/// with libfaketime's DONT_FAKE_MONOTONIC on the sui-node seats.
+const SkewClock = struct {
+    inner: consensus.iface.Clock,
+    skew_ms: i64 = 0,
+
+    fn clock(c: *SkewClock) consensus.iface.Clock {
+        if (c.skew_ms == 0) return c.inner;
+        return .{ .ctx = c, .vtable = &vt };
+    }
+    const vt: consensus.iface.Clock.VTable = .{ .now_ms = nowMs, .mono_ns = monoNs };
+    fn nowMs(ctx: *anyopaque) u64 {
+        const c: *SkewClock = @ptrCast(@alignCast(ctx));
+        const t: i64 = @intCast(c.inner.nowMs());
+        return @intCast(@max(0, t + c.skew_ms));
+    }
+    fn monoNs(ctx: *anyopaque) u64 {
+        const c: *SkewClock = @ptrCast(@alignCast(ctx));
+        return c.inner.monoNs();
+    }
+};
+
+/// ZUI_TEST_CLOCK_SKEW_MS for a local test committee, 0 otherwise or when unset or malformed.
+fn clockSkewMs(mode: gate.Mode) i64 {
+    if (mode != .local_test) return 0;
+    const v = std.c.getenv("ZUI_TEST_CLOCK_SKEW_MS") orelse return 0;
+    return std.fmt.parseInt(i64, std.mem.span(v), 10) catch 0;
+}
+
+test "SkewClock moves the wall clock only" {
+    const Fixed = struct {
+        fn now(_: *anyopaque) u64 {
+            return 1_000_000;
+        }
+        fn mono(_: *anyopaque) u64 {
+            return 42;
+        }
+        const vt: consensus.iface.Clock.VTable = .{ .now_ms = now, .mono_ns = mono };
+    };
+    var dummy: u8 = 0;
+    var c: SkewClock = .{ .inner = .{ .ctx = &dummy, .vtable = &Fixed.vt }, .skew_ms = -2500 };
+    const k = c.clock();
+    try std.testing.expectEqual(@as(u64, 997_500), k.nowMs());
+    try std.testing.expectEqual(@as(u64, 42), k.monoNs());
+    c.skew_ms = 0;
+    try std.testing.expectEqual(@as(u64, 1_000_000), c.clock().nowMs());
+    try std.testing.expectEqual(@as(i64, 0), clockSkewMs(.network));
+}
 
 // ------------------------------------------------------------------ signals
 
@@ -461,7 +516,12 @@ fn runInner(gpa: std.mem.Allocator, io: Io, args: []const []const u8) Error!u8 {
     };
     const db = if (db_opt) |d| d else try std.fmt.allocPrint(arena, "{s}-zui", .{std.mem.trimEnd(u8, c.db_path, "/")});
     const cons_dir = try std.fmt.allocPrint(arena, "{s}/consensus", .{db});
-    var clock: consensus_net.testkit.RealClock = .{ .io = io };
+    var real_clock: consensus_net.testkit.RealClock = .{ .io = io };
+    // ZUI_TEST_CLOCK_SKEW_MS: the clock-skew fault of tools/localnet-mixed (net.sh skew). Only a
+    // local test license gets here (the gate above refused anything else), and it moves only this
+    // process's wall clock, as libfaketime does for the sui-node seats.
+    var skew_clock: SkewClock = .{ .inner = real_clock.clock(), .skew_ms = clockSkewMs(lic.mode) };
+    if (skew_clock.skew_ms != 0) std.debug.print("deepwave-validator seat: wall clock skewed by {d} ms (ZUI_TEST_CLOCK_SKEW_MS)\n", .{skew_clock.skew_ms});
     var params: consensus.config.Parameters = .{};
     params.db_path = cons_dir;
     const context = try arena.create(consensus.Context);
@@ -471,7 +531,7 @@ fn runInner(gpa: std.mem.Allocator, io: Io, args: []const []const u8) Error!u8 {
         .committee = committee,
         .parameters = params,
         .protocol_config = pc,
-        .clock = clock.clock(),
+        .clock = skew_clock.clock(),
     };
 
     std.debug.print("deepwave-validator seat: chain {s}, epoch {d}, protocol {d}, epoch start {d} ms, committee {d}, own index {d} ({s}), gate {s}\n", .{ &g.chain_id, g.epoch, g.protocol_version, g.epoch_start_timestamp_ms, g.validators.len, own_index, me.name, @tagName(lic.mode) });
@@ -502,7 +562,7 @@ fn runInner(gpa: std.mem.Allocator, io: Io, args: []const []const u8) Error!u8 {
     defer _ = std.c.close(fd);
     const sink = try gpa.create(LogSink);
     defer gpa.destroy(sink);
-    sink.* = .{ .fd = fd, .own_index = own_index };
+    sink.* = .{ .fd = fd, .own_index = own_index, .epoch = g.epoch, .clock = context.clock };
     sink.processed.store(resume_from, .release);
     if (resume_from != 0) std.debug.print("deepwave-validator seat: resuming after commit {d} (commit log)\n", .{resume_from});
 
@@ -558,7 +618,7 @@ fn lastLoggedCommit(gpa: std.mem.Allocator, io: Io, path: []const u8) u64 {
     return last;
 }
 
-fn appendAddr(arena: std.mem.Allocator, list: *std.ArrayList([]const u8), a: []const u8) Error!void {
+pub fn appendAddr(arena: std.mem.Allocator, list: *std.ArrayList([]const u8), a: []const u8) Error!void {
     if (a.len == 0) return;
     list.append(arena, a) catch return error.OutOfMemory;
 }

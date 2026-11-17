@@ -73,6 +73,9 @@ pub const Request = struct {
     /// The request's `x-forwarded-for` metadata ("" when absent or longer than
     /// `max_forwarded_for`): an access gate reads it only behind a proxy it trusts.
     forwarded_for: []const u8 = "",
+    /// The request's `authorization` metadata ("" when absent or longer than `max_api_key` plus
+    /// the scheme): bearer credentials, for services that authenticate with them.
+    authorization: []const u8 = "",
 };
 
 /// A peer address as text, held inline (`Conn.peer`, copied into each `Job`).
@@ -352,6 +355,7 @@ pub const Job = struct {
     client_protocol_version: ?u64 = null,
     api_key: []u8 = &.{},
     forwarded_for: []u8 = &.{},
+    authorization: []u8 = &.{},
     peer: Peer = .{},
     /// Set by the connection (under its lock) when nobody waits for the answer any more: the
     /// stream was reset or dropped, or `expireJobs` answered it at its deadline.
@@ -370,11 +374,12 @@ pub const Job = struct {
     }
 
     pub fn request(j: *const Job) Request {
-        return .{ .path = j.path, .authority = j.authority, .body = j.body, .stream_id = j.stream_id, .accept = j.encoding, .deadline_ns = j.deadline_ns, .client_protocol_version = j.client_protocol_version, .api_key = j.api_key, .peer = j.peer.text(), .forwarded_for = j.forwarded_for };
+        return .{ .path = j.path, .authority = j.authority, .body = j.body, .stream_id = j.stream_id, .accept = j.encoding, .deadline_ns = j.deadline_ns, .client_protocol_version = j.client_protocol_version, .api_key = j.api_key, .peer = j.peer.text(), .forwarded_for = j.forwarded_for, .authorization = j.authorization };
     }
     pub fn destroy(j: *Job, gpa: Allocator) void {
         gpa.free(j.api_key);
         gpa.free(j.forwarded_for);
+        gpa.free(j.authorization);
         gpa.free(j.path);
         gpa.free(j.authority);
         gpa.free(j.body);
@@ -403,6 +408,8 @@ pub const Stream = struct {
     api_key: []u8 = &.{},
     /// `x-forwarded-for` (`Request.forwarded_for`); allocated only when the request carries one.
     forwarded_for: []u8 = &.{},
+    /// `authorization` (`Request.authorization`); allocated only when the request carries one.
+    authorization: []u8 = &.{},
     /// `ResponseStream.retry_after_ms` of the call that answered this stream.
     retry_after_ms: ?u32 = null,
     body: std.ArrayList(u8) = .empty,
@@ -457,6 +464,7 @@ pub const Stream = struct {
         gpa.free(s.grpc_encoding);
         gpa.free(s.api_key);
         gpa.free(s.forwarded_for);
+        gpa.free(s.authorization);
         s.body.deinit(gpa);
         s.out.deinit(gpa);
         if (s.trailers) |t| gpa.free(t);
@@ -943,6 +951,10 @@ pub const Conn = struct {
                 gpa.free(self.s.forwarded_for);
                 self.s.forwarded_for = &.{};
                 if (value.len <= max_forwarded_for) self.s.forwarded_for = try gpa.dupe(u8, value);
+            } else if (eql(u8, name, "authorization")) {
+                gpa.free(self.s.authorization);
+                self.s.authorization = &.{};
+                if (value.len <= max_api_key + 16) self.s.authorization = try gpa.dupe(u8, value);
             }
         }
     };
@@ -1071,7 +1083,7 @@ pub const Conn = struct {
         var sink: ConnSink = .{ .c = c, .s = s };
         var rs: ResponseStream = .{ .gpa = c.gpa, .impl = &sink, .vt = &ConnSink.vt, .encoding = s.encoding };
         defer rs.release();
-        const req: Request = .{ .path = s.path, .authority = s.authority, .body = payload, .stream_id = s.id, .accept = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version, .api_key = s.api_key, .peer = c.peer.text(), .forwarded_for = s.forwarded_for };
+        const req: Request = .{ .path = s.path, .authority = s.authority, .body = payload, .stream_id = s.id, .accept = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version, .api_key = s.api_key, .peer = c.peer.text(), .forwarded_for = s.forwarded_for, .authorization = s.authorization };
         const status = c.handler.call(c.handler.ctx, &req, &rs);
         switch (status) {
             .deferred => return,
@@ -1095,7 +1107,9 @@ pub const Conn = struct {
         const api_key: []u8 = if (s.api_key.len > 0) try c.gpa.dupe(u8, s.api_key) else &.{};
         errdefer c.gpa.free(api_key);
         const forwarded_for: []u8 = if (s.forwarded_for.len > 0) try c.gpa.dupe(u8, s.forwarded_for) else &.{};
-        j.* = .{ .stream_id = s.id, .path = path, .authority = authority, .body = body, .encoding = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version, .api_key = api_key, .forwarded_for = forwarded_for, .peer = c.peer };
+        errdefer c.gpa.free(forwarded_for);
+        const authorization: []u8 = if (s.authorization.len > 0) try c.gpa.dupe(u8, s.authorization) else &.{};
+        j.* = .{ .stream_id = s.id, .path = path, .authority = authority, .body = body, .encoding = s.encoding, .deadline_ns = c.deadlineOf(s), .client_protocol_version = s.client_protocol_version, .api_key = api_key, .forwarded_for = forwarded_for, .authorization = authorization, .peer = c.peer };
         return j;
     }
 

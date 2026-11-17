@@ -1,29 +1,57 @@
 //! The validator safety gate (docs/VALIDATOR-DESIGN.md section 8). validator-base owns this file.
 //!
-//! deepwave's validator code is unaudited. It must never sign anything on mainnet or testnet. The
-//! gate decides once, at startup, before any key is opened, socket bound or peer dialed:
+//! The gate decides once, at startup, before any key is opened, socket bound or peer dialed, which
+//! network this process may sign on. Its job is operational: a validator key is never used on a
+//! network by accident.
 //!
 //!   allowed (local_test)  the chain is neither mainnet nor testnet, every committee address is
-//!                         loopback or private (RFC 1918 / ULA / localhost), and every key was
-//!                         generated for this local committee (never loaded from a key file);
-//!   allowed (unaudited)   the binary was built with -Dvalidator-unaudited=true AND the operator
-//!                         passed the runtime flag `--unaudited-validator-i-accept-the-risk`;
+//!                         loopback or private (RFC 1918 / ULA / localhost), and the keys were
+//!                         generated for this local committee or are one seat of a committee
+//!                         Mysten's `sui genesis` generated (never a key file of a real validator);
+//!   allowed (network)     the operator named the network explicitly with `--sign-network
+//!                         mainnet|testnet|<chain id>` and that name matches the genesis chain id;
+//!                         key files and public addresses are allowed in this mode only;
 //!   refused               everything else, with the reason.
 //!
-//! The decision is a `License`. The signer (signer.zig) only opens with a valid license and
-//! binds every signature to the license's chain id, so a later code path cannot skip the gate.
-//! With the build option off (the default), the unaudited branch is compiled out entirely.
+//! The decision is a `License`. The signer (signer.zig) only opens with a valid license and binds
+//! every signature to the license's chain id; it keeps the single-signer lock and the double-sign
+//! watermarks in every mode, so the opt-in never relaxes them.
 const std = @import("std");
-const build_options = @import("validator_options");
 
-/// -Dvalidator-unaudited (default false).
-pub const unaudited_build: bool = build_options.validator_unaudited;
-/// The runtime flag that, together with the build option, allows a non-local network.
-pub const unaudited_runtime_flag = "--unaudited-validator-i-accept-the-risk";
+/// The runtime option that opts in to signing on a named network.
+pub const sign_network_flag = "--sign-network";
 
 /// sui ChainIdentifier: the first 4 bytes of the genesis checkpoint digest, hex.
 pub const mainnet_chain_id = "35834a8a";
 pub const testnet_chain_id = "4c78adac";
+
+/// The network named by `--sign-network`: mainnet, testnet, or a chain id (8 hex characters) for
+/// any other network (a devnet, a private network with public addresses).
+pub const SignNetwork = union(enum) {
+    mainnet,
+    testnet,
+    chain: [8]u8,
+
+    pub fn parse(text: []const u8) ?SignNetwork {
+        if (std.mem.eql(u8, text, "mainnet")) return .mainnet;
+        if (std.mem.eql(u8, text, "testnet")) return .testnet;
+        if (text.len != 8) return null;
+        var c: [8]u8 = undefined;
+        for (text, 0..) |ch, i| {
+            if (!std.ascii.isHex(ch)) return null;
+            c[i] = std.ascii.toLower(ch);
+        }
+        return .{ .chain = c };
+    }
+
+    pub fn chainId(n: SignNetwork) [8]u8 {
+        return switch (n) {
+            .mainnet => mainnet_chain_id.*,
+            .testnet => testnet_chain_id.*,
+            .chain => |c| c,
+        };
+    }
+};
 
 pub const KeySource = enum {
     /// Generated in-process for a local test committee (deepwave-validator localnet).
@@ -45,11 +73,11 @@ pub const Request = struct {
     /// "/dns/localhost/udp/8084", or "host:port").
     addresses: []const []const u8,
     key_source: KeySource,
-    /// The operator passed `unaudited_runtime_flag`.
-    unaudited_flag: bool = false,
+    /// `--sign-network`: the operator's explicit opt-in to sign on that network.
+    sign_network: ?SignNetwork = null,
 };
 
-pub const Mode = enum { local_test, unaudited };
+pub const Mode = enum { local_test, network };
 
 pub const Refusal = enum {
     mainnet,
@@ -59,18 +87,18 @@ pub const Refusal = enum {
     non_local_address,
     bad_address,
     key_file_in_local_mode,
-    unaudited_build_off,
+    sign_network_mismatch,
 
     pub fn text(r: Refusal) []const u8 {
         return switch (r) {
-            .mainnet => "refused: chain is Sui mainnet; zui validator code is unaudited and never signs on mainnet",
-            .testnet => "refused: chain is Sui testnet; zui validator code is unaudited and never signs on testnet",
+            .mainnet => "refused: chain is Sui mainnet; signing on mainnet needs --sign-network mainnet",
+            .testnet => "refused: chain is Sui testnet; signing on testnet needs --sign-network testnet",
             .bad_chain_id => "refused: chain id is not 8 hex characters",
             .empty_committee => "refused: no committee addresses given",
-            .non_local_address => "refused: a committee address is not loopback or private; local test committees only",
+            .non_local_address => "refused: a committee address is not loopback or private; a public network needs --sign-network",
             .bad_address => "refused: a committee address could not be parsed",
-            .key_file_in_local_mode => "refused: local test committees use generated keys only, never key files",
-            .unaudited_build_off => "refused: --unaudited-validator-i-accept-the-risk needs a build with -Dvalidator-unaudited=true",
+            .key_file_in_local_mode => "refused: key files need --sign-network naming the chain; local test committees use generated keys",
+            .sign_network_mismatch => "refused: --sign-network names a different chain than the genesis",
         };
     }
 };
@@ -113,13 +141,14 @@ pub fn decide(req: Request) Decision {
         if (!std.ascii.isHex(c)) return .{ .refused = .bad_chain_id };
         cid[i] = std.ascii.toLower(c);
     }
-    if (unaudited_build and req.unaudited_flag) return issue(.unaudited, &cid);
-
+    if (req.sign_network) |n| {
+        // the opt-in must name exactly this chain: a key is never used on another network
+        const want = n.chainId();
+        if (!std.mem.eql(u8, &want, &cid)) return .{ .refused = .sign_network_mismatch };
+        return issue(.network, &cid);
+    }
     if (std.mem.eql(u8, &cid, mainnet_chain_id)) return .{ .refused = .mainnet };
     if (std.mem.eql(u8, &cid, testnet_chain_id)) return .{ .refused = .testnet };
-    // Asking for unaudited mode on a build without the option is an operator error worth
-    // stopping on, whatever the committee looks like.
-    if (req.unaudited_flag and !unaudited_build) return .{ .refused = .unaudited_build_off };
     if (req.addresses.len == 0) return .{ .refused = .empty_committee };
     for (req.addresses) |a| switch (classify(a)) {
         .local => {},
@@ -190,15 +219,29 @@ fn classifyIp6(s: []const u8) AddressClass {
 
 const local_addrs = [_][]const u8{ "/ip4/127.0.0.1/tcp/8080", "/ip4/192.168.0.9/udp/8084", "/dns/localhost/tcp/1", "127.0.0.1:9000", "[::1]:8080", "/ip6/fd12:3456::1/tcp/1" };
 
-test "mainnet and testnet are always refused without the unaudited build" {
+test "mainnet and testnet are refused without the opt-in" {
     const m = decide(.{ .chain_id = mainnet_chain_id, .addresses = &local_addrs, .key_source = .generated });
     try std.testing.expectEqual(Refusal.mainnet, m.refused);
     const t = decide(.{ .chain_id = "4C78ADAC", .addresses = &local_addrs, .key_source = .generated });
     try std.testing.expectEqual(Refusal.testnet, t.refused);
-    if (!unaudited_build) {
-        const f = decide(.{ .chain_id = mainnet_chain_id, .addresses = &local_addrs, .key_source = .file, .unaudited_flag = true });
-        try std.testing.expectEqual(Refusal.mainnet, f.refused);
-    }
+    const f = decide(.{ .chain_id = mainnet_chain_id, .addresses = &local_addrs, .key_source = .file });
+    try std.testing.expectEqual(Refusal.mainnet, f.refused);
+}
+
+test "--sign-network must name the genesis chain" {
+    const public = [_][]const u8{ "/dns/validator.example.com/tcp/8080", "/ip4/8.8.8.8/udp/8084" };
+    const ok = decide(.{ .chain_id = mainnet_chain_id, .addresses = &public, .key_source = .file, .sign_network = .mainnet });
+    try std.testing.expectEqual(Mode.network, ok.allowed.mode);
+    try std.testing.expect(ok.allowed.valid());
+    try std.testing.expectEqualStrings(mainnet_chain_id, &ok.allowed.chain_id);
+    try std.testing.expectEqual(Refusal.sign_network_mismatch, decide(.{ .chain_id = mainnet_chain_id, .addresses = &public, .key_source = .file, .sign_network = .testnet }).refused);
+    try std.testing.expectEqual(Refusal.sign_network_mismatch, decide(.{ .chain_id = testnet_chain_id, .addresses = &public, .key_source = .file, .sign_network = .mainnet }).refused);
+    // a local chain named by its id
+    const dev = decide(.{ .chain_id = "0BADC0DE", .addresses = &public, .key_source = .file, .sign_network = SignNetwork.parse("0badc0de").? });
+    try std.testing.expectEqual(Mode.network, dev.allowed.mode);
+    try std.testing.expectEqual(Refusal.sign_network_mismatch, decide(.{ .chain_id = "0badc0df", .addresses = &public, .key_source = .file, .sign_network = SignNetwork.parse("0badc0de").? }).refused);
+    try std.testing.expect(SignNetwork.parse("main") == null);
+    try std.testing.expect(SignNetwork.parse("0badc0dz") == null);
 }
 
 test "local test committee is allowed with generated keys only" {
@@ -230,17 +273,8 @@ test "any public address refuses local mode" {
     try std.testing.expectEqual(Refusal.bad_address, decide(.{ .chain_id = "0badc0de", .addresses = &bad, .key_source = .generated }).refused);
 }
 
-test "unaudited flag needs the build option" {
-    const d = decide(.{ .chain_id = "0badc0de", .addresses = &local_addrs, .key_source = .generated, .unaudited_flag = true });
-    if (unaudited_build) {
-        try std.testing.expectEqual(Mode.unaudited, d.allowed.mode);
-    } else {
-        try std.testing.expectEqual(Refusal.unaudited_build_off, d.refused);
-    }
-}
-
 test "a hand-made license is not valid" {
-    const forged: License = .{ .mode = .unaudited, .chain_id = mainnet_chain_id.*, .seal = 1 };
+    const forged: License = .{ .mode = .network, .chain_id = mainnet_chain_id.*, .seal = 1 };
     try std.testing.expect(!forged.valid());
 }
 

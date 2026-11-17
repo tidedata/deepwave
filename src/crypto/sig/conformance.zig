@@ -691,7 +691,7 @@ pub fn parseAliases(a: std.mem.Allocator, vals: []const std.json.Value) ![]const
     return out;
 }
 
-fn checkTxResult(c: *harness.Check, want_v: []const u8, want_idx: ?[]const u64, r: *const user.TxResult) void {
+pub fn checkTxResult(c: *harness.Check, want_v: []const u8, want_idx: ?[]const u64, r: *const user.TxResult) void {
     c.text("verdict", want_v, r.verdict.truthName());
     if (want_idx) |want| {
         if (r.verdict == .valid) {
@@ -717,7 +717,7 @@ fn envOfFlags(epoch: u64, f: *const Flags) user.UserSigEnv {
 }
 
 /// Byte ranges of one checkpoint's transactions in its blob, from the dumper truth.
-const TxBytes = struct {
+pub const TxBytes = struct {
     /// intent message bytes: Intent (3 bytes) ++ BCS(TransactionData)
     intent: []const u8 = &.{},
     sigs: std.ArrayList([]const u8) = .empty,
@@ -730,7 +730,7 @@ fn parseIndex(s: []const u8, i: *usize) !u32 {
 }
 
 /// Reads tx[i].data and tx[i].sig[j] ranges out of truth/checkpoint/<seq>.jsonl.zst.
-fn loadTxBytes(ctx: *harness.Ctx, a: std.mem.Allocator, seq: u64, blob: []const u8) ![]TxBytes {
+pub fn loadTxBytes(ctx: *harness.Ctx, a: std.mem.Allocator, seq: u64, blob: []const u8) ![]TxBytes {
     var pbuf: [64]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "truth/checkpoint/{d}.jsonl.zst", .{seq});
     const text = try ctx.readZstd(path, 1 << 32);
@@ -775,7 +775,7 @@ fn loadTxBytes(ctx: *harness.Ctx, a: std.mem.Allocator, seq: u64, blob: []const 
     return txs;
 }
 
-fn seqOfName(name: []const u8) !u64 {
+pub fn seqOfName(name: []const u8) !u64 {
     const dot = std.mem.indexOfScalar(u8, name, '.') orelse return error.BadName;
     return std.fmt.parseInt(u64, name[0..dot], 10) catch error.BadName;
 }

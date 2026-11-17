@@ -419,6 +419,9 @@ fn idLeak(s: *S, ctx: *Ctx, meter: *c.Meter, scratch: *std.heap.ArenaAllocator) 
         cfgm.analyze(IdLeak, &an, ctx, meter, a, &g, code.code, init) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Vm => {
+                // `check_for_verifier_timeout`: the meter tripped (`to_verification_timeout_error`)
+                if (isVerifierTimeout(ctx.err.major))
+                    return s.fail(.SuiMoveVerificationTimedout, "{s}", .{try c.vmErrorDisplay(s.arena, ctx.err, null, try meter.tripMessage(s.arena))});
                 const msg = an.msg orelse return error.Vm; // a Rust panic path; never in valid input
                 return s.fail(.SuiMoveVerificationError, "{s}", .{msg});
             },
@@ -766,6 +769,22 @@ fn oneTimeWitness(s: *S) Error!void {
 }
 
 // ---------------------------------------------------------------------------------------------
+
+/// sui-verifier `check_for_verifier_timeout`: the statuses that count as a verifier timeout.
+pub fn isVerifierTimeout(s: ff.StatusCode) bool {
+    return switch (s) {
+        .PROGRAM_TOO_COMPLEX,
+        .TOO_MANY_BACK_EDGES,
+        .BORROWLOC_EXISTS_BORROW_ERROR,
+        .COPYLOC_EXISTS_BORROW_ERROR,
+        .DEPRECATED_BYTECODE_FORMAT,
+        .REFERENCE_SAFETY_INCONSISTENT,
+        .VEC_BORROW_ELEMENT_EXISTS_MUTABLE_BORROW_ERROR,
+        .CALL_BORROWED_MUTABLE_REFERENCE_ERROR,
+        => true,
+        else => false,
+    };
+}
 
 /// `sui_verify_module_metered`. Returns null when the module passes.
 pub fn verify(arena: Allocator, scratch: *std.heap.ArenaAllocator, ctx: *Ctx, cfg: *const c.Config, m: *const CompiledModule, meter: *c.Meter) error{ OutOfMemory, Vm }!?SuiError {

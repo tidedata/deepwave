@@ -156,6 +156,12 @@ pub const RandomnessHooks = struct {
         /// After the commit's RandomnessDkgMessage / Confirmation were fed in: `advance_dkg` when
         /// Rust would run it (the hooks decide). May submit this validator's Confirmation.
         advance_dkg: ?*const fn (ctx: *anyopaque) void = null,
+        /// The manager's records of everything since the last call (DKG messages processed, used
+        /// messages, confirmations, own confirmation, the DKG output or the FAILED verdict, the
+        /// reserved round), encoded; null when nothing changed. The handler writes them in the
+        /// commit's durable group, so the DKG state on disk always matches the commits processed
+        /// (the bug class of Sui PR 26846, mainnet halt of 2026-05-28).
+        take_records: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator) error{OutOfMemory}!?[]const u8 = null,
     };
 };
 
@@ -167,6 +173,9 @@ pub const JwkHooks = struct {
         /// here). Returns true when the JWK just reached validity stake and becomes active at
         /// this commit (the handler then schedules an AuthenticatorStateUpdate).
         vote: *const fn (ctx: *anyopaque, from: *const AuthorityName, id: *const types.JwkId, jwk: *const types.JWK, round: u64) bool,
+        /// The `pending_jwks` / `active_jwks` rows of everything since the last call, encoded
+        /// (jwk/hooks.zig); null when nothing changed. Written in the commit's durable group.
+        take_records: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator) error{OutOfMemory}!?[]const u8 = null,
     };
 };
 
@@ -203,8 +212,12 @@ pub const TxExecutor = struct {
     vtable: *const VTable,
     pub const SharedVersion = struct { id: types.ObjectID, initial_shared_version: types.SequenceNumber, assigned: types.SequenceNumber };
     pub const VTable = struct {
-        /// `tx_bcs`: BCS SenderSignedData or a system TransactionKind wrapped as Rust's
-        /// VerifiedExecutableTransaction. Execution order follows the version DAG.
+        /// `tx_bcs`: BCS TransactionData (user transactions: the signed data's intent message
+        /// value; system transactions: the kind wrapped as `TransactionData::new_system`). The
+        /// validator runtime does not go through this entry: it drives `authority/exec_bridge.zig`
+        /// `Runner`, whose `Item.kind` says user / ConsensusCommitPrologue /
+        /// AuthenticatorStateUpdate / RandomnessStateUpdate / settlement. Execution order follows
+        /// the version DAG.
         enqueue: *const fn (ctx: *anyopaque, tx_bcs: []const u8, shared: []const SharedVersion) error{ Full, Unimplemented }!void,
         /// Effects digest once executed (null while pending).
         effects_digest: *const fn (ctx: *anyopaque, digest: *const types.TransactionDigest) ?types.Digest,
@@ -239,6 +252,13 @@ pub const Tracer = struct {
     };
     pub fn mark(t: Tracer, stage: Stage, key: *const [32]u8, mono_ns: u64) void {
         if (t.vtable) |v| v.mark(t.ctx.?, stage, key, mono_ns);
+    }
+    /// Marks with the monotonic clock now (CLOCK_MONOTONIC, the clock consensus marks use).
+    pub fn markNow(t: Tracer, stage: Stage, key: *const [32]u8) void {
+        if (t.vtable == null) return;
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        t.mark(stage, key, @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec)));
     }
 };
 

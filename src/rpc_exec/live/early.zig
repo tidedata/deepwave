@@ -154,7 +154,9 @@ fn denyChecks(arena: Allocator, live: LiveObjects, env: *const EpochEnv, td: *co
 
 /// `pre_object_load_checks`' deny checks (transaction-deny-config), right after `validity_check`.
 fn txDeny(arena: Allocator, live: LiveObjects, td: *const types.TransactionDataV1, sigs: []const []const u8) Allocator.Error!Outcome {
-    const cfg = txdeny.current();
+    var deny_guard = txdeny.effective();
+    defer deny_guard.release();
+    const cfg = deny_guard.config();
     if (!cfg.active()) return .pass;
     const rules = &cfg.rules;
     var kinds: std.ArrayList(checks.InputKind) = .empty;

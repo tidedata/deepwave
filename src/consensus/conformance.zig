@@ -18,8 +18,9 @@
 //! - `consensus-swap`: LeaderSwapTable good/bad nodes (stake cutoffs, tie shuffles) and `swap`.
 //!
 //! Vectors: `$ZUI_CORPUS/consensus/replay.vec`, written by tools/truth/consensus/committer-vectors/run.sh
-//! (format in zui_consensus_vectors.rs). A localnet capture (tools/truth/consensus/capture.sh) adds
-//! `consensus-localnet` later (blocks and commits a real Mysten committee stored).
+//! (format in zui_consensus_vectors.rs). `consensus-localnet` (conformance_localnet.zig) replays a
+//! Mysten localnet capture (tools/truth/consensus/capture.sh): blocks and commits a real Mysten
+//! committee stored.
 const std = @import("std");
 const harness = @import("harness");
 const types = @import("types.zig");
@@ -44,7 +45,7 @@ pub const suites = [_]harness.Suite{
     .{ .name = "consensus-verify", .lane = "val-consensus-core", .doc = "Rust SignedBlockVerifier verdicts on signed blocks (mainnet 141 limits), genesis digests, block signatures", .run = runVerify },
     .{ .name = "consensus-bcs", .lane = "val-consensus-core", .doc = "BCS bytes of fixed consensus values (blocks V1/V2/V3, signed blocks, digests, commit, refs, votes, scores) and BlockRef order", .run = runBcs },
     .{ .name = "consensus-swap", .lane = "val-consensus-core", .doc = "LeaderSwapTable good/bad nodes and swap choices from Rust", .run = runSwap },
-};
+} ++ @import("conformance_localnet.zig").suites;
 
 fn unhex(a: Allocator, s: []const u8) ![]u8 {
     const out = try a.alloc(u8, s.len / 2);
@@ -260,6 +261,18 @@ fn runReplay(ctx: *harness.Ctx) anyerror!void {
                 ctx.nextItem();
                 ctx.fail(item, "expected {d} finalized commits, got {d}", .{ kf, fin.len });
             }
+        } else if (std.mem.eql(u8, kind, "flabels")) {
+            // The finalizer's metric labels since the scenario started (Rust's counters).
+            var nb: [96]u8 = undefined;
+            const item = std.fmt.bufPrint(&nb, "{s}/step{d}/finalizer-labels", .{ ev.?.name, step_no }) catch "flabels";
+            ctx.nextItem();
+            const got = ev.?.fin.counters.labels();
+            var want: [8]u64 = undefined;
+            for (&want) |*w| w.* = try std.fmt.parseInt(u64, it.next() orelse return error.BadVector, 10);
+            const names = [_][]const u8{ "output commits direct", "output commits indirect", "direct_finalize", "direct_reject", "direct_late_reject", "indirect_finalize", "indirect_reject", "skipped voting blocks direct" };
+            var c = ctx.check(item);
+            for (names, want, got) |n, w, g| c.eql(n, w, g);
+            _ = c.finish();
         } else if (std.mem.eql(u8, kind, "swap")) {
             try compareSwap(ctx, ev.?, &it);
         } else if (std.mem.eql(u8, kind, "end")) {

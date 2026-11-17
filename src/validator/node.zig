@@ -54,7 +54,7 @@ pub const usage =
     \\deepwave-validator run (--localnet DIR --index N | --config FILE --chain-id HEX8) [options]
     \\  --localnet DIR         local test committee made by `deepwave-validator localnet` (keys generated from its seed)
     \\  --index N              this validator's member index in the committee (default 0)
-    \\  --config FILE          validator.yaml (key files; allowed only with an unaudited build and flag)
+    \\  --config FILE          validator.yaml (key files; needs --sign-network naming the chain)
     \\  --chain-id HEX8        chain identifier for --config (the gate refuses mainnet and testnet)
     \\  --db DIR               validator database (default: <localnet>/db-<index>, or db-path of the config)
     \\  --node-store DIR       a deepwave data directory (the one holding store/) to answer ObjectInfo,
@@ -72,7 +72,8 @@ pub const usage =
     \\                         such a GPU; off = --sig-preverify off and no GPU (default auto; verdicts identical)
     \\  --gpu MODE             off|auto|metal|cuda: accelerator for the Ed25519 and zkLogin pre-steps
     \\                         (default: $ZUI_GPU, unset = auto; verdicts identical either way)
-    \\  --unaudited-validator-i-accept-the-risk
+    \\  --sign-network NET     mainnet|testnet|CHAINID: the explicit opt-in to sign on that network; must match
+    \\                         the chain id (local test committees need none)
     \\
     \\deepwave-validator localnet DIR --validators N [--seed HEX64] [--base-port P] [--epoch-ms MS]
     \\                           writes localnet.json and validator-<i>.yaml
@@ -88,7 +89,8 @@ pub const Options = struct {
     node_store: ?[]const u8 = null,
     protocol_digests: ?[]const u8 = null,
     exit_after_start: bool = false,
-    unaudited_flag: bool = false,
+    /// `--sign-network`: the operator's explicit opt-in to sign on that network.
+    sign_network: ?gate.SignNetwork = null,
     sig_preverify: authority.preverify.Mode = .auto,
     /// Lanes of the shared CPU pool (`core.pool`); 0 = one per CPU.
     pool_threads: u32 = 0,
@@ -139,8 +141,9 @@ pub fn parseOptions(args: []const []const u8) Error!Options {
         } else if (std.mem.eql(u8, a, "--gpu") and has_next) {
             i += 1;
             o.gpu = gpu.Mode.parse(args[i]) orelse return error.BadArguments;
-        } else if (std.mem.eql(u8, a, gate.unaudited_runtime_flag)) {
-            o.unaudited_flag = true;
+        } else if (std.mem.eql(u8, a, gate.sign_network_flag) and has_next) {
+            i += 1;
+            o.sign_network = gate.SignNetwork.parse(args[i]) orelse return error.BadArguments;
         } else return error.BadArguments;
     }
     if ((o.localnet_dir == null) == (o.config_path == null)) return error.BadArguments;
@@ -290,7 +293,7 @@ pub fn prepare(gpa: std.mem.Allocator, io: Io, o: Options) Error!Prepared {
             try addrs.append(arena, try arena.dupe(u8, m.p2p_address));
             try addrs.append(arena, try arena.dupe(u8, m.metrics_address));
         }
-        const decision = gate.decide(.{ .chain_id = &d.chain_id, .addresses = addrs.items, .key_source = .generated, .unaudited_flag = o.unaudited_flag });
+        const decision = gate.decide(.{ .chain_id = &d.chain_id, .addresses = addrs.items, .key_source = .generated, .sign_network = o.sign_network });
         const lic = switch (decision) {
             .allowed => |l| l,
             .refused => |r| {
@@ -332,12 +335,12 @@ pub fn prepare(gpa: std.mem.Allocator, io: Io, o: Options) Error!Prepared {
             .digests = digests,
         };
     }
-    // validator.yaml with key files: only an unaudited build with the runtime flag gets past the gate
+    // validator.yaml with key files: only `--sign-network` naming this chain gets past the gate
     var cfg = keys.config.load(gpa, io, o.config_path.?) catch return error.BadConfig;
     defer cfg.deinit();
     const c = cfg.cfg;
     const addrs = c.addresses(arena) catch return error.OutOfMemory;
-    const decision = gate.decide(.{ .chain_id = o.chain_id.?, .addresses = addrs, .key_source = .file, .unaudited_flag = o.unaudited_flag });
+    const decision = gate.decide(.{ .chain_id = o.chain_id.?, .addresses = addrs, .key_source = .file, .sign_network = o.sign_network });
     const lic = switch (decision) {
         .allowed => |l| l,
         .refused => |r| {

@@ -24,6 +24,8 @@ pub const p2p_metrics = @import("p2p_metrics.zig");
 pub const hw = @import("hw.zig");
 /// The shared CPU worker pool (batch verification, GPU host prep).
 pub const pool = @import("pool.zig");
+/// Threads started once and kept, for paths that ran a thread per task (no mmap per task).
+pub const threads = @import("threads.zig");
 /// Batch dispatch table (CPU single, CPU pool, GPU on k devices) and its cache.
 pub const dispatch = @import("dispatch.zig");
 

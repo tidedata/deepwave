@@ -45,6 +45,8 @@ pub const Config = struct {
     /// Wall clock in ms (required: in-flight suppression and retry windows depend on it).
     now_ms: *const fn () u64,
     tracer: iface.Tracer = .{},
+    /// Wall clock in microseconds for the commit log (handler `Deps.commit_log_us`); null: none.
+    commit_log_us: ?*const fn () u64 = null,
     /// BCS `StoredExecutionTimeObservations` chunks of the previous epoch's end-of-epoch
     /// observations (system state extra_fields, chunk order), loaded by the epoch lane.
     /// Required for exact congestion estimates when the previous epoch stored any.
@@ -115,6 +117,7 @@ pub const Authority = struct {
             .statuses = &a.statuses,
             .reasons = &a.reasons,
             .tracer = c.tracer,
+            .commit_log_us = c.commit_log_us,
         });
         errdefer a.handler.deinit();
         {
@@ -123,6 +126,9 @@ pub const Authority = struct {
             // previous epoch's stored observations first, then this epoch's sequenced ones
             try a.handler.seedEstimator(ar.allocator(), c.stored_observation_chunks);
             try a.handler.restoreEstimator(ar.allocator());
+            // restarted after the final round: the snapshot is the restored estimator (it also
+            // holds any observation sequenced after the final round, a bounded difference)
+            if (c.epoch_ctl.reconfigState().isRejectAllTx()) try a.handler.snapshotObservations(ar.allocator());
         }
         a.handler.attachBridge(&a.bridge);
         // a randomness reservation that was durable survives the restart; one that was not is made again

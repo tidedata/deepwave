@@ -37,6 +37,9 @@ pub const Params = struct {
     max_programmable_tx_commands: u64 = 1024,
     consensus_max_transaction_size_bytes: u64 = 262144,
     mode_is_execution_time_estimate: bool = true,
+    /// `fix_checkpoint_signature_mapping`: a checkpoint's user signatures are the ones the alias
+    /// claim names (`tx_signatures[sig_idx]`, claim order), not all signatures zipped.
+    fix_checkpoint_signature_mapping: bool = false,
 
     /// Mirrors the reads `ConsensusHandler` and `AuthorityPerEpochStore` make of the config.
     pub fn fromProtocol(cfg: *const protocol.ProtocolConfig, epoch: u64, epoch_start_ms: u64, rgp: u64) Params {
@@ -59,6 +62,7 @@ pub const Params = struct {
         p.commit_rate_window = cfg.consensus_commit_rate_estimation_window_size orelse 0;
         p.randomness_state_enabled = ff.random_beacon;
         p.allowed_proposers = ff.allowed_proposers;
+        p.fix_checkpoint_signature_mapping = ff.fix_checkpoint_signature_mapping;
         p.epoch_close_deadline_ms = cfg.epoch_close_deadline_ms;
         p.accumulators_enabled = ff.enable_accumulators;
         p.max_programmable_tx_commands = cfg.max_programmable_tx_commands orelse 1024;
@@ -111,6 +115,9 @@ pub const EpochControl = struct {
         record_end_of_publish: *const fn (ctx: *anyopaque, authority_index: u32) bool,
         has_end_of_publish_quorum: *const fn (ctx: *anyopaque) bool,
         next_reconfiguration_timestamp_ms: *const fn (ctx: *anyopaque) u64,
+        /// The reconfig state this commit changed, encoded, for the commit's durable group
+        /// (run/epoch_control.zig); null when unchanged. Optional.
+        take_records: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator) error{OutOfMemory}!?[]const u8 = null,
     };
 
     pub fn reconfigState(c: EpochControl) ReconfigState {

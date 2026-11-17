@@ -62,6 +62,7 @@
 //! cache (cache.zig) whose evicted buffers are reclaimed through the store's grace periods, so a
 //! slice handed to a reader stays valid until its snapshot is released, as with mmap views.
 const std = @import("std");
+const tcache = @import("core").threads;
 const format = @import("format.zig");
 const cs = @import("checksum.zig");
 const zstd_enc = @import("zstd.zig");
@@ -507,8 +508,9 @@ pub const Encoder = struct {
 
         var run: Run = .{ .jobs = e.jobs.items };
         const nt: usize = if (g.len < e.min_parallel_bytes) 1 else @min(@max(e.threads, 1), max_threads, e.jobs.items.len);
-        var threads: [max_threads]?std.Thread = @splat(null);
-        for (1..nt) |i| threads[i] = std.Thread.spawn(.{}, Run.work, .{ &run, &e.cz[i] }) catch null;
+        // kept threads (core/threads.zig): a fan-out per group started and ended threads
+        var threads: [max_threads]?tcache.Handle = @splat(null);
+        for (1..nt) |i| threads[i] = tcache.spawn(Run.work, .{ &run, &e.cz[i] }) catch null;
         run.work(&e.cz[0]);
         for (threads[1..nt]) |t| if (t) |th| th.join();
 

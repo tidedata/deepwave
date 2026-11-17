@@ -20,6 +20,7 @@ pub const settlement = @import("settlement.zig");
 pub const movecall = @import("movecall.zig");
 pub const epoch = @import("epoch.zig");
 pub const genesis = @import("genesis.zig");
+pub const fail_vectors_test = @import("fail_vectors_test.zig");
 
 const Allocator = std.mem.Allocator;
 

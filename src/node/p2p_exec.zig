@@ -914,11 +914,20 @@ pub const FullContents = struct {
     txs: []ExecData,
     /// BCS `CheckpointContents` rebuilt from the transactions and signatures.
     contents: []const u8,
+    /// Transactions whose own signatures are not a permutation of the contents' (`splitFullWith`).
+    mismatched: usize = 0,
 };
 
 /// Splits `VersionedFullCheckpointContents` (V1 or V2) into transactions and rebuilds the
 /// `CheckpointContents` whose digest the summary certifies (the caller checks it).
 pub fn splitFull(arena: Allocator, raw: []const u8) !FullContents {
+    return splitFullWith(arena, raw, true);
+}
+
+/// `splitFull`; with `check_sigs` false a transaction's own signatures may differ from the
+/// contents' (sui-node serves each transaction as it stored it, `from_contents_and_execution_data`,
+/// and checks only digests, `verify_digests`); `mismatched` counts those.
+pub fn splitFullWith(arena: Allocator, raw: []const u8, check_sigs: bool) !FullContents {
     var r = bcs.Reader.init(raw);
     const tag = try r.uleb32();
     if (tag > 1) return error.Malformed;
@@ -953,11 +962,15 @@ pub fn splitFull(arena: Allocator, raw: []const u8) !FullContents {
         s.* = raw[a..r.pos()];
     }
     if (r.remaining() != 0) return error.TrailingBytes;
+    var mismatched: usize = 0;
     for (txs, sig_spans) |t, s| {
         // The transaction's own signatures are not covered by any digest: accept the peer's copy
         // only when they are a permutation of the certified ones (the stored order is the
         // submitter's, the contents' is signer order; convert.zig "Signature order").
-        if (!try samePermutation(arena, t.tx, s, tag == 1)) return error.SignatureMismatch;
+        if (!try samePermutation(arena, t.tx, s, tag == 1)) {
+            if (check_sigs) return error.SignatureMismatch;
+            mismatched += 1;
+        }
     }
     for (txs, sig_spans) |t, s| {
         const td = try txDataOf(t.tx);
@@ -972,5 +985,5 @@ pub fn splitFull(arena: Allocator, raw: []const u8) !FullContents {
         for (sig_spans) |s| try out.appendSlice(arena, s);
     }
     sig_spans = sig_spans;
-    return .{ .txs = txs, .contents = out.items };
+    return .{ .txs = txs, .contents = out.items, .mismatched = mismatched };
 }

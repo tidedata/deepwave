@@ -1,0 +1,45 @@
+[package]
+name = "zui-truth-validity"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Golden vectors for the validator's signing-time accept/reject surface (lane validity, PARITY.md G15-G21), computed by Mysten's sui 1.83.1 code"
+
+# Standalone workspace; ../../sui is the Mysten tree (tools/setup-sui.sh). Shared target dir (tools/env.sh).
+[workspace]
+
+[[bin]]
+name = "zui-truth-validity"
+path = "src/main.rs"
+
+[dependencies]
+sui-types = { path = "../../sui/crates/sui-types" }
+sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
+sui-transaction-checks = { path = "../../sui/crates/sui-transaction-checks" }
+sui-config = { path = "../../sui/crates/sui-config" }
+sui-core = { path = "../../sui/crates/sui-core" }
+sui-execution = { path = "../../sui/sui-execution" }
+move-core-types = { path = "../../sui/external-crates/move/crates/move-core-types" }
+move-binary-format = { path = "../../sui/external-crates/move/crates/move-binary-format" }
+move-bytecode-verifier = { path = "../../sui/external-crates/move/crates/move-bytecode-verifier" }
+sui-verifier-latest = { path = "../../sui/sui-execution/latest/sui-verifier" }
+shared-crypto = { path = "../../sui/crates/shared-crypto" }
+move-vm-config = { path = "../../sui/external-crates/move/crates/move-vm-config" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+fastcrypto-pq = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430", package = "fastcrypto-zkp" }
+prometheus = { version = "0.14", features = ["protobuf"] }
+rand = "0.8.5"
+bcs = "0.1.4"
+hex = "0.4"
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+zstd = "0.13.2"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[patch.crates-io]
+h2 = { git = "https://github.com/nickvikeras/h2", rev = "44260b15da7d6cf15c241295a2d27917c157f4c8" }
+
+[profile.release]
+debug = 1

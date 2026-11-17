@@ -16,6 +16,7 @@ const iface = @import("../iface.zig");
 const manager = @import("manager.zig");
 const dkg = @import("dkg.zig");
 const txs = @import("txs.zig");
+const persist = @import("persist.zig");
 const log = std.log.scoped(.randomness);
 
 pub const Adapter = struct {
@@ -111,8 +112,12 @@ pub const Adapter = struct {
         a.dkg_updates = true;
     }
 
+    /// `init_randomness`: a round is reserved only once the DKG succeeded (Rust matches
+    /// `DkgStatus::Successful`; Pending reserves nothing). Reserving while the DKG ran put round 0
+    /// in an earlier checkpoint than a Mysten validator's, a fork of the mixed committee.
     fn reserveNextRound(ctx: *anyopaque, commit_timestamp_ms: u64) ?u64 {
         const a = fromCtx(ctx);
+        if (a.mgr.dkgStatus() != .successful) return null;
         return a.mgr.reserveNextRandomness(&a.batch, commit_timestamp_ms);
     }
 
@@ -130,6 +135,14 @@ pub const Adapter = struct {
         fromCtx(ctx).advanceIfNeeded() catch |e| std.debug.panic("failed to advance randomness DKG: {s}", .{@errorName(e)});
     }
 
+    /// `take_records`: this commit's batch, encoded for the handler's durable group.
+    fn takeRecords(ctx: *anyopaque, arena: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+        const a = fromCtx(ctx);
+        var b = a.takeBatch();
+        defer b.deinit();
+        return persist.encode(arena, &b);
+    }
+
     const vtable: iface.RandomnessHooks.VTable = .{
         .dkg_message = dkgMessage,
         .dkg_confirmation = dkgConfirmation,
@@ -137,6 +150,7 @@ pub const Adapter = struct {
         .dkg_failed = dkgFailed,
         .begin_commit = beginCommitHook,
         .advance_dkg = advanceHook,
+        .take_records = takeRecords,
     };
 };
 
@@ -166,6 +180,10 @@ test "hooks: dkg status is read before the commit's advance, and advance follows
         var ad = Adapter.init(gpa, m, null, members[0].name);
         defer ad.deinit();
         const h = ad.hooks();
+        // a pending DKG reserves no randomness round (Rust: DkgStatus::Pending => None)
+        h.vtable.begin_commit.?(h.ctx, 2, 1_000);
+        try std.testing.expectEqual(@as(?u64, null), h.vtable.reserve_next_round(h.ctx, 1_000));
+        try std.testing.expectEqual(@as(u64, 0), m.next_randomness_round);
         // commit 3001: init_randomness sees Pending, then advance_dkg fails the DKG
         h.vtable.begin_commit.?(h.ctx, 3001, 0);
         try std.testing.expect(!h.vtable.dkg_failed(h.ctx));
@@ -174,9 +192,10 @@ test "hooks: dkg status is read before the commit's advance, and advance follows
         var b = ad.takeBatch();
         defer b.deinit();
         try std.testing.expect(b.dkg_output != null and b.dkg_output.? == .failed);
-        // commit 3002: randomness transactions are cancelled
+        // commit 3002: randomness transactions are cancelled, and no round is reserved
         h.vtable.begin_commit.?(h.ctx, 3002, 0);
         try std.testing.expect(h.vtable.dkg_failed(h.ctx));
+        try std.testing.expectEqual(@as(?u64, null), h.vtable.reserve_next_round(h.ctx, 9_000));
     }
     // testnet 141: late completion allowed; no advance without DKG updates, status reads TimedOut
     // past the timeout round while the DKG stays open

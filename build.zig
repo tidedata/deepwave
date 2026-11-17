@@ -351,14 +351,13 @@ pub fn build(b: *std.Build) void {
     for (mods, 0..) |m, i| addTest(b, test_step, lane_filter, m.name, built[i]);
     addTest(b, test_step, lane_filter, "standby", standby_test_mod);
 
-    // Validator (docs/VALIDATOR-DESIGN.md, unaudited): the consensus, consensus_net and validator
+    // Validator (docs/VALIDATOR-DESIGN.md): the consensus, consensus_net and validator
     // modules and deepwave-validator. A separate table from `mods`, so deepwave, deepwave-tool, the
     // conformance runners and the plain `test` step never compile them; they build only through
     // `./zig build validator`, `./zig build test-validator` or `-Dlane=<one of them>`.
-    // -Dvalidator-unaudited=true (default false) compiles in the gate branch that may allow a
-    // non-local network with the runtime flag; off, local test committees are the only option.
-    const val_unaudited = b.option(bool, "validator-unaudited", "deepwave-validator: allow non-local networks behind a runtime flag (UNAUDITED; default false)") orelse false;
-    addValidator(b, target, optimize, core, harness, &built, test_step, lane_filter, val_unaudited, .{ .suite = suite, .limit = limit, .filter = filter, .jobs = jobs });
+    // Which network a validator signs on is decided at run time by its gate (src/validator/gate.zig:
+    // local test committees, or an explicit `--sign-network` that must match the chain id).
+    addValidator(b, target, optimize, core, harness, &built, test_step, lane_filter, .{ .suite = suite, .limit = limit, .filter = filter, .jobs = jobs });
 
     addTest(b, test_step, lane_filter, "move_tools", move_tools_mod); // tools/move (lane move-tools)
 
@@ -405,18 +404,13 @@ fn addValidator(
     built: []const *std.Build.Module,
     test_step: *std.Build.Step,
     lane_filter: ?[]const u8,
-    unaudited: bool,
     conf: struct { suite: []const u8, limit: u64, filter: []const u8, jobs: u32 },
 ) void {
-    const opts = b.addOptions();
-    opts.addOption(bool, "validator_unaudited", unaudited);
-    const opts_mod = opts.createModule();
     var vbuilt: [val_mods.len]*std.Build.Module = undefined;
     for (val_mods, 0..) |m, i| {
         const mod = b.createModule(.{ .root_source_file = b.path(m.path), .target = target, .optimize = optimize });
         mod.addImport("core", core);
         mod.addImport("harness", harness);
-        mod.addImport("validator_options", opts_mod);
         dep: for (m.deps) |d| {
             for (val_mods[0..i], 0..) |vm, j| if (std.mem.eql(u8, vm.name, d)) {
                 mod.addImport(d, vbuilt[j]);
@@ -455,7 +449,7 @@ fn addValidator(
         const runner = addExe(b, .{ .name = "deepwave-conformance-consensus", .root_module = runner_mod });
         const install_step = b.step("conformance-consensus", "Build and install deepwave-conformance-consensus (validator consensus suites)");
         install_step.dependOn(&b.addInstallArtifact(runner, .{}).step);
-        const cconf = b.step("test-conformance-consensus", "Run the consensus conformance suites against $ZUI_CORPUS/consensus/ (UNAUDITED validator code)");
+        const cconf = b.step("test-conformance-consensus", "Run the consensus conformance suites against $ZUI_CORPUS/consensus/");
         const run = b.addRunArtifact(runner);
         run.has_side_effects = true;
         run.addArgs(&.{ "--suite", "val-consensus-core", "--jobs", "1" });
@@ -484,7 +478,7 @@ fn addValidator(
     const vconf_build = b.step("validator-conformance-runner", "Build deepwave-conformance-validator");
     vconf_build.dependOn(&b.addInstallArtifact(vconf, .{}).step);
 
-    const step = b.step("validator", "Build deepwave-validator (UNAUDITED; gated to local test committees unless -Dvalidator-unaudited)");
+    const step = b.step("validator", "Build deepwave-validator (signs only on local test committees unless --sign-network names the chain)");
     step.dependOn(&b.addInstallArtifact(addExe(b, .{ .name = "deepwave-validator", .root_module = exe_mod }), .{}).step);
 
     // deepwave-consensus-localnet (val-consensus-net): N consensus authorities on loopback, generated keys.

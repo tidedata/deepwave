@@ -14,7 +14,15 @@ $T packages $ZUI_CORPUS <archive gRPC url>                # packages/ part (non-
 $T objects $ZUI_CORPUS <archive gRPC url> $ZUI_CORPUS/vectors/exec-replay/objects.bin.zst  # inputs outside the corpus
 $T bench state-hash --iters N --list <file>             # harness baseline
 $T bench exec --iters N --list <file>                   # harness baseline
+$T funds-sched $ZUI_CORPUS ../../../src/validator/run/testdata/funds_sched.jsonl
 ```
+
+`funds-sched` (src/funds.rs, consumed by the deepwave `validator-funds` suite): certified transactions
+with funds withdrawals decided by sui-core's own funds withdraw scheduler (its sources compiled in,
+src/execution_scheduler) and executed by sui-execution with the scheduler's early error; the
+object-withdrawal scenarios call `move/vault` (`balance::withdraw_funds_from_object`), built in-process by Mysten's
+`sui_move_build::BuildConfig::new_for_testing()` and published by the tool at 0x7a, with sui-core's `UnsettledObjectWithdrawals`
+recording each successful execution as `AuthorityState::execute_certificate` does.
 
 ## state-hash (`vectors/exec-state-hash/truth.jsonl.zst`)
 

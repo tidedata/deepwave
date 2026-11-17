@@ -65,6 +65,17 @@ pub const Options = struct {
     tls_seed: ?[32]u8 = null,
     /// How long `stop` waits for in-flight calls (WaitForEffects may run 20 s) before it gives up.
     stop_wait_ns: u64 = 45 * std.time.ns_per_s,
+    /// zui-only (not a Sui method; `deepwave-validator run --zui-catchup`): `/zui.Catchup/<method>`
+    /// answered by this hook with raw bytes. Null: those paths are UNIMPLEMENTED like any unknown
+    /// method, as on a Mysten validator.
+    zui_catchup: ?ZuiHook = null,
+};
+
+pub const zui_catchup_path = "/zui.Catchup/";
+
+pub const ZuiHook = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, method: []const u8, body: []const u8) error{ Unimplemented, BadRequest, Internal }![]const u8,
 };
 
 /// The socket address a multiaddr binds to, as mysten-network's `ToSocketAddrs for Multiaddr`
@@ -148,10 +159,14 @@ pub const Server = struct {
         return .{ .ctx = s, .call = call, .known = known, .method = methodExists };
     }
 
-    fn known(_: *anyopaque, path: []const u8) bool {
+    fn known(ctx: *anyopaque, path: []const u8) bool {
+        const s: *Server = @ptrCast(@alignCast(ctx));
+        if (s.opts.zui_catchup != null and std.mem.startsWith(u8, path, zui_catchup_path)) return true;
         return std.mem.startsWith(u8, path, service_path) or std.mem.startsWith(u8, path, health_path);
     }
-    fn methodExists(_: *anyopaque, path: []const u8) bool {
+    fn methodExists(ctx: *anyopaque, path: []const u8) bool {
+        const s: *Server = @ptrCast(@alignCast(ctx));
+        if (s.opts.zui_catchup != null and std.mem.startsWith(u8, path, zui_catchup_path)) return true;
         if (std.mem.startsWith(u8, path, health_path)) {
             const m = path[health_path.len..];
             return std.mem.eql(u8, m, "Check") or std.mem.eql(u8, m, "Watch");
@@ -162,6 +177,16 @@ pub const Server = struct {
     fn call(ctx: *anyopaque, req: *const h2.Request, rs: *h2.ResponseStream) h2.Status {
         const s: *Server = @ptrCast(@alignCast(ctx));
         if (std.mem.startsWith(u8, req.path, health_path)) return healthCall(req, rs);
+        if (s.opts.zui_catchup) |hook| if (std.mem.startsWith(u8, req.path, zui_catchup_path)) {
+            var zarena = std.heap.ArenaAllocator.init(s.gpa);
+            defer zarena.deinit();
+            const out = hook.call(hook.ctx, zarena.allocator(), req.path[zui_catchup_path.len..], req.body) catch |e| return switch (e) {
+                error.Unimplemented => .unimplemented,
+                error.BadRequest => .invalid_argument,
+                error.Internal => .internal,
+            };
+            return send(rs, out);
+        };
         const m = methodOf(req.path) orelse return .unimplemented;
         var arena_state = std.heap.ArenaAllocator.init(s.gpa);
         defer arena_state.deinit();

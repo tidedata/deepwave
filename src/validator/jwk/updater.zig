@@ -9,6 +9,7 @@
 //! `Transport` (cold path; the real one is `https.zig`, local test committees use `Fixtures`),
 //! the submission a callback. Nothing here sleeps or spawns.
 const std = @import("std");
+const log = std.log.scoped(.jwk);
 const types = @import("types");
 const providers = @import("providers.zig");
 const parse = @import("parse.zig");
@@ -59,6 +60,22 @@ pub const Fixtures = struct {
     }
     pub fn transport(f: *Fixtures) Transport {
         return .{ .ctx = f, .get = get };
+    }
+};
+
+/// `epoch_store.jwk_active_in_current_epoch(id, jwk)` (the aggregator behind its lock).
+pub const Active = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, id: types.JwkId, jwk: types.JWK) bool,
+
+    /// Over a bare aggregator (single-threaded callers and tests).
+    pub fn of(agg: *aggregator.Aggregator) Active {
+        return .{ .ctx = agg, .f = struct {
+            fn f(ctx: *anyopaque, id: types.JwkId, jwk: types.JWK) bool {
+                const a: *aggregator.Aggregator = @ptrCast(@alignCast(ctx));
+                return a.isActive(id, jwk);
+            }
+        }.f };
     }
 };
 
@@ -125,11 +142,11 @@ pub const Updater = struct {
     }
 
     /// Runs every due provider once. Returns the earliest time something is due next.
-    pub fn poll(u: *Updater, now_ms: u64, transport: Transport, agg: *aggregator.Aggregator, submit: Submit) !u64 {
+    pub fn poll(u: *Updater, now_ms: u64, transport: Transport, active: Active, submit: Submit) !u64 {
         var next: u64 = std.math.maxInt(u64);
         for (u.states) |*s| {
             if (now_ms >= s.next_due_ms) {
-                const ok = u.runProvider(s, transport, agg, submit);
+                const ok = u.runProvider(s, transport, active, submit);
                 s.next_due_ms = now_ms + (if (ok) u.fetch_interval_ms else retry_after_error_ms);
             }
             next = @min(next, s.next_due_ms);
@@ -138,7 +155,7 @@ pub const Updater = struct {
     }
 
     /// One iteration of the provider loop; false when the fetch failed.
-    fn runProvider(u: *Updater, s: *ProviderState, transport: Transport, agg: *aggregator.Aggregator, submit: Submit) bool {
+    fn runProvider(u: *Updater, s: *ProviderState, transport: Transport, active: Active, submit: Submit) bool {
         var arena = std.heap.ArenaAllocator.init(u.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -148,12 +165,14 @@ pub const Updater = struct {
             u.stats.errors += 1;
             return false;
         };
-        const body = transport.get(transport.ctx, a, cfg.jwk_endpoint) catch {
+        const body = transport.get(transport.ctx, a, cfg.jwk_endpoint) catch |e| {
             u.stats.errors += 1;
+            log.warn("Error when fetching JWK for provider {s}: {s}", .{ cfg.jwk_endpoint, @errorName(e) });
             return false;
         };
-        const keys = parse.parseJwks(a, body, s.provider) catch {
+        const keys = parse.parseJwks(a, body, s.provider) catch |e| {
             u.stats.errors += 1;
+            log.warn("Error when fetching JWK for provider {s}: {s}", .{ cfg.jwk_endpoint, @errorName(e) });
             return false;
         };
         // keys.retain(valid && !active && seen.insert(..)): every retained key is marked seen
@@ -165,7 +184,7 @@ pub const Updater = struct {
                 u.stats.invalid_jwks += 1;
                 continue;
             }
-            if (agg.isActive(k.id, k.jwk)) continue;
+            if (active.f(active.ctx, k.id, k.jwk)) continue;
             const sk = seenKey(a, k.id, k.jwk) catch continue;
             if (s.seen.contains(sk)) continue;
             const owned = u.seen_arena.allocator().dupe(u8, sk) catch continue;
@@ -221,7 +240,7 @@ test "updater fetches, filters seen and active, retries after errors" {
     const submit: Submit = .{ .ctx = &sink, .vote = TestSink.vote };
 
     // Twitch has no fixture: error, retry in 30 s; Google submits both keys
-    const next = try upd.poll(0, fx.transport(), &agg, submit);
+    const next = try upd.poll(0, fx.transport(), Active.of(&agg), submit);
     try std.testing.expectEqual(@as(usize, 2), sink.votes.items.len);
     try std.testing.expectEqual(@as(u64, 1), upd.stats.errors);
     try std.testing.expectEqual(@as(u64, 1000), next);
@@ -232,16 +251,16 @@ test "updater fetches, filters seen and active, retries after errors" {
     const id_b: types.JwkId = .{ .iss = .{ .@"0" = "https://accounts.google.com" }, .kid = .{ .@"0" = "b" } };
     const jwk_b: types.JWK = .{ .kty = .{ .@"0" = "RSA" }, .e = .{ .@"0" = "AQAB" }, .n = .{ .@"0" = "n2" }, .alg = .{ .@"0" = "RS256" } };
     for (0..3) |i| _ = try agg.recordVote(&batch, 1, &members[i].name, id_b, jwk_b);
-    _ = try upd.poll(500, fx.transport(), &agg, submit);
+    _ = try upd.poll(500, fx.transport(), Active.of(&agg), submit);
     try std.testing.expectEqual(@as(usize, 2), sink.votes.items.len);
-    _ = try upd.poll(1000, fx.transport(), &agg, submit);
+    _ = try upd.poll(1000, fx.transport(), Active.of(&agg), submit);
     try std.testing.expectEqual(@as(usize, 2), sink.votes.items.len); // a: seen, b: active
 
     // a rotated key is new
     try fx.put("https://www.googleapis.com/oauth2/v2/certs",
         \\{"keys":[{"kty":"RSA","kid":"c","n":"n3","e":"AQAB"}]}
     );
-    _ = try upd.poll(2000, fx.transport(), &agg, submit);
+    _ = try upd.poll(2000, fx.transport(), Active.of(&agg), submit);
     try std.testing.expectEqual(@as(usize, 3), sink.votes.items.len);
     try std.testing.expectEqualStrings("c", sink.votes.items[2]);
 

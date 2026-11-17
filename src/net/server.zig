@@ -108,6 +108,39 @@ const Slot = struct {
 const Job = struct { slot_key: u64, gen: u64, stream: u64, peer: anemo.PeerId, route: []u8, body: []u8 };
 const Done = struct { slot_key: u64, gen: u64, stream: u64, resp: []u8 };
 
+/// Why `Listener.request` failed.
+pub const RequestError = error{
+    /// No established inbound connection from that peer.
+    NotConnected,
+    RequestTimeout,
+    ConnectionClosed,
+    StreamReset,
+    /// The peer's bidirectional stream credit is used up.
+    StreamLimit,
+    /// Malformed response.
+    Protocol,
+    Cancelled,
+    /// The listener is stopping.
+    ShuttingDown,
+} || Allocator.Error;
+
+/// A request we send on a peer's inbound connection (`Listener.request`). Lives on the calling
+/// thread's stack, which waits for `done`; the I/O thread opens the stream, watches it and
+/// fills the result (under `mu`).
+const OutReq = struct {
+    peer: anemo.PeerId,
+    bytes: []const u8,
+    deadline: u64,
+    cancel: ?*const Atomic(bool),
+    slot_key: u64 = 0,
+    gen: u64 = 0,
+    stream: u64 = 0,
+    done: bool = false,
+    err: ?RequestError = null,
+    status: wire.Status = .unknown,
+    body: []u8 = &.{}, // gpa
+};
+
 pub const Listener = struct {
     gpa: Allocator,
     io: Io,
@@ -141,6 +174,10 @@ pub const Listener = struct {
 
     peers_mu: Io.Mutex = .init,
     peers: std.ArrayList(InboundPeer) = .empty,
+    /// Requests of ours waiting for the I/O thread (under `mu`), and the ones it watches.
+    out_new: std.ArrayList(*OutReq) = .empty,
+    out_live: std.ArrayList(*OutReq) = .empty, // I/O thread only
+    out_cv: Io.Condition = .init,
     /// I/O thread only.
     guard: retry_mod.Guard = undefined,
 
@@ -210,6 +247,8 @@ pub const Listener = struct {
         for (l.done.items) |d| gpa.free(d.resp);
         l.done.deinit(gpa);
         l.peers.deinit(gpa);
+        l.out_new.deinit(gpa);
+        l.out_live.deinit(gpa);
         l.done_spare.deinit(gpa);
         l.timers.deinit(gpa);
         l.active.deinit(gpa);
@@ -225,6 +264,154 @@ pub const Listener = struct {
         l.peers_mu.lockUncancelable(l.io);
         defer l.peers_mu.unlock(l.io);
         return a.dupe(InboundPeer, l.peers.items);
+    }
+
+    /// Sends one RPC to `peer` on the connection it opened to us and waits for the response
+    /// (body copied into `arena`). anemo keeps one connection per peer pair and uses it both
+    /// ways: when the remote's dial wins the simultaneous-dial tie-break (anemo
+    /// `connection_manager.rs`: the peer with the greater PeerId is the dialer) a sui-node closes
+    /// the connection we dial and expects our requests on its own. Server-initiated
+    /// bidirectional streams carry them, as quinn does for anemo. NotConnected when that peer
+    /// has no established connection to us.
+    pub fn request(l: *Listener, arena: Allocator, peer: *const anemo.PeerId, route: []const u8, headers: []const wire.Header, body: []const u8, timeout_ms: u64, cancel: ?*const Atomic(bool)) RequestError!anemo.Response {
+        const bytes = try wire.encodeRequest(l.gpa, route, headers, body);
+        defer l.gpa.free(bytes);
+        var req: OutReq = .{ .peer = peer.*, .bytes = bytes, .deadline = l.nowNs() +| timeout_ms * std.time.ns_per_ms, .cancel = cancel };
+        {
+            l.mu.lockUncancelable(l.io);
+            defer l.mu.unlock(l.io);
+            if (l.stop_flag.load(.acquire)) return error.ShuttingDown;
+            try l.out_new.append(l.gpa, &req);
+        }
+        l.wake();
+        {
+            l.mu.lockUncancelable(l.io);
+            defer l.mu.unlock(l.io);
+            while (!req.done) l.out_cv.waitUncancelable(l.io, &l.mu);
+        }
+        defer l.gpa.free(req.body);
+        if (req.err) |e| return e;
+        return .{ .status = req.status, .headers = &.{}, .body = try arena.dupe(u8, req.body) };
+    }
+
+    fn finishOut(l: *Listener, r: *OutReq, err: ?RequestError) void {
+        l.mu.lockUncancelable(l.io);
+        defer l.mu.unlock(l.io);
+        r.err = err;
+        r.done = true;
+        l.out_cv.broadcast(l.io);
+    }
+
+    /// The newest established connection from `peer`.
+    fn slotForPeer(l: *Listener, peer: *const anemo.PeerId) ?*Slot {
+        var best: ?*Slot = null;
+        var it = l.slots.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            const id = s.peer_id orelse continue;
+            if (!s.hello_sent or s.conn.isClosed() or !std.mem.eql(u8, &id, peer)) continue;
+            if (best == null or s.gen > best.?.gen) best = s;
+        }
+        return best;
+    }
+
+    /// I/O thread: opens the streams of new requests and settles the ones whose response came,
+    /// whose stream or connection went, or whose deadline passed.
+    fn processOut(l: *Listener) void {
+        var fresh: std.ArrayList(*OutReq) = .empty;
+        defer fresh.deinit(l.gpa);
+        {
+            l.mu.lockUncancelable(l.io);
+            defer l.mu.unlock(l.io);
+            if (l.out_new.items.len == 0 and l.out_live.items.len == 0) return;
+            std.mem.swap(std.ArrayList(*OutReq), &fresh, &l.out_new);
+        }
+        for (fresh.items) |r| {
+            const s = l.slotForPeer(&r.peer) orelse {
+                l.finishOut(r, error.NotConnected);
+                continue;
+            };
+            const id = s.conn.openBidi() catch {
+                l.finishOut(r, error.StreamLimit);
+                continue;
+            };
+            s.conn.streamWrite(id, r.bytes, true) catch {
+                s.conn.streamAbort(id, 0);
+                l.finishOut(r, error.ConnectionClosed);
+                continue;
+            };
+            r.slot_key = s.key;
+            r.gen = s.gen;
+            r.stream = id;
+            l.touch(s);
+            l.out_live.append(l.gpa, r) catch {
+                s.conn.streamAbort(id, 0);
+                l.finishOut(r, error.OutOfMemory);
+            };
+        }
+        const now = l.nowNs();
+        var i: usize = 0;
+        while (i < l.out_live.items.len) {
+            const r = l.out_live.items[i];
+            const res = l.checkOut(r, now) orelse {
+                i += 1;
+                continue;
+            };
+            _ = l.out_live.swapRemove(i);
+            l.finishOut(r, res.err);
+        }
+    }
+
+    const OutDone = struct { err: ?RequestError };
+
+    /// Null while the request is pending.
+    fn checkOut(l: *Listener, r: *OutReq, now: u64) ?OutDone {
+        const s = l.slots.get(r.slot_key) orelse return .{ .err = error.ConnectionClosed };
+        if (s.gen != r.gen or s.conn.isClosed()) return .{ .err = error.ConnectionClosed };
+        const c = s.conn;
+        const st = c.stream(r.stream) orelse return .{ .err = error.StreamReset };
+        if (st.reset != null) {
+            c.streamAbort(r.stream, 0);
+            l.touch(s);
+            return .{ .err = error.StreamReset };
+        }
+        var arena_state = std.heap.ArenaAllocator.init(l.gpa);
+        defer arena_state.deinit();
+        const parsed = wire.parseResponse(arena_state.allocator(), st.recv.contiguous(), wire.sui_max_response_frame) catch {
+            c.streamAbort(r.stream, 0);
+            l.touch(s);
+            return .{ .err = error.Protocol };
+        };
+        if (parsed) |resp| {
+            // the body points into the stream's receive buffer: copy it before freeing the stream
+            r.status = resp.status;
+            const body = l.gpa.dupe(u8, resp.body);
+            c.streamFree(r.stream);
+            l.touch(s);
+            r.body = body catch return .{ .err = error.OutOfMemory };
+            return .{ .err = null };
+        }
+        const cancelled = if (r.cancel) |cf| cf.load(.acquire) else false;
+        if (cancelled or now >= r.deadline) {
+            c.streamAbort(r.stream, 0);
+            l.touch(s);
+            return .{ .err = if (cancelled) error.Cancelled else error.RequestTimeout };
+        }
+        return null;
+    }
+
+    /// At stop: every request of ours still waiting fails.
+    fn failAllOut(l: *Listener) void {
+        for (l.out_live.items) |r| l.finishOut(r, error.ShuttingDown);
+        l.out_live.clearRetainingCapacity();
+        l.mu.lockUncancelable(l.io);
+        defer l.mu.unlock(l.io);
+        for (l.out_new.items) |r| {
+            r.err = error.ShuttingDown;
+            r.done = true;
+        }
+        l.out_new.clearRetainingCapacity();
+        l.out_cv.broadcast(l.io);
     }
 
     fn wake(l: *Listener) void {
@@ -259,7 +446,7 @@ pub const Listener = struct {
             const call = p2pm.inbound.begin(job.route, job.body.len);
             const reply = l.opts.handler.serve(l.opts.handler.ctx, a, &job.peer, job.route, job.body);
             p2pm.inbound.end(call, @intFromEnum(reply.status), reply.body.len);
-            const resp = wire.encodeResponse(l.gpa, reply.status, &.{}, reply.body) catch null;
+            const resp = wire.encodeResponse(l.gpa, reply.status, reply.headers, reply.body) catch null;
             arena_state.deinit();
             l.gpa.free(job.route);
             l.gpa.free(job.body);
@@ -276,6 +463,7 @@ pub const Listener = struct {
     // ------------------------------------------------------------ I/O thread
 
     fn ioLoop(l: *Listener) void {
+        defer l.failAllOut();
         defer l.closeAll();
         var wbuf: [64]u8 = undefined;
         while (!l.stop_flag.load(.acquire)) {
@@ -315,6 +503,7 @@ pub const Listener = struct {
                 }
             }
             l.collectDone();
+            l.processOut();
             now = l.nowNs();
             // due timers join the active list
             while (l.timers.peek()) |t| {
@@ -747,4 +936,57 @@ test "a zui client session to the zui listener stays up past 120 s (ZUI_NET_LONG
     try std.testing.expect(!p.conn.isClosed());
     try std.testing.expectEqual(@as(u64, 1), l.stats.accepted.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), l.stats.active.load(.monotonic));
+}
+
+test "the listener sends requests on a peer's inbound connection (anemo uses one connection both ways)" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const skey = try Ed25519.KeyPair.generateDeterministic(@splat(42));
+    var dummy: u8 = 0;
+    const l = try Listener.start(gpa, io, .{
+        .listen = .{ .ip4 = Io.net.Ip4Address.loopback(0) },
+        .key = skey,
+        .server_name = "sui-35834a8a",
+        .handler = .{ .ctx = @ptrCast(&dummy), .serve = TestHandler.serve },
+        .threads = 1,
+    });
+    defer l.stop();
+    // the client answers what the listener sends it (TestHandler: echo)
+    const p = try anemo.Peer.connect(gpa, io, l.address(), .{
+        .server_name = "sui-35834a8a",
+        .expected = skey.public_key.toBytes(),
+        .identity_seed = @splat(7),
+        .handler = .{ .ctx = @ptrCast(&dummy), .serve = TestHandler.serve },
+    });
+    defer p.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // one request each way first, so the connection is established on both ends
+    _ = try p.request(a, "/zui.Test/Echo", &.{}, "up", 5_000);
+    const Pumper = struct {
+        fn run(peer: *anemo.Peer, stop: *Atomic(bool)) void {
+            while (!stop.load(.acquire)) peer.pump(20) catch return;
+        }
+    };
+    var stop: Atomic(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Pumper.run, .{ p, &stop });
+    const cid = (try Ed25519.KeyPair.generateDeterministic(@splat(7))).public_key.toBytes();
+    for (0..20) |i| {
+        var b: [16]u8 = undefined;
+        const s = try std.fmt.bufPrint(&b, "back {d}", .{i});
+        const r = try l.request(a, &cid, "/zui.Test/Echo", &.{}, s, 5_000, null);
+        try std.testing.expectEqual(wire.Status.success, r.status);
+        try std.testing.expectEqualSlices(u8, s, r.body);
+    }
+    const nf = try l.request(a, &cid, "/zui.Test/Nope", &.{}, "", 5_000, null);
+    try std.testing.expectEqual(wire.Status.not_found, nf.status);
+    stop.store(true, .release);
+    t.join();
+    // nobody pumps the client now: the request times out
+    try std.testing.expectError(error.RequestTimeout, l.request(a, &cid, "/zui.Test/Echo", &.{}, "x", 300, null));
+    const other: anemo.PeerId = @splat(9);
+    try std.testing.expectError(error.NotConnected, l.request(a, &other, "/zui.Test/Echo", &.{}, "x", 1_000, null));
 }

@@ -11,6 +11,7 @@ const types = @import("types");
 const protocol = @import("protocol");
 const tx_mod = @import("tx.zig");
 const deferral = @import("deferral.zig");
+const bcs = @import("bcs");
 
 const Allocator = std.mem.Allocator;
 pub const Id = tx_mod.Id;
@@ -52,6 +53,101 @@ pub fn keyOfCommand(arena: Allocator, c: *const types.Command) Allocator.Error![
         .Publish => try arena.dupe(u8, &.{tag_publish}),
         .MakeMoveVec => try arena.dupe(u8, &.{tag_make_vec}),
         .Upgrade => try arena.dupe(u8, &.{tag_upgrade}),
+    };
+}
+
+const StoredEntry = @typeInfo(@FieldType(types.StoredExecutionTimeObservations, "V1")).pointer.child;
+
+/// `filter_and_sort_v1` over a key-sorted `storedObservations` snapshot: the entries whose key
+/// (canonical bytes) is in `included`, at most `limit`.
+pub fn filterStored(arena: Allocator, sorted: types.StoredExecutionTimeObservations, included: *const std.StringHashMapUnmanaged(void), limit: usize) Allocator.Error!types.StoredExecutionTimeObservations {
+    var out: std.ArrayList(StoredEntry) = .empty;
+    for (sorted.V1) |ent| {
+        if (out.items.len == limit) break;
+        if (included.contains(try keyBytes(arena, &ent.@"0"))) try out.append(arena, ent);
+    }
+    return .{ .V1 = out.items };
+}
+
+/// Canonical bytes of a key (`keyOfCommand` for MoveEntryPoint with its type arguments).
+pub fn keyBytes(arena: Allocator, k: *const types.ExecutionTimeObservationKey) Allocator.Error![]const u8 {
+    return @import("handler.zig").obsKeyBytes(arena, k);
+}
+
+/// The key of canonical bytes (`keyOfCommand`, handler.obsKeyBytes).
+pub fn keyFromBytes(arena: Allocator, b: []const u8) (Allocator.Error || error{Corrupt})!types.ExecutionTimeObservationKey {
+    if (b.len == 0) return error.Corrupt;
+    return switch (b[0]) {
+        tag_move => blk: {
+            if (b.len < 1 + 32 + 4) return error.Corrupt;
+            var p: usize = 33;
+            const ml = std.mem.readInt(u32, b[p..][0..4], .little);
+            p += 4;
+            if (b.len < p + ml + 4) return error.Corrupt;
+            const module = b[p .. p + ml];
+            p += ml;
+            const fl = std.mem.readInt(u32, b[p..][0..4], .little);
+            p += 4;
+            if (b.len < p + fl) return error.Corrupt;
+            const function = b[p .. p + fl];
+            p += fl;
+            const ta = bcs.decode([]const types.TypeInput, arena, b[p..]) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.Corrupt,
+            };
+            break :blk .{ .MoveEntryPoint = .{ .package = .{ .@"0" = .{ .@"0" = b[1..33].* } }, .module = .{ .@"0" = module }, .function = .{ .@"0" = function }, .type_arguments = ta } };
+        },
+        tag_transfer => .{ .TransferObjects = {} },
+        tag_split => .{ .SplitCoins = {} },
+        tag_merge => .{ .MergeCoins = {} },
+        tag_publish => .{ .Publish = {} },
+        tag_make_vec => .{ .MakeMoveVec = {} },
+        tag_upgrade => .{ .Upgrade = {} },
+        else => error.Corrupt,
+    };
+}
+
+/// Rust's derived `Ord` of `ExecutionTimeObservationKey`: variant, then package, module and
+/// function (byte order), then the type arguments (lexicographic over `TypeInput`'s derived Ord).
+pub fn orderKey(a: *const types.ExecutionTimeObservationKey, b: *const types.ExecutionTimeObservationKey) std.math.Order {
+    const ta = @intFromEnum(std.meta.activeTag(a.*));
+    const tb = @intFromEnum(std.meta.activeTag(b.*));
+    if (ta != tb) return std.math.order(ta, tb);
+    const ma = switch (a.*) {
+        .MoveEntryPoint => |m| m,
+        else => return .eq,
+    };
+    const mb = b.MoveEntryPoint;
+    var o = std.mem.order(u8, &ma.package.@"0".@"0", &mb.package.@"0".@"0");
+    if (o == .eq) o = std.mem.order(u8, ma.module.@"0", mb.module.@"0");
+    if (o == .eq) o = std.mem.order(u8, ma.function.@"0", mb.function.@"0");
+    if (o == .eq) o = orderTypes(ma.type_arguments, mb.type_arguments);
+    return o;
+}
+
+fn orderTypes(a: []const types.TypeInput, b: []const types.TypeInput) std.math.Order {
+    for (a[0..@min(a.len, b.len)], b[0..@min(a.len, b.len)]) |*x, *y| {
+        const o = orderType(x, y);
+        if (o != .eq) return o;
+    }
+    return std.math.order(a.len, b.len);
+}
+
+fn orderType(a: *const types.TypeInput, b: *const types.TypeInput) std.math.Order {
+    const ta = @intFromEnum(std.meta.activeTag(a.*));
+    const tb = @intFromEnum(std.meta.activeTag(b.*));
+    if (ta != tb) return std.math.order(ta, tb);
+    return switch (a.*) {
+        .vector => |v| orderType(v, b.vector),
+        .@"struct" => |s| blk: {
+            const t = b.@"struct";
+            var o = std.mem.order(u8, &s.address.@"0", &t.address.@"0");
+            if (o == .eq) o = std.mem.order(u8, s.module.@"0", t.module.@"0");
+            if (o == .eq) o = std.mem.order(u8, s.name.@"0", t.name.@"0");
+            if (o == .eq) o = orderTypes(s.type_args, t.type_args);
+            break :blk o;
+        },
+        else => .eq,
     };
 }
 
@@ -147,6 +243,30 @@ pub const Estimator = struct {
     pub fn recomputeAll(e: *Estimator) void {
         var it = e.map.valueIterator();
         while (it.next()) |o| o.updateMedian(e.stakes, &e.params);
+    }
+
+    /// `take_observations`, sorted by the key's derived `Ord` (the order `filter_and_sort_v1`
+    /// keeps): every key with the authorities that have a duration, in authority index order
+    /// (`names[i]` is authority i). The estimator is left as is.
+    pub fn storedObservations(e: *const Estimator, arena: Allocator, names: []const [96]u8) (Allocator.Error || error{Corrupt})!types.StoredExecutionTimeObservations {
+        const Entry = StoredEntry;
+        const Obs = @typeInfo(@FieldType(Entry, "1")).pointer.child;
+        var out: std.ArrayList(Entry) = .empty;
+        var it = e.map.iterator();
+        while (it.next()) |kv| {
+            var obs: std.ArrayList(Obs) = .empty;
+            for (kv.value_ptr.obs, 0..) |slot, i| if (slot.dur) |d| {
+                if (i >= names.len) continue;
+                try obs.append(arena, .{ .{ .@"0" = names[i] }, .{ .secs = d / 1_000_000_000, .nanos = @intCast(d % 1_000_000_000) } });
+            };
+            try out.append(arena, .{ try keyFromBytes(arena, kv.key_ptr.*), obs.items });
+        }
+        std.mem.sort(Entry, out.items, {}, struct {
+            fn lt(_: void, a: Entry, b: Entry) bool {
+                return orderKey(&a.@"0", &b.@"0") == .lt;
+            }
+        }.lt);
+        return .{ .V1 = out.items };
     }
 
     /// `get_estimate`: sum over commands of (median or default) * command_length, capped at
@@ -375,4 +495,64 @@ test "estimator default and median" {
     // stale generation ignored
     try e.processObservation(arena, 1, 1, &key, 99_000_000, false);
     try std.testing.expectEqual(@as(?u64, 4_000_000), e.map.get(&key).?.median);
+}
+
+test "end-of-epoch observations: key order, authority names, window filter and limit" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const stakes = [_]u64{ 25, 25, 25, 25 };
+    var e = Estimator.init(std.testing.allocator, &stakes, .{ .max_estimate_us = 1_500_000, .stake_weighted_median_threshold = 50, .default_none_duration_for_new_keys = true });
+    defer e.deinit();
+    const call = struct {
+        fn key(a: Allocator, pkg: u8, module: []const u8, function: []const u8) ![]const u8 {
+            const c: types.Command = .{ .MoveCall = .{ .package = .{ .@"0" = .{ .@"0" = @splat(pkg) } }, .module = .{ .@"0" = module }, .function = .{ .@"0" = function }, .type_arguments = &.{}, .arguments = &.{} } };
+            return keyOfCommand(a, &c);
+        }
+    }.key;
+    const random_new = try call(arena, 0xae, "random", "new");
+    const counter_inc = try call(arena, 0xae, "counter", "increment");
+    const other = try call(arena, 0x01, "zz", "f");
+    const transfer = [_]u8{tag_transfer};
+    // authority 2 never observes; durations carry seconds and nanos
+    for ([_]u32{ 3, 0, 1 }) |src| try e.processObservation(arena, src, 1, random_new, 700_000 + src, false);
+    try e.processObservation(arena, 1, 1, counter_inc, 1_000_000_123, false);
+    try e.processObservation(arena, 0, 1, other, 5, false);
+    try e.processObservation(arena, 0, 1, &transfer, 6, false);
+    try e.processObservation(arena, 0, 1, &[_]u8{tag_publish}, 7, false); // never stored
+
+    var names: [4][96]u8 = undefined;
+    for (&names, 0..) |*n, i| n.* = @splat(@intCast(i + 1));
+    const all = try e.storedObservations(arena, &names);
+    // derived Ord: MoveEntryPoint before TransferObjects; package, then module, then function
+    try std.testing.expectEqual(@as(usize, 4), all.V1.len);
+    try std.testing.expectEqualSlices(u8, "zz", all.V1[0].@"0".MoveEntryPoint.module.@"0");
+    try std.testing.expectEqualSlices(u8, "counter", all.V1[1].@"0".MoveEntryPoint.module.@"0");
+    try std.testing.expectEqualSlices(u8, "random", all.V1[2].@"0".MoveEntryPoint.module.@"0");
+    try std.testing.expect(all.V1[3].@"0" == .TransferObjects);
+    // observers in authority index order, by name
+    const obs = all.V1[2].@"1";
+    try std.testing.expectEqual(@as(usize, 3), obs.len);
+    try std.testing.expectEqual(names[0], obs[0].@"0".@"0");
+    try std.testing.expectEqual(names[1], obs[1].@"0".@"0");
+    try std.testing.expectEqual(names[3], obs[2].@"0".@"0");
+    try std.testing.expectEqual(@as(u32, 700_003), obs[2].@"1".nanos);
+    try std.testing.expectEqual(@as(u64, 1), all.V1[1].@"1"[0].@"1".secs);
+    try std.testing.expectEqual(@as(u32, 123), all.V1[1].@"1"[0].@"1".nanos);
+    // each key round-trips through its canonical bytes
+    for (all.V1) |ent| {
+        const b = try keyBytes(arena, &ent.@"0");
+        try std.testing.expect(e.map.contains(b));
+    }
+
+    // only keys of the window's commands, sorted, at most `limit`
+    var included: std.StringHashMapUnmanaged(void) = .empty;
+    try included.put(arena, random_new, {});
+    try included.put(arena, counter_inc, {});
+    try included.put(arena, &transfer, {});
+    const kept = try filterStored(arena, all, &included, 2);
+    try std.testing.expectEqual(@as(usize, 2), kept.V1.len);
+    try std.testing.expectEqualSlices(u8, "counter", kept.V1[0].@"0".MoveEntryPoint.module.@"0");
+    try std.testing.expectEqualSlices(u8, "random", kept.V1[1].@"0".MoveEntryPoint.module.@"0");
+    try std.testing.expectEqual(@as(usize, 3), (try filterStored(arena, all, &included, std.math.maxInt(usize))).V1.len);
 }

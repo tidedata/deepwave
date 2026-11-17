@@ -417,6 +417,12 @@ pub fn cmd_synth(corpus: &Path, out: &Path) -> Result<()> {
         Some((epoch, data, gas)) => craft(&env, &deny, &metrics, epoch, &data, &gas, deny_obj.as_ref(), regulated.as_ref(), &mut lines)?,
         None => eprintln!("synth: no base transaction for the crafted vectors"),
     }
+    // ZUI_SYNTH_ONLY=<prefix>[,<prefix>..]: keep only the vectors whose name starts with one of
+    // them (vectors committed to the repository, e.g. src/exec/testdata/synth_parity.jsonl)
+    if let Ok(only) = std::env::var("ZUI_SYNTH_ONLY") {
+        let pfx: Vec<String> = only.split(',').map(|p| format!("{{\"name\":\"{p}")).collect();
+        lines.retain(|l| pfx.iter().any(|p| l.starts_with(p.as_str())));
+    }
     std::fs::create_dir_all(out)?;
     let f = std::fs::File::create(out.join("vectors.jsonl.zst"))?;
     let mut z = zstd::Encoder::new(f, 9)?;
@@ -538,6 +544,8 @@ fn craft(
         cases.push((name.into(), pt.inputs, pt.commands, vec![]));
     }
     cases.extend(upgrade_cases(&ctx, base, gas)?);
+    // parity G2/G7: type-argument constraints and arity, failing publishes
+    cases.extend(parity_cases(base)?);
     // review round 4: the in-transaction package store and missing packages; a case may run at
     // another protocol version and with a chosen transaction digest
     let (more, mut overrides) = intx_cases(&ctx, base, gas)?;
@@ -1032,6 +1040,124 @@ fn upgrade_cases(ctx: &Ctx, base: &TransactionData, gas: &Object) -> Result<Vec<
 type Overrides = HashMap<String, (Option<u64>, Option<TransactionDigest>)>;
 
 /// `upg_module` bytes changed in place (an enum, a friend declaration).
+/// Parity G2 and G7 (docs/PARITY.md), each over the base sender and gas:
+/// - `typearg/...`: Move call and MakeMoveVec type arguments whose struct instantiations break
+///   the datatype's ability constraints (phantom and not, at several depths and argument
+///   positions) or its arity; their order against TypeNotFound (the whole tag resolves first),
+///   against each other (v4 loads the arguments before `verify_ty_args`), and the function's
+///   own type-parameter constraints and arity;
+/// - `publish-fail/...`: publishes whose modules fail deserialization, the Move bytecode
+///   verifier, linking against their dependencies (a missing module, a missing function, a
+///   struct handle with abilities the definition lacks, modules that import each other) or the
+///   Sui verifier.
+fn parity_cases(base: &TransactionData) -> Result<Vec<Case>> {
+    use move_binary_format::file_format::{Ability, AbilitySet, AddressIdentifierIndex, Bytecode, DatatypeHandle, FunctionHandle, IdentifierIndex, ModuleHandle, ModuleHandleIndex, SignatureIndex, SignatureToken, Visibility};
+    use move_core_types::account_address::AccountAddress;
+    use move_core_types::identifier::Identifier;
+    let one = sui_types::MOVE_STDLIB_PACKAGE_ID;
+    let two = sui_types::SUI_FRAMEWORK_PACKAGE_ID;
+    let s = |t: StructTag| TypeTag::Struct(Box::new(t));
+    let coin = |p: Vec<TypeTag>| s(fw("coin", "Coin", p));
+    let table = |p: Vec<TypeTag>| s(fw("table", "Table", p));
+    let field = |p: Vec<TypeTag>| s(fw("dynamic_field", "Field", p));
+    let vec_map = |p: Vec<TypeTag>| s(fw("vec_map", "VecMap", p));
+    let option = |p: Vec<TypeTag>| -> Result<TypeTag> { Ok(s(StructTag { address: AccountAddress::ONE, module: Identifier::new("option")?, name: Identifier::new("Option")?, type_params: p })) };
+    let vector = |t: TypeTag| TypeTag::Vector(Box::new(t));
+    let tx_ctx = s(fw("tx_context", "TxContext", vec![]));
+    // Table<phantom K: copy + drop + store, phantom V: store>: Coin<SUI> has key + store
+    let bad_table = table(vec![coin(vec![sui_tag()]), TypeTag::U64]);
+    let nowhere = s(fw("nope", "Nope", vec![]));
+    let none = |t: TypeTag| vec![call(one, "option", "none", vec![t], vec![])];
+    let new_table = |k: TypeTag, v: TypeTag| vec![call(two, "table", "new", vec![k, v], vec![])];
+    let vec_of = |t: TypeTag| vec![Command::MakeMoveVec(Some(t.into()), vec![])];
+    let mut cases: Vec<Case> = Vec::new();
+    let mut add = |name: &str, inputs: Vec<CallArg>, cmds: Vec<Command>| cases.push((name.into(), inputs, cmds, vec![]));
+    add("typearg/control", vec![], none(vec_map(vec![TypeTag::U64, TypeTag::U64])));
+    add("typearg/call-phantom", vec![], none(bad_table.clone()));
+    add("typearg/call-second-arg", vec![], new_table(TypeTag::U64, bad_table.clone()));
+    add("typearg/call-non-phantom-first", vec![], none(field(vec![coin(vec![sui_tag()]), TypeTag::U64])));
+    add("typearg/call-non-phantom-second", vec![], none(field(vec![TypeTag::U64, tx_ctx.clone()])));
+    add("typearg/call-deep", vec![], none(vector(option(vec![vector(bad_table.clone())])?)));
+    add("typearg/call-arity-missing", vec![], none(coin(vec![])));
+    add("typearg/call-arity-extra", vec![], none(coin(vec![sui_tag(), TypeTag::U64])));
+    add("typearg/call-arity-non-generic", vec![], none(s(fw("sui", "SUI", vec![TypeTag::U64]))));
+    add("typearg/call-arity-deep", vec![], new_table(TypeTag::U64, vector(option(vec![coin(vec![])])?)));
+    add("typearg/order-constraint-before-arity", vec![], none(vec_map(vec![bad_table.clone(), TypeTag::U64, TypeTag::U8])));
+    add("typearg/order-arity-before-constraint", vec![], none(table(vec![coin(vec![sui_tag()])])));
+    add("typearg/order-not-found-wins", vec![], none(field(vec![bad_table.clone(), nowhere.clone()])));
+    add("typearg/order-first-arg-wins", vec![], new_table(coin(vec![]), nowhere.clone()));
+    add("typearg/function-constraint", vec![CallArg::Pure(bcs::to_bytes(&0u64)?)], vec![call(two, "transfer", "public_freeze_object", vec![TypeTag::U64], vec![Argument::Input(0)])]);
+    add("typearg/function-arity", vec![], vec![call(one, "option", "none", vec![], vec![])]);
+    add("typearg/function-constraint-after-struct", vec![CallArg::Pure(bcs::to_bytes(&0u64)?)], vec![call(two, "transfer", "public_freeze_object", vec![bad_table.clone()], vec![Argument::Input(0)])]);
+    add("typearg/vec-constraint", vec![], vec_of(bad_table.clone()));
+    add("typearg/vec-arity", vec![], vec_of(coin(vec![])));
+    add("typearg/vec-deep", vec![], vec_of(vector(field(vec![TypeTag::U64, tx_ctx.clone()]))));
+    add("typearg/second-command", vec![], vec![Command::MakeMoveVec(Some(TypeTag::U64.into()), vec![]), call(one, "option", "none", vec![bad_table.clone()], vec![])]);
+    // publishes: Publish([modules], [0x1, 0x2]) and the UpgradeCap to the sender
+    let publish = |mods: Vec<Vec<u8>>| -> Result<(Vec<CallArg>, Vec<Command>)> {
+        Ok((
+            vec![CallArg::Pure(bcs::to_bytes(&base.sender())?)],
+            vec![Command::Publish(mods, vec![one, two]), Command::TransferObjects(vec![Argument::Result(0)], Argument::Input(0))],
+        ))
+    };
+    let store_ab = AbilitySet::EMPTY | Ability::Store;
+    let plain = |name: &str| upg_module_full(name, SignatureToken::U64, store_ab, &[UFun { name: "f", k: 1, vis: Visibility::Public, entry: false, param: false }], true, None);
+    let mut pubs: Vec<(&str, Vec<Vec<u8>>)> = Vec::new();
+    pubs.push(("publish-fail/control", vec![plain("m")?]));
+    pubs.push(("publish-fail/deserialize", vec![vec![0xde, 0xad, 0xbe, 0xef]]));
+    // `f` pops from an empty stack
+    let move_bad = |name: &str| -> Result<Vec<u8>> {
+        tweak(&plain(name)?, |m| {
+            m.function_defs[0].code.as_mut().unwrap().code = vec![Bytecode::Add, Bytecode::Ret];
+        })
+    };
+    pubs.push(("publish-fail/move-verifier", vec![move_bad("m")?]));
+    // struct S has key { x: u64 }: the first field of a key struct must be `id: UID`
+    let key_first = |name: &str| upg_module_full(name, SignatureToken::U64, AbilitySet::EMPTY | Ability::Key | Ability::Store, &[], false, None);
+    pubs.push(("publish-fail/sui-key-first-field", vec![key_first("m")?]));
+    // `init` must be private
+    pubs.push(("publish-fail/sui-init-public", vec![tweak(&plain("m")?, |m| {
+        let last = m.function_defs.len() - 1;
+        m.function_defs[last].visibility = Visibility::Public;
+    })?]));
+    // `fun init(_: u64): u64`
+    pubs.push(("publish-fail/sui-init-signature", vec![upg_module_full("m", SignatureToken::U64, store_ab, &[UFun { name: "init", k: 1, vis: Visibility::Private, entry: false, param: true }], false, None)?]));
+    // the Move verifier of a later module wins over the Sui verifier of an earlier one
+    pubs.push(("publish-fail/move-before-sui", vec![key_first("a")?, move_bad("b")?]));
+    // a handle to module 0x2::nope
+    pubs.push(("publish-fail/link-missing-module", vec![tweak(&plain("m")?, |m| {
+        m.identifiers.push(Identifier::new("nope").unwrap());
+        m.module_handles.push(ModuleHandle { address: AddressIdentifierIndex(1), name: IdentifierIndex(m.identifiers.len() as u16 - 1) });
+    })?]));
+    // a handle to function 0x2::tx_context::nope()
+    pubs.push(("publish-fail/link-missing-function", vec![tweak(&plain("m")?, |m| {
+        m.identifiers.push(Identifier::new("nope").unwrap());
+        m.function_handles.push(FunctionHandle { module: ModuleHandleIndex(1), name: IdentifierIndex(m.identifiers.len() as u16 - 1), parameters: SignatureIndex(0), return_: SignatureIndex(0), type_parameters: vec![] });
+    })?]));
+    // the handle of 0x2::tx_context::TxContext declared with copy, which the definition lacks
+    pubs.push(("publish-fail/link-struct-abilities", vec![tweak(&plain("m")?, |m| {
+        let h: &mut DatatypeHandle = &mut m.datatype_handles[1];
+        h.abilities = h.abilities | Ability::Copy;
+    })?]));
+    // modules `a` and `b` of the package import each other
+    let import = |bytes: Vec<u8>, other: &str| -> Result<Vec<u8>> {
+        let other = other.to_string();
+        tweak(&bytes, move |m| {
+            m.identifiers.push(Identifier::new(other).unwrap());
+            m.module_handles.push(ModuleHandle { address: AddressIdentifierIndex(0), name: IdentifierIndex(m.identifiers.len() as u16 - 1) });
+        })
+    };
+    pubs.push(("publish-fail/link-cycle", vec![import(plain("a")?, "b")?, import(plain("b")?, "a")?]));
+    pubs.push(("publish-fail/link-import-ok", vec![import(plain("a")?, "b")?, plain("b")?]));
+    // linking runs after every module's Move verifier and before the Sui verifier
+    pubs.push(("publish-fail/link-before-sui", vec![key_first("a")?, import(plain("b")?, "nope")?]));
+    for (name, mods) in pubs {
+        let (inputs, cmds) = publish(mods)?;
+        add(name, inputs, cmds);
+    }
+    Ok(cases)
+}
+
 fn tweak(bytes: &[u8], f: impl FnOnce(&mut move_binary_format::file_format::CompiledModule)) -> Result<Vec<u8>> {
     let mut m = move_binary_format::file_format::CompiledModule::deserialize_with_defaults(bytes)?;
     f(&mut m);
@@ -1321,4 +1447,350 @@ fn clock_cases(ctx: &Ctx, base: &TransactionData, gas: &Object) -> Result<(Vec<C
     // version, so deepwave reports "clock version not assigned" and no vector keeps a permanent skip)
     let _ = extra;
     Ok((cases, ov, cv))
+}
+
+// ---- limits: check_effects (EffectsTooLarge, WrittenObjectsTooLarge, CoinBalanceOverflow)
+
+/// `limits-units`: Rust's `estimate_effects_size_upperbound_v2`, `estimate_accumulator_write_size_upperbound`
+/// and `check_limit_in_range` on the inputs of deepwave's unit tests (src/exec/ptb/limits.zig).
+pub fn cmd_limits_units() -> Result<()> {
+    use sui_types::effects::TransactionEffects as Fx;
+    for (w, m, d, idonly, unch, acc, complete) in [
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, false),
+        (0, 0, 0, 0, 0, 0, true),
+        (1, 1, 1, 0, 0, 0, true),
+        (3, 2, 5, 7, 2, 1, false),
+        (3, 2, 5, 7, 2, 1, true),
+        (2048, 2048, 2048, 2048, 1000, 1024, true),
+    ] {
+        // `acc` accumulator events of Balance<SUI> for distinct addresses
+        let events: Vec<sui_types::accumulator_event::AccumulatorEvent> = (0..acc)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0] = 0x11;
+                b[28..].copy_from_slice(&(i as u32).to_be_bytes());
+                let ty = sui_types::balance::Balance::type_tag(sui_types::gas_coin::GAS::type_tag());
+                sui_types::accumulator_event::AccumulatorEvent::from_balance_change(SuiAddress::from(ObjectID::new(b)), ty, 5).unwrap()
+            })
+            .collect();
+        println!("estimate w={w} m={m} deps={d} id_only={idonly} unchanged={unch} acc_events={acc} complete={complete}: {}", Fx::estimate_effects_size_upperbound_v2(w, m, d, idonly, unch, &events, complete));
+    }
+    let bal = sui_types::balance::Balance::type_tag(sui_types::gas_coin::GAS::type_tag());
+    println!("accumulator write Balance<SUI>: {}", Fx::estimate_accumulator_write_size_upperbound(&bal));
+    for (x, soft, hard) in [(524_287u64, 524_288u64, 524_288u64), (524_288, 524_288, 524_288), (524_288, 524_288, 8_388_608), (8_388_608, 524_288, 8_388_608)] {
+        let r = match sui_protocol_config::check_limit_in_range(x, soft, hard) {
+            sui_protocol_config::LimitThresholdCrossed::None => "None".to_string(),
+            sui_protocol_config::LimitThresholdCrossed::Soft(a, b) => format!("Soft({a}, {b})"),
+            sui_protocol_config::LimitThresholdCrossed::Hard(a, b) => format!("Hard({a}, {b})"),
+        };
+        println!("check_limit_in_range({x}, {soft}, {hard}): {r}");
+    }
+    Ok(())
+}
+
+fn lim_oid(tag: u8, i: u32) -> ObjectID {
+    let mut b = [0u8; 32];
+    b[0] = tag;
+    b[28..].copy_from_slice(&i.to_be_bytes());
+    ObjectID::new(b)
+}
+
+/// A programmable transaction under construction.
+#[derive(Default, Clone)]
+struct Ptb {
+    inputs: Vec<CallArg>,
+    cmds: Vec<Command>,
+    objs: Vec<Object>,
+}
+
+impl Ptb {
+    fn pure<T: serde::Serialize>(&mut self, v: &T) -> Result<Argument> {
+        self.inputs.push(CallArg::Pure(bcs::to_bytes(v)?));
+        Ok(Argument::Input((self.inputs.len() - 1) as u16))
+    }
+    fn obj(&mut self, o: &Object) -> Argument {
+        let arg = match o.owner {
+            Owner::Shared { initial_shared_version } => ObjectArg::SharedObject { id: o.id(), initial_shared_version, mutability: sui_types::transaction::SharedObjectMutability::Immutable },
+            _ => ObjectArg::ImmOrOwnedObject(o.compute_object_reference()),
+        };
+        self.inputs.push(CallArg::Object(arg));
+        self.objs.push(o.clone());
+        Argument::Input((self.inputs.len() - 1) as u16)
+    }
+    fn cmd(&mut self, c: Command) -> u16 {
+        self.cmds.push(c);
+        (self.cmds.len() - 1) as u16
+    }
+    /// `n` new 1-MIST coins split off the gas coin and sent to `to`, 500 per command.
+    fn new_coins(&mut self, n: usize, amt: Argument, to: Argument) {
+        let mut left = n;
+        while left > 0 {
+            let k = left.min(500);
+            let s = self.cmd(Command::SplitCoins(Argument::GasCoin, vec![amt; k]));
+            self.cmd(Command::TransferObjects((0..k).map(|i| Argument::NestedResult(s, i as u16)).collect(), to));
+            left -= k;
+        }
+    }
+}
+
+struct Limits<'a> {
+    env: &'a ExecEnv,
+    metrics: Arc<sui_types::metrics::ExecutionMetrics>,
+    epoch: u64,
+    sender: SuiAddress,
+    gas: Object,
+    lines: Vec<String>,
+}
+
+impl Limits<'_> {
+    fn data(&self, p: &Ptb) -> TransactionData {
+        let gas_data = sui_types::transaction::GasData { payment: vec![self.gas.compute_object_reference()], owner: self.sender, price: self.env.epochs[self.epoch as usize].1, budget: 100_000_000_000 };
+        TransactionData::new_with_gas_data(TransactionKind::ProgrammableTransaction(ProgrammableTransaction { inputs: p.inputs.clone(), commands: p.cmds.clone() }), self.sender, gas_data)
+    }
+
+    fn run(&self, pv: u64, p: &Ptb) -> Result<(TransactionData, Run)> {
+        let cfg = ProtocolConfig::get_for_version(ProtocolVersion::new(pv), Chain::Mainnet);
+        let ctx = Ctx { env: self.env, ex: sui_execution::executor(&cfg, true)?, cfg, metrics: self.metrics.clone(), epoch: self.epoch };
+        let data = self.data(p);
+        let mut objs: HashMap<ObjectID, Object> = HashMap::new();
+        objs.insert(self.gas.id(), self.gas.clone());
+        for o in &p.objs {
+            objs.insert(o.id(), o.clone());
+        }
+        let r = ctx.run(&data, &objs, &HashMap::new())?;
+        Ok((data, r))
+    }
+
+    fn emit(&mut self, name: &str, pv: u64, p: &Ptb) -> Result<sui_types::execution_status::ExecutionStatus> {
+        let (data, r) = self.run(pv, p)?;
+        let status = r.effects.status().clone();
+        eprintln!("synth-limits: {name} (pv {pv}, {} tx bytes): {status:?}", bcs::serialized_size(&data)?);
+        let ep = self.env.epochs[self.epoch as usize];
+        let mut objs = vec![self.gas.clone()];
+        objs.extend(p.objs.iter().cloned());
+        let loaded: Vec<serde_json::Value> = r.loaded.iter().map(|(id, v)| serde_json::json!({"id": hex::encode(id), "version": v})).collect();
+        let line = serde_json::json!({
+            "name": name,
+            "pv": pv,
+            "epoch": self.epoch,
+            "rgp": ep.1,
+            "start_ms": ep.2,
+            "tx": hex::encode(bcs::to_bytes(&data)?),
+            "objects": hexs(&objs)?,
+            "latest": Vec::<String>::new(),
+            "effects": hex::encode(bcs::to_bytes(&r.effects)?),
+            "events": r.events.as_ref().map(hex::encode),
+            "written": hexs(&r.written)?,
+            "loaded": loaded,
+        });
+        self.lines.push(line.to_string());
+        Ok(status)
+    }
+
+    /// The EffectsTooLarge / WrittenObjectsTooLarge current size of a run, None on any other status.
+    fn too_large(&self, pv: u64, p: &Ptb, written: bool) -> Result<Option<u64>> {
+        use sui_types::execution_status::{ExecutionErrorKind as K, ExecutionStatus as S};
+        let (_, r) = self.run(pv, p)?;
+        Ok(match r.effects.status() {
+            S::Failure(f) => match (&f.error, written) {
+                (K::EffectsTooLarge { current_size, .. }, false) => Some(*current_size),
+                (K::WrittenObjectsTooLarge { current_size, .. }, true) => Some(*current_size),
+                _ => {
+                    eprintln!("synth-limits: calibration run: {:?}", r.effects.status());
+                    None
+                }
+            },
+            S::Success => None,
+        })
+    }
+
+    /// The largest `k` whose transaction stays under the effects size limit and the smallest
+    /// that crosses it, from the sizes Rust reports at `k_hi` and `k_hi - 1` (both over).
+    fn calibrate(&self, pv: u64, k_hi: usize, build: &dyn Fn(usize) -> Result<Ptb>) -> Result<(usize, usize)> {
+        let limit = ProtocolConfig::get_for_version(ProtocolVersion::new(pv), Chain::Mainnet).max_serialized_tx_effects_size_bytes();
+        let hi = self.too_large(pv, &build(k_hi)?, false)?.context("calibration: k_hi is not over the effects limit")?;
+        let lo = self.too_large(pv, &build(k_hi - 1)?, false)?.context("calibration: k_hi - 1 is not over the effects limit")?;
+        let step = hi - lo;
+        let over = k_hi - ((hi - limit) / step) as usize;
+        eprintln!("synth-limits: calibration pv {pv}: {hi} at {k_hi}, {step} per unit, limit {limit}: over at {over}");
+        Ok((over - 1, over))
+    }
+}
+
+fn bag_obj(id: ObjectID, owner: Owner) -> Result<Object> {
+    let mut contents = id.to_vec();
+    contents.extend_from_slice(&0u64.to_le_bytes());
+    let mo = unsafe { MoveObject::new_from_execution_with_limit(fw("bag", "Bag", vec![]).into(), true, SequenceNumber::from_u64(7), contents, 512)? };
+    Ok(Object::new_move(mo, owner, TransactionDigest::new([0x5c; 32])))
+}
+
+/// `synth-limits <corpus> <out.jsonl.zst>`: vectors at the limits of `check_effects` (execution
+/// version 4), same line format as `synth`, over synthetic objects (sender 0x55.., a 1000 SUI gas
+/// coin, owned coins, shared and immutable bags) at the newest corpus epoch:
+/// - `limits/effects/...`: the estimated effects size just under and just over
+///   `max_serialized_tx_effects_size_bytes` (new coins and unused owned inputs; with accumulator
+///   writes, coins wrapped in a bag, read-only shared and immutable inputs; the legacy gas path at
+///   protocol 137 with merged coins);
+/// - `limits/written/...`: the written objects size one byte under and exactly at
+///   `max_size_written_objects` (a bag of large `vector<u8>` fields and a published package);
+/// - `limits/amounts/...`: `check_accumulator_amounts_representable` (SUI merges to the total
+///   supply and past it) and the object runtime's per-key u64 cap for another type.
+pub fn cmd_synth_limits(corpus: &Path, out: &Path) -> Result<()> {
+    let env = load_exec_env(corpus)?;
+    let epoch = (env.epochs.len() - 1) as u64;
+    let pv = env.epochs[epoch as usize].0;
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(sui_types::metrics::ExecutionMetrics::new(&registry));
+    let sender = SuiAddress::from(ObjectID::new([0x55; 32]));
+    let prev = TransactionDigest::new([0x5b; 32]);
+    let sui = |id: ObjectID, v: u64| Object::new_move(MoveObject::new_gas_coin(SequenceNumber::from_u64(100), id, v), Owner::AddressOwner(sender), prev);
+    let gas = sui(lim_oid(0x9a, 0), 1_000_000_000_000);
+    let mut l = Limits { env: &env, metrics, epoch, sender, gas, lines: Vec::new() };
+    let two = sui_types::SUI_FRAMEWORK_PACKAGE_ID;
+    let one = sui_types::MOVE_STDLIB_PACKAGE_ID;
+    let coin_t = |t: TypeTag| TypeTag::Struct(Box::new(fw("coin", "Coin", vec![t])));
+
+    // effects: 1972 new coins, k unused owned coins (each mutated by ensure_active_inputs_mutated)
+    let coins = |k: usize| -> Result<Ptb> {
+        let mut p = Ptb::default();
+        let amt = p.pure(&1u64)?;
+        let to = p.pure(&sender)?;
+        p.new_coins(1972, amt, to);
+        for i in 0..k {
+            p.obj(&sui(lim_oid(0xc0, i as u32), 1_000));
+        }
+        Ok(p)
+    };
+    let (under, over) = l.calibrate(pv, 920, &coins)?;
+    l.emit("limits/effects/coins-under", pv, &coins(under)?)?;
+    l.emit("limits/effects/coins-over", pv, &coins(over)?)?;
+
+    // effects with every term of the complete estimate: 150 send_funds to distinct addresses
+    // (accumulator writes), 50 coins wrapped in a new bag (id-only changes), 3 read-only shared
+    // bags (unchanged consensus objects), an immutable bag, 1700 new coins, k unused owned coins
+    // (new ids, coins included, stay under max_num_new_move_object_ids)
+    let shared: Vec<Object> = (0..3).map(|i| bag_obj(lim_oid(0xb5, i), Owner::Shared { initial_shared_version: SequenceNumber::from_u64(5) })).collect::<Result<_>>()?;
+    let frozen = bag_obj(lim_oid(0xb1, 0), Owner::Immutable)?;
+    let mixed = |k: usize| -> Result<Ptb> {
+        let mut p = Ptb::default();
+        let amt = p.pure(&1u64)?;
+        let to = p.pure(&sender)?;
+        let s = p.cmd(Command::SplitCoins(Argument::GasCoin, vec![amt; 150]));
+        for i in 0..150u32 {
+            let a = p.pure(&SuiAddress::from(lim_oid(0xa0, i)))?;
+            p.cmd(call(two, "coin", "send_funds", vec![sui_tag()], vec![Argument::NestedResult(s, i as u16), a]));
+        }
+        let bag = p.cmd(call(two, "bag", "new", vec![], vec![]));
+        let s2 = p.cmd(Command::SplitCoins(Argument::GasCoin, vec![amt; 50]));
+        for i in 0..50u16 {
+            let key = p.pure(&(i as u64))?;
+            p.cmd(call(two, "bag", "add", vec![TypeTag::U64, coin_t(sui_tag())], vec![Argument::Result(bag), key, Argument::NestedResult(s2, i)]));
+        }
+        p.cmd(Command::TransferObjects(vec![Argument::Result(bag)], to));
+        for o in &shared {
+            p.obj(o);
+        }
+        p.obj(&frozen);
+        p.new_coins(1700, amt, to);
+        for i in 0..k {
+            p.obj(&sui(lim_oid(0xc0, i as u32), 1_000));
+        }
+        Ok(p)
+    };
+    let (under, over) = l.calibrate(pv, 910, &mixed)?;
+    l.emit("limits/effects/mixed-under", pv, &mixed(under)?)?;
+    l.emit("limits/effects/mixed-over", pv, &mixed(over)?)?;
+
+    // the legacy gas path (gas model 14, protocol 137; the estimate without the 141 terms, checked
+    // before the mutable inputs are touched): 2000 new coins, k coins merged into the gas coin
+    let legacy_pv = 137;
+    let legacy = |k: usize| -> Result<Ptb> {
+        let mut p = Ptb::default();
+        let amt = p.pure(&1u64)?;
+        let to = p.pure(&sender)?;
+        p.new_coins(2000, amt, to);
+        let ins: Vec<Argument> = (0..k).map(|i| p.obj(&sui(lim_oid(0xc0, i as u32), 1_000))).collect();
+        for c in ins.chunks(500) {
+            p.cmd(Command::MergeCoins(Argument::GasCoin, c.to_vec()));
+        }
+        Ok(p)
+    };
+    let (under, over) = l.calibrate(legacy_pv, 1600, &legacy)?;
+    l.emit("limits/effects/legacy-under-pv137", legacy_pv, &legacy(under)?)?;
+    l.emit("limits/effects/legacy-over-pv137", legacy_pv, &legacy(over)?)?;
+
+    // written objects: a bag of 19 `vector<u8>` fields of 255,900 bytes and one tail field of
+    // `tail` bytes, plus a published package; one byte under and exactly at the limit
+    let chunk: Vec<u8> = (0..16_000u32).map(|i| (i % 251) as u8).collect();
+    let module = event_module("m", 1)?;
+    let written = |tail: usize| -> Result<Ptb> {
+        let mut p = Ptb::default();
+        let to = p.pure(&sender)?;
+        let ch = p.pure(&chunk)?;
+        let acc = p.pure(&chunk[..255_900 - 15 * 16_000].to_vec())?;
+        let vec_u8 = TypeTag::Vector(Box::new(TypeTag::U8));
+        for _ in 0..15 {
+            p.cmd(call(one, "vector", "append", vec![TypeTag::U8], vec![acc, ch]));
+        }
+        let bag = p.cmd(call(two, "bag", "new", vec![], vec![]));
+        for i in 0..19u64 {
+            let key = p.pure(&i)?;
+            p.cmd(call(two, "bag", "add", vec![TypeTag::U64, vec_u8.clone()], vec![Argument::Result(bag), key, acc]));
+        }
+        let m = (tail - 1) / 16_000;
+        let t = p.pure(&chunk[..tail - 16_000 * m].to_vec())?;
+        for _ in 0..m {
+            p.cmd(call(one, "vector", "append", vec![TypeTag::U8], vec![t, ch]));
+        }
+        let key = p.pure(&19u64)?;
+        p.cmd(call(two, "bag", "add", vec![TypeTag::U64, vec_u8.clone()], vec![Argument::Result(bag), key, t]));
+        let publ = p.cmd(Command::Publish(vec![module.clone()], vec![one, two]));
+        p.cmd(Command::TransferObjects(vec![Argument::Result(bag), Argument::Result(publ)], to));
+        Ok(p)
+    };
+    let wlimit = ProtocolConfig::get_for_version(ProtocolVersion::new(pv), Chain::Mainnet).max_size_written_objects();
+    let t0 = 200_000usize;
+    let s0 = l.too_large(pv, &written(t0)?, true)?.context("written calibration: not over the limit")?;
+    let at = t0 - (s0 - wlimit) as usize;
+    eprintln!("synth-limits: written {s0} at tail {t0}, limit {wlimit}: tail {at} is at the limit");
+    l.emit("limits/written/under", pv, &written(at - 1)?)?;
+    l.emit("limits/written/at", pv, &written(at)?)?;
+
+    // check_accumulator_amounts_representable: SUI merged into one address balance up to the
+    // total supply (10^19 MIST) and one MIST past it, in one event and in two
+    let supply = 10_000_000_000u64 * 1_000_000_000;
+    let to2 = SuiAddress::from(lim_oid(0xa1, 0));
+    let sends = |vals: &[u64], ty: Option<TypeTag>| -> Result<Ptb> {
+        let mut p = Ptb::default();
+        let to = p.pure(&to2)?;
+        for (i, v) in vals.iter().enumerate() {
+            let o = match &ty {
+                None => sui(lim_oid(0xd0, i as u32), *v),
+                Some(t) => Object::new_move(MoveObject::new_coin(t.clone(), SequenceNumber::from_u64(100), lim_oid(0xd0, i as u32), *v), Owner::AddressOwner(sender), prev),
+            };
+            let c = p.obj(&o);
+            p.cmd(call(two, "coin", "send_funds", vec![ty.clone().unwrap_or_else(sui_tag)], vec![c, to]));
+        }
+        Ok(p)
+    };
+    l.emit("limits/amounts/sui-supply", pv, &sends(&[supply], None)?)?;
+    l.emit("limits/amounts/sui-over-supply", pv, &sends(&[supply + 1], None)?)?;
+    l.emit("limits/amounts/sui-two-to-supply", pv, &sends(&[supply / 2, supply / 2], None)?)?;
+    l.emit("limits/amounts/sui-two-over-supply", pv, &sends(&[supply / 2, supply / 2 + 1], None)?)?;
+    let other = TypeTag::Struct(Box::new(StructTag { address: move_core_types::account_address::AccountAddress::ONE, module: "ascii".parse()?, name: "String".parse()?, type_params: vec![] }));
+    l.emit("limits/amounts/other-u64-max", pv, &sends(&[u64::MAX / 2, u64::MAX / 2 + 1], Some(other.clone()))?)?;
+    l.emit("limits/amounts/other-over-u64", pv, &sends(&[u64::MAX / 2 + 1, u64::MAX / 2 + 1], Some(other))?)?;
+
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let f = std::fs::File::create(out)?;
+    let mut z = zstd::Encoder::new(f, 19)?;
+    for line in &l.lines {
+        z.write_all(line.as_bytes())?;
+        z.write_all(b"\n")?;
+    }
+    z.finish()?;
+    eprintln!("synth-limits: {} vectors", l.lines.len());
+    Ok(())
 }

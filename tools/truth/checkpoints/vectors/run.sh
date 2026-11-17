@@ -13,6 +13,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 SUI_SRC="${SUI_SRC:-$HOME/src/sui-1.83.1}"
 OUT="${OUT:?set OUT to the vectors file to write}"
+mkdir -p "$(dirname "$OUT")"
 WORK="${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/zui-ckpt-vectors.XXXXXX")}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/zui/target-swarm}"
 

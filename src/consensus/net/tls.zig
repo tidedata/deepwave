@@ -576,6 +576,44 @@ test "tls: mutual handshake pinned to committee keys, h2 echo over many records"
     try std.testing.expectEqual(@as(u32, 1), peer_idx); // authority index of key 2
 }
 
+test "tls: handshake at multi-digit epochs (server name consensus_epoch_N, N >= 10)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]u64{ 9, 10, 99, 100, 1313, 123456789 }) |epoch| {
+        var name_buf: [48]u8 = undefined;
+        const name = try serverName(&name_buf, epoch);
+        const seed_a: [32]u8 = @splat(1);
+        const seed_b: [32]u8 = @splat(2);
+        const id_a = try Identity.init(&seed_a, name);
+        const id_b = try Identity.init(&seed_b, name);
+        var peers: TestPeers = .{ .keys = .{ try testSeedKey(1), try testSeedKey(2), try testSeedKey(3) } };
+        const check: PeerKeyCheck = .{ .ctx = &peers, .lookup = TestPeers.lookup };
+        var any: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(0) };
+        var ls = try any.listen(io, .{ .reuse_address = true });
+        defer ls.deinit(io);
+        const port = ls.socket.address.ip4.port;
+        var res: ?Error = null;
+        var peer_idx: u32 = 99;
+        const t = try std.Thread.spawn(.{}, Loop.serve, .{ gpa, io, &ls, &id_a, check, name, &res, &peer_idx });
+        defer t.join();
+        var addr: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(port) };
+        const stream = try addr.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        const pub_a = id_a.publicKey();
+        const cl = Session.connect(gpa, io, stream.socket.handle, name, &id_b, &pub_a) catch |e| {
+            std.debug.print("epoch {d}: client handshake failed: {s}\n", .{ epoch, @errorName(e) });
+            return e;
+        };
+        defer cl.deinit();
+        try cl.writeAll("ping");
+        var got: [4]u8 = undefined;
+        try readExact(cl, &got);
+        try std.testing.expectEqualStrings("ping", &got);
+        cl.shutdown();
+        try std.testing.expect(res == null);
+    }
+}
+
 test "tls: KeyUpdate rotates both directions (requested and by record count)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

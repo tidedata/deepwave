@@ -79,6 +79,104 @@ pub fn current() *const Config {
     return &global_cfg;
 }
 
+// ---- the effective config ---------------------------------------------------------------------
+
+/// The config the signing-time checks enforce (sui-core `TransactionDenyConfigManager::
+/// effective_config`): the local config with the rules peers shared through consensus merged in
+/// (validator/authority/deny_manager.zig publishes it). Until a manager publishes one it is the
+/// local config, as on a full node (no committee votes reach it).
+pub const Snapshot = struct {
+    gpa: Allocator,
+    arena: std.heap.ArenaAllocator,
+    cfg: Config,
+    /// One for the slot holding it, one per reader.
+    refs: std.atomic.Value(u32) = .init(1),
+
+    fn unref(s: *Snapshot) void {
+        if (s.refs.fetchSub(1, .acq_rel) != 1) return;
+        const gpa = s.gpa;
+        s.arena.deinit();
+        gpa.destroy(s);
+    }
+};
+
+/// A held snapshot; `release` when the check is done.
+pub const Guard = struct {
+    snap: ?*Snapshot,
+    fallback: *const Config,
+
+    pub fn config(g: *const Guard) *const Config {
+        return if (g.snap) |s| &s.cfg else g.fallback;
+    }
+    pub fn release(g: *Guard) void {
+        if (g.snap) |s| s.unref();
+        g.snap = null;
+    }
+};
+
+/// Where the effective config is swapped (ArcSwap): readers take a reference under a short spin,
+/// a publish replaces the pointer and drops the slot's reference.
+pub const Slot = struct {
+    lock: std.atomic.Value(u32) = .init(0),
+    cur: ?*Snapshot = null,
+
+    fn spin(s: *Slot) void {
+        while (s.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    pub fn acquire(s: *Slot) Guard {
+        s.spin();
+        const p = s.cur;
+        if (p) |x| _ = x.refs.fetchAdd(1, .monotonic);
+        s.lock.store(0, .release);
+        return .{ .snap = p, .fallback = &global_cfg };
+    }
+
+    /// Takes ownership of `n` (null: back to the local config).
+    pub fn publish(s: *Slot, n: ?*Snapshot) void {
+        s.spin();
+        const old = s.cur;
+        s.cur = n;
+        s.lock.store(0, .release);
+        if (old) |o| o.unref();
+    }
+};
+
+/// A snapshot holding `rules` (copied) with the local config's dynamic predicate
+/// (`TransactionDenyConfig::with_rules`: the predicate is local-only and carried over).
+pub fn newSnapshot(gpa: Allocator, local: *const Config, rules: *const Rules) Allocator.Error!*Snapshot {
+    const s = try gpa.create(Snapshot);
+    errdefer gpa.destroy(s);
+    s.* = .{ .gpa = gpa, .arena = .init(gpa), .cfg = .{} };
+    errdefer s.arena.deinit();
+    const a = s.arena.allocator();
+    s.cfg = .{
+        .rules = try cloneRules(a, rules),
+        .has_dynamic_transaction_checks = local.has_dynamic_transaction_checks,
+        .dynamic_program = try a.dupe(u8, local.dynamic_program),
+    };
+    return s;
+}
+
+pub fn cloneRules(a: Allocator, r: *const Rules) Allocator.Error!Rules {
+    var out = r.*;
+    out.object_deny_list = try a.dupe(Id, r.object_deny_list);
+    out.package_deny_list = try a.dupe(Id, r.package_deny_list);
+    out.address_deny_list = try a.dupe(Id, r.address_deny_list);
+    const provs = try a.alloc([]const u8, r.zklogin_disabled_providers.len);
+    for (r.zklogin_disabled_providers, provs) |p, *o| o.* = try a.dupe(u8, p);
+    out.zklogin_disabled_providers = provs;
+    return out;
+}
+
+/// The process's effective config (the validator's deny manager publishes here).
+pub var effective_slot: Slot = .{};
+
+/// What every signing-time deny check reads (`effective_config().load()`).
+pub fn effective() Guard {
+    return effective_slot.acquire();
+}
+
 // ---- config from run flags --------------------------------------------------------------------
 
 /// The keys of `transaction-deny-config` (kebab-case, as in fullnode.yaml).

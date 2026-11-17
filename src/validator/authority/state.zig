@@ -84,6 +84,14 @@ pub const QueueOp = union(enum) { push: QueuedRoots, flush: PendingCheckpoint };
 pub const UserSigs = struct { digest: Id, sigs: []const []const u8, alias_versions: []const ?u64 };
 
 pub const ObsRecord = struct { authority: u32, generation: u64, estimates_bcs: []const u8 };
+/// One side-record of another component in a commit group (see `Batch.ext`).
+pub const Ext = struct { tag: u8, bytes: []const u8 };
+/// `Ext.tag` of the randomness manager's records (randomness/persist.zig).
+pub const ext_randomness: u8 = 1;
+/// `Ext.tag` of the JWK aggregator's rows (jwk/hooks.zig).
+pub const ext_jwk: u8 = 2;
+/// `Ext.tag` of the reconfig state (run/epoch_control.zig).
+pub const ext_epoch: u8 = 3;
 
 // ------------------------------------------------------------------------ batch
 
@@ -114,6 +122,11 @@ pub const Batch = struct {
     queue_next_seq: ?u64 = null,
     queue_height: ?u64 = null,
     queue_drained: bool = true,
+    /// Records of other components that must be durable in this commit's group (the randomness
+    /// manager's DKG tables, `ext_randomness`): written after everything else, replayed into
+    /// `EpochState.ext` in order. A component that kept state for a commit but whose records were
+    /// not written with it would diverge after a restart (Sui PR 26846: the failed DKG verdict).
+    ext: std.ArrayList(Ext) = .empty,
 
     pub fn init(arena: Allocator, indices: Indices) Batch {
         return .{ .arena = arena, .indices = indices };
@@ -147,6 +160,7 @@ const T = struct {
     const user_sigs: u8 = 15;
     const sigs_del: u8 = 16;
     const randomness_round: u8 = 17;
+    const ext: u8 = 18;
 };
 
 fn putKey(w: *codec.Writer, k: DeferralKey) !void {
@@ -379,6 +393,11 @@ fn encodeInto(w: *codec.Writer, b: *const Batch) !void {
         try w.u64_(b.queue_height orelse std.math.maxInt(u64));
         try w.u8_(@intFromBool(b.queue_drained));
     }
+    for (b.ext.items) |e| {
+        try w.u8_(T.ext);
+        try w.u8_(e.tag);
+        try w.blob(e.bytes);
+    }
     try w.u8_(T.end);
 }
 
@@ -424,6 +443,8 @@ pub const EpochState = struct {
     queue_drained: bool = true,
     pending: std.ArrayList(PendingOwned) = .empty,
     sigs: std.AutoHashMapUnmanaged(Id, UserSigs) = .empty,
+    /// Side-records of other components in group order (`Batch.ext`); bytes in `arena`.
+    ext: std.ArrayList(Ext) = .empty,
     /// The arena that owns decoded slices (roots, assigned versions); freed in `deinit`.
     arena: std.heap.ArenaAllocator,
     /// `additional_consensus_state_window_size`: commit times kept.
@@ -455,6 +476,7 @@ pub const EpochState = struct {
         s.queue.deinit(s.gpa);
         s.pending.deinit(s.gpa);
         s.sigs.deinit(s.gpa);
+        s.ext.deinit(s.gpa);
         s.arena.deinit();
     }
 
@@ -651,6 +673,10 @@ pub const EpochState = struct {
                     s.ackAssigned(k);
                 },
                 T.randomness_round => s.randomness_last = try r.u64_(),
+                T.ext => {
+                    const etag = try r.u8_();
+                    try s.ext.append(gpa, .{ .tag = etag, .bytes = try a.dupe(u8, try r.blob()) });
+                },
                 T.pending_ack => s.ackPending(try r.u64_()),
                 T.sigs_del => _ = s.sigs.remove(try r.id()),
                 T.queue_meta => {
@@ -776,7 +802,9 @@ test "batch round trip through mem log" {
     try b.deferred_set.append(ar.allocator(), .{ .key = DeferralKey.newForConsensusRound(10, 9), .txs = &.{ "aa", "bbb" } });
     try b.debts.append(ar.allocator(), .{ .randomness = false, .id = @splat(8), .round = 5, .debt = 100 });
     try b.commit_times.append(ar.allocator(), 1000);
+    try b.ext.append(ar.allocator(), .{ .tag = ext_randomness, .bytes = "dkg records of commit 1" });
     try commit(&st, &log, &b);
+    try std.testing.expectEqual(@as(usize, 1), st.ext.items.len);
 
     try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(7))), st.lockHolder(ref));
     try std.testing.expect(st.isProcessed(&@as([32]u8, @splat(3))));
@@ -799,6 +827,10 @@ test "batch round trip through mem log" {
     try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(7))), st2.lockHolder(ref));
     try std.testing.expectEqual(@as(u64, 10), st2.indices.sub_dag_index);
     try std.testing.expect(st2.deferredFor(DeferralKey.newForConsensusRound(10, 9)) == null);
+    // side-records come back in group order
+    try std.testing.expectEqual(@as(usize, 1), st2.ext.items.len);
+    try std.testing.expectEqual(ext_randomness, st2.ext.items[0].tag);
+    try std.testing.expectEqualStrings("dkg records of commit 1", st2.ext.items[0].bytes);
 }
 
 test "commit interval estimate" {

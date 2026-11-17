@@ -181,8 +181,9 @@ fn configOf(arena: Allocator, store: Store, ty: []const u8) !?Id {
     return c[32 + n ..][0..32].*;
 }
 
-/// `read_config_setting::<K, bool>(..., Some(epoch))`, `unwrap_or(false)`.
-fn setting(store: Store, config: *const Id, key_name: []const u8, key: []const u8, epoch: u64) bool {
+/// `read_config_setting::<K, bool>(..., cur_epoch)`, `unwrap_or(false)`; a null epoch (signing)
+/// always reads the newer value.
+fn setting(store: Store, config: *const Id, key_name: []const u8, key: []const u8, epoch: ?u64) bool {
     var tag_buf: [64]u8 = undefined;
     const key_type = fwTag(&tag_buf, "deny_list", key_name, null);
     const fid = fieldId(config, key_type, key);
@@ -217,7 +218,7 @@ fn setting(store: Store, config: *const Id, key_name: []const u8, key: []const u
     const newer = Opt.boolOpt(&r) catch return false;
     const older = Opt.boolOpt(&r) catch return false;
     if (r.len != 0) return false;
-    const v = if (epoch > newer_epoch) newer else older;
+    const v = if (epoch == null or epoch.? > newer_epoch) newer else older;
     return v orelse false;
 }
 
@@ -248,6 +249,96 @@ pub fn check(arena: Allocator, store: Store, epoch: u64, pairs: []Pair) !?Denied
         for (pairs[g.first..g.end]) |p| {
             if (setting(store, &g.cfg, "AddressKey", &p.owner, epoch))
                 return .{ .address = .{ .address = p.owner, .coin_type = ty } };
+        }
+    }
+    return null;
+}
+
+/// One coin type (canonical string) and the addresses checked for it, in byte order: the
+/// `addresses_by_coin_type_for_denylist_check` map, types in string order.
+pub const SigningGroup = struct { ty: []const u8, addrs: []const Id };
+
+/// `check_coin_deny_list_v2_during_signing`: type by type, the per-type config, then the global
+/// pause and each address's setting, read with `read_value(None)`.
+pub fn checkSigningV2(arena: Allocator, store: Store, groups: []const SigningGroup) !?Denied {
+    for (groups) |g| {
+        const cfg = try configOf(arena, store, g.ty) orelse continue;
+        if (setting(store, &cfg, "GlobalPauseKey", &.{0}, null)) return .{ .pause = g.ty };
+        for (g.addrs) |a| if (setting(store, &cfg, "AddressKey", &a, null))
+            return .{ .address = .{ .address = a, .coin_type = g.ty } };
+    }
+    return null;
+}
+
+/// Contents of the dynamic field `Field<K, V>` of `parent` under `key` (BCS of a key of type
+/// `key_type`, BCS TypeTag), after the field id and the key; null when absent or another key.
+fn fieldValue(store: Store, parent: *const Id, key_type: []const u8, key: []const u8) ?[]const u8 {
+    const fid = fieldId(parent, key_type, key);
+    const c = moveContents(store, &fid) orelse return null;
+    if (c.len < 32 + key.len or !std.mem.eql(u8, c[32..][0..key.len], key)) return null;
+    return c[32 + key.len ..];
+}
+
+/// `check_coin_deny_list_v1`: the v1 `PerTypeDenyList` (the 0x403 `lists` bag entry 0). Every
+/// address is first looked up in `denied_count` (byte order); when one is denied anywhere, each
+/// type (string order) whose addresses include a denied one reads its `denied_addresses` entry
+/// and the first of its addresses (byte order) in that set is the denial. Missing objects or
+/// fields read as not denied.
+pub fn checkSigningV1(arena: Allocator, store: Store, groups: []const SigningGroup) !?Denied {
+    const root = moveContents(store, &deny_list_id) orelse return null;
+    // DenyList { id: UID, lists: Bag { id: UID, size: u64 } }
+    if (root.len < 72) return null;
+    const bag: Id = root[32..64].*;
+    const zero_u64: [8]u8 = @splat(0);
+    const per_type = fieldValue(store, &bag, &.{2}, &zero_u64) orelse return null;
+    // PerTypeDenyList { id, denied_count: Table { id, size }, denied_addresses: Table { id, size } }
+    if (per_type.len < 32 + 40 + 40) return null;
+    const count_id: Id = per_type[32..64].*;
+    const addrs_id: Id = per_type[72..104].*;
+
+    var all: std.ArrayList(Id) = .empty;
+    for (groups) |g| for (g.addrs) |a| {
+        for (all.items) |x| {
+            if (std.mem.eql(u8, &x, &a)) break;
+        } else try all.append(arena, a);
+    };
+    var denied: std.ArrayList(Id) = .empty;
+    std.mem.sort(Id, all.items, {}, struct {
+        fn lt(_: void, a: Id, b: Id) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.lt);
+    for (all.items) |a| {
+        const v = fieldValue(store, &count_id, &.{4}, &a) orelse continue;
+        if (v.len >= 8 and std.mem.readInt(u64, v[0..8], .little) > 0) try denied.append(arena, a);
+    }
+    if (denied.items.len == 0) return null;
+    for (groups) |g| {
+        var hit = false;
+        for (g.addrs) |a| for (denied.items) |d| {
+            if (std.mem.eql(u8, &a, &d)) hit = true;
+        };
+        if (!hit) continue;
+        const key = try arena.alloc(u8, 10 + g.ty.len);
+        const n = appendUleb(key, g.ty.len);
+        @memcpy(key[n..][0..g.ty.len], g.ty);
+        const set = fieldValue(store, &addrs_id, &.{ 6, 1 }, key[0 .. n + g.ty.len]) orelse continue;
+        // VecSet<address> { contents: vector<address> }
+        var r = set;
+        var len: usize = 0;
+        var shift: u6 = 0;
+        while (r.len > 0) {
+            const b = r[0];
+            r = r[1..];
+            len |= @as(usize, b & 0x7f) << shift;
+            if (b & 0x80 == 0) break;
+            shift +|= 7;
+            if (shift > 35) return null;
+        }
+        if (r.len < len * 32) continue;
+        for (g.addrs) |a| {
+            for (0..len) |k| if (std.mem.eql(u8, r[k * 32 ..][0..32], &a))
+                return .{ .address = .{ .address = a, .coin_type = g.ty } };
         }
     }
     return null;

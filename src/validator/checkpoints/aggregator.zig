@@ -379,6 +379,9 @@ pub const Aggregator = struct {
     dropped_votes: u64 = 0,
     /// Set when a split brain was seen at this sequence number (the builder's fork marker).
     split_brain_seq: ?u64 = null,
+    /// `logDivergence` bookkeeping (guarded by `lock`).
+    divergence_logged: u32 = 0,
+    divergence_last_seq: u64 = std.math.maxInt(u64),
 
     pub fn init(gpa: std.mem.Allocator, committee: *const checkpoint.Committee, st: store_mod.Store, sink: iface.CertifiedSink) Aggregator {
         return .{ .gpa = gpa, .committee = committee, .store = st, .sink = sink };
@@ -403,6 +406,25 @@ pub const Aggregator = struct {
 
     /// iface.CheckpointSignatureSink: a sequenced signature from a peer (or from ourselves).
     /// Never blocks on the aggregation work: it only queues.
+    /// A peer signed a different summary at a sequence number we built: print both summaries'
+    /// BCS once per sequence number (first 8), the evidence for a split brain.
+    fn logDivergence(a: *Aggregator, seq: u64, digest: *const [32]u8, peer_bcs: []const u8) void {
+        const local = a.store.locallyComputedDigest(seq) orelse return;
+        if (std.mem.eql(u8, &local, digest)) return;
+        a.lock.lock();
+        const first = a.divergence_logged < 8 and a.divergence_last_seq != seq;
+        if (first) {
+            a.divergence_logged += 1;
+            a.divergence_last_seq = seq;
+        }
+        a.lock.unlock();
+        if (!first) return;
+        var arena = std.heap.ArenaAllocator.init(a.gpa);
+        defer arena.deinit();
+        const mine = (a.store.builtSummary(arena.allocator(), seq) catch null) orelse &.{};
+        std.log.warn("checkpoint {d}: a peer signed a different summary\n  peer  {x}\n  local {x}", .{ seq, peer_bcs, mine });
+    }
+
     pub fn addSignature(a: *Aggregator, from: *const messages.AuthorityName, msg: *const messages.CheckpointSignatureMessage) Error!void {
         _ = from;
         const data = &msg.summary.data;
@@ -424,6 +446,7 @@ pub const Aggregator = struct {
             .authority = si.authority.@"0",
             .sig = si.signature,
         };
+        a.logDivergence(vote.seq, &vote.digest, bytes);
         a.lock.lock();
         defer a.lock.unlock();
         if (a.pending_count + a.inbox.items.len >= max_pending) {
@@ -542,6 +565,30 @@ pub const Aggregator = struct {
             }
             return done;
         }
+    }
+
+    /// A certificate a peer served over state sync for the next checkpoint to certify. A
+    /// sui-node validator takes certified checkpoints from StateSync as well as from its
+    /// aggregator: at an epoch end the validators that certified the last checkpoint reconfigure
+    /// and abandon the epoch's DAG, so the commits carrying the remaining signatures may never
+    /// reach this seat. Taken only when this seat built the same summary (byte equal) and the
+    /// quorum signature verifies against this epoch's committee. True when it certified. Call it
+    /// from the thread that calls `poll`.
+    pub fn addCertified(a: *Aggregator, arena: std.mem.Allocator, certified: []const u8) Error!bool {
+        const seq = a.store.nextToCertify();
+        const digest = a.store.locallyComputedDigest(seq) orelse return false;
+        const summary = (try a.store.builtSummary(arena, seq)) orelse return false;
+        if (certified.len <= summary.len or !std.mem.startsWith(u8, certified, summary)) return false;
+        if (!checkpoint.verifyCertifiedSummary(a.committee, .{ .summary = summary, .sig = certified[summary.len..] }).isOk()) return false;
+        try a.store.putCertified(seq, digest, certified);
+        const contents = (try a.store.builtContents(arena, seq)) orelse return error.Io;
+        a.sink.certified(seq, certified, contents) catch return error.Io;
+        a.certified_count += 1;
+        if (a.current) |*c| {
+            c.deinit();
+            a.current = null;
+        }
+        return true;
     }
 };
 
@@ -673,4 +720,82 @@ test "a split vote never certifies and is reported as split brain" {
     try testing.expect(o4.cert == null);
     try testing.expect(o4.split_brain);
     try testing.expect(agg.quorumUnreachable());
+}
+
+test "a peer's certificate certifies the built checkpoint only when it matches and verifies" {
+    var net = try TestNet.init(testing.allocator, 5);
+    defer net.deinit();
+    const mk = struct {
+        fn f(gpa: std.mem.Allocator, ts: u64) ![]u8 {
+            const s: types.CheckpointSummary = .{
+                .epoch = 5,
+                .sequence_number = 12,
+                .network_total_transactions = 1,
+                .content_digest = .{ .@"0" = .{ .@"0" = @splat(1) } },
+                .previous_digest = null,
+                .epoch_rolling_gas_cost_summary = .{ .computationCost = 0, .storageCost = 0, .storageRebate = 0, .nonRefundableStorageFee = 0 },
+                .timestamp_ms = ts,
+                .checkpoint_commitments = &.{},
+                .end_of_epoch_data = null,
+                .version_specific_data = &.{},
+            };
+            return bcs.encodeAlloc(types.CheckpointSummary, gpa, &s);
+        }
+        /// A quorum certificate over `sbytes` from members 0, 1 and 3.
+        fn cert(n: *const TestNet, sbytes: []const u8) ![]u8 {
+            var agg = try SignatureAggregator.init(testing.allocator, &n.committee, 12, 5, sbytes);
+            defer agg.deinit();
+            _ = try agg.tryAggregate(try n.vote(0, 12, 5, sbytes));
+            _ = try agg.tryAggregate(try n.vote(1, 12, 5, sbytes));
+            const c = (try agg.tryAggregate(try n.vote(3, 12, 5, sbytes))).cert.?;
+            defer testing.allocator.free(c.bitmap);
+            return certifiedBcs(testing.allocator, sbytes, c);
+        }
+    };
+    const Sink = struct {
+        n: u32 = 0,
+        seq: u64 = 0,
+        fn f(ctx: *anyopaque, seq: u64, _: []const u8, _: []const u8) error{ Io, Unimplemented }!void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            s.n += 1;
+            s.seq = seq;
+        }
+        const vt: iface.CertifiedSink.VTable = .{ .certified = f };
+    };
+    var sink: Sink = .{};
+    var ms = store_mod.MemStore.init(testing.allocator);
+    defer ms.deinit();
+    ms.seedCertified(.{ .seq = 11, .epoch = 5, .timestamp_ms = 0, .network_total_transactions = 0, .rolling_gas = .{}, .digest = @splat(0) });
+    const mine = try mk.f(testing.allocator, 1);
+    defer testing.allocator.free(mine);
+    const st = ms.store();
+    try st.putBuilt(12, 1, .{ .seq = 12, .epoch = 5, .timestamp_ms = 1, .network_total_transactions = 1, .rolling_gas = .{}, .digest = types.digest.checkpointSummaryDigest(mine) }, mine, "contents");
+    var a = Aggregator.init(testing.allocator, &net.committee, st, .{ .ctx = &sink, .vtable = &Sink.vt });
+    defer a.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // a certificate over another summary at the same sequence number: refused
+    const other = try mk.f(testing.allocator, 2);
+    defer testing.allocator.free(other);
+    const c_other = try mk.cert(&net, other);
+    defer testing.allocator.free(c_other);
+    try testing.expect(!try a.addCertified(arena.allocator(), c_other));
+    // our summary with a broken quorum signature: refused
+    const good = try mk.cert(&net, mine);
+    defer testing.allocator.free(good);
+    const bad = try testing.allocator.dupe(u8, good);
+    defer testing.allocator.free(bad);
+    bad[mine.len + 8 + 4] ^= 1;
+    try testing.expect(!try a.addCertified(arena.allocator(), bad));
+    try testing.expectEqual(@as(?u64, 11), st.highestCertified());
+    try testing.expectEqual(@as(u32, 0), sink.n);
+    // the matching, verifying certificate certifies 12 and reaches the sink once
+    try testing.expect(try a.addCertified(arena.allocator(), good));
+    try testing.expectEqual(@as(?u64, 12), st.highestCertified());
+    try testing.expectEqual(@as(u32, 1), sink.n);
+    try testing.expectEqual(@as(u64, 12), sink.seq);
+    // nothing built at 13: the same bytes again do nothing
+    try testing.expect(!try a.addCertified(arena.allocator(), good));
+    try testing.expectEqual(@as(u32, 1), sink.n);
 }

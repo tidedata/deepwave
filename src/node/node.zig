@@ -545,6 +545,16 @@ pub const mainnet_chain_id: [32]u8 = blk: {
     break :blk serve.b58.decode32(mainnet_chain_id_b58).?;
 };
 
+/// A binary that wraps deepwave's main (an embedder) learns when the node is built and when it
+/// stops: `started` runs once `Node.init` returned, before the node syncs and serves, and
+/// `stopping` once `run` returned. Set before main runs; null in deepwave.
+pub const Embedder = struct {
+    ctx: *anyopaque,
+    started: *const fn (ctx: *anyopaque, n: *Node) anyerror!void,
+    stopping: *const fn (ctx: *anyopaque) void,
+};
+pub var embedder: ?Embedder = null;
+
 /// Set by SIGINT/SIGTERM; `signals` counts them (a second one skips the RPC drain).
 pub var stop_signal: Atomic(bool) = .init(false);
 pub var signals: Atomic(u32) = .init(0);
@@ -1015,6 +1025,8 @@ pub const Node = struct {
         if (envU32("ZUI_AGE_SERIAL", 0) != 0) scfg.age_serial = true;
         // The ager's memory (`--age-mem-mb`, ZUI_AGE_MEM_MB): pending set, live set, buffers.
         scfg.age_mem_bytes = @as(u64, envU32("ZUI_AGE_MEM_MB", @intCast(scfg.age_mem_bytes >> 20))) << 20;
+        // Locked time a background age-out step may take (ZUI_AGE_STEP_MS; 0: bytes only).
+        scfg.age_step_ms = envU32("ZUI_AGE_STEP_MS", @intCast(scfg.age_step_ms));
         // Segment pass with a live set (lane ager-segment-pass), off by default: one sequential
         // pass over the live table instead of a lookup per record of every aged segment.
         // ZUI_AGE_SET_MB: memory for its bits.
@@ -1525,13 +1537,22 @@ pub const Node = struct {
         return info.syncCommittee(arena) catch null;
     }
 
-    /// What the serve ports answer with: the forwarding handler of an edge with a core upstream,
-    /// else the service's own.
-    pub fn serveHandler(n: *Node) serve.h2.Handler {
+    /// What serve port `l` answers with: the forwarding handler of an edge with a core upstream,
+    /// else the service's own, behind the gate when `--gate-scope` covers `l`.
+    pub fn serveHandler(n: *Node, l: gate_mod.Listener) serve.h2.Handler {
         // With `--gate`, a forwarder asks the gate itself, before it routes (`gate_hook`); a
-        // node without one has the gate as a wrapper around the service.
+        // node without one has the gate as a wrapper around the service. (`--gate-scope
+        // serve-tls` is refused with a forwarder at the start.)
         if (n.edge_fwd) |f| return f.handler();
-        return if (n.gate != null) n.gate_handler else n.service.handler();
+        if (n.gate == null) return n.service.handler();
+        return n.cfg.gate.?.scope.pick(l, n.gate_handler, n.service.handler());
+    }
+
+    /// Whether the gate is in front of listener `l` (`--gate` and `--gate-scope`).
+    fn gateCovers(n: *const Node, l: gate_mod.Listener) bool {
+        if (n.gate == null) return false;
+        const gs = n.cfg.gate orelse return false;
+        return gs.scope.covers(l);
     }
 
     /// The first epoch whose start the store's live set covers in full: the epoch after a
@@ -3801,14 +3822,14 @@ pub const Node = struct {
         };
         n.native_certs = certs;
         if (files != null) installReloadSignal();
-        n.native_listener = try native.listener.Listener.start(n.gpa, n.io, .{ .listen = addr, .identity_seed = id_seed, .certs = certs, .slow_worker_exit = simulate.api.releaseThreadCaches, .feed_workers = n.cfg.native_feed_workers, .feed_queue = n.cfg.native_feed_queue, .gate = if (n.gate) |ng| ng.nativeHook() else null }, &n.native_disp);
-        // The HTTP form of zui/1 has no gate in front of it yet: with `--gate` it stays off,
-        // so nothing a gated node serves goes around the gate.
-        if (n.gate != null and n.cfg.native_http_rpc) std.log.warn("gate: --native-http-rpc is off while --gate is on (POST /zui1/rpc is not behind the gate)", .{});
+        n.native_listener = try native.listener.Listener.start(n.gpa, n.io, .{ .listen = addr, .identity_seed = id_seed, .certs = certs, .slow_worker_exit = simulate.api.releaseThreadCaches, .feed_workers = n.cfg.native_feed_workers, .feed_queue = n.cfg.native_feed_queue, .gate = if (n.gate) |ng| (if (n.gateCovers(.native)) ng.nativeHook() else null) else null }, &n.native_disp);
+        // The HTTP form of zui/1 has no gate in front of it yet: with the gate on zui/1 it
+        // stays off, so nothing a gated listener serves goes around the gate.
+        if (n.gateCovers(.native) and n.cfg.native_http_rpc) std.log.warn("gate: --native-http-rpc is off while --gate is on (POST /zui1/rpc is not behind the gate)", .{});
         const hash = certs.cur.sha256;
         // GET http://ADDR/native/cert-hash on TCP at the same address (CORS, for dapps in dev)
         switch (addr) {
-            .ip4 => |a4| n.native_certhttp = native.certhttp.Server.startCerts(n.gpa, a4.bytes, a4.port, certs, if (n.cfg.native_http_rpc and n.gate == null) &n.native_disp else null) catch |e| blk: {
+            .ip4 => |a4| n.native_certhttp = native.certhttp.Server.startCerts(n.gpa, a4.bytes, a4.port, certs, if (n.cfg.native_http_rpc and !n.gateCovers(.native)) &n.native_disp else null) catch |e| blk: {
                 std.log.warn("zui/1: /native/cert-hash not served on tcp {s}: {s}", .{ text, @errorName(e) });
                 break :blk null;
             },
@@ -3952,7 +3973,7 @@ pub const Node = struct {
             f.gate_hook = ng.forwardHook();
             f.meter_hook = ng.meterHook();
         }
-        std.log.info("gate: on, edge id {s}, state in {s}, {d} trusted prox{s}; keyless callers get the free tier", .{ gs.edge_id, gs.dir, gs.proxies.len, if (gs.proxies.len == 1) "y" else "ies" });
+        std.log.info("gate: on ({s}), edge id {s}, state in {s}, {d} trusted prox{s}; keyless callers get the free tier", .{ gs.scope.label(), gs.edge_id, gs.dir, gs.proxies.len, if (gs.proxies.len == 1) "y" else "ies" });
     }
 
     fn serveTlsMain(n: *Node) void {
@@ -3960,7 +3981,7 @@ pub const Node = struct {
         sopts.poll_accept = n.cfg.handoff_sock != null;
         sopts.stop_grace_ns = @as(u64, n.cfg.drain_ms) * std.time.ns_per_ms;
         sopts.tls = n.serve_tls.acceptor();
-        serve.stream_conn.serveBlocking(n.gpa, n.io, &n.serve_tls_server.?, sopts, n.serveHandler(), &n.serve_stop) catch |e| {
+        serve.stream_conn.serveBlocking(n.gpa, n.io, &n.serve_tls_server.?, sopts, n.serveHandler(.serve_tls), &n.serve_stop) catch |e| {
             if (!n.stopping.load(.acquire)) std.log.err("serve-tls: {s}", .{@errorName(e)});
         };
     }
@@ -3969,7 +3990,7 @@ pub const Node = struct {
         var sopts = n.cfg.serve_opts;
         sopts.poll_accept = n.cfg.handoff_sock != null;
         sopts.stop_grace_ns = @as(u64, n.cfg.drain_ms) * std.time.ns_per_ms;
-        serve.stream_conn.serveBlocking(n.gpa, n.io, &n.serve_server.?, sopts, n.serveHandler(), &n.serve_stop) catch |e| {
+        serve.stream_conn.serveBlocking(n.gpa, n.io, &n.serve_server.?, sopts, n.serveHandler(.serve), &n.serve_stop) catch |e| {
             if (!n.stopping.load(.acquire)) std.log.err("serve: {s}", .{@errorName(e)});
         };
     }
@@ -4202,6 +4223,11 @@ pub const Node = struct {
         // The edge feed queue: what it holds now, and the feed requests refused, by reason (a
         // client over its share of a full queue; a full queue with nobody over a share).
         if (n.native_listener) |nl| try nl.feed_stats.render(w, "zui_native_feed");
+        // Congestion windows and round-trip times of the zui/1 and WebTransport connections.
+        if (n.native_listener) |nl| try nl.cc_stats.render(w);
+        // The I/O thread's longest pass and the work it hands to workers (read queue,
+        // subscription frames, shared pre-state).
+        if (n.native_listener) |nl| try nl.renderWork(w);
         // The ledger-history index against the store's window: what List* can answer, and the
         // checkpoints the store serves that the index does not hold (0 on a healthy node).
         if (n.ledger_history) |h| if (n.st.committed()) |tip| {
@@ -4310,7 +4336,7 @@ pub const Node = struct {
             // Age-out by data type: dead records turned into holes, sidecar bytes written, old
             // frames punched (fallocate), and the superseded locations the passes still wait on.
             const ast = &n.st.age_stats;
-            inline for (.{ "steps", "groups_rewritten", "chunks_rewritten", "records_dropped", "bytes_dropped", "phys_written", "phys_punched", "pending_full", "pending_prunes", "pending_behind", "handoff_waits", "deferred", "bulk_runs", "warm_groups", "warm_pages", "warm_uring_pages", "warm_fallback_pages", "warm_errors", "lookups", "lookups_cold", "seg_passes", "set_builds", "set_pages", "set_marked", "set_kept", "set_groups_skipped", "set_chunks_skipped", "set_dead", "set_restarts", "set_inexact", "set_misses", "set_links", "link_kept" }) |name| {
+            inline for (.{ "steps", "groups_rewritten", "chunks_rewritten", "records_dropped", "bytes_dropped", "phys_written", "phys_punched", "pending_full", "pending_prunes", "pending_behind", "pending_forgot", "pending_spilled", "pending_spills", "pending_loads", "pending_disk_errors", "pending_active_spills", "step_cuts", "slow_steps", "seg_read", "seg_load_cuts", "seg_tails", "handoff_waits", "deferred", "bulk_runs", "warm_groups", "warm_pages", "warm_uring_pages", "warm_fallback_pages", "warm_errors", "lookups", "lookups_cold", "seg_passes", "set_builds", "set_pages", "set_marked", "set_kept", "set_groups_skipped", "set_chunks_skipped", "set_dead", "set_restarts", "set_inexact", "set_misses", "set_links", "link_kept" }) |name| {
                 try w.print("# TYPE zui_store_age_{s} counter\nzui_store_age_{s} {d}\n", .{ name, name, @field(ast, name).load(.monotonic) });
             }
             // Deferred age-out: 1 while the node is far behind the tip, and the logical bytes of
@@ -4318,6 +4344,8 @@ pub const Node = struct {
             try w.print("# TYPE zui_store_age_behind gauge\nzui_store_age_behind {d}\n# TYPE zui_store_age_backlog_bytes gauge\nzui_store_age_backlog_bytes {d}\n", .{
                 @intFromBool(n.st.age_behind.load(.monotonic)), ast.backlog.load(.monotonic),
             });
+            try w.print("# TYPE zui_store_age_max_commit_ms gauge\nzui_store_age_max_commit_ms {d}\n# TYPE zui_store_age_max_sync_ms gauge\nzui_store_age_max_sync_ms {d}\n", .{ ast.max_commit_ns.load(.monotonic) / std.time.ns_per_ms, ast.max_sync_ns.load(.monotonic) / std.time.ns_per_ms });
+            try w.print("# TYPE zui_store_age_pending_mem_entries gauge\nzui_store_age_pending_mem_entries {d}\n# TYPE zui_store_age_pending_files gauge\nzui_store_age_pending_files {d}\n# TYPE zui_store_age_pending_disk_bytes gauge\nzui_store_age_pending_disk_bytes {d}\n", .{ ast.pending_mem_entries.load(.monotonic), ast.pending_files.load(.monotonic), ast.pending_disk_bytes.load(.monotonic) });
             try w.print("# TYPE zui_store_age_pending gauge\nzui_store_age_pending {d}\n# TYPE zui_store_age_max_step_ms gauge\nzui_store_age_max_step_ms {d}\n# TYPE zui_store_age_failed gauge\nzui_store_age_failed {d}\n", .{
                 ast.pending.load(.monotonic), ast.max_step_ns.load(.monotonic) / std.time.ns_per_ms, @intFromBool(ast.failed.load(.monotonic)),
             });

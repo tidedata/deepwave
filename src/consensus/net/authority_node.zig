@@ -85,11 +85,16 @@ pub const Options = struct {
     observe_only: bool = false,
     /// Safety: by default the authority refuses a committee (or listen address) that is not
     /// loopback/private, so it cannot reach a real network by accident. The validator sets this
-    /// only when its gate (validator/gate.zig) returned `Mode.unaudited`; never otherwise.
+    /// only when its gate (validator/gate.zig) returned `Mode.network` (`--sign-network` naming this chain); never otherwise.
     allow_non_local: bool = false,
     /// Authorities this process started before this one (0 on the first boot). Rust syncs the
     /// last known own block only when it is 0; later boots (epoch changes) propose at once.
     boot_counter: u64 = 0,
+    /// A floor for the last known own proposed round: the signer's block watermark for this
+    /// epoch. A block signed just before a crash may never have reached the store (nor any peer),
+    /// so neither recovery nor the own-block sync knows its round, and proposing at or below it
+    /// again would be refused by the signer. 0: no floor (zui-only; Rust has no signer watermark).
+    min_known_proposed_round: types.Round = 0,
     verify_tiles: u8 = 2,
     /// Tests: an in-memory store and a driver replace LogStore and consensus.Core.
     store_override: ?Store = null,
@@ -242,6 +247,10 @@ pub const ConsensusAuthority = struct {
     commit_syncer: ?*sync.CommitSyncer = null,
     prober: ?*sync.RoundProber = null,
     pending: std.ArrayList(PendingCommits) = .empty,
+    /// Diagnostics: pushes the sink refused, and the last commit index it took.
+    refused_pushes: u64 = 0,
+    core_failed: std.atomic.Value(bool) = .init(false),
+    delivered_through: types.CommitIndex = 0,
     /// This epoch's genesis block refs (the block verifier borrows them).
     genesis_refs: []types.BlockRef = &.{},
     /// Written by the core thread before `startup_failed` is set (release); read after (acquire).
@@ -471,6 +480,17 @@ pub const ConsensusAuthority = struct {
         return a.shared.published.commit_index.load(.acquire);
     }
 
+    /// True once the core thread stopped on an error: the node no longer proposes or commits and
+    /// the owner should exit so a restart recovers from the store.
+    pub fn coreFailed(a: *const ConsensusAuthority) bool {
+        return a.core_failed.load(.acquire);
+    }
+
+    /// Last commit index handed to the CommitSink (racy read; diagnostics).
+    pub fn deliveredThrough(a: *const ConsensusAuthority) types.CommitIndex {
+        return @atomicLoad(types.CommitIndex, &a.delivered_through, .monotonic);
+    }
+
     pub fn lastProposedRound(a: *const ConsensusAuthority) types.Round {
         return a.shared.published.last_proposed.load(.acquire);
     }
@@ -501,6 +521,7 @@ pub const ConsensusAuthority = struct {
             } else {
                 log.err("core thread failed: {s}", .{@errorName(e)});
                 if (@errorReturnTrace()) |t| std.debug.dumpErrorReturnTrace(t);
+                a.core_failed.store(true, .release);
             }
             // A failed core must not leave the node half alive.
             a.shared.stopping.store(true, .release);
@@ -545,7 +566,9 @@ pub const ConsensusAuthority = struct {
                         try d.vtable.add_certified_commits(d.ctx, step_arena.allocator(), c.commits, c.blocks, c.certifier_rejects, &out);
                     },
                     .propagation_delay => |p| propagation_delay = p,
-                    .last_known_round => |r| {
+                    .last_known_round => |r0| {
+                        const r = @max(r0, a.options.min_known_proposed_round);
+                        if (r != r0) log.info("last known own round {d} raised to the signer watermark {d}", .{ r0, r });
                         d.vtable.set_last_known_proposed_round(d.ctx, r);
                         s.may_propose.store(true, .release);
                         try d.vtable.try_propose(d.ctx, step_arena.allocator(), true, .{ .propagation_delay = propagation_delay }, &out);
@@ -631,7 +654,12 @@ pub const ConsensusAuthority = struct {
         while (a.pending.items.len > 0) {
             const p = &a.pending.items[0];
             while (p.next < p.items.len) {
-                if (!a.options.commit_sink.push(&p.items[p.next].sub_dag)) return;
+                if (!a.options.commit_sink.push(&p.items[p.next].sub_dag)) {
+                    a.refused_pushes += 1;
+                    if (a.refused_pushes % 1000 == 1) log.warn("commit sink refused commit {d} ({d} refusals)", .{ p.items[p.next].sub_dag.commit_ref.index, a.refused_pushes });
+                    return;
+                }
+                @atomicStore(types.CommitIndex, &a.delivered_through, p.items[p.next].sub_dag.commit_ref.index, .monotonic);
                 p.items[p.next].deinit();
                 p.next += 1;
             }

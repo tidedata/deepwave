@@ -2,10 +2,14 @@
 //! every QUIC connection (net/conn.zig server role, demultiplexed by our connection id, the same
 //! shape as net/server.zig's anemo listener). ALPN picks the stack: `zui/1` streams carry the
 //! protocol directly; `h3` connections run the HTTP/3 + WebTransport session (h3.zig) and the
-//! protocol rides WT streams. Requests are answered on the I/O thread from one store snapshot
-//! each (store reads are zero-copy); subscriptions are pulled per checkpoint while the data
-//! stream's backlog is small.
+//! protocol rides WT streams. The I/O thread does socket work, the QUIC connections and the
+//! streams, and never reads the store: a store read can wait on a page fault, and while the I/O
+//! thread waits no datagram is read, no ACK processed and nothing sent, for every connection.
+//! Requests are answered on worker pools (jobs.zig: reads, slow methods, the edge feed), and
+//! subscriptions' frames are produced on workers (subjobs.zig) while the data stream's backlog
+//! is small; the I/O thread writes the finished bytes to their streams.
 const std = @import("std");
+const tcache = @import("core").threads;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
@@ -22,6 +26,7 @@ const certs_mod = @import("certs.zig");
 const jobs_mod = @import("jobs.zig");
 const fairq = @import("fairq.zig");
 const gate_mod = @import("gate.zig");
+const subjobs = @import("subjobs.zig");
 
 pub const alpns = [_][]const u8{ proto.alpn, "h3" };
 
@@ -55,6 +60,13 @@ pub const Options = struct {
     feed_workers: usize = 4,
     feed_queue: usize = 64,
     feed_min_share: usize = 2,
+    /// Worker threads and queue depth for every other request (reads: objects, transactions,
+    /// checkpoints, index queries, hello), divided between clients like the feed queue.
+    read_workers: usize = 4,
+    read_queue: usize = 1024,
+    read_min_share: usize = 8,
+    /// Worker threads that produce subscription frames (subjobs.zig).
+    sub_workers: usize = 2,
     /// Run on each slow worker before it exits (the simulate engine's thread caches).
     slow_worker_exit: ?*const fn () void = null,
     /// Half-open connections above which a new client must come back with a Retry token
@@ -123,6 +135,88 @@ pub const Stats = struct {
     io_passes: Atomic(u64) = .init(0),
     io_polls: Atomic(u64) = .init(0),
     io_cpu_ns: Atomic(u64) = .init(0),
+    /// Wall time the I/O thread spent in passes (from its receive returning to the pass's end),
+    /// and its major page faults (Linux; sampled every 64 passes). Faults here mean something
+    /// on the I/O thread read cold memory: the stall that holds every connection.
+    io_busy_ns: Atomic(u64) = .init(0),
+    io_major_faults: Atomic(u64) = .init(0),
+};
+
+fn threadMajorFaults() u64 {
+    if (comptime @import("builtin").os.tag != .linux) return 0;
+    var ru: std.os.linux.rusage = undefined;
+    if (std.os.linux.getrusage(1, &ru) != 0) return 0; // RUSAGE_THREAD
+    return @intCast(@max(ru.majflt, 0));
+}
+
+/// Congestion state of the listener's connections (zui/1 and WebTransport), sampled by the I/O
+/// thread every 64 passes. Gauges are the connections open at the sample; the counters add
+/// those of closed connections, so they only rise. Rendered as `zui_native_cc_*`.
+pub const CcStats = struct {
+    /// Connections in the sample, the largest congestion window among them (bytes) and the
+    /// largest smoothed round-trip time (ms).
+    conns: Atomic(u64) = .init(0),
+    cwnd_max: Atomic(u64) = .init(0),
+    srtt_max_ms: Atomic(u64) = .init(0),
+    /// Connections whose smoothed round-trip time is at most each bound (ms), cumulative.
+    srtt_le: [srtt_bounds.len]Atomic(u64) = @splat(.init(0)),
+    /// ACKs that acknowledged data; those that found the sender application-limited (the
+    /// window did not grow on them); those after which `max_cwnd` held the window down.
+    acks: Atomic(u64) = .init(0),
+    acks_app_limited: Atomic(u64) = .init(0),
+    cwnd_capped: Atomic(u64) = .init(0),
+    /// I/O thread only: what closed connections counted.
+    closed: [3]u64 = @splat(0),
+
+    pub const srtt_bounds = [_]u64{ 50, 100, 250, 500, 1000, 2000 };
+
+    fn sample(s: *CcStats, slots: *const std.AutoHashMapUnmanaged(u64, *Slot)) void {
+        var n: u64 = 0;
+        var cwnd: u64 = 0;
+        var srtt: u64 = 0;
+        var le: [srtt_bounds.len]u64 = @splat(0);
+        var tot = s.closed;
+        var it = slots.valueIterator();
+        while (it.next()) |sp| {
+            const c = sp.*.conn;
+            tot[0] += c.acks;
+            tot[1] += c.acks_app_limited;
+            tot[2] += c.cwnd_capped;
+            if (sp.*.kind == .pending or !c.isEstablished()) continue;
+            n += 1;
+            cwnd = @max(cwnd, c.cwnd);
+            const r = c.srtt / std.time.ns_per_ms;
+            srtt = @max(srtt, r);
+            for (srtt_bounds, 0..) |b, i| {
+                if (r <= b) le[i] += 1;
+            }
+        }
+        s.conns.store(n, .monotonic);
+        s.cwnd_max.store(cwnd, .monotonic);
+        s.srtt_max_ms.store(srtt, .monotonic);
+        for (&s.srtt_le, le) |*a, v| a.store(v, .monotonic);
+        s.acks.store(tot[0], .monotonic);
+        s.acks_app_limited.store(tot[1], .monotonic);
+        s.cwnd_capped.store(tot[2], .monotonic);
+    }
+
+    fn noteClosed(s: *CcStats, c: *const conn_mod.Connection) void {
+        s.closed[0] += c.acks;
+        s.closed[1] += c.acks_app_limited;
+        s.closed[2] += c.cwnd_capped;
+    }
+
+    pub fn render(s: *const CcStats, w: *std.Io.Writer) !void {
+        try w.print("# HELP zui_native_cc_connections established zui/1 and WebTransport connections at the last sample\n# TYPE zui_native_cc_connections gauge\nzui_native_cc_connections {d}\n", .{s.conns.load(.monotonic)});
+        try w.print("# HELP zui_native_cc_cwnd_max_bytes largest congestion window among them\n# TYPE zui_native_cc_cwnd_max_bytes gauge\nzui_native_cc_cwnd_max_bytes {d}\n", .{s.cwnd_max.load(.monotonic)});
+        try w.print("# HELP zui_native_cc_srtt_max_ms largest smoothed round-trip time among them\n# TYPE zui_native_cc_srtt_max_ms gauge\nzui_native_cc_srtt_max_ms {d}\n", .{s.srtt_max_ms.load(.monotonic)});
+        try w.writeAll("# HELP zui_native_cc_srtt_ms connections whose smoothed round-trip time is at most le ms\n# TYPE zui_native_cc_srtt_ms gauge\n");
+        for (srtt_bounds, 0..) |b, i| try w.print("zui_native_cc_srtt_ms{{le=\"{d}\"}} {d}\n", .{ b, s.srtt_le[i].load(.monotonic) });
+        try w.print("zui_native_cc_srtt_ms{{le=\"+Inf\"}} {d}\n", .{s.conns.load(.monotonic)});
+        try w.print("# HELP zui_native_cc_acks ACKs that acknowledged data\n# TYPE zui_native_cc_acks counter\nzui_native_cc_acks {d}\n", .{s.acks.load(.monotonic)});
+        try w.print("# HELP zui_native_cc_acks_app_limited of those, ACKs that found the sender application-limited (no window growth)\n# TYPE zui_native_cc_acks_app_limited counter\nzui_native_cc_acks_app_limited {d}\n", .{s.acks_app_limited.load(.monotonic)});
+        try w.print("# HELP zui_native_cc_cwnd_capped ACKs after which the window was held at the hard bound\n# TYPE zui_native_cc_cwnd_capped counter\nzui_native_cc_cwnd_capped {d}\n", .{s.cwnd_capped.load(.monotonic)});
+    }
 };
 
 fn threadCpuNs() u64 {
@@ -199,6 +293,10 @@ const Sub = struct {
     last_match_ms: u64 = 0,
     /// Access gate: the subscription's ticket (its stream slot) until it ends.
     gate: ?gate_mod.Ticket = null,
+    /// A worker is producing its next frames (subjobs.zig): one at a time, in order.
+    busy: bool = false,
+    /// Access gate: frames delivered since the gate was last told.
+    gate_frames: u64 = 0,
 };
 
 const CIo = struct {
@@ -242,6 +340,7 @@ pub const Listener = struct {
     sock: Io.net.Socket,
     stop_flag: Atomic(bool) = .init(false),
     io_thread: ?std.Thread = null,
+    watchdog_thread: ?std.Thread = null,
     slots: std.AutoHashMapUnmanaged(u64, *Slot) = .empty,
     next_sub: u64 = 1,
     keys: sub.KeyCache,
@@ -254,8 +353,17 @@ pub const Listener = struct {
     req_arena: std.heap.ArenaAllocator = undefined,
     jobs: ?*jobs_mod.Jobs = null,
     feed_jobs: ?*jobs_mod.Jobs = null,
+    read_jobs: ?*jobs_mod.Jobs = null,
+    /// The read queue now, and what it refused (`zui_native_read_queue_*`).
+    read_stats: fairq.Stats = .{},
+    sub_jobs: ?*subjobs.Pool = null,
+    sub_stats: subjobs.Stats = .{},
+    /// The longest I/O pass in the last 10 to 20 s (ns), for `zui_native_io_stall_max_ms`.
+    io_stall_max_ns: Atomic(u64) = .init(0),
     /// The feed queue now, and what it refused (`zui_native_feed_queue_*`).
     feed_stats: fairq.Stats = .{},
+    /// Congestion windows and round-trip times of the connections (`zui_native_cc_*`).
+    cc_stats: CcStats = .{},
     /// I/O thread only: Retry tokens, and connections whose handshake is not finished.
     guard: net.retry.Guard = undefined,
     half_open: usize = 0,
@@ -289,11 +397,16 @@ pub const Listener = struct {
         o.early_settings = envSwitch("ZUI_NATIVE_EARLY_SETTINGS", o.early_settings);
         if (o.pacing or o.hystart or o.cubic or o.pmtud or o.iw_mtu or o.bbr or o.early_settings)
             std.log.info("native: QUIC sender switches: pacing={} hystart={} cubic={} pmtud={} iw_mtu={} bbr={} early_settings={}", .{ o.pacing, o.hystart, o.cubic, o.pmtud, o.iw_mtu, o.bbr, o.early_settings });
-        l.* = .{ .gpa = gpa, .io = io, .opts = o, .disp = disp, .sock = sock, .keys = .init(gpa), .us = .init(sock.handle), .tx = tx, .rx = rx, .req_arena = .init(gpa) };
+        l.* = .{ .gpa = gpa, .io = io, .opts = o, .disp = disp, .sock = sock, .keys = .init(gpa, io), .us = .init(sock.handle), .tx = tx, .rx = rx, .req_arena = .init(gpa) };
         var gk: [32]u8 = undefined;
         io.random(&gk);
         l.guard = net.retry.Guard.init(gk);
+        // the pools the watchdog looks at exist from the start, every worker running: a fixed
+        // set of threads, none started per request or per subscription batch
+        (l.readJobs() orelse return error.OutOfMemory).startWorkers();
+        (l.subJobs() orelse return error.OutOfMemory).startWorkers();
         l.io_thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, ioLoop, .{l});
+        l.watchdog_thread = std.Thread.spawn(.{}, watchdog, .{l}) catch null;
         return l;
     }
 
@@ -304,6 +417,7 @@ pub const Listener = struct {
     pub fn stop(l: *Listener) void {
         l.stop_flag.store(true, .release);
         if (l.io_thread) |t| t.join();
+        if (l.watchdog_thread) |t| t.join();
         l.closeAll();
         if (l.jobs) |j| {
             j.deinit();
@@ -312,6 +426,14 @@ pub const Listener = struct {
         if (l.feed_jobs) |j| {
             j.deinit();
             l.gpa.destroy(j);
+        }
+        if (l.read_jobs) |j| {
+            j.deinit();
+            l.gpa.destroy(j);
+        }
+        if (l.sub_jobs) |p| {
+            p.deinit();
+            l.gpa.destroy(p);
         }
         var it = l.slots.valueIterator();
         while (it.next()) |sp| l.freeSlot(sp.*);
@@ -364,7 +486,8 @@ pub const Listener = struct {
         // `path MTU` is the size at the end; a connection whose client went away ends in probe
         // timeouts, so the highest size it validated and the fallbacks to 1200 are named too.
         if (c.pkts_lost != 0 or c.ptos != 0)
-            std.log.info("native: connection done, {d} packets sent, {d} lost, {d} PTOs, path MTU {d} (highest {d}, {d} fallbacks), srtt {d} ms, cwnd {d}", .{ c.pkts_sent, c.pkts_lost, c.ptos, c.mtu, c.mtu_peak, c.pmtu_black_holes, c.srtt / std.time.ns_per_ms, c.cwnd });
+            std.log.info("native: connection done, {d} packets sent, {d} lost, {d} PTOs, path MTU {d} (highest {d}, {d} fallbacks), srtt {d} ms, cwnd {d}, min rtt {d} ms, app-limited acks {d} of {d}", .{ c.pkts_sent, c.pkts_lost, c.ptos, c.mtu, c.mtu_peak, c.pmtu_black_holes, c.srtt / std.time.ns_per_ms, c.cwnd, if (c.rtt_initialized) c.min_rtt / std.time.ns_per_ms else 0, c.acks_app_limited, c.acks });
+        l.cc_stats.noteClosed(c);
         s.conn.deinit();
         if (s.ident) |e| l.opts.certs.?.release(e);
         if (s.h3s) |*h| h.deinit();
@@ -384,6 +507,57 @@ pub const Listener = struct {
         l.gpa.destroy(s);
     }
 
+    /// Logs a stall where it happens: the I/O thread in one pass for 2 s or more, or the read or
+    /// subscription workers with work in flight and none of it finishing for 5 s. Looks every
+    /// 250 ms; says each stall once (and again every 10 s while it lasts) with how long so far.
+    fn watchdog(l: *Listener) void {
+        const ms = std.time.ns_per_ms;
+        var last_pass: u64 = l.stats.io_passes.load(.monotonic);
+        var pass_at = l.nowNs();
+        var said_io: u64 = 0;
+        var reads_done: u64 = 0;
+        var reads_at = pass_at;
+        var said_reads: u64 = 0;
+        var subs_done: u64 = 0;
+        var subs_at = pass_at;
+        var said_subs: u64 = 0;
+        while (!l.stop_flag.load(.acquire)) {
+            l.io.sleep(.fromMilliseconds(250), .awake) catch {};
+            const now = l.nowNs();
+            const tip = l.disp.svc.store.committed() orelse 0;
+            const pass = l.stats.io_passes.load(.monotonic);
+            if (pass != last_pass) {
+                last_pass = pass;
+                pass_at = now;
+            } else if (now - pass_at >= 2000 * ms and now - said_io >= 10_000 * ms) {
+                said_io = now;
+                std.log.warn("native: stall: the I/O thread has been in one pass for {d} ms (store tip {d})", .{ (now - pass_at) / ms, tip });
+            }
+            if (l.read_jobs) |j| {
+                const done = j.finished.load(.monotonic);
+                const inflight = j.inflightNow();
+                if (done != reads_done or inflight == 0) {
+                    reads_done = done;
+                    reads_at = now;
+                } else if (now - reads_at >= 5000 * ms and now - said_reads >= 10_000 * ms) {
+                    said_reads = now;
+                    std.log.warn("native: stall: {d} read requests in flight and none finished for {d} ms (store tip {d})", .{ inflight, (now - reads_at) / ms, tip });
+                }
+            }
+            if (l.sub_jobs) |p| {
+                const done = l.sub_stats.works.load(.monotonic);
+                const busy = p.busyNow();
+                if (done != subs_done or busy == 0) {
+                    subs_done = done;
+                    subs_at = now;
+                } else if (now - subs_at >= 5000 * ms and now - said_subs >= 10_000 * ms) {
+                    said_subs = now;
+                    std.log.warn("native: stall: {d} subscription batches queued or running and none finished for {d} ms (store tip {d})", .{ busy, (now - subs_at) / ms, tip });
+                }
+            }
+        }
+    }
+
     /// One pass: block in one batched receive until a datagram or the next timer (SO_RCVTIMEO;
     /// a timer under 10 ms away is waited for with ppoll on Linux, `udpio.Sock.waitShort`),
     /// drain the socket in batches, run every connection, then send everything queued
@@ -397,6 +571,10 @@ pub const Listener = struct {
         };
         var more = false; // a connection still had datagrams to send at the burst cap
         var last_busy: u64 = 0;
+        // the longest pass in this window and the one before (`io_stall_max_ns`)
+        var stall_cur: u64 = 0;
+        var stall_prev: u64 = 0;
+        var window_start: u64 = l.nowNs();
         const spin_ns: u64 = @as(u64, l.opts.spin_us) * std.time.ns_per_us;
         while (!l.stop_flag.load(.acquire)) {
             var now = l.nowNs();
@@ -416,8 +594,25 @@ pub const Listener = struct {
             const block = !more and !spinning and wait_ns >= std.time.ns_per_ms;
             const pass = l.stats.io_passes.fetchAdd(1, .monotonic);
             if (!block) _ = l.stats.io_polls.fetchAdd(1, .monotonic);
-            if (pass % 64 == 0) l.stats.io_cpu_ns.store(threadCpuNs(), .monotonic);
+            if (pass % 64 == 0) {
+                l.stats.io_cpu_ns.store(threadCpuNs(), .monotonic);
+                l.stats.io_major_faults.store(threadMajorFaults(), .monotonic);
+                l.cc_stats.sample(&l.slots);
+            }
             var n = l.rx.recvWait(&l.us, if (block) wait_ns else 0);
+            const pass_start = l.nowNs();
+            defer {
+                const end = l.nowNs();
+                const dt = end -| pass_start;
+                _ = l.stats.io_busy_ns.fetchAdd(dt, .monotonic);
+                stall_cur = @max(stall_cur, dt);
+                if (end -| window_start >= 10 * std.time.ns_per_s) {
+                    stall_prev = stall_cur;
+                    stall_cur = 0;
+                    window_start = end;
+                }
+                l.io_stall_max_ns.store(@max(stall_cur, stall_prev), .monotonic);
+            }
             if (n > 0) last_busy = now;
             if (n == 0 and spinning and !more) {
                 std.atomic.spinLoopHint();
@@ -455,6 +650,7 @@ pub const Listener = struct {
                 if (kv.value.kind == .pending) l.half_open -|= 1;
                 for (kv.value.reqs.keys(), kv.value.reqs.values()) |id, *r| if (r.relay) |rr| l.relayDetach(k, id, rr);
                 if (l.feed_jobs) |j| j.cancel(k); // its queued feed requests give their places back
+                if (l.read_jobs) |j| j.cancel(k);
                 l.freeSlot(kv.value);
             };
             l.relaySweep();
@@ -645,6 +841,8 @@ pub const Listener = struct {
         // slow methods finished on a worker
         if (l.jobs) |j| j.collect(s.key, JobCtx{ .l = l, .s = s }, jobDone, &l.slots);
         if (l.feed_jobs) |j| j.collect(s.key, JobCtx{ .l = l, .s = s }, jobDone, &l.slots);
+        if (l.read_jobs) |j| j.collect(s.key, JobCtx{ .l = l, .s = s }, jobDone, &l.slots);
+        if (l.sub_jobs) |p| p.collect(s.key, JobCtx{ .l = l, .s = s }, subWorkDone, &l.slots);
         // requests
         var i: usize = 0;
         while (i < s.reqs.count()) {
@@ -819,6 +1017,28 @@ pub const Listener = struct {
         return j;
     }
 
+    fn readJobs(l: *Listener) ?*jobs_mod.Jobs {
+        if (l.read_jobs) |j| return j;
+        const j = l.gpa.create(jobs_mod.Jobs) catch return null;
+        const workers = @max(l.opts.read_workers, 1);
+        j.* = .{ .gpa = l.gpa, .io = l.io, .disp = l.disp, .wake = .{ .ctx = l, .call = wakeSelf }, .workers = workers, .max_inflight = l.opts.read_queue, .may_block = false };
+        j.shares = .{ .cap = l.opts.read_queue, .workers = workers, .min_share = l.opts.read_min_share };
+        j.share_stats = &l.read_stats;
+        j.evict_message = read_refused;
+        l.read_jobs = j;
+        return j;
+    }
+
+    const read_refused = "too many requests in flight";
+
+    fn subJobs(l: *Listener) ?*subjobs.Pool {
+        if (l.sub_jobs) |p| return p;
+        const p = l.gpa.create(subjobs.Pool) catch return null;
+        p.* = .{ .gpa = l.gpa, .io = l.io, .disp = l.disp, .keys = &l.keys, .wake = .{ .ctx = l, .call = wakeSelf }, .workers = @max(l.opts.sub_workers, 1), .stats = &l.sub_stats };
+        l.sub_jobs = p;
+        return p;
+    }
+
     /// The message of RATE_LIMITED on a feed request (an edge halves its requests in flight).
     const feed_refused = "too many feed requests in flight";
 
@@ -986,9 +1206,15 @@ pub const Listener = struct {
         if (req.method == .hello) if (dispatch.helloToken(req.body)) |t| if (l.disp.hooks.auth) |au| if (au.check(au.ctx, t)) |p| {
             s.principal = p;
         };
-        l.disp.handle(a, req, s.principal, &out);
-        l.gateSettle(r, out.items);
-        l.respond(s, id, out.items);
+        // every answer reads the store: on a worker (the module comment)
+        const j = l.readJobs();
+        if (j != null and j.?.pushFor(feedClient(s.principal, &s.addr), s.key, id, s.principal, r.buf.items)) {
+            r.queued = true;
+            return;
+        }
+        l.gateSettle(r, &.{6});
+        proto.errorResponse(&out, a, .rate_limited, read_refused, &.{ 0, 0, 0, 0 }) catch return;
+        return l.respond(s, id, out.items);
     }
 
     // ------------------------------------------------------------ access gate (Options.gate)
@@ -1315,15 +1541,12 @@ pub const Listener = struct {
         };
     }
 
+    /// Runs every subscription of `s`: ends the ones the client cancelled or that lag, queues
+    /// the production of the next frames (subjobs.zig) for the ones with credit and room, and
+    /// sends heartbeats. No store read here: the frames come back through `subWorkDone`.
     fn pumpSubs(l: *Listener, s: *Slot, tip_opt: ?u64) void {
         if (s.subs.items.len == 0) return;
         const c = s.conn;
-        var snap = l.disp.svc.store.snapshot();
-        defer snap.release();
-        var arena_state = std.heap.ArenaAllocator.init(l.gpa);
-        defer arena_state.deinit();
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(l.gpa);
         var i: usize = 0;
         while (i < s.subs.items.len) {
             const sb = &s.subs.items[i];
@@ -1350,50 +1573,31 @@ pub const Listener = struct {
                 l.endSub(s, i, .lagged, sb.cursor -| 1);
                 continue;
             }
-            var budget: u32 = 64;
-            var failed: ?anyerror = null;
-            const delivered0 = sb.delivered;
-            while (budget > 0 and sb.cursor <= tip and c.streamUnsent(sb.data) < l.opts.sub_backlog) : (budget -= 1) {
-                if (sb.credit_on and sb.delivered >= sb.granted) break; // out of credit
-                // An edge: the frames of this checkpoint would carry a certificate that is not
-                // its core's (a Checkpoint frame, or the Proof of a verified match).
-                if ((sb.req.filter == .checkpoints or sb.req.verify) and l.disp.withholdSeq(sb.cursor)) {
-                    failed = error.ForeignCertificate;
-                    break;
-                }
-                const rec = snap.checkpoint(sb.cursor) orelse break;
-                _ = arena_state.reset(.retain_capacity);
-                out.clearRetainingCapacity();
-                const n = sub.produce(l.gpa, arena_state.allocator(), l.disp.svc, &snap, &l.keys, &sb.req, rec, &out) catch |e| {
-                    failed = e;
-                    break;
+            if (!sb.busy and sb.cursor <= tip) {
+                const unsent = c.streamUnsent(sb.data);
+                const credit: u64 = if (sb.credit_on) sb.granted -| sb.delivered else std.math.maxInt(u64);
+                const max_cps = @min(@as(u64, 64), credit);
+                if (unsent < l.opts.sub_backlog and max_cps > 0) if (l.subJobs()) |p| {
+                    if (p.push(s.key, sb.id, &sb.req, sb.cursor, tip, max_cps, l.opts.sub_backlog - unsent)) sb.busy = true;
                 };
-                c.streamWrite(sb.data, out.items, false) catch break;
-                _ = l.stats.sub_frames.fetchAdd(1, .monotonic);
-                sb.cursor += 1;
-                sb.delivered += 1;
-                if (n > 0) sb.last_match_ms = l.nowMs();
-            }
-            if (failed) |e| {
-                // A checkpoint whose frames cannot be built (say its input objects are not held)
-                // would stall the stream forever: end it, naming the last checkpoint delivered.
-                std.log.warn("zui/1 subscription: checkpoint {d}: {s}; ending it (UNAVAILABLE)", .{ sb.cursor, @errorName(e) });
-                l.endSub(s, i, .unavailable, sb.cursor -| 1);
-                continue;
             }
             if (l.opts.gate) |g| if (sb.gate) |*t| {
                 // counts the frames and asks whether the caller may keep the stream
-                if (g.stream_frames(g.ctx, t, s.gate_key, @intCast(sb.delivered - delivered0))) |refusal| {
+                const frames = sb.gate_frames;
+                sb.gate_frames = 0;
+                if (g.stream_frames(g.ctx, t, s.gate_key, @intCast(frames))) |refusal| {
                     l.endSub(s, i, refusal.code, sb.cursor -| 1);
                     continue;
                 }
             };
-            if (sb.live and sb.req.filter != .checkpoints) {
+            // a heartbeat only between checkpoints: never while frames up to the tip are coming
+            if (sb.live and !sb.busy and sb.cursor > tip and sb.req.filter != .checkpoints) {
                 const now = l.nowMs();
                 if (now -| sb.last_match_ms >= heartbeat_ms) {
                     var hb: [8]u8 = undefined;
                     std.mem.writeInt(u64, &hb, tip, .little);
-                    out.clearRetainingCapacity();
+                    var out: std.ArrayList(u8) = .empty;
+                    defer out.deinit(l.gpa);
                     proto.frame(&out, l.gpa, .heartbeat, &hb) catch {};
                     c.streamWrite(sb.data, out.items, false) catch {};
                     sb.last_match_ms = now;
@@ -1402,6 +1606,56 @@ pub const Listener = struct {
             if (ds.?.send_buf.items.len > 4 * l.opts.sub_backlog) c.streamTrim(sb.data);
             i += 1;
         }
+    }
+
+    /// A worker's frames for a subscription (subjobs.zig): written to its data stream in one
+    /// piece, the cursor moved past them; a checkpoint whose frames could not be built ends it.
+    fn subWorkDone(ctx: JobCtx, w: *subjobs.Work) void {
+        const l = ctx.l;
+        const s = ctx.s;
+        const i = for (s.subs.items, 0..) |*x, k| {
+            if (x.id == w.sub_id) break k;
+        } else return; // the subscription ended meanwhile
+        const sb = &s.subs.items[i];
+        sb.busy = false;
+        if (w.start != sb.cursor) return;
+        if (w.out.items.len > 0) s.conn.streamWrite(sb.data, w.out.items, false) catch return;
+        _ = l.stats.sub_frames.fetchAdd(w.produced, .monotonic);
+        sb.cursor += w.produced;
+        sb.delivered += w.produced;
+        sb.gate_frames += w.produced;
+        if (w.matched) sb.last_match_ms = l.nowMs();
+        if (w.failed) |e| {
+            // A checkpoint whose frames cannot be built (say its input objects are not held)
+            // would stall the stream forever: end it, naming the last checkpoint delivered.
+            std.log.warn("zui/1 subscription: checkpoint {d}: {s}; ending it (UNAVAILABLE)", .{ sb.cursor, @errorName(e) });
+            l.endSub(s, i, .unavailable, sb.cursor -| 1);
+        }
+    }
+
+    /// The I/O thread's health and the work it hands to workers (`zui_native_*`, node metrics).
+    pub fn renderWork(l: *Listener, w: *std.Io.Writer) !void {
+        try w.print("# TYPE zui_native_io_stall_max_ms gauge\nzui_native_io_stall_max_ms {d}\n", .{l.io_stall_max_ns.load(.monotonic) / std.time.ns_per_ms});
+        try l.read_stats.render(w, "zui_native_read");
+        const ks = &l.keys.stats;
+        try w.print("# TYPE zui_native_prestate_hits counter\nzui_native_prestate_hits {d}\n", .{ks.hits.load(.monotonic)});
+        try w.print("# TYPE zui_native_prestate_coalesced counter\nzui_native_prestate_coalesced {d}\n", .{ks.coalesced.load(.monotonic)});
+        try w.print("# TYPE zui_native_prestate_misses counter\nzui_native_prestate_misses {d}\n", .{ks.misses.load(.monotonic)});
+        try w.print("# TYPE zui_native_prestate_compute_ns counter\nzui_native_prestate_compute_ns {d}\n", .{ks.compute_ns.load(.monotonic)});
+        try w.print("# TYPE zui_native_prestate_compute_max_ms gauge\nzui_native_prestate_compute_max_ms {d}\n", .{ks.compute_max_ns.load(.monotonic) / std.time.ns_per_ms});
+        const ps = &l.sub_stats;
+        try w.print("# TYPE zui_native_sub_work_queue_depth gauge\nzui_native_sub_work_queue_depth {d}\n", .{ps.queued.load(.monotonic)});
+        try w.print("# TYPE zui_native_sub_works counter\nzui_native_sub_works {d}\n", .{ps.works.load(.monotonic)});
+        try w.print("# TYPE zui_native_sub_work_ns counter\nzui_native_sub_work_ns {d}\n", .{ps.produce_ns.load(.monotonic)});
+        try w.print("# TYPE zui_native_sub_work_max_ms gauge\nzui_native_sub_work_max_ms {d}\n", .{ps.produce_max_ns.load(.monotonic) / std.time.ns_per_ms});
+        // process-wide: kept threads (core/threads.zig) and every thread of the process; a
+        // started count that keeps climbing is a thread per task somewhere
+        const ts = &tcache.stats;
+        try w.print("# TYPE zui_kept_threads gauge\nzui_kept_threads {d}\n", .{ts.threads.load(.monotonic)});
+        try w.print("# TYPE zui_kept_threads_parked gauge\nzui_kept_threads_parked {d}\n", .{ts.parked.load(.monotonic)});
+        try w.print("# TYPE zui_kept_threads_started counter\nzui_kept_threads_started {d}\n", .{ts.started.load(.monotonic)});
+        try w.print("# TYPE zui_kept_threads_reused counter\nzui_kept_threads_reused {d}\n", .{ts.reused.load(.monotonic)});
+        if (tcache.processThreads()) |n| try w.print("# TYPE zui_process_threads gauge\nzui_process_threads {d}\n", .{n});
     }
 };
 

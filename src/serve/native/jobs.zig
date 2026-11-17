@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const proto = @import("proto.zig");
 const dispatch = @import("dispatch.zig");
 const fairq = @import("fairq.zig");
+const bufs_mod = @import("bufs.zig");
 
 pub const Job = struct {
     key: u64,
@@ -18,8 +19,10 @@ pub const Job = struct {
     principal: ?dispatch.Principal,
     /// The whole request (header and body), owned.
     req: []u8,
-    /// The whole response, owned (set by the worker).
-    out: []u8 = &.{},
+    /// The whole response (set by the worker): `buf`'s items.
+    out: []const u8 = &.{},
+    /// Holds `out`; taken from and given back to the pool's `bufs`.
+    buf: std.ArrayList(u8) = .empty,
     /// Pools with `shares`: who the job is accounted to.
     client: fairq.Key = 0,
 };
@@ -46,6 +49,14 @@ pub const Jobs = struct {
     threads: std.ArrayList(std.Thread) = .empty,
     /// Called on each worker before it exits (the simulate engine's thread caches).
     on_exit: ?*const fn () void = null,
+    /// A job may wait on a core (`dispatch.may_block`). False for the read pool: its requests
+    /// keep the answers they had on the I/O thread (a marked certificate: UNAVAILABLE, retry).
+    may_block: bool = true,
+    /// Jobs finished by a worker (the listener's watchdog: in flight and none finishing).
+    finished: std.atomic.Value(u64) = .init(0),
+    /// Response buffers given back by freed jobs and taken by the workers (bufs.zig: no mmap
+    /// and munmap per response).
+    bufs: bufs_mod.Bufs = .{},
     /// The pool's queue divided between clients (fairq.zig; `pushFor` names the client). Its
     /// `cap` is the limit and its entries are the queue: `max_inflight` and `queue` are not
     /// used. Null: one first-come queue for everyone.
@@ -71,12 +82,23 @@ pub const Jobs = struct {
         }
         j.queue.deinit(j.gpa);
         j.done.deinit(j.gpa);
+        j.bufs.deinit(j.gpa);
     }
 
     fn free(j: *Jobs, x: *Job) void {
         j.gpa.free(x.req);
-        j.gpa.free(x.out);
+        j.bufs.give(j.gpa, j.io, &x.buf);
         j.gpa.destroy(x);
+    }
+
+    /// Starts every worker now rather than on the first jobs (a fixed set, started once).
+    pub fn startWorkers(j: *Jobs) void {
+        j.mu.lockUncancelable(j.io);
+        defer j.mu.unlock(j.io);
+        while (j.threads.items.len < j.workers) {
+            const t = std.Thread.spawn(.{ .stack_size = 64 << 20 }, worker, .{j}) catch return;
+            j.threads.append(j.gpa, t) catch return t.detach();
+        }
     }
 
     /// Queues a request; false when the pool is full or closed (the caller answers RATE_LIMITED).
@@ -138,10 +160,8 @@ pub const Jobs = struct {
 
     /// A queued job gave its place up: its answer is the one a refused push gets.
     fn refuse(j: *Jobs, x: *Job) void {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(j.gpa);
-        proto.errorResponse(&out, j.gpa, .rate_limited, j.evict_message, &.{ 0, 0, 0, 0 }) catch {};
-        x.out = j.gpa.dupe(u8, out.items) catch &.{};
+        proto.errorResponse(&x.buf, j.gpa, .rate_limited, j.evict_message, &.{ 0, 0, 0, 0 }) catch x.buf.clearRetainingCapacity();
+        x.out = x.buf.items;
         j.done.append(j.gpa, x) catch j.free(x);
     }
 
@@ -190,6 +210,13 @@ pub const Jobs = struct {
         return j.done.items.len;
     }
 
+    /// Jobs queued or running (any thread).
+    pub fn inflightNow(j: *Jobs) usize {
+        j.mu.lockUncancelable(j.io);
+        defer j.mu.unlock(j.io);
+        return j.inflight;
+    }
+
     /// Jobs no worker has taken yet (caller holds the lock).
     fn waiting(j: *const Jobs) usize {
         return if (j.shares) |*q| q.entries.items.len else j.queue.items.len;
@@ -197,6 +224,10 @@ pub const Jobs = struct {
 
     fn worker(j: *Jobs) void {
         defer if (j.on_exit) |f| f();
+        // one arena per worker for its whole life, reset between jobs: a fresh one per job
+        // grew (and on deinit unmapped) its blocks every time
+        var arena = std.heap.ArenaAllocator.init(j.gpa);
+        defer arena.deinit();
         while (true) {
             j.mu.lockUncancelable(j.io);
             while (j.waiting() == 0 and !j.closed) j.cond.waitUncancelable(j.io, &j.mu);
@@ -209,7 +240,9 @@ pub const Jobs = struct {
                 break :blk q.pop().?.item;
             } else j.queue.orderedRemove(0);
             j.mu.unlock(j.io);
-            j.run(x);
+            j.run(&arena, x);
+            _ = arena.reset(.{ .retain_with_limit = arena_keep });
+            _ = j.finished.fetchAdd(1, .monotonic);
             j.mu.lockUncancelable(j.io);
             if (j.shares) |*q| {
                 q.finish(x.client);
@@ -226,20 +259,24 @@ pub const Jobs = struct {
         }
     }
 
-    fn run(j: *Jobs, x: *Job) void {
-        var arena = std.heap.ArenaAllocator.init(j.gpa);
-        defer arena.deinit();
+    fn run(j: *Jobs, arena: *std.heap.ArenaAllocator, x: *Job) void {
         const a = arena.allocator();
         var out: std.ArrayList(u8) = .empty;
         // a worker may wait on a core (an edge passing a request on, dispatch.zig `Foreign`)
-        dispatch.may_block = true;
+        dispatch.may_block = j.may_block;
         defer dispatch.may_block = false;
         if (proto.parseRequest(x.req)) |req| {
             j.disp.handle(a, req, x.principal, &out);
         } else proto.errorResponse(&out, a, .bad_request, "request header", "") catch {};
-        x.out = j.gpa.dupe(u8, out.items) catch &.{};
+        // the answer outlives the arena: into a kept buffer, which holds its pages
+        x.buf = j.bufs.take(j.io);
+        x.buf.appendSlice(j.gpa, out.items) catch x.buf.clearRetainingCapacity();
+        x.out = x.buf.items;
     }
 };
+
+/// Bytes a worker's arena keeps between jobs.
+pub const arena_keep: usize = 4 << 20;
 
 // ------------------------------------------------------------------ tests
 

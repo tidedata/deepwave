@@ -17,6 +17,8 @@ pub const certhttp = @import("certhttp.zig");
 pub const tcptls = @import("tcptls.zig");
 pub const indexq = @import("indexq.zig");
 pub const jobs = @import("jobs.zig");
+pub const subjobs = @import("subjobs.zig");
+pub const bufs = @import("bufs.zig");
 pub const fairq = @import("fairq.zig");
 pub const edgefeed = @import("edgefeed.zig");
 pub const dicts = @import("dicts.zig");
@@ -31,6 +33,7 @@ test {
     _ = @import("feedshare_test.zig");
     _ = @import("feed_readsets_test.zig");
     _ = @import("gate_test.zig");
+    _ = @import("offthread_test.zig");
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(listener.Listener);
     std.testing.refAllDecls(dispatch.Dispatcher);

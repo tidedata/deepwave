@@ -37,6 +37,7 @@
 //! any time is about one group's rows.
 const std = @import("std");
 const builtin = @import("builtin");
+const tcache = @import("core").threads;
 const Allocator = std.mem.Allocator;
 const store = @import("store");
 const sorted = @import("sorted.zig");
@@ -1661,11 +1662,12 @@ pub const Builder = struct {
     fn phaseSort(b: *Builder, g: u32) !void {
         b.next_part.store(0, .monotonic);
         b.err = null;
-        const ts = try b.db.gpa.alloc(std.Thread, b.threads);
+        const ts = try b.db.gpa.alloc(tcache.Handle, b.threads);
         defer b.db.gpa.free(ts);
         var n: usize = 0;
         for (ts) |*t| {
-            t.* = std.Thread.spawn(.{ .stack_size = 16 << 20 }, sortWorker, .{ b, g }) catch break;
+            // kept threads (core/threads.zig), not a set started and ended per flush
+            t.* = tcache.spawn(sortWorker, .{ b, g }) catch break;
             n += 1;
         }
         if (n == 0) sortWorker(b, g);
@@ -1820,11 +1822,11 @@ pub const Builder = struct {
         if (first) |f0| {
             b.next_range.store(f0, .monotonic);
             b.err = null;
-            const ts = try db.gpa.alloc(std.Thread, b.threads);
+            const ts = try db.gpa.alloc(tcache.Handle, b.threads);
             defer db.gpa.free(ts);
             var n: usize = 0;
             for (ts) |*t| {
-                t.* = std.Thread.spawn(.{ .stack_size = 16 << 20 }, mergeWorker, .{ b, last, gen0 }) catch break;
+                t.* = tcache.spawn(mergeWorker, .{ b, last, gen0 }) catch break;
                 n += 1;
             }
             if (n == 0) mergeWorker(b, last, gen0);

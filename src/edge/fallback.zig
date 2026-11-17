@@ -672,7 +672,7 @@ test "fallback prober: stop ends a probe of a core that never answers at once, n
     try testing.expectEqual(@as(u64, 0), sw.stats.probes.load(.monotonic));
     const t0 = nowNs(io);
     p.deinit();
-    try testing.expect((nowNs(io) - t0) / ms < 500);
+    try testing.expect((nowNs(io) - t0) / ms < 1500); // not the 4 s probe timeout
     // the probe a stop cut short is not a verdict on the core
     try testing.expectEqual(@as(u64, 0), sw.stats.probes.load(.monotonic));
 }

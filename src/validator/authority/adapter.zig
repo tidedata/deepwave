@@ -86,6 +86,9 @@ pub const Adapter = struct {
     tick: u64 = 0,
     closed_for_users: bool = false,
     stats: Stats = .{},
+    /// Own blocks consensus reported committed (`committed`), until they fall far below the GC
+    /// round: their transactions are sequenced and must not be resubmitted as garbage collected.
+    committed_own: std.AutoHashMapUnmanaged(consensus.types.BlockRef, void) = .empty,
     /// Backing storage for the slices `next` returns (stay valid until `ack`).
     scratch_valid: bool = false,
 
@@ -105,6 +108,7 @@ pub const Adapter = struct {
         a.queued_ckeys.deinit(a.gpa);
         a.positions.deinit(a.gpa);
         a.position_order.deinit(a.gpa);
+        a.committed_own.deinit(a.gpa);
     }
 
     pub fn pendingUser(a: *Adapter) usize {
@@ -308,7 +312,38 @@ pub const Adapter = struct {
         const a: *Adapter = @ptrCast(@alignCast(ctx));
         a.ack(block);
     }
-    const source_vt: consensus.iface.TransactionSource.VTable = .{ .next = vtNext, .ack = vtAck };
+    fn vtCommitted(ctx: *anyopaque, own: []const consensus.types.BlockRef, gc_round: consensus.types.Round) void {
+        const a: *Adapter = @ptrCast(@alignCast(ctx));
+        _ = a.committed(own, gc_round);
+    }
+    const source_vt: consensus.iface.TransactionSource.VTable = .{ .next = vtNext, .ack = vtAck, .committed = vtCommitted };
+
+    /// `notify_own_blocks_status`: transactions of our blocks that consensus committed stay
+    /// tracked until the handler sequences them; those of our blocks at or below `gc_round` that
+    /// were never committed are garbage collected and go back in the queue at once (Rust's
+    /// `BlockStatus::GarbageCollected` resubmission), instead of waiting for the age timeout.
+    /// Returns how many were requeued.
+    pub fn committed(a: *Adapter, own: []const consensus.types.BlockRef, gc_round: consensus.types.Round) usize {
+        a.lock.lock();
+        defer a.lock.unlock();
+        for (own) |r| a.committed_own.put(a.gpa, r, {}) catch {};
+        // forget committed refs long below the GC round (their transactions were sequenced)
+        const keep_from = gc_round -| 4 * 60;
+        var stale: std.ArrayList(consensus.types.BlockRef) = .empty;
+        defer stale.deinit(a.gpa);
+        var cit = a.committed_own.keyIterator();
+        while (cit.next()) |r| if (r.round < keep_from) stale.append(a.gpa, r.*) catch break;
+        for (stale.items) |r| _ = a.committed_own.remove(r);
+        // proposed in a block that GC dropped uncommitted
+        var due: std.ArrayList([32]u8) = .empty;
+        defer due.deinit(a.gpa);
+        var it = a.proposed.iterator();
+        while (it.next()) |kv| {
+            const b = kv.value_ptr.block;
+            if (b.round <= gc_round and !a.committed_own.contains(b)) due.append(a.gpa, kv.key_ptr.*) catch break;
+        }
+        return a.requeueKeysLocked(due.items);
+    }
 
     pub fn source(a: *Adapter) consensus.iface.TransactionSource {
         return .{ .ctx = a, .vtable = &source_vt };
@@ -385,7 +420,13 @@ pub const Adapter = struct {
         defer due.deinit(a.gpa);
         var it = a.proposed.iterator();
         while (it.next()) |kv| if (a.tick -| kv.value_ptr.at_tick >= age) due.append(a.gpa, kv.key_ptr.*) catch break;
-        for (due.items) |k| {
+        n = a.requeueKeysLocked(due.items);
+        return n;
+    }
+
+    fn requeueKeysLocked(a: *Adapter, keys: []const [32]u8) usize {
+        var n: usize = 0;
+        for (keys) |k| {
             const p = a.proposed.fetchRemove(k).?.value;
             if (p.entry.ckey) |ck| _ = a.by_ckey.remove(ck);
             const list = if (p.entry.priority == .system) &a.system else &a.user;
@@ -496,4 +537,29 @@ test "any appearance of a user transaction ends tracking of our copy" {
     a.ack(.{ .round = 1, .author = 0, .digest = @splat(0) });
     try std.testing.expectEqual(@as(usize, 0), a.proposed.count());
     try std.testing.expectEqual(@as(usize, 0), a.resubmitOlderThan(0));
+}
+
+test "committed: own blocks GC'd uncommitted are requeued at once, committed ones are not" {
+    const gpa = std.testing.allocator;
+    var a = Adapter.init(gpa, .{});
+    defer a.deinit();
+    var out: [4]consensus.types.Transaction = undefined;
+    try a.submit(&.{"in-committed-block"}, .user);
+    try std.testing.expectEqual(@as(usize, 1), a.next(&out, 1 << 20));
+    const b1: consensus.types.BlockRef = .{ .round = 5, .author = 0, .digest = @splat(1) };
+    a.ack(b1);
+    try a.submit(&.{"in-dropped-block"}, .user);
+    try std.testing.expectEqual(@as(usize, 1), a.next(&out, 1 << 20));
+    const b2: consensus.types.BlockRef = .{ .round = 6, .author = 0, .digest = @splat(2) };
+    a.ack(b2);
+    // b1 committed; GC at round 4: nothing is due yet
+    try std.testing.expectEqual(@as(usize, 0), a.committed(&.{b1}, 4));
+    // GC passes round 6: b2 was never committed, its transaction goes back; b1's stays tracked
+    try std.testing.expectEqual(@as(usize, 1), a.committed(&.{}, 6));
+    try std.testing.expectEqual(@as(usize, 1), a.next(&out, 1 << 20));
+    try std.testing.expectEqualStrings("in-dropped-block", out[0].data);
+    try std.testing.expectEqual(@as(usize, 1), a.proposed.count());
+    // through the consensus interface
+    const src = a.source();
+    src.committed(&.{}, 7);
 }

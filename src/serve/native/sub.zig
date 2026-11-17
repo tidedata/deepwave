@@ -3,6 +3,7 @@
 //! unsent backlog is small, reading from the store, so a slow client costs no memory and never
 //! holds back anyone else; replay (`From`) and live are the same loop.
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const bcs = @import("bcs");
 const types = @import("types");
@@ -177,33 +178,189 @@ pub fn bodyLen(body: []const u8) ParseError!usize {
     return r.p;
 }
 
-/// Per-transaction filter keys of one checkpoint, shared by every subscription on the listener.
+/// Per-transaction filter keys of a checkpoint (its pre-state: the loaded input objects at their
+/// old versions, read from the store), computed once per checkpoint and shared by every
+/// subscription of the listener: the subscription workers (subjobs.zig) take entries from here
+/// on any thread. An ask for a checkpoint whose computation another worker is running gets
+/// `error.Pending` at once instead of repeating it, and never waits: a worker holds a store
+/// snapshot, and none is held across a wait on another thread (the subscription asks again on
+/// a later pass). Bounded: at most `cap` checkpoints are kept, the lowest sequence number unused
+/// at the moment goes first.
 pub const KeyCache = struct {
-    arena: std.heap.ArenaAllocator,
-    seq: ?u64 = null,
-    keys: []txfilter.KeySet = &.{},
+    gpa: Allocator,
+    io: Io,
+    mu: Io.Mutex = .init,
+    entries: [cap]?*Entry = @splat(null),
+    stats: Stats = .{},
+    /// Tests: called on the computing thread before each computation (a slow store read).
+    test_stall: ?*const fn (seq: u64) void = null,
+    /// Arenas of freed entries, reset and kept for the next computation: a fresh arena per
+    /// checkpoint mapped (and on free unmapped) its large blocks every time (bufs.zig).
+    spares: [2]?std.heap.ArenaAllocator = @splat(null),
 
-    pub fn init(gpa: Allocator) KeyCache {
-        return .{ .arena = .init(gpa) };
+    pub const cap = 16;
+    /// Bytes a spare arena keeps.
+    pub const spare_keep: usize = 32 << 20;
+
+    pub const Stats = struct {
+        /// Asks answered from a kept entry, asks that found another's computation running
+        /// (answered `error.Pending`), and computations.
+        hits: std.atomic.Value(u64) = .init(0),
+        coalesced: std.atomic.Value(u64) = .init(0),
+        misses: std.atomic.Value(u64) = .init(0),
+        /// Time spent computing, in total and the longest one.
+        compute_ns: std.atomic.Value(u64) = .init(0),
+        compute_max_ns: std.atomic.Value(u64) = .init(0),
+    };
+
+    pub const Entry = struct {
+        seq: u64,
+        arena: std.heap.ArenaAllocator,
+        keys: []txfilter.KeySet = &.{},
+        ready: bool = false,
+        err: ?anyerror = null,
+        refs: u32 = 1,
+        /// In `entries` (false: freed when the last user releases it).
+        kept: bool = false,
+    };
+
+    pub fn init(gpa: Allocator, io: Io) KeyCache {
+        return .{ .gpa = gpa, .io = io };
     }
+
     pub fn deinit(k: *KeyCache) void {
-        k.arena.deinit();
+        for (&k.entries) |*slot| if (slot.*) |e| {
+            e.arena.deinit();
+            k.gpa.destroy(e);
+            slot.* = null;
+        };
+        for (&k.spares) |*s| if (s.*) |*a| {
+            a.deinit();
+            s.* = null;
+        };
     }
 
-    fn get(k: *KeyCache, svc: *serve.service.Service, snap: *store.Snapshot, rec: store.CheckpointRecord) ![]txfilter.KeySet {
-        if (k.seq == rec.seq) return k.keys;
-        _ = k.arena.reset(.retain_capacity);
-        const a = k.arena.allocator();
-        k.seq = null;
+    /// A spare arena, or a new one (caller holds the lock).
+    fn arena(k: *KeyCache) std.heap.ArenaAllocator {
+        for (&k.spares) |*s| if (s.*) |a| {
+            s.* = null;
+            return a;
+        };
+        return .init(k.gpa);
+    }
+
+    /// Frees `e`, keeping its arena as a spare if there is room (caller holds the lock).
+    fn retire(k: *KeyCache, e: *Entry) void {
+        defer k.gpa.destroy(e);
+        for (&k.spares) |*s| if (s.* == null) {
+            _ = e.arena.reset(.{ .retain_with_limit = spare_keep });
+            s.* = e.arena;
+            return;
+        };
+        e.arena.deinit();
+    }
+
+    /// The keys of checkpoint `rec`, held until `release`.
+    pub fn acquire(k: *KeyCache, svc: *serve.service.Service, snap: *store.Snapshot, rec: store.CheckpointRecord) !*Entry {
+        k.mu.lockUncancelable(k.io);
+        for (k.entries) |slot| if (slot) |e| if (e.seq == rec.seq) {
+            if (!e.ready) {
+                _ = k.stats.coalesced.fetchAdd(1, .monotonic);
+                k.mu.unlock(k.io);
+                return error.Pending;
+            }
+            // (a failed computation is never kept)
+            e.refs += 1;
+            _ = k.stats.hits.fetchAdd(1, .monotonic);
+            k.mu.unlock(k.io);
+            return e;
+        };
+        _ = k.stats.misses.fetchAdd(1, .monotonic);
+        const e = k.gpa.create(Entry) catch |err| {
+            k.mu.unlock(k.io);
+            return err;
+        };
+        e.* = .{ .seq = rec.seq, .arena = k.arena() };
+        k.keep(e);
+        k.mu.unlock(k.io);
+
+        const t0 = nowNs();
+        if (k.test_stall) |f| f(rec.seq);
+        const got = compute(e.arena.allocator(), svc, snap, rec);
+        const dt = nowNs() -| t0;
+        _ = k.stats.compute_ns.fetchAdd(dt, .monotonic);
+        _ = k.stats.compute_max_ns.fetchMax(dt, .monotonic);
+
+        k.mu.lockUncancelable(k.io);
+        if (got) |keys| e.keys = keys else |err| {
+            e.err = err;
+            // not kept: the next ask computes again
+            for (&k.entries) |*slot| if (slot.* == e) {
+                slot.* = null;
+                e.kept = false;
+            };
+        }
+        e.ready = true;
+        k.mu.unlock(k.io);
+        if (e.err) |err| {
+            k.release(e);
+            return err;
+        }
+        return e;
+    }
+
+    pub fn release(k: *KeyCache, e: *Entry) void {
+        k.mu.lockUncancelable(k.io);
+        defer k.mu.unlock(k.io);
+        e.refs -= 1;
+        if (e.refs == 0 and !e.kept) k.retire(e);
+    }
+
+    /// Puts `e` in a free place, or in place of the lowest-numbered entry nobody holds (caller
+    /// holds the lock). With every place in use `e` is not kept.
+    fn keep(k: *KeyCache, e: *Entry) void {
+        var victim: ?usize = null;
+        for (&k.entries, 0..) |*slot, i| {
+            const x = slot.* orelse {
+                slot.* = e;
+                e.kept = true;
+                return;
+            };
+            if (x.refs != 0 or !x.ready) continue;
+            if (victim == null or x.seq < k.entries[victim.?].?.seq) victim = i;
+        }
+        const i = victim orelse return;
+        k.retire(k.entries[i].?);
+        k.entries[i] = e;
+        e.kept = true;
+    }
+
+    fn compute(a: Allocator, svc: *serve.service.Service, snap: *store.Snapshot, rec: store.CheckpointRecord) ![]txfilter.KeySet {
         const d = try serve.service.loadCheckpointData(svc, a, snap, rec, true, true);
         var set = try serve.objset.ObjSet.build(a, d.objects);
         const keys = try a.alloc(txfilter.KeySet, d.txs.len);
         for (d.txs, keys) |t, *ks| ks.* = try txfilter.transactionKeys(a, t.transaction, t.effects, t.events, &set);
-        k.keys = keys;
-        k.seq = rec.seq;
         return keys;
     }
 };
+
+fn nowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// A copy of `r` that owns its own filter (a subscription worker's, freed with `deinit`).
+pub fn clone(gpa: Allocator, r: *const Req) !Req {
+    var c = r.*;
+    switch (r.filter) {
+        .objects => |ids| c.filter = .{ .objects = try gpa.dupe([32]u8, ids) },
+        .event_type => |t| c.filter = .{ .event_type = try gpa.dupe(u8, t) },
+        else => {},
+    }
+    c.owned = true;
+    return c;
+}
 
 fn has(ks: *const txfilter.KeySet, dim: txfilter.Dim, v: []const u8) bool {
     var b: [64]u8 = undefined;
@@ -228,7 +385,9 @@ pub fn produce(gpa: Allocator, a: Allocator, svc: *serve.service.Service, snap: 
     var n: u32 = 0;
     switch (req.filter) {
         .address, .package => {
-            const keys = try kc.get(svc, snap, rec);
+            const held = try kc.acquire(svc, snap, rec);
+            defer kc.release(held);
+            const keys = held.keys;
             if (ds.len != keys.len) return error.Internal;
             for (keys, ds) |*ks, *dg| {
                 const hit = switch (req.filter) {

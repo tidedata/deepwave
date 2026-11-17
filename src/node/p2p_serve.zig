@@ -382,7 +382,7 @@ pub const PeerBook = struct {
     /// Appends up to 200 shareable envelopes as a BCS vector (uleb count + envelopes). With more
     /// than 200 known, peers we are connected to come first (sui-node: "prefer returning peers
     /// that we are connected to as they are known-good"), the rest rotate.
-    fn appendShared(b: *PeerBook, a: Allocator, out: *std.ArrayList(u8), versioned: bool, requester_trusted: bool, now_ms: u64, connected: []const [32]u8) !void {
+    pub fn appendShared(b: *PeerBook, a: Allocator, out: *std.ArrayList(u8), versioned: bool, requester_trusted: bool, now_ms: u64, connected: []const [32]u8) !void {
         b.lock.lockUncancelable(b.io);
         defer b.lock.unlock(b.io);
         const map = if (versioned) &b.v2 else &b.v1;

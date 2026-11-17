@@ -1051,7 +1051,12 @@ pub fn table(gpa: Allocator, ls: []const Link, vs: []const Variant, work: Work, 
 /// 0xbd68a2dc86f92d47, 0x69884442ea3c69ca). Every link moved, the lossless one included: phase 4
 /// drops the last datagram of each response, and each of those probe timeouts was followed by
 /// one such retransmission.
-const pinned = [links.len]u64{ 0xc29f6c2809741bf0, 0x1244562c33bb631a, 0x37062a96f9b0a27c, 0x8ef1bb1b2685d425 };
+/// Re-pinned again: the window no longer grows on ACKs that find the sender
+/// application-limited (RFC 9002 section 7.8), so between the requests of phase 3 it stays at
+/// what the responses use instead of growing on every ACK, and the probe timeout's backoff
+/// stops at 2 s (before: 0xc29f6c2809741bf0,
+/// 0x1244562c33bb631a, 0x37062a96f9b0a27c, 0x8ef1bb1b2685d425).
+const pinned = [links.len]u64{ 0x5822e904359c2092, 0xd211a7bbe915f175, 0x68783f383facb1fe, 0x3e1f930b5f623157 };
 
 test "linkbench: the workload completes on every reference link; the default sender is pinned" {
     const gpa = std.testing.allocator;

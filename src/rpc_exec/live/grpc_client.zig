@@ -661,7 +661,7 @@ pub const Conn = struct {
             const step: u32 = @intCast(@min(left, 0x7fff_ffff));
             var wu: [4]u8 = undefined;
             std.mem.writeInt(u32, &wu, step, .big);
-            c.writeFrame(frame_window, 0, id_slot.*, &wu) catch return c.dieLocked("write failed");
+            c.writeFrame(frame_window, 0, id_slot.*, &wu) catch return c.dieLocked(write_failed_reason);
             left -= step;
         }
         c.flush();
@@ -717,8 +717,8 @@ pub const Conn = struct {
             const v = std.fmt.bufPrint(&tbuf, "{d}", .{pv}) catch unreachable;
             hpack.encodeLiteral(&hb, c.gpa, "x-sui-client-protocol-version", v) catch return c.failCallLocked(id, "out of memory");
         }
-        c.writeHeaderBlock(id, hb.items) catch return c.dieLocked("write failed");
-        c.pumpLocked(id, call) catch return c.dieLocked("write failed");
+        c.writeHeaderBlock(id, hb.items) catch return c.dieLocked(write_failed_reason);
+        c.pumpLocked(id, call) catch return c.dieLocked(write_failed_reason);
         c.flush();
     }
 
@@ -764,7 +764,7 @@ pub const Conn = struct {
     }
 
     fn flush(c: *Conn) void {
-        c.flushOut() catch c.dieLocked("write failed");
+        c.flushOut() catch c.dieLocked(write_failed_reason);
     }
 
     /// Flushes the h2 writer and, under TLS, the socket writer below it.
@@ -1288,8 +1288,8 @@ pub const Conn = struct {
                 if (now -| c.ping_at < every) return false;
                 var payload: [8]u8 = undefined;
                 std.mem.writeInt(u64, &payload, now, .big);
-                c.writeFrame(frame_ping, 0, 0, &payload) catch return c.dieAndFalse("write failed");
-                c.flushOut() catch return c.dieAndFalse("write failed");
+                c.writeFrame(frame_ping, 0, 0, &payload) catch return c.dieAndFalse(write_failed_reason);
+                c.flushOut() catch return c.dieAndFalse(write_failed_reason);
                 c.ping_at = now;
                 c.ping_due = true;
             },
@@ -1304,6 +1304,11 @@ pub const Conn = struct {
 };
 
 const goaway_reason = "transport error: connection closed by peer (GOAWAY)";
+/// A connection that dies on a write (the core went away while a frame went out). "transport
+/// error" like every other death of the connection: the edge tells its own failures from the
+/// core's answers by that prefix (edge/forward.zig `sinkDone`), and without it a core that dropped
+/// mid-answer was relayed as INTERNAL "ended inside a message" and counted as up.
+const write_failed_reason = "transport error: write failed";
 
 /// RFC 9113 6.5.2: values a peer may not send (a PROTOCOL_ERROR / FLOW_CONTROL_ERROR that ends
 /// the connection). A MAX_FRAME_SIZE of 0 used to make every write loop forever.

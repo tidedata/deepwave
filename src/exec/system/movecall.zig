@@ -428,8 +428,9 @@ pub fn run(arena: Allocator, s: *store_mod.Store, env: *const sys.Env, src: sys.
         .ok => |e| e,
         .unsupported => |why| return .{ .unsupported = why },
         .aborted => |ab| {
-            const status = (try abortStatus(arena, ab)) orelse return .{ .unsupported = "system Move call failed with a VM error other than an abort" };
-            return .{ .done = s.intoFailure(status) catch |e| switch (e) {
+            // setup_randomness_state_update / setup_authenticator_state_update return the
+            // execution error (`.map_err(|(e, _)| e)?`): Failure effects, writes dropped
+            return .{ .done = s.intoFailure(failureStatus(ab)) catch |e| switch (e) {
                 error.Unsupported => return .{ .unsupported = s.why },
                 else => |x| return x,
             } };
@@ -438,26 +439,45 @@ pub fn run(arena: Allocator, s: *store_mod.Store, env: *const sys.Env, src: sys.
     return finish(s, events);
 }
 
-/// `ExecutionStatus::Failure` of a Move abort (`convert_vm_error` for ABORTED): `MoveAbort` at
-/// the aborting module's runtime id, function definition index, code offset and function name,
-/// with the command index. Null for any other VM error (not modeled here).
-pub fn abortStatus(a: Allocator, ab: Abort) !?types.ExecutionStatus {
-    if (ab.err.major != .ABORTED) return null;
-    const m = ab.err.module orelse return null;
-    const off = ab.err.off orelse return null;
-    // ABORTED without a code is VMInvariantViolation in Rust (not modeled here).
-    const code = ab.err.sub orelse return null;
-    const fname = m.cm.identifiers[m.cm.function_handles[m.cm.function_defs[off.fdef].function].name];
-    _ = a;
-    return .{ .Failure = .{
-        .@"error" = .{ .MoveAbort = .{ .{
+/// `ExecutionStatus::Failure` of a VM error in a system call: error.rs `convert_vm_error_impl`
+/// (the System mode keeps the error kind; command index from the PTB). Framework modules have
+/// runtime id = storage id, so `resolve_abort_locations_to_package_id` changes nothing here.
+///   EXECUTED                                  VMInvariantViolation
+///   ABORTED without a code                    VMInvariantViolation
+///   ABORTED with a code, at a module          MoveAbort(location, code)
+///   OUT_OF_GAS                                InsufficientGas (unmetered: not reached)
+///   other execution status (4000..4999)       MovePrimitiveRuntimeError(location at a module, else none)
+///   invariant violation (2000..2999)          VMInvariantViolation
+///   validation/verification/deserialization   VMVerificationOrDeserializationError
+/// A module location without offsets takes function 0, instruction 0 (`unwrap_or((0, 0))`).
+pub fn failureStatus(ab: Abort) types.ExecutionStatus {
+    return .{ .Failure = .{ .@"error" = vmErrorKind(ab.err), .command = ab.command } };
+}
+
+pub fn vmErrorKind(e: vm.interp.VmError) types.ExecutionErrorKind {
+    const code: u64 = @intFromEnum(e.major);
+    const loc: ?types.MoveLocation = if (e.module) |m| blk: {
+        const fdef: u16 = if (e.off) |o| o.fdef else 0;
+        const pc: u16 = if (e.off) |o| o.pc else 0;
+        const name: ?bcs.String = if (fdef < m.cm.function_defs.len) .{ .@"0" = m.cm.identifiers[m.cm.function_handles[m.cm.function_defs[fdef].function].name] } else null;
+        break :blk .{
             .module = .{ .address = .{ .@"0" = m.cm.selfAddress().* }, .name = .{ .@"0" = m.cm.selfName() } },
-            .function = off.fdef,
-            .instruction = off.pc,
-            .function_name = .{ .@"0" = fname },
-        }, code } },
-        .command = ab.command,
-    } };
+            .function = fdef,
+            .instruction = pc,
+            .function_name = name,
+        };
+    } else null;
+    if (code == 4001) return .VMInvariantViolation; // EXECUTED
+    if (code == 4016) { // ABORTED
+        const sub = e.sub orelse return .VMInvariantViolation;
+        if (loc) |l| return .{ .MoveAbort = .{ l, sub } };
+    }
+    if (code == 4002) return .InsufficientGas; // OUT_OF_GAS
+    return switch (code) {
+        4000...4999 => .{ .MovePrimitiveRuntimeError = .{ .@"0" = loc } },
+        2000...2999 => .VMInvariantViolation,
+        else => .VMVerificationOrDeserializationError,
+    };
 }
 
 /// `Store.intoEffects` with an unsupported store reason as an outcome.

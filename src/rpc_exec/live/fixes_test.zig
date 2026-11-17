@@ -498,6 +498,59 @@ test "a dead connection has no writer left (no write through the reader's freed 
     try testing.expectEqual(@as(u8, 14), r.status.code);
 }
 
+test "a connection that dies on a write ends its calls as a transport error (how the edge tells the way to the core from the core's answer)" {
+    // the core answered part of a message and is still there; then a write (the receive window
+    // the edge gives back) fails. It used to end the call as "write failed": the edge took that
+    // for the core's own status, relayed INTERNAL "ended inside a message" and counted the core up.
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try responseHeaders(&script, false);
+    try frame(&script, 0, 0, 1, &[_]u8{ 0, 0, 0, 0, 5, 'w', 'h', 'o', 'l', 'e', 0, 0, 0, 0, 4 });
+    var peer: Peer = .{ .script = script.items };
+    try peer.start();
+    defer peer.stop();
+    const c = try plainConn(peer.port);
+    defer c.release();
+    const Got = struct {
+        bytes: std.atomic.Value(usize) = .init(0),
+        done: std.atomic.Value(bool) = .init(false),
+        code: u8 = 0,
+        message: []const u8 = "",
+        fn onData(ctx: *anyopaque, _: u64, b: []const u8) void {
+            const g: *@This() = @ptrCast(@alignCast(ctx));
+            _ = g.bytes.fetchAdd(b.len, .release);
+        }
+        fn onDone(ctx: *anyopaque, _: u64, r: grpc.Result) void {
+            const g: *@This() = @ptrCast(@alignCast(ctx));
+            switch (r) {
+                .status => |s| {
+                    g.code = s.code;
+                    g.message = s.message; // the connection's reasons are static text
+                },
+                .ok => g.code = 0,
+            }
+            g.done.store(true, .release);
+        }
+    };
+    var got: Got = .{};
+    var slot: u32 = 0;
+    c.startOpts(&slot, "/x/Y", "body", .{ .ctx = &got, .done = Got.onDone }, 0, .{ .raw = .{ .on_data = Got.onData } });
+    var i: u32 = 0;
+    while (got.bytes.load(.acquire) < 15 and i < join_limit_ms) : (i += 1) try Io.sleep(io, .fromMilliseconds(1), .awake);
+    try testing.expectEqual(@as(usize, 15), got.bytes.load(.acquire));
+    try testing.expect(!got.done.load(.acquire));
+    // the next write fails (EPIPE), while the reader still waits on a peer that says nothing
+    c.mu.lockUncancelable(io);
+    const st = c.stream.?;
+    c.mu.unlock(io);
+    try st.shutdown(io, .send);
+    c.credit(&slot, 10);
+    try testing.expect(got.done.load(.acquire)); // ended by that write, not by the reader
+    try testing.expectEqual(@as(u8, 14), got.code);
+    try testing.expectEqualStrings("transport error: write failed", got.message);
+    try testing.expect(c.isDead());
+}
+
 test "SETTINGS_MAX_FRAME_SIZE 0 ends the connection instead of spinning" {
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(gpa);
@@ -1184,6 +1237,13 @@ test "a slow ExecuteTransaction does not hold up the other streams of its connec
     var slot: u32 = 0;
     c.start(&slot, "/sui.rpc.v2.TransactionExecutionService/ExecuteTransaction", "tx", .{ .ctx = &w, .done = W.sink }, 1, null);
     try Io.sleep(io, .fromMilliseconds(100), .awake);
+    // The read's worker pool is started before the clock runs: the first call of a class starts
+    // that pool (pool.zig, 4 workers per CPU) on the connection thread, a one-time cost that
+    // took up to 1045 ms on a loaded rig (load 70 to 100 on 32 CPUs) and is not what this test
+    // measures. With the pool started the read took 0 to 34 ms there, the same as with nothing
+    // in flight.
+    const so: h2.ServerOptions = .{};
+    _ = h2.pool.getClass(io, .{ .workers = so.workers, .stack_size = so.stack_size }, .fast);
     // a read on the same connection answers while the execute is still running
     var a = std.heap.ArenaAllocator.init(gpa);
     defer a.deinit();

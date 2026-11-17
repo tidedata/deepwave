@@ -1,10 +1,12 @@
 //! Transaction checks the validator runs before it signs, votes or submits (sui-core
 //! `handle_vote_transaction`, `check_transaction_validity`, `SuiTxValidator::vote_transaction`):
 //!
-//!   1. `TransactionData::validity_check` (rpc_exec.checks.validity),
-//!   2. transaction deny config (rpc_exec.txdeny),
-//!   3. input loading at the claimed versions and `check_transaction_input` (gas status, gas
-//!      objects and balance, object ownership, replay protection, receiving objects),
+//!   1. `SenderSignedData::validity_check` (rpc_exec.checks.senderSignedValidity),
+//!   2. `pre_object_load_checks`: transaction deny config (rpc_exec.txdeny), the declared funds
+//!      withdrawals against the latest address balances (gasless: the remaining amounts),
+//!   3. input loading at the claimed versions, `check_transaction_input` (gas status, gas
+//!      objects and balance, object ownership, replay protection, gasless object inputs,
+//!      receiving objects), then the coin deny list v1/v2 (`handle_coin_deny_list_checks`),
 //!   4. owned objects must be live: exactly the claimed version and digest
 //!      (`ObjectLocks::validate_owned_object_versions`; locking itself happens after consensus),
 //!   5. user signatures over the intent message for every required signer (sig.user), with the
@@ -22,6 +24,7 @@ const rpc_exec = @import("rpc_exec");
 const tx_mod = @import("tx.zig");
 
 const checks = rpc_exec.checks;
+const usersig = rpc_exec.live.usersig;
 const txdeny = rpc_exec.txdeny;
 const Allocator = std.mem.Allocator;
 const ObjectView = exec.objects.ObjectView;
@@ -39,9 +42,17 @@ pub const Env = struct {
     committee_size: u32,
     state: rpc_exec.State,
     sig_env: *const sig.user.UserSigEnv,
-    /// Maximum number of user signatures (`max_tx_gas`-independent: Rust checks
-    /// `tx_signatures().len() <= max_num_user_signatures` in `validity_check`); 0 = unchecked.
-    max_signatures: usize = 0,
+    /// The epoch's object markers (null: none recorded, as on a store without markers).
+    markers: ?Markers = null,
+};
+
+/// sui-core's per-epoch marker table as `read_objects_for_signing` reads it.
+pub const Markers = struct {
+    ctx: *anyopaque,
+    /// `have_received_object_at_version(FullObjectKey(id, None, version), epoch)`.
+    received: *const fn (ctx: *anyopaque, epoch: u64, id: *const Id, version: u64) bool,
+    /// `get_last_consensus_stream_end_info(FullObjectID(id, Some(start_version)), epoch)` is Some.
+    stream_ended: *const fn (ctx: *anyopaque, epoch: u64, id: *const Id, start_version: u64) bool,
 };
 
 fn lessId(_: void, a: Id, b: Id) bool {
@@ -53,36 +64,34 @@ pub const Opts = struct {
     validity: bool = true,
 };
 
-/// Step 1 alone: validity check and the signature count limit.
+/// Step 1 alone: `SenderSignedData::validity_check` (signature schemes, system kinds, the
+/// serialized size limits, `TransactionData::validity_check`).
 pub fn checkValidity(arena: Allocator, env: *const Env, u: *const tx_mod.UserTx) Error!?Fail {
     const td = u.data();
-    if (checks.isSystemKind(&td.kind)) return try checks.userInput(arena, "system transactions cannot be submitted by users", .{});
-    var kinds: std.ArrayList(checks.InputKind) = .empty;
-    var recv: std.ArrayList(checks.Receiving) = .empty;
-    if (try checks.inputKinds(arena, td, &kinds, &recv)) |f| return f;
+    const raw_sigs = try arena.alloc([]const u8, u.signatures().len);
+    for (u.signatures(), raw_sigs) |s, *o| o.* = s.@"0";
+    const size = bcs.encodedLen(types.SenderSignedData, &u.tx.tx.data);
     const vctx: checks.ValidityCtx = .{ .cfg = env.cfg, .epoch = env.epoch, .chain_id = env.chain_id, .rgp = env.rgp, .committee_size = env.committee_size };
-    if (try checks.validity(arena, &vctx, td)) |f| return f;
-    if (env.max_signatures != 0 and u.signatures().len > env.max_signatures)
-        return try checks.userInput(arena, "Too many signatures: {d} (max {d})", .{ u.signatures().len, env.max_signatures });
-    return null;
+    return checks.senderSignedValidity(arena, &vctx, td, raw_sigs, size);
 }
 
 /// Steps 1 to 4.
 pub fn checkInputs(arena: Allocator, env: *const Env, u: *const tx_mod.UserTx, opts: Opts) Error!?Fail {
     const cfg = env.cfg;
     const td = u.data();
+    if (opts.validity) if (try checkValidity(arena, env, u)) |f| return f;
     if (checks.isSystemKind(&td.kind)) return try checks.userInput(arena, "system transactions cannot be submitted by users", .{});
-    if (checks.unsupportedWithdrawal(td)) |why| return try checks.unsupportedFeature(arena, "{s}", .{why});
 
+    // input_objects() (duplicates were refused by validity_check)
     var kinds: std.ArrayList(checks.InputKind) = .empty;
     var recv: std.ArrayList(checks.Receiving) = .empty;
     if (try checks.inputKinds(arena, td, &kinds, &recv)) |f| return f;
 
-    if (opts.validity) if (try checkValidity(arena, env, u)) |f| return f;
-
-    // deny config
+    // deny config: the effective one (local rules plus what peers shared through consensus)
     {
-        const deny_cfg = txdeny.current();
+        var deny_guard = txdeny.effective();
+        defer deny_guard.release();
+        const deny_cfg = deny_guard.config();
         if (deny_cfg.active()) {
             const raw_sigs = try arena.alloc([]const u8, u.signatures().len);
             for (u.signatures(), raw_sigs) |s, *o| o.* = s.@"0";
@@ -90,8 +99,14 @@ pub fn checkInputs(arena: Allocator, env: *const Env, u: *const tx_mod.UserTx, o
         }
     }
 
-    // read_objects_for_signing
+    // process_funds_withdrawals_for_signing, check_amounts_available, gasless remaining amounts
     const state = env.state;
+    const withdrawals = switch (try checks.fundsForSigning(arena, cfg, td, &env.chain_id, state)) {
+        .fail => |f| return f,
+        .ok => |l| l,
+    };
+
+    // read_objects_for_signing
     const loaded = try arena.alloc(checks.Loaded, kinds.items.len);
     for (kinds.items, 0..) |k, i| switch (k) {
         .package => |pid| {
@@ -101,16 +116,27 @@ pub fn checkInputs(arena: Allocator, env: *const Env, u: *const tx_mod.UserTx, o
             loaded[i] = try loadedOf(arena, k, raw);
         },
         .shared => |s| {
-            const raw = state.latest(&s.id) orelse return try checks.userInput(arena, "Could not find the referenced object {s} at version None", .{checks.hex(&s.id).s()});
-            const l = try loadedOf(arena, k, raw);
-            const start: ?u64 = switch (l.owner) {
-                .Shared => |x| x.initial_shared_version.@"0",
-                .ConsensusAddressOwner => |x| x.start_version.@"0",
-                .Party => |x| x.start_version.@"0",
-                else => null,
+            // the live object when its full id (id, start version) is the one claimed
+            if (state.latest(&s.id)) |raw| {
+                const l = try loadedOf(arena, k, raw);
+                const start: ?u64 = switch (l.owner) {
+                    .Shared => |x| x.initial_shared_version.@"0",
+                    .ConsensusAddressOwner => |x| x.start_version.@"0",
+                    .Party => |x| x.start_version.@"0",
+                    else => null,
+                };
+                if (start != null and start.? == s.isv) {
+                    loaded[i] = l;
+                    continue;
+                }
+            }
+            // otherwise the consensus stream may have ended this epoch (deleted, or transferred
+            // out of consensus): ObjectConsensusStreamEnded, which check_objects skips
+            if (env.markers) |m| if (m.stream_ended(m.ctx, env.epoch, &s.id, s.isv)) {
+                loaded[i] = checks.Loaded.streamEnded(k, s.id, s.isv);
+                continue;
             };
-            if (start == null or start.? != s.isv) return try checks.userInput(arena, "Could not find the referenced object {s} at version None", .{checks.hex(&s.id).s()});
-            loaded[i] = l;
+            return try checks.userInput(arena, "Could not find the referenced object {s} at version None", .{checks.hex(&s.id).s()});
         },
         .owned => |o| {
             const raw = state.at(&o.id, o.version) orelse {
@@ -124,11 +150,22 @@ pub fn checkInputs(arena: Allocator, env: *const Env, u: *const tx_mod.UserTx, o
         },
     };
     const recv_objs = try arena.alloc(?[]const u8, recv.items.len);
+    // read_receiving_objects_for_signing: already received at that version this epoch is
+    // PreviouslyReceivedObject (null: check_receiving_objects skips it)
     for (recv.items, recv_objs) |r, *o| {
+        if (env.markers) |m| if (m.received(m.ctx, env.epoch, &r.id, r.version)) {
+            o.* = null;
+            continue;
+        };
         o.* = state.latest(&r.id) orelse return try checks.userInput(arena, "Could not find the referenced object {s} at version Some(SequenceNumber({d}))", .{ checks.hex(&r.id).s(), r.version });
     }
 
     if (try checks.transactionInput(arena, cfg, env.rgp, td, loaded, recv.items, recv_objs)) |f| return f;
+    // check_non_system_packages_to_be_published (G19)
+    if (try rpc_exec.pkgverify.check(arena, cfg, td)) |f| return f;
+
+    // handle_coin_deny_list_checks
+    if (try checks.coinDenyForSigning(arena, cfg, td, state, loaded, recv_objs, withdrawals)) |f| return f;
 
     // validate_owned_object_versions: owned (non-immutable) inputs are live at the claimed ref
     for (loaded) |l| switch (l.kind) {
@@ -161,9 +198,11 @@ pub const SigResult = union(enum) {
 /// One required signer's (signature index, alias version) as `verify_transaction_with_current_aliases`.
 pub const AliasEntry = struct { sig_index: u8, alias_version: ?u64 };
 
-/// Step 5. Aliases: no alias objects are consulted here (each signer is its own alias), which is
-/// what a network without AddressAliases state produces; the alias resolver hook of the epoch
-/// lane replaces `aliases` when mainnet alias state must be honoured.
+/// Step 5, `verify_tx_with_current_aliases` (signature_verifier.rs, mainnet-v1.83.1). With
+/// `aliases` empty and `address_aliases` on, each required signer's alias set is its
+/// AddressAliases object (derived under 0xa) in the live store, and the object's version is
+/// returned as that signer's alias version; a signer without the object is its own only alias
+/// (version None). A non-empty `aliases` is used as given (versions None).
 pub fn verifySignatures(arena: Allocator, env: *const Env, u: *const tx_mod.UserTx, aliases: []const sig.user.AliasSet) Error!SigResult {
     return verifySignaturesIntent(arena, env, u, try intentMessage(arena, u), aliases);
 }
@@ -185,8 +224,10 @@ pub fn intentMessage(arena: Allocator, u: *const tx_mod.UserTx) Allocator.Error!
 pub fn verifySignaturesIntent(arena: Allocator, env: *const Env, u: *const tx_mod.UserTx, intent: []const u8, aliases: []const sig.user.AliasSet) Error!SigResult {
     const sigs = try arena.alloc([]const u8, u.signatures().len);
     for (u.signatures(), sigs) |s, *o| o.* = s.@"0";
+    var versions: [2]?u64 = .{ null, null };
+    const sets: []const sig.user.AliasSet = if (aliases.len == 0 and env.cfg.feature_flags.address_aliases) try currentAliases(arena, env, u, &versions) else aliases;
     const scratch = try arena.alloc(u8, sig.user.txScratchLen(sigs));
-    const res = sig.user.verifyTransaction(env.sig_env, intent, sigs, aliases, scratch) catch |e| switch (e) {
+    const res = sig.user.verifyTransaction(env.sig_env, intent, sigs, sets, scratch) catch |e| switch (e) {
         error.Bcs => return .{ .fail = try checks.userInput(arena, "Invalid transaction data", .{}) },
         else => return .{ .fail = try checks.internal(arena, "Signature verification failed: {s}", .{@errorName(e)}) },
     };
@@ -195,8 +236,35 @@ pub fn verifySignaturesIntent(arena: Allocator, env: *const Env, u: *const tx_mo
         .invalid => |r| return .{ .fail = try checks.internal(arena, "Signature is not valid: {s}", .{r.truthName()}) },
     }
     const out = try arena.alloc(AliasEntry, res.n);
-    for (out, 0..) |*o, i| o.* = .{ .sig_index = res.indices[i], .alias_version = null };
+    for (out, 0..) |*o, i| o.* = .{ .sig_index = res.indices[i], .alias_version = if (i < versions.len) versions[i] else null };
     return .{ .ok = out };
+}
+
+/// `TransactionData::required_signers()`: the sender, then the gas owner when it differs.
+pub fn requiredSigners(u: *const tx_mod.UserTx, out: *[2]Id) []const Id {
+    const td = u.data();
+    out[0] = td.sender.@"0";
+    if (std.mem.eql(u8, &td.gas_data.owner.@"0", &out[0])) return out[0..1];
+    out[1] = td.gas_data.owner.@"0";
+    return out[0..2];
+}
+
+/// `get_address_aliases_from_store` for every required signer, in order: the alias sets and
+/// (into `versions`) the AddressAliases object versions.
+pub fn currentAliases(arena: Allocator, env: *const Env, u: *const tx_mod.UserTx, versions: *[2]?u64) Allocator.Error![]const sig.user.AliasSet {
+    var buf: [2]Id = undefined;
+    const signers = requiredSigners(u, &buf);
+    const out = try arena.alloc(sig.user.AliasSet, signers.len);
+    for (signers, out, 0..) |signer, *o, i| {
+        o.* = .{ .signer = signer, .aliases = &.{} };
+        const oid = usersig.aliasesObjectId(&signer);
+        const raw = env.state.latest(&oid) orelse continue;
+        const v = ObjectView.parse(raw) catch continue;
+        versions[i] = v.version;
+        // Rust `expect`s the contents to parse; an empty set falls back to the signer
+        o.aliases = usersig.parseAliases(arena, v.contents()) orelse &.{};
+    }
+    return out;
 }
 
 /// The address-alias claim a `UserTransactionV2` carries must equal what verification derives

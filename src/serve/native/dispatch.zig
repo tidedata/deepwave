@@ -172,6 +172,8 @@ pub const Dispatcher = struct {
     /// An edge's marked certificates (`Foreign`); null: none.
     foreign: ?Foreign = null,
     foreign_stats: ForeignStats = .{},
+    /// Tests: called before each answer, on the thread that answers (a slow store read).
+    test_stall: ?*const fn (req: proto.Request) void = null,
 
     /// While this edge holds marked certificates: the requests whose answer can carry a
     /// certified summary run on a worker, where a marked one can be passed to a core (the
@@ -209,6 +211,7 @@ pub const Dispatcher = struct {
 
     /// Answers one request into `out` (a whole response: header, body, proof).
     pub fn handle(d: *Dispatcher, a: Allocator, req: proto.Request, principal: ?Principal, out: *std.ArrayList(u8)) void {
+        if (@import("builtin").is_test) if (d.test_stall) |f| f(req);
         defer dicts_mod.Dicts.compressResponse(d.dicts, a, req.method, req.flags, out) catch {};
         foreign_watch = if (d.foreign) |*fh| fh else null;
         foreign_hit = false;

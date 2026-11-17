@@ -149,14 +149,42 @@ fn selfIdEq(a: *const CM, b: *const CM) bool {
 // abilities): ExecutionCompatibilityMode, where only entry linking is ignored.
 
 fn compatible(old: *const CM, new: *const CM) bool {
+    return compatibleAs(old, new, false);
+}
+
+/// `Compatibility::framework_upgrade_check` (sui-framework `compare_system_package`): datatype
+/// layout checked, private entry linking checked, only `key` disallowed as a new ability.
+pub fn frameworkCompatible(old: *const CM, new: *const CM) bool {
+    return compatibleAs(old, new, true);
+}
+
+/// `framework_upgrade_check` over a whole package: every module of the existing package must be
+/// in the new one (by name) and compatible with it.
+pub fn frameworkCheck(existing: []const CM, upgrading: []const CM) bool {
+    for (existing) |*cur| {
+        const new = for (upgrading) |*m| {
+            if (std.mem.eql(u8, m.selfName(), cur.selfName())) break m;
+        } else return false;
+        if (!frameworkCompatible(cur, new)) return false;
+    }
+    return true;
+}
+
+fn abilitiesCompatible(framework: bool, old: ff.AbilitySet, new: ff.AbilitySet) bool {
+    // upgrade_check disallows every new ability (old <= new and nothing new: equal);
+    // framework_upgrade_check only a new `key`
+    if (!framework) return old.bits == new.bits;
+    return old.isSubset(new) and (!new.hasKey() or old.hasKey());
+}
+
+fn compatibleAs(old: *const CM, new: *const CM, framework: bool) bool {
     if (!selfIdEq(old, new)) return false;
     for (old.struct_defs, 0..) |sd, i| {
         const name = structName(old, @intCast(i));
         const j = findStruct(new, name) orelse return false;
         const oh = old.datatype_handles[sd.struct_handle];
         const nh = new.datatype_handles[new.struct_defs[j].struct_handle];
-        // old <= new and nothing new (every ability disallowed): equal
-        if (oh.abilities.bits != nh.abilities.bits) return false;
+        if (!abilitiesCompatible(framework, oh.abilities, nh.abilities)) return false;
         if (!tyParamsEq(oh.type_parameters, nh.type_parameters)) return false;
         if (!fieldsEq(old, structFields(old, @intCast(i)), new, structFields(new, j))) return false;
     }
@@ -166,7 +194,7 @@ fn compatible(old: *const CM, new: *const CM) bool {
         const ned = new.enum_defs[j];
         const oh = old.datatype_handles[ed.enum_handle];
         const nh = new.datatype_handles[ned.enum_handle];
-        if (oh.abilities.bits != nh.abilities.bits) return false;
+        if (!abilitiesCompatible(framework, oh.abilities, nh.abilities)) return false;
         if (!tyParamsEq(oh.type_parameters, nh.type_parameters)) return false;
         if (ned.variants.len > ed.variants.len) return false;
         for (ed.variants, 0..) |ov, tag| {
@@ -179,13 +207,19 @@ fn compatible(old: *const CM, new: *const CM) bool {
     for (old.function_defs, 0..) |of, i| {
         const name = funcName(old, i);
         const public = of.visibility == .Public;
+        // entry linking breaks only count for the framework check (check_private_entry_linking)
+        const entry = framework and of.is_entry;
         const j = findFunc(new, name) orelse {
-            if (public) return false;
+            if (public or entry) return false;
             continue;
         };
         const nf = new.function_defs[j];
         if (public and nf.visibility != .Public) return false;
-        if (!public) continue; // a signature change only breaks public linking (entry ignored)
+        if (framework) {
+            if (old.version < 5 and new.version < 5 and of.visibility != .Private and of.is_entry != nf.is_entry) return false;
+            if (of.is_entry and !nf.is_entry) return false;
+        }
+        if (!public and !entry) continue; // a signature change only breaks public (and entry) linking
         const oh = old.function_handles[of.function];
         const nh = new.function_handles[nf.function];
         if (!sigIdxEq(old, oh.parameters, new, nh.parameters) or !sigIdxEq(old, oh.return_, new, nh.return_)) return false;

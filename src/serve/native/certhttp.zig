@@ -20,6 +20,7 @@
 //! `max_conns` at once), only the methods that never block for long (no dry_run, submit,
 //! subscribe, pair_relay or edge feed).
 const std = @import("std");
+const tcache = @import("core").threads;
 const c = std.c;
 const Atomic = std.atomic.Value;
 const dispatch = @import("dispatch.zig");
@@ -154,7 +155,8 @@ pub const Server = struct {
                 continue;
             }
             _ = s.live.fetchAdd(1, .acq_rel);
-            const t = std.Thread.spawn(.{}, connThread, .{ s, cfd }) catch {
+            // a kept thread, not one started per connection (core/threads.zig)
+            const t = tcache.spawn(connThread, .{ s, cfd }) catch {
                 _ = s.live.fetchSub(1, .acq_rel);
                 _ = c.close(cfd);
                 continue;

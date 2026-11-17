@@ -359,6 +359,21 @@ pub const Counters = struct {
     indirect_finalized: u64 = 0,
     late_rejected: u64 = 0,
     indirect_rejected: u64 = 0,
+    /// Rust's other finalizer metric labels (`finalizer_output_commits` direct / indirect,
+    /// `finalizer_transaction_status` direct_finalize / direct_reject,
+    /// `finalizer_skipped_voting_blocks{*, "direct"}`), compared per step with Mysten's by the
+    /// `val-consensus-core` replay (`flabels` lines). The three above are direct_late_reject,
+    /// indirect_finalize and indirect_reject.
+    direct_commits: u64 = 0,
+    indirect_commits: u64 = 0,
+    direct_finalized: u64 = 0,
+    direct_rejected: u64 = 0,
+    direct_skipped_blocks: u64 = 0,
+
+    /// The eight values in the `flabels` order of tools/truth/consensus/committer-vectors.
+    pub fn labels(c: Counters) [8]u64 {
+        return .{ c.direct_commits, c.indirect_commits, c.direct_finalized, c.direct_rejected, c.late_rejected, c.indirect_finalized, c.indirect_rejected, c.direct_skipped_blocks };
+    }
 };
 
 pub const CommitFinalizer = struct {
@@ -519,6 +534,7 @@ pub const CommitFinalizer = struct {
             try self.tryDirectFinalizeCommit(out, i);
         }
         try self.popFinalizedCommits(out, &finalized);
+        self.counters.direct_commits += finalized.items.len;
 
         if (self.pending_commits.items.len > 0) {
             try self.linkBlocksInLastCommit();
@@ -529,9 +545,19 @@ pub const CommitFinalizer = struct {
                 const before = finalized.items.len;
                 try self.popFinalizedCommits(out, &finalized);
                 if (finalized.items.len == before) break;
+                self.counters.indirect_commits += finalized.items.len - before;
             }
         }
         if (self.sw.cross_check and self.sw.walk == .dense) try self.verifyDense();
+        // a commit held back far longer than INDIRECT_REJECT_DEPTH rounds is a liveness bug: say
+        // which one and why, once every 256 commits
+        if (self.pending_commits.items.len > 0 and sub_dag.commit_ref.index % 256 == 0) {
+            const f = self.pending_commits.items[0];
+            const l = self.pending_commits.items[self.pending_commits.items.len - 1];
+            std.log.scoped(.commit_finalizer).warn("{d} commits held: first index {d} leader round {d} local {} pending blocks {d} pending tx entries {d}; last leader round {d}", .{
+                self.pending_commits.items.len, f.commit.commit_ref.index, f.commit.leader.round, f.commit.decided_with_local_blocks, f.pending_blocks.items.len, f.pending_transactions.entries.items.len, l.commit.leader.round,
+            });
+        }
         return finalized.items;
     }
 
@@ -601,14 +627,19 @@ pub const CommitFinalizer = struct {
                 const e = st.pending_transactions.getOrPut(self.gpa, pb.ref) catch return error.OutOfMemory;
                 var k: usize = 0;
                 while (k < pb.num_transactions) : (k += 1) idxInsert(self.gpa, &e.idx, @intCast(k)) catch return error.OutOfMemory;
+                self.counters.direct_skipped_blocks += 1;
                 continue;
             }
             const reject_votes = (try self.votes.getRejectVotes(scratch, pb.ref)) orelse return error.MissingBlock;
+            // Rust: `inc_by((num_transactions - reject_votes.len()) as u64)`, wrapping in release
+            // when Byzantine votes name indices past the block's transactions.
+            self.counters.direct_finalized +%= @as(u64, pb.num_transactions) -% @as(u64, reject_votes.len);
             for (reject_votes) |rv| {
                 if (rv.stake < quorum) {
                     const e = st.pending_transactions.getOrPut(self.gpa, pb.ref) catch return error.OutOfMemory;
                     idxInsert(self.gpa, &e.idx, rv.index) catch return error.OutOfMemory;
                 } else {
+                    self.counters.direct_rejected += 1;
                     const e = st.rejected_transactions.getOrPut(self.gpa, pb.ref) catch return error.OutOfMemory;
                     idxInsert(self.gpa, &e.idx, rv.index) catch return error.OutOfMemory;
                 }

@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const bcs = @import("bcs");
 const Reader = bcs.Reader;
 const roaring = @import("roaring.zig");
+const sigparse = @import("sigparse.zig");
 
 /// A fixed-size byte string serialized as BCS bytes (length prefix N) inside a newtype struct:
 /// Rust `Digest(#[serde_as(as = "Bytes")] [u8; 32])`. Decode rejects any other length.
@@ -471,14 +472,15 @@ pub const Base64PublicKey = struct {
     ///   03 or compact 05, kept as given (fastcrypto caches the 33 input bytes); or 65 bytes with
     ///   prefix 04, re-encoded compressed. Hybrid is rejected.
     /// - MLDSA65 (7): 1952 bytes.
-    /// Point validity (on-curve, x < p, ed25519 decompression) is not checked here: those
-    /// vectors are tracked as `gap-lg-*` in testdata/rust_edge.txt (CONTRACTS.md 2.3).
+    /// Points must be valid as those parsers check them (`sigparse.keyPointOk`: coordinates
+    /// below p and on the curve, ed25519 decompression).
     pub fn decodeCanonical(s: []const u8, buf: *[max_decoded]u8) ?[]const u8 {
         const dec = std.base64.standard.Decoder;
         const n = dec.calcSizeForSlice(s) catch return null;
         if (n == 0 or n > buf.len) return null;
         dec.decode(buf[0..n], s) catch return null;
         const b = buf[0..n];
+        if (!sigparse.keyPointOk(b)) return null;
         const k = b[1..];
         switch (b[0]) {
             0 => return if (k.len == 32) b else null,
@@ -541,8 +543,8 @@ pub fn MultiSigLegacyOf(comptime CompressedSignature: type) type {
 /// sui_types::signature::GenericSignature: a newtype around the signature bytes (flag byte
 /// first). Decode validates the flag and the structure of the inner value, the way
 /// `GenericSignature::from_bytes` parses it, including MultiSig::init_and_validate and the
-/// MultiSigLegacy bitmap and key rules. Still open (CONTRACTS.md 2.3): passkey client data,
-/// zkLogin header/iss parsing and public key point validity.
+/// MultiSigLegacy bitmap and key rules (with key point validity), `ZkLoginInputs::init` and
+/// the passkey `TryFrom` checks (sigparse.zig, PARITY.md G20).
 pub const GenericSignature = struct {
     @"0": []const u8,
     pub const bcs_newtype = true;
@@ -569,8 +571,10 @@ pub const GenericSignature = struct {
                 if (multiSigLegacyOk(b[1..])) return .multisig_legacy;
                 return null;
             },
-            5 => return if (innerOk(ZkLoginAuthenticator, b[1..])) .zklogin else null,
-            6 => return if (innerOk(RawPasskeyAuthenticator, b[1..])) .passkey else null,
+            // ZkLoginAuthenticator::from_bytes: BCS, then ZkLoginInputs::init.
+            5 => return if (innerOk(ZkLoginAuthenticator, b[1..]) and sigparse.zkLoginInitOk(b[1..])) .zklogin else null,
+            // PasskeyAuthenticator: BCS of the raw form, then TryFrom (client data, r1 key/sig).
+            6 => return if (innerOk(RawPasskeyAuthenticator, b[1..]) and sigparse.passkeyOk(b[1..])) .passkey else null,
             else => return null,
         }
     }

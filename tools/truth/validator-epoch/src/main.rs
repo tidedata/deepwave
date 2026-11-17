@@ -5,6 +5,8 @@
 //!   sui-types/src/transaction.rs                   VerifiedTransaction::new_end_of_epoch_transaction
 //!   sui-types/src/messages_grpc.rs                 Validator API request and response types
 //!   sui-types/src/messages_checkpoint.rs           CheckpointRequest(V2)
+mod upgrade;
+
 use std::{fs, path::PathBuf};
 
 use anyhow::{Result, bail};
@@ -30,7 +32,7 @@ fn chains() -> [(Chain, &'static str); 3] {
 fn protocol_digests(out: &PathBuf) -> Result<()> {
     let mut text = String::new();
     for (chain, name) in chains() {
-        for v in 1..=141u64 {
+        for v in 1..=ProtocolVersion::MAX.as_u64() {
             let s = SupportedProtocolVersionsWithHashes::from_supported_versions(
                 SupportedProtocolVersions::new_for_testing(v, v),
                 chain,
@@ -124,6 +126,8 @@ fn grpc_req(out: &PathBuf) -> Result<()> {
         inflight_consensus_messages: Some(3),
         consensus_round: Some(4),
         checkpoint_sequence: Some(5),
+        // 1.84 adds the optional `staggering_active` (absent: the 1.83.1 bytes)
+        ..Default::default()
     };
     lines.push(json!({"name": "health", "bcs": hex::encode(prost::Message::encode_to_vec(&health))}));
     write_lines(out, "grpc-req.jsonl", lines)
@@ -141,8 +145,14 @@ fn write_lines(out: &PathBuf, name: &str, lines: Vec<serde_json::Value>) -> Resu
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if (args.len() == 4 || args.len() == 5) && args[1] == "upgrade" {
+        let out = PathBuf::from(&args[2]);
+        fs::create_dir_all(&out)?;
+        protocol_digests(&out)?;
+        return upgrade::dump(&out, &PathBuf::from(&args[3]));
+    }
     if args.len() != 3 || args[1] != "dump" {
-        bail!("usage: zui-valepoch-truth dump OUT_DIR");
+        bail!("usage: zui-valepoch-truth dump OUT_DIR | upgrade OUT_DIR MAINNET_OBJECTS.jsonl [EXTRA.jsonl]");
     }
     let out = PathBuf::from(&args[2]);
     fs::create_dir_all(&out)?;

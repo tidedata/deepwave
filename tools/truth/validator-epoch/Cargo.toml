@@ -3,7 +3,7 @@ name = "zui-valepoch-truth"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Ground truth for the zui validator epoch/API/keys lane (val-epoch-api-keys), built against Mysten's sui 1.83.1 sui-types and sui-protocol-config"
+description = "Ground truth for the zui validator epoch/API/keys lane (val-epoch-api-keys), built against Mysten's sui-types, sui-protocol-config and sui-framework (1.83.1, or 1.84 through tools/sui)"
 
 # Standalone workspace. ../../sui is the symlink made by tools/setup-sui.sh (Mysten mainnet-v1.83.1).
 [workspace]
@@ -11,10 +11,14 @@ description = "Ground truth for the zui validator epoch/API/keys lane (val-epoch
 [dependencies]
 sui-protocol-config = { path = "../../sui/crates/sui-protocol-config" }
 sui-types = { path = "../../sui/crates/sui-types" }
+sui-framework = { path = "../../sui/crates/sui-framework" }
+move-binary-format = { path = "../../sui/external-crates/move/crates/move-binary-format" }
+futures = "0.3"
+itertools = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 bcs = "0.1"
-prost = "0.13"
+prost = "0.14"
 hex = "0.4"
 anyhow = "1"
 

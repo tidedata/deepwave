@@ -375,6 +375,9 @@ pub const Bbr = struct {
     /// BBR.MinPipeCwnd, in datagrams.
     pub const min_pipe_cwnd = 4;
     pub const extra_acked_filter_len = 10;
+    /// The most of the window the aggregation estimate may add: this long at the bandwidth
+    /// estimate (Linux bbr_extra_acked_max_us).
+    pub const extra_acked_max = 100 * ms;
     pub const startup_full_loss_cnt = 6;
     /// A round counts as growth when the delivery rate rose by a quarter; three rounds
     /// without growth are a plateau (5.3.1.2).
@@ -594,7 +597,13 @@ pub const Bbr = struct {
         // 5.4.1 HandleRestartFromIdle
         if (inflight_before == 0 and b.app_limited != 0) {
             b.idle_restart = true;
+            // a new aggregation epoch: its interval and its count start together (Linux
+            // bbr_cwnd_event zeroes ack_epoch_acked here). Restarting the interval alone kept
+            // the count of every earlier burst, so a sender that paused between bursts saw
+            // all it ever delivered as "extra acked", the window took it in, and every ACK
+            // grew the window by what it acknowledged: gigabytes after hours of a feed.
             b.extra_acked_interval_start = now;
+            b.extra_acked_delivered = 0;
             if (b.inProbeBw()) {
                 b.setPacingRateWithGain(100);
             } else if (b.state == .probe_rtt) b.checkProbeRttDone(now, cwnd);
@@ -1178,8 +1187,11 @@ pub const Bbr = struct {
     }
 
     fn setCwnd(b: *Bbr, a: Ack, cwnd: *u64) void {
-        // UpdateMaxInflight
-        b.max_inflight = b.quantizationBudget(b.bdpMultiple(b.bw, b.cwnd_gain) +| b.extra_acked);
+        // UpdateMaxInflight. The aggregation allowance is at most 100 ms of the bandwidth
+        // estimate (Linux bbr_extra_acked_max_us): it covers ACKs that arrive in bunches, not
+        // a count that has run away from the model.
+        const aggr = @min(b.extra_acked, mulDiv(b.bw, extra_acked_max, sec));
+        b.max_inflight = b.quantizationBudget(b.bdpMultiple(b.bw, b.cwnd_gain) +| aggr);
         // a quiet sender's model knows its own bursts, not the path: not below what the path
         // has carried (the bounds that loss sets still apply below)
         if (b.quiet()) b.max_inflight = @max(b.max_inflight, b.carried);

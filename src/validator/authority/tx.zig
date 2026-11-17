@@ -180,7 +180,9 @@ pub fn fromDecodedWhy(arena: Allocator, raw: []const u8, t: messages.PlainTransa
 
     var kinds: std.ArrayList(checks.InputKind) = .empty;
     var recv: std.ArrayList(checks.Receiving) = .empty;
-    if (try checks.inputKinds(arena, td, &kinds, &recv)) |f| {
+    // Without `why` (vote, submit) a duplicated input is kept: `validity_check` runs first there
+    // and reports it at Rust's position.
+    if (try checks.inputKindsOpt(arena, td, &kinds, &recv, why != null)) |f| {
         if (why) |w| w.* = f.message;
         return error.Malformed;
     }

@@ -1402,7 +1402,10 @@ fn waitFor(comptime what: []const u8, ctx: anytype, comptime pred: fn (@TypeOf(c
 }
 
 test "gate threads: a first call waits for its resolve, a slow gate costs at most the wait, never the serving thread" {
-    var r = try Rig.init(.{ .real_clock = true, .wait_ms = 150 });
+    // Times far apart (a 20 ms gate, a 1000 ms wait, a 2500 ms gate): a host running test
+    // binaries side by side stalls a thread for hundreds of ms, and the kind of each answer
+    // (key: the resolve came in time; ip: the wait ran out) is what says which path it took.
+    var r = try Rig.init(.{ .real_clock = true, .wait_ms = 1000 });
     defer r.deinit();
     var b: [512]u8 = undefined;
     try r.mock.setKey("key-fast", okKey(&b, "kid_fast", ",\"rps\":100,\"burst\":100,\"ttl_s\":60,\"lease_units\":null"));
@@ -1416,19 +1419,22 @@ test "gate threads: a first call waits for its resolve, a slow gate costs at mos
     const fast = r.g.admitWait(&.{ .key = "key-fast", .peer = peer, .method = r.get });
     var took = (clock.mono(null) - t0) / ns_per_ms;
     try testing.expect(fast == .allow and fast.allow.kind == .key);
-    try testing.expect(took < 140);
-    // a gate that takes 600 ms: the call gets free-tier treatment after about 150 ms
-    r.mock.delay_ms = 600;
+    try testing.expect(took < 1000);
+    try testing.expectEqual(@as(u64, 0), r.g.m.wait_timeouts.load(.monotonic));
+    // a gate that takes 2500 ms: the call gets free-tier treatment after the 1000 ms wait
+    r.mock.delay_ms = 2500;
     t0 = clock.mono(null);
     const slow = r.g.admitWait(&.{ .key = "key-slow", .peer = peer, .method = r.get });
     took = (clock.mono(null) - t0) / ns_per_ms;
     try testing.expect(slow == .allow and slow.allow.kind == .ip);
-    try testing.expect(took >= 140 and took < 450);
+    try testing.expect(took >= 990 and took < 2500);
     try testing.expectEqual(@as(u64, 1), r.g.m.wait_timeouts.load(.monotonic));
-    // meanwhile a known key is not held up at all
+    // meanwhile a known key is not held up at all: no wait of its own, and none behind the
+    // slow resolve (2500 ms)
     t0 = clock.mono(null);
     for (0..50) |_| try testing.expect(r.g.admitWait(&.{ .key = "key-fast", .peer = peer, .method = r.get }) == .allow);
-    try testing.expect((clock.mono(null) - t0) / ns_per_ms < 50);
+    try testing.expectEqual(@as(u64, 1), r.g.m.wait_timeouts.load(.monotonic));
+    try testing.expect((clock.mono(null) - t0) / ns_per_ms < 1000);
     // and the resolve finishes behind the scenes
     const Ctx = struct {
         g: *Gate,
@@ -1437,14 +1443,15 @@ test "gate threads: a first call waits for its resolve, a slow gate costs at mos
             return f.cfg.status == .ok;
         }
     };
-    try waitFor("the slow key's resolve", Ctx{ .g = r.g }, Ctx.resolved, 3000);
+    try waitFor("the slow key's resolve", Ctx{ .g = r.g }, Ctx.resolved, 10_000);
     const later = r.g.admitWait(&.{ .key = "key-slow", .peer = peer, .method = r.get });
     try testing.expect(later == .allow and later.allow.kind == .key);
     r.mock.delay_ms = 0;
 }
 
 test "gate threads: calls from many threads are all counted and reach the gate; stop is bounded" {
-    var r = try Rig.init(.{ .real_clock = true, .cut_ns = 0 });
+    // the first call waits for its resolve however long a loaded host takes (not free tier)
+    var r = try Rig.init(.{ .real_clock = true, .cut_ns = 0, .wait_ms = 10_000 });
     defer r.deinit();
     var b: [512]u8 = undefined;
     try r.mock.setKey("key-a", okKey(&b, "kid_a", ",\"rps\":1000000,\"burst\":1000000,\"ttl_s\":60,\"lease_units\":null"));
@@ -1513,7 +1520,8 @@ test "gate threads: a stop during a usage post that never answers returns at onc
     const peer = ident.Ip.parse("198.51.100.1").?;
     {
         var hang: HangingUsage = .{};
-        var r = try Rig.init(.{ .dir = tmp.dir, .real_clock = true, .cut_ns = 0, .transport = hang.transport() });
+        // the first call waits for its resolve however long a loaded host takes (not free tier)
+        var r = try Rig.init(.{ .dir = tmp.dir, .real_clock = true, .cut_ns = 0, .transport = hang.transport(), .wait_ms = 10_000 });
         defer r.deinit();
         hang.mock = r.mock;
         try r.mock.setKey("key-a", okKey(&b, "kid_a", ",\"rps\":1000,\"burst\":1000,\"ttl_s\":60,\"lease_units\":null"));

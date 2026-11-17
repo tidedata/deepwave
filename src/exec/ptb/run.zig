@@ -865,7 +865,7 @@ pub fn finish(r: *Run) Error!Results {
                 if (idx >= r.events.items.len) return r.diag().unsupported("accumulator event reference");
                 const raw = try bcs.encodeAlloc(types.Event, arena, &r.events.items[idx]);
                 const one = try arena.alloc(@typeInfo(@FieldType(types.AccumulatorValue, "EventDigest")).pointer.child, 1);
-                one[0] = .{ idx, .{ .@"0" = types.digest.digestOf("Event", raw) } };
+                one[0] = .{ idx, .{ .@"0" = eventDigest(raw) } };
                 break :blk .{ .EventDigest = one };
             },
         };
@@ -1175,7 +1175,20 @@ pub fn buildPackage(r: *Run, mods: []ff.CompiledModule, b: Build) Error!Built {
         else => return r.diag().unsupported("published package does not load"),
     };
     try r.published.append(arena, id);
-    if (vpkg.refused != null) return r.diag().unsupported("published package refused by the verifier");
+    // validate_package (its gas meter is unused): deserialization and the Move bytecode verifier,
+    // then linking against the dependencies, then the JIT; each error through
+    // `convert_linked_vm_error` as the VM gives it (not `expect_no_verification_errors`)
+    const static = versions.executorOf(cfg) == .static;
+    if (vpkg.refused) |rf| if (rf.stage == .validate) {
+        if (!static) return r.diag().unsupported("published package refused by the verifier");
+        return r.diag().failWith(convertStatus(r, rf.raw orelse rf.fail.err.major, null, null), null);
+    };
+    if (static) if (try linkFailure(r, mods, vlink, b.original_id)) |code|
+        return r.diag().failWith(convertStatus(r, code, null, null), null);
+    if (vpkg.refused) |rf| {
+        if (!static) return r.diag().unsupported("published package refused by the JIT");
+        return r.diag().failWith(convertStatus(r, rf.raw orelse rf.fail.err.major, null, null), null);
+    }
     {
         const tp = try arena.create(pkgs.Pkg);
         tp.* = .{ .raw = &.{}, .view = undefined, .version_id = id, .original_id = b.original_id, .version = b.version, .linkage = vlink, .type_origins = vorigins, .modules = named, .gas_size = 0, .vm = vpkg };
@@ -1188,8 +1201,13 @@ pub fn buildPackage(r: *Run, mods: []ff.CompiledModule, b: Build) Error!Built {
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
         for (mods) |*m| {
+            // sui_verify_module_unmetered, in the payload's module order
             const res = try move_format.verifier.verify.verifyModule(arena, &scratch, &val.verifier, m, &val.natives);
-            if (res.move != null or res.sui != null) return r.diag().unsupported("published module fails the Sui verifier");
+            if (res.move != null) return r.diag().unsupported("published module passed the loader's verifier but not this one");
+            if (res.sui) |se| {
+                if (!static or se.kind != .SuiMoveVerificationError) return r.diag().unsupported("published module fails the Sui verifier");
+                return r.diag().failWith(.SuiMoveVerificationError, null);
+            }
         }
     }
     // check_compatibility (upgrade); `is_new`: the modules the predecessor did not have
@@ -1207,6 +1225,50 @@ pub fn buildPackage(r: *Run, mods: []ff.CompiledModule, b: Build) Error!Built {
         for (mods, is_new) |*m, *n| n.* = cur_vm.module(m.selfName()) == null;
     }
     return .{ .vlink = vlink, .is_new = is_new, .bytes = try bcs.encodeAlloc(types.MovePackage, arena, &mp) };
+}
+
+/// linkage.rs `verify_linkage_and_cyclic_checks_for_publication` for the package's modules
+/// (`mods`, its self address `original`), under its linkage `vlink` (original id, storage id).
+fn linkFailure(r: *Run, mods: []const ff.CompiledModule, vlink: []const [2][32]u8, original: [32]u8) Error!?ff.StatusCode {
+    const arena = r.arena;
+    const Deps = struct {
+        original: [32]u8,
+        own: []const *const ff.CompiledModule,
+        ids: []const [32]u8,
+        pkgs: []const *const move_vm.Package,
+
+        fn find(ctx: *const anyopaque, addr: *const [32]u8, name: []const u8) ?*const ff.CompiledModule {
+            const d: *const @This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, addr, &d.original)) {
+                for (d.own) |m| if (std.mem.eql(u8, m.selfName(), name)) return m;
+                return null;
+            }
+            for (d.ids, d.pkgs) |*id, p| if (std.mem.eql(u8, id, addr)) {
+                const m = p.module(name) orelse return null;
+                return &m.cm;
+            };
+            return null;
+        }
+    };
+    const own = try arena.alloc(*const ff.CompiledModule, mods.len);
+    for (mods, own) |*m, *o| o.* = m;
+    std.mem.sort(*const ff.CompiledModule, own, {}, struct {
+        fn lt(_: void, a: *const ff.CompiledModule, b: *const ff.CompiledModule) bool {
+            return std.mem.order(u8, a.selfName(), b.selfName()) == .lt;
+        }
+    }.lt);
+    var ids: std.ArrayList([32]u8) = .empty;
+    var loaded: std.ArrayList(*const move_vm.Package) = .empty;
+    for (vlink) |l| {
+        if (std.mem.eql(u8, &l[0], &original)) continue;
+        const pkg = try r.p.linker.pkg(&l[1]);
+        const vp = r.p.linker.cache.load(pkg) catch return r.diag().unsupported("dependency does not load");
+        if (vp.refused != null) return r.diag().unsupported("dependency refused by the loader");
+        try ids.append(arena, l[0]);
+        try loaded.append(arena, vp);
+    }
+    const deps: Deps = .{ .original = original, .own = own, .ids = ids.items, .pkgs = loaded.items };
+    return move_format.verifier.dependencies.verifyPackage(arena, own, .{ .ctx = &deps, .find = Deps.find });
 }
 
 pub const Built = struct {
@@ -1275,4 +1337,20 @@ fn buildAndInit(r: *Run, pb: *const typing.Publish, mods: []ff.CompiledModule, b
     }
     try r.packages.append(arena, .{ .id = id, .version = b.version, .bytes = bp.bytes });
     return id;
+}
+
+/// `Event::digest` (an authenticated event's accumulator value): Blake2b-256 of the event's
+/// BCS, without the `Event::` type-name salt of the other digests.
+pub fn eventDigest(event_bcs: []const u8) [32]u8 {
+    return @import("hash").blake2b256(&.{event_bcs});
+}
+
+test "authenticated event digest: Event::digest of a sui-node 1.83.1 auth_event::E" {
+    // TransactionEvents[0] of a localnet `auth_event::emit_multiple` transaction; its effects'
+    // EventStreamHead accumulator write carries EventDigest [(0, 9517ae..)]
+    var ev: [130]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&ev, "b9c9d016557a4bb9ac071c13ff2f8109be195724fc21dbc3f6dd47402cd5e8600a617574685f6576656e74c27ec2b9a3b2d5894d4a5c18cac0d2499a47e3091f57229b07c5e2e8f2fb654ab9c9d016557a4bb9ac071c13ff2f8109be195724fc21dbc3f6dd47402cd5e8600a617574685f6576656e74014500080100000000000000");
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, "9517aeefa1920a8e0427061e47ebe5d512fdac3cf9d06a85d641a1b5b86a064f");
+    try std.testing.expectEqualSlices(u8, &want, &eventDigest(&ev));
 }

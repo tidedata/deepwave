@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Produces tools/truth/consensus/committer-vectors output: consensus vectors (replay, verify, bcs,
-# swap, elect) from Mysten's consensus-core at mainnet-v1.83.1. Builds Rust in the shared target
-# dir. Never talks to a network.
+# swap, elect) from Mysten's consensus-core at mainnet-v1.83.1. Builds Rust: run it on a test machine
+# (tools/remote, through tools/heavy.sh, shared target dir). Never talks to a network.
 #
-#   SUI_SRC=$ZUI_SUI_SRC OUT=$ZUI_CORPUS/consensus/replay.vec ./run.sh
+#   SUI_SRC=/data/sui-1.83.1 CARGO_TARGET_DIR=target \
+#     OUT=$ZUI_CORPUS/consensus/replay.vec ./run.sh
 #
 # Then: ZUI_CORPUS=... zig-out/bin/deepwave-conformance-consensus --suite val-consensus-core --jobs 1
 #

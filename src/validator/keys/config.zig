@@ -7,6 +7,7 @@ const std = @import("std");
 const node = @import("node");
 const yaml = node.fullnode_yaml;
 const material = @import("material.zig");
+const deny_manager = @import("../authority/deny_manager.zig");
 
 pub const Error = error{ BadConfig, Io, OutOfMemory };
 
@@ -42,6 +43,8 @@ pub const Consensus = struct {
     external_address: ?[]const u8 = null,
 };
 
+pub const ChainProviders = struct { chain: []const u8, names: []const []const u8 };
+
 pub const ValidatorConfig = struct {
     db_path: []const u8,
     /// Multiaddr of the sui.validator.Validator gRPC server.
@@ -58,9 +61,17 @@ pub const ValidatorConfig = struct {
     p2p_external_address: ?[]const u8 = null,
     seed_peers: []const []const u8 = &.{},
     jwk_fetch_interval_seconds: u64 = 3600,
+    /// `zklogin-oauth-providers` (`BTreeMap<Chain, BTreeSet<String>>`): provider names per chain
+    /// ("Mainnet", "Testnet", "Unknown"). Null when the key is absent: sui-node's
+    /// `default_zklogin_oauth_providers` (jwk/providers.zig `defaultProviderNames`).
+    zklogin_oauth_providers: ?[]const ChainProviders = null,
     overload: Overload = .{},
     grpc_concurrency_limit: ?usize = 20_000_000_000,
     grpc_load_shed: ?bool = null,
+    /// `transaction-deny-config` as `KEY=VALUE` items (`rpc_exec.txdeny.parseItems`).
+    tx_deny: []const []const u8 = &.{},
+    /// `peer-deny-sync-config` (sui-config PeerDenySyncConfig; validated when the manager starts).
+    peer_deny_sync: deny_manager.SyncConfig = .{},
     /// Top-level keys this loader does not know (NodeConfig tolerates them; the caller warns).
     unknown_keys: []const []const u8 = &.{},
 
@@ -206,6 +217,16 @@ fn fromValue(a: std.mem.Allocator, root: yaml.Value) Error!ValidatorConfig {
             if (v.get("genesis-file-location")) |g| c.genesis_path = try str(g) else return error.BadConfig;
         } else if (std.mem.eql(u8, k, "jwk-fetch-interval-seconds")) {
             c.jwk_fetch_interval_seconds = try int(u64, v);
+        } else if (std.mem.eql(u8, k, "zklogin-oauth-providers")) {
+            if (v != .map) return error.BadConfig;
+            const out = try a.alloc(ChainProviders, v.map.len);
+            for (v.map, out) |cp, *o| {
+                if (cp.value != .seq) return error.BadConfig;
+                const names = try a.alloc([]const u8, cp.value.seq.len);
+                for (cp.value.seq, names) |n, *x| x.* = try str(n);
+                o.* = .{ .chain = cp.key, .names = names };
+            }
+            c.zklogin_oauth_providers = out;
         } else if (std.mem.eql(u8, k, "grpc-load-shed")) {
             c.grpc_load_shed = if (v == .null) null else try boolean(v);
         } else if (std.mem.eql(u8, k, "grpc-concurrency-limit")) {
@@ -228,6 +249,10 @@ fn fromValue(a: std.mem.Allocator, root: yaml.Value) Error!ValidatorConfig {
             }
         } else if (std.mem.eql(u8, k, "authority-overload-config")) {
             c.overload = try overload(v);
+        } else if (std.mem.eql(u8, k, "transaction-deny-config")) {
+            c.tx_deny = try denyItems(a, v, true);
+        } else if (std.mem.eql(u8, k, "peer-deny-sync-config")) {
+            c.peer_deny_sync = try peerDenySync(a, v);
         } else {
             var known = false;
             for (known_keys) |kk| {
@@ -238,6 +263,126 @@ fn fromValue(a: std.mem.Allocator, root: yaml.Value) Error!ValidatorConfig {
     }
     if (!have_db) return error.BadConfig;
     c.unknown_keys = unknown.items;
+    return c;
+}
+
+// ---- transaction-deny-config / peer-deny-sync-config (sui-config transaction_deny_config.rs)
+
+const deny_lists = [_][]const u8{ "object-deny-list", "package-deny-list", "address-deny-list", "zklogin-disabled-providers" };
+const deny_bools = [_][]const u8{ "package-publish-disabled", "package-upgrade-disabled", "shared-object-disabled", "user-transaction-disabled", "gasless-disabled", "receiving-objects-disabled", "zklogin-sig-disabled" };
+
+fn isIn(l: []const []const u8, k: []const u8) bool {
+    for (l) |x| if (std.mem.eql(u8, x, k)) return true;
+    return false;
+}
+
+/// A TransactionDenyRules map (plus `dynamic-transaction-checks` for the local config) as
+/// `KEY=VALUE` items; unknown keys are ignored (serde does not deny them).
+fn denyItems(a: std.mem.Allocator, v: yaml.Value, with_dynamic: bool) Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    if (v == .null) return out.items;
+    if (v != .map) return error.BadConfig;
+    for (v.map) |p| {
+        if (isIn(&deny_lists, p.key)) {
+            const items: []const yaml.Value = switch (p.value) {
+                .seq => |x| x,
+                .null => &.{},
+                else => return error.BadConfig,
+            };
+            var l: std.ArrayList(u8) = .empty;
+            for (items) |it| {
+                if (l.items.len > 0) try l.append(a, ',');
+                try l.appendSlice(a, try str(it));
+            }
+            try out.append(a, try std.fmt.allocPrint(a, "{s}={s}", .{ p.key, l.items }));
+        } else if (isIn(&deny_bools, p.key)) {
+            try out.append(a, try std.fmt.allocPrint(a, "{s}={}", .{ p.key, try boolean(p.value) }));
+        } else if (with_dynamic and std.mem.eql(u8, p.key, "dynamic-transaction-checks")) {
+            if (p.value != .null) try out.append(a, try std.fmt.allocPrint(a, "dynamic-transaction-checks={s}", .{try str(p.value)}));
+        }
+    }
+    return out.items;
+}
+
+fn denyRules(a: std.mem.Allocator, v: yaml.Value) Error!deny_manager.Rules {
+    const items = try denyItems(a, v, false);
+    const c = node_rpc_txdeny.parseItems(a, items) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.BadConfig;
+    return c.rules;
+}
+
+const node_rpc_txdeny = @import("rpc_exec").txdeny;
+
+/// AuthorityName in YAML: Base64 of the 96 key bytes.
+fn authorityName(v: yaml.Value) Error![96]u8 {
+    const text = try str(v);
+    var out: [96]u8 = undefined;
+    const dec = std.base64.standard.Decoder;
+    const n = dec.calcSizeForSlice(text) catch return error.BadConfig;
+    if (n != 96) return error.BadConfig;
+    dec.decode(&out, text) catch return error.BadConfig;
+    return out;
+}
+
+fn nameSet(a: std.mem.Allocator, v: yaml.Value) Error![]const [96]u8 {
+    const items: []const yaml.Value = switch (v) {
+        .seq => |x| x,
+        .null => &.{},
+        else => return error.BadConfig,
+    };
+    var out: std.ArrayList([96]u8) = .empty;
+    for (items) |it| {
+        const n = try authorityName(it);
+        for (out.items) |x| {
+            if (std.mem.eql(u8, &x, &n)) break;
+        } else try out.append(a, n);
+    }
+    return out.items;
+}
+
+/// SharedDenyRuleThreshold (flattened into its ruleset / bucket): `eligibility` as
+/// `{allowlist: [...]}` or `{denylist: [...]}`, `stake-threshold-percent`; both required.
+fn threshold(a: std.mem.Allocator, v: yaml.Value) Error!deny_manager.Threshold {
+    const e = v.get("eligibility") orelse return error.BadConfig;
+    if (e != .map or e.map.len != 1) return error.BadConfig;
+    const tag = e.map[0].key;
+    const eligibility: deny_manager.Eligibility = if (std.mem.eql(u8, tag, "allowlist"))
+        .{ .allowlist = try nameSet(a, e.map[0].value) }
+    else if (std.mem.eql(u8, tag, "denylist"))
+        .{ .denylist = try nameSet(a, e.map[0].value) }
+    else
+        return error.BadConfig;
+    const pct = try int(u16, v.get("stake-threshold-percent") orelse return error.BadConfig);
+    return .{ .eligibility = eligibility, .stake_threshold_percent = pct };
+}
+
+fn peerDenySync(a: std.mem.Allocator, v: yaml.Value) Error!deny_manager.SyncConfig {
+    var c: deny_manager.SyncConfig = .{};
+    if (v == .null) return c;
+    if (v != .map) return error.BadConfig;
+    if (v.get("rulesets")) |rs| if (rs != .null) {
+        if (rs != .seq) return error.BadConfig;
+        const out = try a.alloc(deny_manager.Ruleset, rs.seq.len);
+        for (rs.seq, out) |r, *o| o.* = .{
+            .name = try str(r.get("name") orelse return error.BadConfig),
+            .rules = try denyRules(a, r.get("rules") orelse return error.BadConfig),
+            .threshold = try threshold(a, r),
+        };
+        c.rulesets = out;
+    };
+    if (v.get("default-buckets")) |bs| if (bs != .null) {
+        if (bs != .seq) return error.BadConfig;
+        const out = try a.alloc(deny_manager.Bucket, bs.seq.len);
+        for (bs.seq, out) |b, *o| {
+            var kinds: deny_manager.KindSet = .empty;
+            const ks = b.get("element-kinds") orelse return error.BadConfig;
+            if (ks != .seq) return error.BadConfig;
+            for (ks.seq) |k| kinds.insert(deny_manager.Kind.parse(try str(k)) orelse return error.BadConfig);
+            o.* = .{ .name = try str(b.get("name") orelse return error.BadConfig), .element_kinds = kinds, .threshold = try threshold(a, b) };
+        }
+        c.default_buckets = out;
+    };
+    if (v.get("broadcast-on-startup")) |x| c.broadcast_on_startup = try boolean(x);
+    if (v.get("broadcast-on-epoch-change")) |x| c.broadcast_on_epoch_change = try boolean(x);
     return c;
 }
 
@@ -355,6 +500,20 @@ test "a loaded config does not point into the caller's text" {
     try std.testing.expectEqualStrings("/ip4/127.0.0.1/tcp/1", l.cfg.network_address);
 }
 
+test "zklogin-oauth-providers: provider names per chain" {
+    var l = try parse(std.testing.allocator, "db-path: /db/x\njwk-fetch-interval-seconds: 30\nzklogin-oauth-providers:\n  Unknown:\n    - Google\n    - Twitch\n");
+    defer l.deinit();
+    try std.testing.expectEqual(@as(u64, 30), l.cfg.jwk_fetch_interval_seconds);
+    const m = l.cfg.zklogin_oauth_providers.?;
+    try std.testing.expectEqual(@as(usize, 1), m.len);
+    try std.testing.expectEqualStrings("Unknown", m[0].chain);
+    try std.testing.expectEqual(@as(usize, 2), m[0].names.len);
+    try std.testing.expectEqualStrings("Twitch", m[0].names[1]);
+    var d = try parse(std.testing.allocator, "db-path: /db/x\n");
+    defer d.deinit();
+    try std.testing.expect(d.cfg.zklogin_oauth_providers == null);
+}
+
 test "missing db-path and wrong shapes are rejected" {
     try std.testing.expectError(error.BadConfig, parse(std.testing.allocator, "network-address: x\n"));
     try std.testing.expectError(error.BadConfig, parse(std.testing.allocator, "db-path: /x\nadmin-interface-port: notanumber\n"));
@@ -421,4 +580,48 @@ test "a validator.yaml written by Mysten's ConfigBuilder (sui genesis) loads, ke
 test "an in-place key value Mysten's serde would reject is BadConfig" {
     try std.testing.expectError(error.BadConfig, parse(std.testing.allocator, "db-path: /x\nnetwork-key-pair:\n  value: AAAA\n"));
     try std.testing.expectError(error.BadConfig, parse(std.testing.allocator, "db-path: /x\nprotocol-key-pair:\n  value: //////////////////////////////////////////8=\n"));
+}
+
+test "validator.yaml: transaction-deny-config and peer-deny-sync-config" {
+    const text =
+        \\db-path: /tmp/db
+        \\transaction-deny-config:
+        \\  object-deny-list: ["0x5"]
+        \\  package-publish-disabled: true
+        \\  dynamic-transaction-checks: "True"
+        \\peer-deny-sync-config:
+        \\  rulesets:
+        \\    - name: freeze
+        \\      rules:
+        \\        object-deny-list: ["0x7", "0x6"]
+        \\        user-transaction-disabled: true
+        \\      eligibility:
+        \\        allowlist: ["AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB"]
+        \\      stake-threshold-percent: 67
+        \\  default-buckets:
+        \\    - name: objects
+        \\      element-kinds: [object, zk-login-provider]
+        \\      eligibility:
+        \\        denylist: []
+        \\      stake-threshold-percent: 34
+        \\  broadcast-on-startup: true
+    ;
+    var l = try parse(std.testing.allocator, text);
+    defer l.deinit();
+    const d = node_rpc_txdeny.parseItems(l.arena.allocator(), l.cfg.tx_deny) catch unreachable;
+    try std.testing.expect(d.rules.package_publish_disabled and d.has_dynamic_transaction_checks);
+    try std.testing.expectEqual(@as(usize, 1), d.rules.object_deny_list.len);
+    const s = l.cfg.peer_deny_sync;
+    try std.testing.expect(s.broadcast_on_startup and !s.broadcast_on_epoch_change);
+    try std.testing.expectEqual(@as(usize, 1), s.rulesets.len);
+    try std.testing.expectEqual(@as(u8, 6), s.rulesets[0].rules.object_deny_list[0][31]);
+    try std.testing.expect(s.rulesets[0].rules.user_transaction_disabled);
+    try std.testing.expect(s.rulesets[0].threshold.eligibility.isEligible(&@as([96]u8, @splat(1))));
+    try std.testing.expect(!s.rulesets[0].threshold.eligibility.isEligible(&@as([96]u8, @splat(2))));
+    try std.testing.expectEqual(@as(u16, 34), s.default_buckets[0].threshold.stake_threshold_percent);
+    try std.testing.expect(s.default_buckets[0].element_kinds.contains(.zklogin_provider));
+    try std.testing.expect(s.default_buckets[0].threshold.eligibility.isEligible(&@as([96]u8, @splat(2))));
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    try std.testing.expect((try s.validate(ar.allocator())) == null);
 }

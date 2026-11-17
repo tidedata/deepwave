@@ -42,8 +42,12 @@ pub const OwnedLocks = struct {
         return l.current.get(state_mod.lockKey(ref));
     }
 
-    /// Checks `refs` for `tx` and, when free, records them as held by `tx` in this commit
-    /// (the caller adds them to the commit batch). Does not mutate anything on conflict.
+    /// Checks `refs` for `tx` and, when free or already held by `tx`, records them as held by
+    /// `tx` in this commit (the caller adds them to the commit batch when `.acquired`). Rust
+    /// returns every ref as a new lock even when an earlier commit took it for the same digest, and
+    /// adds them all to the commit's `owned_object_locks`, so a later conflicting transaction of
+    /// the commit marks `tx` contested (a double-spend deferral) whichever commit took the lock.
+    /// Does not mutate anything on conflict.
     pub fn tryAcquirePostConsensus(l: *OwnedLocks, refs: []const ObjRef, tx: *const Id) Allocator.Error!Outcome {
         var all_ours = refs.len != 0;
         for (refs) |r| {
@@ -51,12 +55,11 @@ pub const OwnedLocks = struct {
                 if (!std.mem.eql(u8, &h, tx)) return .conflict;
             } else all_ours = false;
         }
-        if (all_ours) return .already_ours;
         for (refs) |r| {
             const gop = try l.current.getOrPut(l.arena, state_mod.lockKey(r));
             if (!gop.found_existing) gop.value_ptr.* = tx.*;
         }
-        return .acquired;
+        return if (all_ours) .already_ours else .acquired;
     }
 };
 
@@ -98,4 +101,26 @@ test "locks of earlier commits conflict" {
     var l = OwnedLocks.init(ar.allocator(), &st);
     try std.testing.expectEqual(Outcome.conflict, try l.tryAcquirePostConsensus(&.{mkref(7, 3)}, &@as(Id, @splat(2))));
     try std.testing.expectEqual(Outcome.already_ours, try l.tryAcquirePostConsensus(&.{mkref(7, 3)}, &@as(Id, @splat(1))));
+}
+
+test "a lock re-taken from an earlier commit counts as held in this commit (double-spend contest)" {
+    const gpa = std.testing.allocator;
+    var st = state_mod.EpochState.init(gpa);
+    defer st.deinit();
+    var log = @import("epoch_log.zig").MemLog.init(gpa);
+    defer log.deinit();
+    var ar: std.heap.ArenaAllocator = .init(gpa);
+    defer ar.deinit();
+    const t: Id = @splat(1);
+    var batch = state_mod.Batch.init(ar.allocator(), .{ .last_committed_round = 3, .sub_dag_index = 2, .transaction_index = 0 });
+    try batch.addLock(mkref(7, 8), t);
+    try state_mod.commit(&st, &log, &batch);
+    var l = OwnedLocks.init(ar.allocator(), &st);
+    // before t is seen again in this commit, a conflicting tx is not an intra-commit contest
+    try std.testing.expect(l.holderInCommit(mkref(7, 8)) == null);
+    // a copy of t (deferred in the earlier commit) arrives: its lock is now held in this commit
+    try std.testing.expectEqual(Outcome.already_ours, try l.tryAcquirePostConsensus(&.{mkref(7, 8)}, &t));
+    try std.testing.expectEqualSlices(u8, &t, &l.holderInCommit(mkref(7, 8)).?);
+    // so a later tx spending the same gas ref conflicts with an in-commit holder
+    try std.testing.expectEqual(Outcome.conflict, try l.tryAcquirePostConsensus(&.{mkref(7, 8)}, &@as(Id, @splat(2))));
 }

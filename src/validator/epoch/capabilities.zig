@@ -1,11 +1,12 @@
-//! This validator's CapabilityNotificationV2 (protocol-upgrade vote) at mainnet-v1.83.1:
+//! This validator's CapabilityNotificationV2 (protocol-upgrade vote) at 1.84 (MAX 142):
 //! `AuthorityCapabilitiesV2::new` (messages_consensus.rs) with `SupportedProtocolVersionsWithHashes`
 //! (supported_protocol_versions.rs): for every version in the supported range the Blake2b256 digest
 //! of BCS(ProtocolConfig::get_for_version(v, chain)), plus the available system packages.
 //!
 //! The digest of the Rust struct's serde layout is not reproduced by deepwave's config types, so Rust's
-//! values for versions 1..=141 on the unknown, mainnet and testnet chains are compiled in
-//! (`protocol-digests.txt`, written by tools/truth/validator-keys from sui-types 1.83.1): every
+//! values for versions 1..=142 on the unknown, mainnet and testnet chains are compiled in
+//! (`protocol-digests.txt`, written by tools/truth/validator-epoch from sui-types 1.84; versions
+//! 1..=141 are byte-equal to the 1.83.1 table, see testdata/upgrade): every
 //! notification carries Mysten's digests unless a `DigestTable` (`--protocol-digests`) overrides
 //! them. Only a version outside that table falls back to a digest of the insta snapshot text,
 //! which no Mysten validator would match.
@@ -17,9 +18,9 @@ const messages = @import("../messages.zig");
 
 pub const Error = error{ OutOfMemory, BadTable, UnsupportedVersion };
 
-/// `ProtocolVersion::MIN` / `MAX` of sui-protocol-config at mainnet-v1.83.1.
+/// `ProtocolVersion::MIN` / `MAX` of sui-protocol-config at 1.84 (`MAX_PROTOCOL_VERSION` 142).
 pub const supported_min: u64 = 1;
-pub const supported_max: u64 = 141;
+pub const supported_max: u64 = 142;
 
 pub const Flavour = enum { snapshot_text, rust_truth };
 

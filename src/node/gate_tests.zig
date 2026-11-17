@@ -326,6 +326,80 @@ test "gate over HTTP: keys, the free tier, refusals with their statuses, streams
     }
 }
 
+test "gate scope serve-tls: only the TLS listener is gated; the plain serve port and zui/1 answer as without the gate" {
+    const gpa = testing.allocator;
+    try testing.expectEqual(gate.ListenScope.all, gate.ListenScope.parse("all").?);
+    try testing.expectEqual(gate.ListenScope.serve_tls, gate.ListenScope.parse("serve-tls").?);
+    try testing.expectEqual(@as(?gate.ListenScope, null), gate.ListenScope.parse("tls"));
+    for ([_]gate.Listener{ .serve, .serve_tls, .native }) |l| try testing.expect(gate.ListenScope.all.covers(l));
+    try testing.expect(gate.ListenScope.serve_tls.covers(.serve_tls));
+    try testing.expect(!gate.ListenScope.serve_tls.covers(.serve));
+    try testing.expect(!gate.ListenScope.serve_tls.covers(.native));
+
+    var rig: Rig = undefined;
+    try rig.init(token ++ "\n");
+    defer rig.deinit();
+    rig.settings.scope = .serve_tls;
+    var inner: Inner = .{};
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    const ng = try gate.NodeGate.start(gpa, testing.io, rig.settings, null);
+    defer ng.deinit();
+    ng.core.cfg.cut_ns = 0;
+    const Ready = struct {
+        fn free(n: *gate.NodeGate) bool {
+            return n.core.free_known.load(.monotonic);
+        }
+    };
+    try waitFor("the free tier from the mock gate", ng, Ready.free, 5000);
+    // the two serve ports as node.zig `serveHandler` builds them
+    const gated = ng.handler(inner.handler());
+    var tls_front: Front = undefined;
+    try tls_front.start(rig.settings.scope.pick(.serve_tls, gated, inner.handler()));
+    defer tls_front.stop();
+    var plain_front: Front = undefined;
+    try plain_front.start(rig.settings.scope.pick(.serve, gated, inner.handler()));
+    defer plain_front.stop();
+
+    // the plain port: a keyless caller far over the free tier's 5 a second (burst 10) is never
+    // limited, and an unknown key is not refused (no key is looked at)
+    var plain = try Client.connect(plain_front.port);
+    defer plain.close();
+    for (0..40) |_| {
+        try plain.call("/sui.rpc.v2.LedgerService/GetCheckpoint", null, &got);
+        try testing.expect(has(got.items, "grpc-status:0"));
+    }
+    try plain.call("/sui.rpc.v2.LedgerService/GetCheckpoint", "key-unknown-0001", &got);
+    try testing.expect(has(got.items, "grpc-status:0"));
+    try testing.expectEqual(@as(u32, 41), inner.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), rig.mock.resolves);
+
+    // the TLS port (the same handler without the TLS layer): the free tier applies
+    var tls = try Client.connect(tls_front.port);
+    defer tls.close();
+    var passed: u32 = 0;
+    var limited: u32 = 0;
+    for (0..14) |_| {
+        try tls.call("/sui.rpc.v2.LedgerService/GetTransaction", null, &got);
+        if (has(got.items, "grpc-status:0")) passed += 1 else limited += 1;
+    }
+    try testing.expect(passed >= 10 and passed <= 11);
+    try testing.expectEqual(@as(u32, 14), passed + limited);
+
+    // usage: the TLS port's calls are reported, the plain port's never
+    const Sent = struct {
+        m: *g.mock.MockGate,
+        want: u64,
+        fn all(x: @This()) bool {
+            const r = x.m.row("i127.0.0.0/24", "sui.rpc.v2.LedgerService/GetTransaction");
+            return r.local + r.limited == x.want;
+        }
+    };
+    try waitFor("the TLS port's usage at the mock gate", Sent{ .m = rig.mock, .want = 14 }, Sent.all, 8000);
+    try testing.expectEqual(g.contract.Counters{}, rig.mock.row("i127.0.0.0/24", "sui.rpc.v2.LedgerService/GetCheckpoint"));
+    ng.stop();
+}
+
 test "gate over HTTP: a wrong credential is a configuration error and the node falls back to the free tier" {
     const gpa = testing.allocator;
     var rig: Rig = undefined;

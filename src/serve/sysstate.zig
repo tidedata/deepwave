@@ -140,6 +140,25 @@ pub fn summary(s: State) Error!Summary {
     return out;
 }
 
+/// The id of the inner state's `extra_fields` Bag (its last field, after
+/// `epoch_start_timestamp_ms`): where `store_execution_time_estimates_v2` keeps the stored
+/// execution time observations.
+pub fn extraFieldsId(s: State) Error![32]u8 {
+    if (s.version != 1 and s.version != 2) return error.UnsupportedSystemState;
+    var r = Reader.init(s.inner);
+    _ = try r.bytes(24); // epoch, protocol_version, system_state_version
+    try skipValidatorSet(&r);
+    _ = try r.bytes(16); // storage fund
+    _ = try r.bytes(if (s.version == 2) 8 * 8 + 40 else 7 * 8 + 40); // parameters
+    _ = try r.int(u64); // reference_gas_price
+    try skipReportRecords(&r);
+    _ = try r.bytes(8 * 4 + 2 + 40); // stake subsidy
+    _ = try r.boolean();
+    _ = try r.bytes(8 * 4);
+    _ = try r.int(u64); // epoch_start_timestamp_ms
+    return (try readAddr(&r)).*;
+}
+
 /// Parameters and flags the validator lane reads at an epoch switch (val-epoch-api-keys): the
 /// system parameters' `epoch_duration_ms` (their first field in V1 and V2) and `safe_mode`.
 pub fn epochParams(s: State) Error!struct { epoch_duration_ms: u64, safe_mode: bool } {

@@ -13,12 +13,14 @@
 //!   endofepoch.zig  EndOfEpochTransaction / ChangeEpoch construction
 //!   manager.zig     committee switch, epoch store close/open, safe mode, component restart
 //!   capabilities.zig  this validator's CapabilityNotificationV2 (versions with digests)
+//!   packages.zig    available system packages and the upgrade's package bytes (framework.bin)
 //!   hooks.zig       iface.EpochHooks over an EpochState
 //!   driver.zig      iface.CertifiedSink that switches epochs on the last checkpoint of an epoch
 const store = @import("store.zig");
 pub const reconfig = @import("reconfig.zig");
 pub const endofepoch = @import("endofepoch.zig");
 pub const capabilities = @import("capabilities.zig");
+pub const packages = @import("packages.zig");
 pub const manager = @import("manager.zig");
 pub const hooks = @import("hooks.zig");
 pub const driver = @import("driver.zig");

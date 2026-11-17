@@ -287,7 +287,9 @@ pub const TxValidator = struct {
             accepted_early = true;
         };
         if (!accepted_early) {
-            if (v.hooks.executed_last_epoch) |f| if (f(v.hooks.ctx.?, &u.digest)) return "Transaction already executed";
+            // SuiErrorKind::TransactionAlreadyExecuted
+            if (v.hooks.executed_last_epoch) |f| if (f(v.hooks.ctx.?, &u.digest))
+                return std.fmt.allocPrint(arena, "Attempt to move to `Executed` state an transaction that has already been executed: TransactionDigest({s}).", .{try b58(arena, &u.digest)}) catch return error.OutOfMemory;
             if (checker.checkInputs(arena, env, u, .{ .validity = false }) catch return error.OutOfMemory) |f| return f.message;
         }
         if (u.immutableClaims().len != 0) {
@@ -313,6 +315,10 @@ pub const TxValidator = struct {
         return .{ .ctx = v, .vtable = &vt };
     }
 };
+
+fn b58(arena: Allocator, d: *const [32]u8) Allocator.Error![]const u8 {
+    return @import("rpc_exec").checks.b58(arena, d);
+}
 
 fn firstAliasesV2(claims: []const messages.TransactionClaim) ?@FieldType(messages.TransactionClaim, "AddressAliasesV2") {
     for (claims) |c| switch (c) {

@@ -45,6 +45,7 @@ const adapter_mod = @import("adapter.zig");
 const status_mod = @import("status.zig");
 const locks_mod = @import("locks.zig");
 const tx_validator = @import("tx_validator.zig");
+const commit_log = @import("commit_log.zig");
 
 const Allocator = std.mem.Allocator;
 pub const Id = tx_mod.Id;
@@ -61,6 +62,14 @@ pub const Router = struct {
     randomness: ?iface.RandomnessHooks = null,
     jwk: ?iface.JwkHooks = null,
     epoch: ?iface.EpochHooks = null,
+    /// The transaction-deny manager (`process_transaction_deny_config_updates`): each sequenced
+    /// UpdateTransactionDenyConfig with its author, after the block-verify path applied it early.
+    deny_config: ?DenyConfigSink = null,
+};
+
+pub const DenyConfigSink = struct {
+    ctx: *anyopaque,
+    apply: *const fn (ctx: *anyopaque, author: *const [96]u8, update: *const messages.SharedTransactionDenyConfig) void,
 };
 
 /// JWKs that became active in `round` (`get_new_jwks`), supplied by the JWK lane.
@@ -114,7 +123,83 @@ pub const Deps = struct {
     statuses: ?*status_mod.StatusCache = null,
     reasons: ?*tx_validator.ReasonCache = null,
     tracer: iface.Tracer = .{},
+    /// Wall clock in microseconds: when set, every handled commit writes sui-core's
+    /// "Received consensus output" line (authority/commit_log.zig) to stderr.
+    commit_log_us: ?*const fn () u64 = null,
 };
+
+/// `FinalizedTransactionsCache` (sui-core finalized_transactions_cache.rs, mainnet-v1.83.1):
+/// the user transaction digests sequenced this epoch, generational FIFO. Inserts fill `cur`;
+/// once it holds `gen_cap` digests it becomes `prev` (the old `prev` is dropped). In memory only,
+/// one per epoch (`AuthorityPerEpochStore::new`, capacity 100_000 split in two generations).
+/// Handler thread writes, vote threads read.
+/// A transaction's checkpoint user signatures (`process_user_signatures`): with
+/// fix_checkpoint_signature_mapping, one entry per alias claim entry, (tx_signatures[sig_idx],
+/// version) in claim order; without a claim (`no_aliases`), every signature with no version.
+/// Before the flag: all signatures zipped with the claim's versions in order.
+pub fn checkpointSigs(arena: Allocator, fix_mapping: bool, u: *const tx_mod.UserTx) Allocator.Error!state_mod.UserSigs {
+    const sigs = u.signatures();
+    if (fix_mapping) if (Handler.claimV2(u)) |al| {
+        const raw = try arena.alloc([]const u8, al.len);
+        const av = try arena.alloc(?u64, al.len);
+        for (al, raw, av) |e, *r, *v| {
+            // the vote checked every index against the signatures (aliasClaimMatches)
+            r.* = if (e.@"0" < sigs.len) sigs[e.@"0"].@"0" else &.{};
+            v.* = if (e.@"1") |x| x.@"0" else null;
+        }
+        return .{ .digest = u.digest, .sigs = raw, .alias_versions = av };
+    };
+    const raw = try arena.alloc([]const u8, sigs.len);
+    for (sigs, raw) |s, *o| o.* = s.@"0";
+    var av: std.ArrayList(?u64) = .empty;
+    if (Handler.claimV2(u)) |al| for (al) |e| try av.append(arena, if (e.@"1") |v| v.@"0" else null);
+    return .{ .digest = u.digest, .sigs = raw, .alias_versions = av.items };
+}
+
+pub const FinalizedCache = struct {
+    lock: adapter_mod.Spin = .{},
+    cur: std.AutoHashMapUnmanaged(Id, void) = .empty,
+    prev: std.AutoHashMapUnmanaged(Id, void) = .empty,
+    gen_cap: usize = 100_000 / 2,
+
+    pub fn deinit(c: *FinalizedCache, gpa: Allocator) void {
+        c.cur.deinit(gpa);
+        c.prev.deinit(gpa);
+    }
+
+    /// Best effort like Rust's (advisory): an allocation failure leaves the digest out.
+    pub fn insert(c: *FinalizedCache, gpa: Allocator, d: *const Id) void {
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.cur.count() >= c.gen_cap) {
+            c.prev.deinit(gpa);
+            c.prev = c.cur;
+            c.cur = .empty;
+        }
+        c.cur.put(gpa, d.*, {}) catch {};
+    }
+
+    pub fn contains(c: *FinalizedCache, d: *const Id) bool {
+        c.lock.lock();
+        defer c.lock.unlock();
+        return c.cur.contains(d.*) or c.prev.contains(d.*);
+    }
+};
+
+test "finalized cache: generations age out in FIFO order" {
+    const gpa = std.testing.allocator;
+    var c: FinalizedCache = .{ .gen_cap = 2 };
+    defer c.deinit(gpa);
+    const d = [_]Id{ @splat(1), @splat(2), @splat(3), @splat(4), @splat(5) };
+    c.insert(gpa, &d[0]);
+    c.insert(gpa, &d[1]);
+    c.insert(gpa, &d[2]); // rotates: prev {1,2}, cur {3}
+    try std.testing.expect(c.contains(&d[0]) and c.contains(&d[1]) and c.contains(&d[2]));
+    c.insert(gpa, &d[3]);
+    c.insert(gpa, &d[4]); // rotates: prev {3,4}, cur {5}
+    try std.testing.expect(!c.contains(&d[0]) and !c.contains(&d[1]));
+    try std.testing.expect(c.contains(&d[2]) and c.contains(&d[3]) and c.contains(&d[4]));
+}
 
 const CommitInfo = struct {
     round: u64,
@@ -176,6 +261,13 @@ pub const Handler = struct {
     ack_assigned: std.ArrayList(Key) = .empty,
     ack_sigs: std.ArrayList([32]u8) = .empty,
     ack_pending: ?u64 = null,
+    /// BCS StoredExecutionTimeObservations (key sorted) of the estimator at the final round
+    /// (`record_end_of_epoch_execution_time_observations`), read by the end-of-epoch builder.
+    eoe_obs: ?[]u8 = null,
+    eoe_obs_lock: adapter_mod.Spin = .{},
+    /// User transactions sequenced this epoch (`cache_recently_finalized_transaction`), read by
+    /// the vote path's `is_recently_finalized`.
+    finalized: FinalizedCache = .{},
 
     pub const InitError = Allocator.Error || error{MissingEpochStart};
 
@@ -201,6 +293,32 @@ pub const Handler = struct {
         for (h.inbox.items) |i| i.destroy(h.gpa);
         h.inbox.deinit(h.gpa);
         h.committee_index.deinit(h.gpa);
+        if (h.eoe_obs) |b| h.gpa.free(b);
+        h.finalized.deinit(h.gpa);
+    }
+
+    /// Snapshots the estimator for the end-of-epoch transaction (Rust drains it at the final
+    /// round; later observations of the epoch never reach the stored list).
+    pub fn snapshotObservations(h: *Handler, arena: Allocator) Error!void {
+        const names = try arena.alloc([96]u8, h.d.committee.len);
+        for (h.d.committee, names) |c, *n| n.* = c.@"0";
+        const stored = h.d.estimator.storedObservations(arena, names) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Corrupt => return error.Corrupt,
+        };
+        const enc = try bcs.encodeAlloc(types.StoredExecutionTimeObservations, h.gpa, &stored);
+        h.eoe_obs_lock.lock();
+        defer h.eoe_obs_lock.unlock();
+        if (h.eoe_obs) |b| h.gpa.free(b);
+        h.eoe_obs = enc;
+    }
+
+    /// The final-round snapshot, decoded into `arena`; null before the final round.
+    pub fn endOfEpochObservations(h: *Handler, arena: Allocator) ?types.StoredExecutionTimeObservations {
+        h.eoe_obs_lock.lock();
+        defer h.eoe_obs_lock.unlock();
+        const b = h.eoe_obs orelse return null;
+        return bcs.decode(types.StoredExecutionTimeObservations, arena, b) catch null;
     }
 
     /// Rebuilds the execution time estimator from the observations in the epoch state (restart):
@@ -231,6 +349,20 @@ pub const Handler = struct {
     /// Wires the executor's completion callback to `noteExecuted`. `h` must not move afterwards.
     pub fn attachBridge(h: *Handler, b: *exec_bridge.Bridge) void {
         b.on_done = .{ .ctx = h, .f = noteExecutedCb };
+    }
+
+    /// After a restart: the pending checkpoints that were durable but not acknowledged as built
+    /// go to the builder again, in order (the builder skips what it already stored). Call before
+    /// the consensus starts delivering commits. Returns how many.
+    pub fn repushPending(h: *Handler, arena: Allocator) Allocator.Error!usize {
+        const sink = h.d.pending_sink orelse return 0;
+        var n: usize = 0;
+        for (h.d.state.pending.items) |*pc| {
+            const ipc = try toIfacePending(arena, pc);
+            sink.push(&ipc) catch continue;
+            n += 1;
+        }
+        return n;
     }
 
     /// The checkpoint builder consumed the signatures of `digest`.
@@ -524,6 +656,7 @@ pub const Handler = struct {
             .additional_digest = try additionalStateDigest(arena, ring),
         };
         if (info.round <= last_committed_round and last_committed_round != 0) return error.Corrupt;
+        if (h.d.commit_log_us) |now_us| commit_log.emit(now_us(), sub, &info.rejected_digest);
 
         var batch = Batch.init(arena, .{ .last_committed_round = info.round, .sub_dag_index = info.commit_ref.index, .transaction_index = 0 });
         try batch.commit_times.append(arena, sub.timestamp_ms);
@@ -685,6 +818,8 @@ pub const Handler = struct {
                 a.onSequenced(&pt.raw_hash);
                 if (pt.user != null) a.onConsensusKey(&key);
             }
+            // every verified user transaction of the commit, duplicates included
+            if (pt.user) |*u| h.finalized.insert(h.gpa, &u.digest);
             const oc = try occurrence.getOrPut(arena, key);
             if (oc.found_existing) oc.value_ptr.* += 1 else oc.value_ptr.* = 1;
             if (pt.user) |u| {
@@ -725,7 +860,10 @@ pub const Handler = struct {
                 _ = jh.vtable.vote(jh.ctx, &j.@"0", &j.@"1", &j.@"2", info.round);
             },
             .CapabilityNotificationV2 => |c| if (h.d.router.epoch) |eh| eh.vtable.capabilities(eh.ctx, &c),
-            .UpdateTransactionDenyConfig => |c| if (h.d.router.epoch) |eh| eh.vtable.deny_config(eh.ctx, &c),
+            .UpdateTransactionDenyConfig => |c| {
+                if (h.d.router.deny_config) |ds| if (pt.author < h.d.committee.len) ds.apply(ds.ctx, &h.d.committee[pt.author].@"0", &c);
+                if (h.d.router.epoch) |eh| eh.vtable.deny_config(eh.ctx, &c);
+            },
             .ExecutionTimeObservation => |o| try h.processObservation(arena, &batch, &o),
             .CheckpointSignatureV2 => |*m| if (h.d.router.checkpoint_signature) |cs| cs.vtable.add(cs.ctx, &m.summary.auth_signature.authority, m),
             .RandomnessDkgMessage => |m| if (p.randomness_state_enabled) if (h.d.router.randomness) |rh| rh.vtable.dkg_message(rh.ctx, &m.@"0", m.@"1"),
@@ -754,6 +892,8 @@ pub const Handler = struct {
             h.last_handled.store(info.commit_ref.index, .release);
             return;
         }
+
+        if (close.final_round) try h.snapshotObservations(arena);
 
         // 10. schedulables, version assignment, queue, pending checkpoints
         try h.finishCommit(arena, &batch, &info, sched, &cancelled, &indirect, auth_update, randomness_round, dkg_failed, close.final_round);
@@ -1236,6 +1376,16 @@ pub const Handler = struct {
         batch.queue_drained = qroots.items.len == 0;
         _ = assigned_map;
 
+        // the randomness manager's records go into the same group as the commit they belong to
+        if (h.d.router.randomness) |rh| if (rh.vtable.take_records) |take| {
+            if (try take(rh.ctx, arena)) |rec| try batch.ext.append(arena, .{ .tag = state_mod.ext_randomness, .bytes = rec });
+        };
+        if (h.d.epoch_ctl.vtable.take_records) |take| {
+            if (try take(h.d.epoch_ctl.ctx, arena)) |rec| try batch.ext.append(arena, .{ .tag = state_mod.ext_epoch, .bytes = rec });
+        }
+        if (h.d.router.jwk) |jh| if (jh.vtable.take_records) |take| {
+            if (try take(jh.ctx, arena)) |rec| try batch.ext.append(arena, .{ .tag = state_mod.ext_jwk, .bytes = rec });
+        };
         // durable
         state_mod.commit(st, h.d.log, batch) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
@@ -1257,17 +1407,17 @@ pub const Handler = struct {
     }
 
     fn recordSigs(h: *Handler, arena: Allocator, batch: *Batch, u: *const tx_mod.UserTx) Allocator.Error!void {
-        _ = h;
-        const sigs = u.signatures();
-        const raw = try arena.alloc([]const u8, sigs.len);
-        for (sigs, raw) |s, *o| o.* = s.@"0";
-        var av: std.ArrayList(?u64) = .empty;
-        // alias versions as claimed (AddressAliasesV2): one entry per required signer
+        h.d.tracer.markNow(.tx_sequenced, &u.digest);
+        try batch.user_sigs.append(arena, try checkpointSigs(arena, h.d.params.fix_checkpoint_signature_mapping, u));
+    }
+
+    /// `tx.aliases()`: the first AddressAliasesV2 claim.
+    fn claimV2(u: *const tx_mod.UserTx) ?[]const messages.AliasEntryV2 {
         for (u.tx.claims) |c| switch (c) {
-            .AddressAliasesV2 => |al| for (al) |e| try av.append(arena, if (e.@"1") |v| v.@"0" else null),
+            .AddressAliasesV2 => |al| return al,
             else => {},
         };
-        try batch.user_sigs.append(arena, .{ .digest = u.digest, .sigs = raw, .alias_versions = av.items });
+        return null;
     }
 
     fn epochVersionsGet(ctx: *const anyopaque, k: versions.ObjKey) ?u64 {

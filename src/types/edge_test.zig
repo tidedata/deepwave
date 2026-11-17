@@ -46,8 +46,6 @@ test "hand-written Deserialize rules match sui-types 1.83.1" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     var n: usize = 0;
-    var gaps: usize = 0;
-    var gaps_open: usize = 0;
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |line| {
         var f = std.mem.tokenizeScalar(u8, line, ' ');
@@ -115,32 +113,22 @@ test "hand-written Deserialize rules match sui-types 1.83.1" {
             try check(gen.TypeInput, a, name, input, ok, re, true);
         } else if (std.mem.startsWith(u8, name, "lay-")) {
             try check(layout.MoveTypeLayout, a, name, input, ok, re, true);
-        } else if (std.mem.startsWith(u8, name, "zk-")) {
+        } else if (std.mem.startsWith(u8, name, "zk-") or std.mem.startsWith(u8, name, "pk-")) {
+            // zkLogin (BCS + ZkLoginInputs::init) and passkey (BCS + TryFrom) decode checks
             try check(gen.GenericSignature, a, name, input, ok, null, false);
-            const g = try bcs.decode(gen.GenericSignature, a, input);
-            const canon = try hand.GenericSignature.canonical(a, g.@"0");
-            const cg: gen.GenericSignature = .{ .@"0" = canon };
-            try t.expectEqualSlices(u8, re.?, try bcs.encodeAlloc(gen.GenericSignature, a, &cg));
-        } else if (std.mem.startsWith(u8, name, "gap-")) {
-            // Rust rejects these and deepwave does not yet (CONTRACTS.md 2.3): gap-zk-* in
-            // ZkLoginInputs::init (JWT header / iss claim parsing), gap-lg-* in the public key
-            // parsers (point validity). Tracked so that closing a gap is visible: deepwave must never
-            // reject what Rust accepts.
-            gaps += 1;
             if (ok) {
-                _ = bcs.decode(gen.GenericSignature, a, input) catch return error.TestUnexpectedResult;
-            } else if (bcs.decode(gen.GenericSignature, a, input)) |_| {
-                gaps_open += 1;
-            } else |_| {}
+                const g = try bcs.decode(gen.GenericSignature, a, input);
+                const canon = try hand.GenericSignature.canonical(a, g.@"0");
+                const cg: gen.GenericSignature = .{ .@"0" = canon };
+                try t.expectEqualSlices(u8, re.?, try bcs.encodeAlloc(gen.GenericSignature, a, &cg));
+            }
         } else if (std.mem.startsWith(u8, name, "ssd-")) {
             try check(gen.SenderSignedData, a, name, input, ok, re, true);
         } else return error.UnknownCase;
         n += 1;
     }
-    try t.expect(n >= 150);
-    try t.expect(gaps >= 10);
-    // Known open gaps (deepwave accepts, Rust rejects): six zkLogin init checks, four key points.
-    try t.expectEqual(gaps, gaps_open);
+    // Every case is checked exactly: no open gaps (deepwave accepting what Rust rejects) remain.
+    try t.expect(n >= 250);
 }
 
 test "legacy multisig base64 keys accept every PublicKey::decode_base64 flag and SEC1 tag" {
@@ -158,7 +146,16 @@ test "legacy multisig base64 keys accept every PublicKey::decode_base64 flag and
     }) |c| {
         @memset(&raw, 0);
         raw[0] = c[0];
-        raw[1] = c[2];
+        // a valid point in the encoding's shape (the key parsers check points): the base point,
+        // whose y is even on secp256k1 (so hybrid tag 06 matches, 07 does not)
+        const ecc = std.crypto.ecc;
+        switch (c[0]) {
+            0 => raw[1..33].* = ecc.Edwards25519.basePoint.toBytes(),
+            1 => raw[1..66].* = ecc.Secp256k1.basePoint.toUncompressedSec1(),
+            2, 6 => raw[1..66].* = ecc.P256.basePoint.toUncompressedSec1(),
+            else => {},
+        }
+        if (c[0] != 0) raw[1] = c[2]; // SEC1 tag; a 33-byte key keeps x after it
         const s = enc.encode(&buf, raw[0 .. 1 + c[1]]);
         var w: [4200]u8 = undefined;
         var bw = bcs.Writer.init(&w);

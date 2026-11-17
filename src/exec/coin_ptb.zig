@@ -17,6 +17,12 @@
 //!   non-public transfers at run time. Charging goes through `charge_gas`, with
 //!   `handle_storage_and_rebate_v1` below gas model 4. Effects are V1 until `enable_effects_v2`.
 //!
+//! The `check_effects` limits (ptb/limits.zig) are not modeled here and need not be: an
+//! effects size near `max_serialized_tx_effects_size_bytes` takes about 2,000 written objects,
+//! far past the 500-unit modeled Move gas bound below, so such a transaction is reported
+//! unsupported and runs on the Move-call executor, which checks them (synth vectors
+//! `limits/effects/coins-*`); the written-objects limit takes megabytes of coins.
+//!
 //! Anything this slice does not model returns `.unsupported` with a reason, never a guess:
 //! - argument and typing errors other than InvalidTransferObject and MergeCoins TypeMismatch.
 //!   The static executor reports them before execution. The dynamic executor reports them when

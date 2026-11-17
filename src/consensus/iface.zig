@@ -86,6 +86,11 @@ pub const TransactionSource = struct {
         next: *const fn (ctx: *anyopaque, out: []types.Transaction, max_bytes: u64) usize,
         /// The proposal that carried the last `next` batch was included in `block`.
         ack: *const fn (ctx: *anyopaque, block: types.BlockRef) void,
+        /// `TransactionConsumer::notify_own_blocks_status`: our own blocks in the sub-dags just
+        /// committed, and the GC round after them. A source resolves the transactions of
+        /// committed blocks as sequenced, and those of own blocks at or below `gc_round` that were
+        /// never committed as garbage collected (to be resubmitted). Optional.
+        committed: ?*const fn (ctx: *anyopaque, own_blocks: []const types.BlockRef, gc_round: types.Round) void = null,
     };
 
     pub fn next(s: TransactionSource, out: []types.Transaction, max_bytes: u64) usize {
@@ -93,6 +98,9 @@ pub const TransactionSource = struct {
     }
     pub fn ack(s: TransactionSource, block: types.BlockRef) void {
         s.vtable.ack(s.ctx, block);
+    }
+    pub fn committed(s: TransactionSource, own_blocks: []const types.BlockRef, gc_round: types.Round) void {
+        if (s.vtable.committed) |f| f(s.ctx, own_blocks, gc_round);
     }
 };
 

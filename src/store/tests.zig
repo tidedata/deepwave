@@ -2662,6 +2662,48 @@ fn ageExpectLive(s: *Store, seq_end: u64) !void {
     for (0..seq_end) |q| try std.testing.expectEqualSlices(u8, noise(q *% 31 + 5, &b4), snap.liveObject(&idOf(100 + q)).?.bytes);
 }
 
+test "age-out: a step past its deadline stops at the next group, and steps cut that way end where steps by bytes do" {
+    const gpa = std.testing.allocator;
+    var hashes: [2][2]?u64 = undefined;
+    var objects: [2]u64 = undefined;
+    for (0..2) |run| {
+        const sim = try SimIo.init(gpa, 31, .{}, 64 << 20);
+        defer sim.deinit();
+        var cfg = smallCfg();
+        cfg.chunk_bytes = 16 << 10;
+        cfg.age_lag_checkpoints = 0;
+        var s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+        defer s.deinit();
+        var seq = try ageFill(s, 0, 0, 200);
+        seq = try ageFill(s, seq, 1, 10);
+        _ = try s.setFloors(.{ .cp_pruned = 49, .obj_pruned = 149, .cp_epoch = 0, .obj_epoch = 0 });
+        try s.flushIndex();
+        // Run 1: a deadline of 1 ns, so every step is late after its first group.
+        const opts: Store.AgeStepOpts = .{ .deadline_ns = if (run == 1) 1 else 0 };
+        var steps: u64 = 0;
+        while (steps < 100_000) : (steps += 1) {
+            const r = try s.ageStepOpts(1 << 30, opts);
+            if (r.idle) break;
+        }
+        const st = &s.age_stats;
+        if (run == 1) {
+            try std.testing.expect(st.step_cuts.load(.monotonic) > 0);
+            try std.testing.expect(steps > 100);
+        } else try std.testing.expectEqual(@as(u64, 0), st.step_cuts.load(.monotonic));
+        try ageExpectLive(s, seq);
+        // The same records are holes either way. (The counters differ: in one step both
+        // passes rewrite a group from its published frames and count its dead versions twice.)
+        for (0..2) |e| hashes[run][e] = try s.segmentLogicalHash(e);
+        objects[run] = st.objects_dropped.load(.monotonic);
+        var snap = s.snapshot();
+        defer snap.release();
+        try std.testing.expect(snap.objectAt(&idOf(1), 148) == null);
+        try std.testing.expect(snap.objectAt(&idOf(1), 150) != null);
+    }
+    try std.testing.expect(objects[1] > 0);
+    for (0..2) |e| try std.testing.expectEqual(hashes[0][e], hashes[1][e]);
+}
+
 test "age-out: object versions go when their successor is below the object floor, checkpoint data below the checkpoint floor (simulator)" {
     const gpa = std.testing.allocator;
     const sim = try SimIo.init(gpa, 31, .{}, 64 << 20);
@@ -3192,6 +3234,39 @@ test "age-out segment pass: with the live set the same records survive as with a
     }
 }
 
+test "age-out segment pass: steps out of time cut a group load and go on where it stopped; over groups with nothing to drop the pass moves on and ends" {
+    const gpa = std.testing.allocator;
+    for ([_]SegMode{ .serial, .set }) |mode| {
+        var w = try SegWorld.open(gpa, mode, 64 << 10, 1 << 20);
+        defer w.close();
+        // The image: 48 groups of about 10 KiB in 4 KiB chunks, every record live. Then the
+        // window moves past it: the segment pass walks it and has nothing to rewrite.
+        try w.image();
+        try w.update(1, &.{});
+        try w.update(1, &.{});
+        try w.floors(1);
+        const st = &w.s.age_stats;
+        const logical = w.s.segmentDisk().logical;
+        // A deadline of 1 ns: every step is out of time after its first chunk (an edge,
+        // 2026-11-13: segment-pass steps of 3.2 to 10.9 s, each read cold under the lock).
+        var steps: u32 = 0;
+        while (true) : (steps += 1) {
+            try std.testing.expect(steps < 20_000);
+            const r = try w.s.ageStepOpts(1 << 20, .{ .deadline_ns = 1 });
+            if (r.idle) break;
+        }
+        std.debug.print("segment pass out of time ({s}): {d} steps, {d} group loads cut and resumed, {d} KiB decoded for {d} KiB of segments, {d} passes\n", .{
+            @tagName(mode), steps, st.seg_load_cuts.load(.monotonic), st.seg_read.load(.monotonic) >> 10, logical >> 10, st.seg_passes.load(.monotonic),
+        });
+        try std.testing.expect(st.seg_passes.load(.monotonic) >= 1);
+        try std.testing.expect(st.seg_load_cuts.load(.monotonic) > 0);
+        // Each chunk decoded once: a cut group is not decoded again from its start.
+        try std.testing.expect(st.seg_read.load(.monotonic) <= logical);
+        try std.testing.expectEqual(@as(u64, 0), st.groups_rewritten.load(.monotonic));
+        try w.expectLive();
+    }
+}
+
 test "age-out segment pass: a record that dies after the table pass named it is kept by that pass and goes with the next; no live record goes" {
     const gpa = std.testing.allocator;
     var w = try SegWorld.open(gpa, .set, 64 << 10, 1 << 20);
@@ -3327,6 +3402,7 @@ test "real files: a close does not wait for a saturated ager (pending set full, 
     cfg.segment_reserve = 64 << 20;
     cfg.age_lag_checkpoints = 0;
     cfg.age_pending_max = 40_000;
+    cfg.age_pending_bucket_bits = 16;
     cfg.age_budget = 64 << 20; // the whole epoch is one step
     cfg.age_mbps = 1 << 20; // no pacing naps
     const h = try root.openDir(gpa, io, &cfg, .{ .sync = .none });
@@ -3358,7 +3434,8 @@ test "real files: a close does not wait for a saturated ager (pending set full, 
     const st = &s.age_stats;
     const clock = @import("clock.zig");
     const t_wait = clock.now();
-    while (st.pending_full.load(.monotonic) == 0) {
+    // Saturated: the full set spilled its lower half to a run (before: dropped what did not fit).
+    while (st.pending_full.load(.monotonic) == 0 and st.pending_spills.load(.monotonic) == 0) {
         try std.testing.expect(clock.now() - t_wait < 120 * std.time.ns_per_s);
         clock.sleep(std.time.ns_per_ms);
     }
@@ -3589,6 +3666,7 @@ test "age-out memory: a pending set driven to its cap stays inside its share of 
     // 4 MiB for the ager: 1 MiB for the pending set, which is a table of 65,536 slots at most
     // (9 bytes each, and half as much again while it doubles) and so 52,427 entries.
     cfg.age_mem_bytes = 4 << 20;
+    cfg.age_pending_bucket_bits = 14;
     const s = try Store.open(gpa, .{ .sim = sim }, &cfg);
     defer s.deinit();
     try std.testing.expectEqual(@as(u64, 52_427), s.agePendingMax());
@@ -3618,17 +3696,21 @@ test "age-out memory: a pending set driven to its cap stays inside its share of 
         idle = (try s.ageStep(512 << 10)).idle;
         try std.testing.expect(st.mem.load(.monotonic) <= cfg.age_mem_bytes);
     }
-    // Full, at the cap, inside its quarter; the whole inside the budget at every step.
-    try std.testing.expect(st.pending_full.load(.monotonic) > 5000);
-    try std.testing.expectEqual(@as(u64, 52_427), st.pending.load(.monotonic));
-    try std.testing.expect(@as(u64, s.ager.pending.capacity()) * 9 * 3 / 2 <= cfg.age_mem_bytes / 4);
-    try std.testing.expect(st.mem_pending.load(.monotonic) <= cfg.age_mem_bytes / 4);
+    // Driven to its cap: the in-memory set fills while the scan runs ahead of the object pass,
+    // and spills its lower half to a run instead of dropping what does not fit. Memory inside
+    // its quarter, the whole inside the budget at every step; nothing dropped.
+    try std.testing.expectEqual(@as(u64, 0), st.pending_full.load(.monotonic));
+    try std.testing.expect(st.pending_spills.load(.monotonic) > 0);
+    try std.testing.expect(st.pending_forgot.load(.monotonic) > 0);
+    try std.testing.expect(s.ager.pending.mem_n <= s.agePendingMax() + s.agePendingMax() / 8);
+    try std.testing.expect(s.ager.pending.memBytes() <= cfg.age_mem_bytes / 4 + cfg.age_mem_bytes / 32);
+    try std.testing.expect(st.mem_pending.load(.monotonic) <= cfg.age_mem_bytes / 4 + cfg.age_mem_bytes / 32);
     try std.testing.expect(st.mem_max.load(.monotonic) <= cfg.age_mem_bytes);
     try std.testing.expect(st.mem_max.load(.monotonic) >= st.mem_pending.load(.monotonic));
     // A full set is pruned once per move of the checkpoint pass, never once per record.
     try std.testing.expect(st.pending_prunes.load(.monotonic) <= steps);
-    std.debug.print("age-out memory: budget {d} KiB, most held {d} KiB, pending set {d} KiB for {d} entries, {d} records not remembered, {d} prune passes in {d} steps\n", .{
-        cfg.age_mem_bytes >> 10, st.mem_max.load(.monotonic) >> 10, st.mem_pending.load(.monotonic) >> 10, st.pending.load(.monotonic), st.pending_full.load(.monotonic), st.pending_prunes.load(.monotonic), steps,
+    std.debug.print("age-out memory: budget {d} KiB, most held {d} KiB, pending set {d} KiB for {d} entries, {d} records not remembered, {d} spills, {d} forgotten, {d} prune passes in {d} steps\n", .{
+        cfg.age_mem_bytes >> 10, st.mem_max.load(.monotonic) >> 10, st.mem_pending.load(.monotonic) >> 10, st.pending.load(.monotonic), st.pending_full.load(.monotonic), st.pending_spills.load(.monotonic), st.pending_forgot.load(.monotonic), st.pending_prunes.load(.monotonic), steps,
     });
     // The store's default budget and the configured entry count: the smaller wins.
     var d = smallCfg();
@@ -3640,6 +3722,255 @@ test "age-out memory: a pending set driven to its cap stays inside its share of 
     try std.testing.expectEqual(@as(u64, 3_355_442), s2.agePendingMax());
     s2.cfg.age_pending_max = 1000;
     try std.testing.expectEqual(@as(u64, 1000), s2.agePendingMax());
+}
+
+/// An edge's shape (production 2026-11-12, `ZUI_AGE_MEM_MB=1024`): the checkpoint floor trails
+/// the object floor by most of an epoch, so the checkpoint pass, and with it the point both
+/// passes have passed, sits far behind the scan. Every checkpoint writes new versions of hot
+/// objects (superseded within the lag: the object pass takes them) and of a slow pool (each
+/// superseded long after it was written, after the object pass went by: only the checkpoint
+/// pass can take them). Epochs of `edge_epoch_cps` checkpoints, each its own segment; the
+/// object window is not left (no segment pass to hide what the other passes miss). Returns
+/// the segments' disk use after each round, and the store's age stats through `out`.
+const EdgeAgeRun = struct {
+    disk: [edge_rounds]u64 = @splat(0),
+    side: [edge_rounds]u64 = @splat(0),
+
+    pending_full: u64 = 0,
+    objects_dropped: u64 = 0,
+    mem_max: u64 = 0,
+    pending_max: u64 = 0,
+    active_spills: u64 = 0,
+    spills: u64 = 0,
+    /// Versions whose successor went below the object floor well before the end (both passes
+    /// had time to take them) and that still read: work the ager dropped.
+    unreclaimed: u64 = 0,
+    reclaimable: u64 = 0,
+};
+const edge_rounds = 48;
+const edge_epoch_cps = 100;
+const edge_round_cps = 25;
+const edge_hot = 16;
+const edge_slow = 1600;
+const edge_slow_per_cp = 16; // each slow object: a new version every 100 checkpoints
+
+fn edgeAgeRun(gpa: std.mem.Allocator, out: *EdgeAgeRun, bucket_bits: u6) !void {
+    const sim = try SimIo.init(gpa, 2026_11_12, .{}, 8 << 20);
+    defer sim.deinit();
+    var cfg = smallCfg();
+    cfg.max_live_objects = 4096;
+    cfg.max_object_versions = 1 << 16;
+    cfg.max_batch_objects = 1024;
+    cfg.segment_reserve = 8 << 20;
+    cfg.chunk_bytes = 8 << 10;
+    cfg.age_lag_checkpoints = 8;
+    cfg.age_whole_group_bytes = 64 << 10;
+    // Room for 1,000 locations: the window between the passes holds about 4,000 slow ones.
+    cfg.age_pending_max = 1000;
+    cfg.age_pending_bucket_bits = bucket_bits;
+    const s = try Store.open(gpa, .{ .sim = sim }, &cfg);
+    defer s.deinit();
+    // Per object, the checkpoint that wrote each version (version v at index v - 1).
+    var written: [edge_hot + edge_slow]std.ArrayList(u64) = @splat(.empty);
+    defer for (&written) |*w| w.deinit(gpa);
+    var pay: [160]u8 = undefined;
+    var big: [512]u8 = undefined;
+    var seq: u64 = 0;
+    for (0..edge_rounds) |round| {
+        for (0..edge_round_cps) |_| {
+            const b = try s.begin(seq, seq / edge_epoch_cps);
+            try b.checkpoint(noise(seq *% 7 + 1, &big), noise(seq *% 7 + 2, big[0..256]));
+            for (0..edge_hot) |h| {
+                try written[h].append(gpa, seq);
+                try put(b, 20_000 + h, written[h].items.len, noise(seq *% 977 + h, &pay));
+            }
+            for (0..edge_slow_per_cp) |k| {
+                const o = edge_hot + (seq * edge_slow_per_cp + k) % edge_slow;
+                try written[o].append(gpa, seq);
+                try put(b, 20_000 + o, written[o].items.len, noise(seq *% 991 + o, &pay));
+            }
+            try s.commit(b);
+            seq += 1;
+        }
+        // Objects 60 checkpoints back, checkpoints 300 back: the checkpoint pass trails the
+        // object pass by about 240 checkpoints (an edge: about 13 hours).
+        if (seq > 300) {
+            _ = try s.setFloors(.{ .obj_pruned = seq - 60, .cp_pruned = seq - 300 });
+            try s.flushIndex();
+        }
+        var guard: u32 = 0;
+        while (guard < 10_000) : (guard += 1) {
+            const r = try s.ageStep(256 << 10);
+            out.pending_max = @max(out.pending_max, s.age_stats.pending.load(.monotonic));
+            if (r.idle) break;
+        }
+        const dk = s.segmentDisk();
+        out.disk[round] = dk.disk;
+        out.side[round] = dk.side;
+    }
+
+    // Every object's newest version reads; every version whose successor went below both
+    // floors a while ago (more than a segment back: both passes are past it) is gone.
+    var snap = s.snapshot();
+    defer snap.release();
+    // (Between the floors a version may wait for the checkpoint pass: the object pass leaves
+    // a group or chunk where it would free less than an eighth.)
+    const settled = seq - 300 - edge_epoch_cps;
+    for (&written, 0..) |*w, o| {
+        const id = idOf(20_000 + o);
+        try std.testing.expect(snap.liveObject(&id) != null);
+        for (w.items[1..], 1..) |succ, v| {
+            if (succ >= settled) break;
+            out.reclaimable += 1;
+            if (snap.objectAt(&id, v) != null) out.unreclaimed += 1;
+        }
+    }
+    const st = &s.age_stats;
+    out.pending_full = st.pending_full.load(.monotonic);
+    out.objects_dropped = st.objects_dropped.load(.monotonic);
+    out.mem_max = st.mem_max.load(.monotonic);
+    out.active_spills = st.pending_active_spills.load(.monotonic);
+    out.spills = st.pending_spills.load(.monotonic);
+}
+
+test "age-out pending set: with the checkpoint pass far behind the object pass (an edge), nothing superseded is dropped and the segments stop growing" {
+    const gpa = std.testing.allocator;
+    var r: EdgeAgeRun = .{};
+    try edgeAgeRun(gpa, &r, 13);
+    // From round 12 (seq 300) the floors move; by round 24 the checkpoint floor has passed the
+    // first epochs, and from there each round's writes supersede as much as they add.
+    const h = edge_rounds / 2 - 1;
+    const e = edge_rounds - 1;
+    std.debug.print("edge age-out: segments {d} KiB at round 24, {d} KiB at round 48 (sidecars {d} -> {d} KiB; {d} KiB written a round); {d} of {d} versions superseded below both floors still read, pending_full {d}, objects dropped {d}, ager memory at most {d} KiB, pending entries at most {d}\n", .{
+        (r.disk[h] - r.side[h]) >> 10, (r.disk[e] - r.side[e]) >> 10, r.side[h] >> 10, r.side[e] >> 10, (r.disk[11] / 12) >> 10, r.unreclaimed, r.reclaimable, r.pending_full, r.objects_dropped, r.mem_max >> 10, r.pending_max,
+    });
+    try std.testing.expectEqual(@as(u64, 0), r.pending_full);
+    try std.testing.expectEqual(@as(u64, 0), r.unreclaimed);
+    // The segment files stay flat, and with their sidecars grow by a third at most over the 24
+    // rounds (they doubled before: the dropped half was never punched).
+    try std.testing.expect(r.disk[e] - r.side[e] <= (r.disk[h] - r.side[h]) * 5 / 4);
+    try std.testing.expect(r.disk[e] <= r.disk[h] * 4 / 3);
+}
+
+test "age-out pending set: an edge whose buckets are whole segments (every add lands where the passes are) never refuses an add and drops nothing" {
+    const gpa = std.testing.allocator;
+    var r: EdgeAgeRun = .{};
+    // 8 MiB buckets: a segment or more each, so the scan's adds all land in the buckets the
+    // object pass and the checkpoint pass are in (an edge, 2026-11-13: error.Full with nothing
+    // else left to write out).
+    try edgeAgeRun(gpa, &r, 23);
+    std.debug.print("edge age-out, whole-segment buckets: pending_full {d}, {d} of {d} superseded versions still read, {d} bucket writes ({d} of a bucket a pass was in), ager memory at most {d} KiB, pending entries at most {d}\n", .{
+        r.pending_full, r.unreclaimed, r.reclaimable, r.spills, r.active_spills, r.mem_max >> 10, r.pending_max,
+    });
+    try std.testing.expectEqual(@as(u64, 0), r.pending_full);
+    try std.testing.expectEqual(@as(u64, 0), r.unreclaimed);
+    try std.testing.expect(r.active_spills > 0);
+}
+
+// Rig soak at an edge's scale (real files, `ZUI_AGER_SOAK=<dir>`; skipped without it, run it
+// in ReleaseFast): the edge's ager memory (`ZUI_AGER_SOAK_MEM_MB`, default 1024: a pending set
+// of 8,388,608), the production lag of 4,096 checkpoints, the checkpoint floor 80,000
+// checkpoints behind the object floor, 100 hot objects and 100 of a slow pool of 800,000 a
+// checkpoint (each slow version superseded 8,000 checkpoints after it was written, long after
+// the object pass went by): 16 million superseded locations between the passes, twice the
+// set. Prints one line per round: segment disk, pending set, steps.
+test "rig soak (ZUI_AGER_SOAK): the ager at an edge's scale on real files" {
+    const dir_z = std.c.getenv("ZUI_AGER_SOAK") orelse return;
+    const gpa = std.heap.c_allocator;
+    const io = std.testing.io;
+    const dir = std.mem.span(dir_z);
+    const mem_mb: u64 = if (std.c.getenv("ZUI_AGER_SOAK_MEM_MB")) |v| std.fmt.parseInt(u64, std.mem.span(v), 10) catch 1024 else 1024;
+    const rounds: u64 = if (std.c.getenv("ZUI_AGER_SOAK_ROUNDS")) |v| std.fmt.parseInt(u64, std.mem.span(v), 10) catch 44 else 44;
+    // Checkpoints between floor moves (default: once a round). Small: the floors creep up as
+    // on an edge, and the scan's adds land in the buckets the passes are in.
+    const every: u64 = if (std.c.getenv("ZUI_AGER_SOAK_FLOOR_EVERY")) |v| @max(1, std.fmt.parseInt(u64, std.mem.span(v), 10) catch 5000) else 5000;
+    const hot = 100;
+    const slow_per_cp = 100;
+    const slow_pool = 800_000;
+    const round_cps = 5000;
+    const epoch_cps = 25_000;
+    const wo = 20_000; // object floor behind the tip
+    const wc = 100_000; // checkpoint floor behind the tip
+    var cfg: root.Config = .{ .dir = dir, .seed = 7 };
+    cfg.max_live_objects = 2 << 20;
+    cfg.max_object_versions = 1 << 22;
+    cfg.max_batch_objects = 4096;
+    cfg.max_segments = 256;
+    cfg.segment_reserve = 4 << 30;
+    cfg.age_mem_bytes = mem_mb << 20;
+    // ZUI_AGER_SOAK_SET=1: the live-set segment pass, as the edges run it (the pass that stalled
+    // on an edge, 2026-11-13). Its bits take half the ager's memory.
+    if (std.c.getenv("ZUI_AGER_SOAK_SET") != null) {
+        cfg.age_live_set = true;
+        cfg.age_set_bytes = cfg.age_mem_bytes / 2;
+    }
+    const h = try root.openDir(gpa, io, &cfg, .{ .sync = .none });
+    defer h.io.deinit();
+    const s = h.store;
+    defer s.deinit();
+    const ver = try gpa.alloc(u64, hot + slow_pool);
+    defer gpa.free(ver);
+    @memset(ver, 0);
+    var prng: std.Random.DefaultPrng = .init(99);
+    const rnd = prng.random();
+    var pay: [256]u8 = undefined;
+    var cpb: [1024]u8 = undefined;
+    var seq: u64 = 0;
+    const clock = @import("clock.zig");
+    const t_start = clock.now();
+    std.debug.print("soak: pending set cap {d} (ager {d} MiB)\n", .{ s.agePendingMax(), mem_mb });
+    for (0..rounds) |round| {
+        const t0 = clock.now();
+        var steps: u64 = 0;
+        var max_ns: u64 = 0;
+        for (0..round_cps) |_| {
+            const b = try s.begin(seq, seq / epoch_cps);
+            rnd.bytes(&cpb);
+            try b.checkpoint(&cpb, cpb[0..256]);
+            for (0..hot) |o| {
+                ver[o] += 1;
+                rnd.bytes(pay[0..128]);
+                try put(b, 1_000_000 + o, ver[o], &pay);
+            }
+            for (0..slow_per_cp) |k| {
+                const o = hot + (seq * slow_per_cp + k) % slow_pool;
+                ver[o] += 1;
+                rnd.bytes(pay[0..128]);
+                try put(b, 1_000_000 + o, ver[o], &pay);
+            }
+            try s.commit(b);
+            seq += 1;
+            if (seq % every != 0) continue;
+            if (seq > wc) {
+                _ = try s.setFloors(.{ .obj_pruned = seq - wo, .cp_pruned = seq - wc });
+                try s.flushIndex();
+            }
+            while (true) : (steps += 1) {
+                const ts = clock.now();
+                const r = try s.ageStepOpts(cfg.age_budget, .{ .deadline_ns = cfg.age_step_ms * std.time.ns_per_ms });
+                max_ns = @max(max_ns, clock.now() - ts);
+                if (r.idle) break;
+            }
+        }
+        const st = &s.age_stats;
+        const d = s.segmentDisk();
+        var runs: u64 = 0;
+        var spills: u64 = 0;
+        var run_bytes: u64 = 0;
+        var active: u64 = 0;
+        if (@hasField(Store.AgeStats, "pending_active_spills")) active = st.pending_active_spills.load(.monotonic);
+        if (@hasField(Store.AgeStats, "pending_spills")) {
+            runs = st.pending_files.load(.monotonic);
+            spills = st.pending_spills.load(.monotonic);
+            run_bytes = st.pending_disk_bytes.load(.monotonic);
+        }
+        std.debug.print("soak round {d} seq {d}: disk {d} MiB (sidecars {d} MiB, logical {d} MiB), dropped {d} objects, pending {d} ({d} MiB in memory), pending_full {d}, pending files {d} ({d} MiB, {d} bucket writes, {d} of active buckets), ager mem now {d} MiB max {d} MiB, {d} steps, round {d} ms (longest step {d} ms, commits at most {d} ms, syncs {d} ms, {d} cut by time), {d} s in\n", .{
+            round, seq, d.disk >> 20, d.side >> 20, d.logical >> 20,
+            st.objects_dropped.load(.monotonic), st.pending.load(.monotonic), st.mem_pending.load(.monotonic) >> 20, st.pending_full.load(.monotonic), runs,
+            run_bytes >> 20, spills, active, st.mem.load(.monotonic) >> 20, st.mem_max.load(.monotonic) >> 20, steps,
+            (clock.now() - t0) / std.time.ns_per_ms, max_ns / std.time.ns_per_ms, st.max_commit_ns.load(.monotonic) / std.time.ns_per_ms, st.max_sync_ns.load(.monotonic) / std.time.ns_per_ms, st.step_cuts.load(.monotonic), (clock.now() - t_start) / std.time.ns_per_s,
+        });
+    }
 }
 
 test "real files: age-out at retention 0 across an epoch change frees the bytes (st_blocks) and reads stay correct" {

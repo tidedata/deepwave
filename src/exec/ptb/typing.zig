@@ -340,8 +340,20 @@ fn datatypeByDefining(p: *Ptb, defining: *const Id, module: []const u8, name: []
     return p.rt().findDatatype(&pkg.original_id, module, name) catch p.diag.unsupported("datatype not found");
 }
 
-/// A runtime type from a type tag (struct addresses are defining ids).
+/// A runtime type from a type tag (struct addresses are defining ids), loaded with no type
+/// argument index (`load_type_from_struct`, `convert_linked_vm_error`).
 pub fn fromTag(p: *Ptb, tag: *const types.TypeTag) Error!Ty {
+    return loadTag(p, null, tag);
+}
+
+pub fn fromStruct(p: *Ptb, st: *const types.StructTag) Error!Ty {
+    return loadStruct(p, null, st);
+}
+
+/// `load_vm_type_from_type_tag`: the VM's `load_type` of a tag whose struct addresses are
+/// defining ids. `at` is the type argument index (`Some(idx)`: `convert_type_argument_error`)
+/// or null (`convert_linked_vm_error`).
+pub fn loadTag(p: *Ptb, at: ?usize, tag: *const types.TypeTag) Error!Ty {
     return switch (tag.*) {
         .bool => &Type.t_bool,
         .u8 => &Type.t_u8,
@@ -352,17 +364,72 @@ pub fn fromTag(p: *Ptb, tag: *const types.TypeTag) Error!Ty {
         .u256 => &Type.t_u256,
         .address => &Type.t_address,
         .signer => &Type.t_signer,
-        .vector => |e| try mk(p.arena, .{ .vector = try fromTag(p, e) }),
-        .@"struct" => |*st| try fromStruct(p, st),
+        .vector => |e| try mk(p.arena, .{ .vector = try loadTag(p, at, e) }),
+        .@"struct" => |*st| try loadStruct(p, at, st),
     };
 }
 
-pub fn fromStruct(p: *Ptb, st: *const types.StructTag) Error!Ty {
+/// One datatype of `loadTag`, with `verify_ty_args` (the datatype's `type_param_constraints`,
+/// phantom parameters included). v4 (move-vm-runtime dispatch_tables.rs `load_type_impl`): a
+/// datatype with no type parameters and a tag with none is done; otherwise every argument loads
+/// first (its own errors win), then the arity (NUMBER_OF_TYPE_ARGUMENTS_MISMATCH), then each
+/// argument's abilities against its parameter's constraints in order (CONSTRAINT_NOT_SATISFIED).
+/// v3 static (env.rs `load_struct_tag`) checks the arity before loading the arguments.
+fn loadStruct(p: *Ptb, at: ?usize, st: *const types.StructTag) Error!Ty {
     const dt = try datatypeByDefining(p, &st.address.@"0", st.module.@"0", st.name.@"0");
-    if (dt.n_type_params != st.type_args.len) return p.diag.unsupported("type argument arity");
+    const arity_first = versions.cutOf(p.cfg) != .v4;
+    if (arity_first and dt.n_type_params != st.type_args.len) return tyArgFail(p, at, .arity);
     const args = try p.arena.alloc(Ty, st.type_args.len);
-    for (st.type_args, args) |*a, *o| o.* = try fromTag(p, a);
+    for (st.type_args, args) |*a, *o| o.* = try loadTag(p, at, a);
+    if (dt.n_type_params != args.len) return tyArgFail(p, at, .arity);
+    for (args, handleOf(dt).type_parameters) |a, tp| {
+        if (!tp.constraints.isSubset(abilities(a))) return tyArgFail(p, at, .constraint);
+    }
     return mk(p.arena, .{ .datatype = .{ .dt = dt, .args = args } });
+}
+
+/// env.rs `convert_type_argument_error` (a type argument) or `convert_linked_vm_error` (a
+/// Verification status: VMVerificationOrDeserializationError) of a `verify_ty_args` failure.
+/// The dynamic cuts' adapters convert these differently (not modeled; never certified).
+fn tyArgFail(p: *Ptb, at: ?usize, what: enum { arity, constraint }) Error {
+    if (versions.executorOf(p.cfg) == .dynamic) return p.diag.unsupported(switch (what) {
+        .arity => "type argument arity",
+        .constraint => "type argument constraint",
+    });
+    const idx = at orelse return p.fail(.VMVerificationOrDeserializationError);
+    return p.fail(switch (what) {
+        .arity => .TypeArityMismatch,
+        .constraint => .{ .TypeArgumentError = .{ .argument_idx = @intCast(idx), .kind = .ConstraintNotSatisfied } },
+    });
+}
+
+/// `to_type_tag_internal` (static executor): every struct of the input through its package's
+/// type origin table, so a TypeNotFound anywhere in the input wins over the VM's errors.
+fn resolveInput(p: *Ptb, idx: usize, ti: *const types.TypeInput) Error!*const types.TypeTag {
+    const out = try p.arena.create(types.TypeTag);
+    out.* = switch (ti.*) {
+        .bool => .bool,
+        .u8 => .u8,
+        .u16 => .u16,
+        .u32 => .u32,
+        .u64 => .u64,
+        .u128 => .u128,
+        .u256 => .u256,
+        .address => .address,
+        .signer => .signer,
+        .vector => |e| .{ .vector = try resolveInput(p, idx, e) },
+        .@"struct" => |*si| blk: {
+            const not_found: types.ExecutionErrorKind = .{ .TypeArgumentError = .{ .argument_idx = @intCast(idx), .kind = .TypeNotFound } };
+            const pkg = (try p.linker.cache.get(&si.address.@"0")) orelse return p.fail(not_found);
+            const defining = for (pkg.type_origins) |o| {
+                if (std.mem.eql(u8, o.module, si.module.@"0") and std.mem.eql(u8, o.name, si.name.@"0")) break o.defining;
+            } else return p.fail(not_found);
+            const args = try p.arena.alloc(types.TypeTag, si.type_args.len);
+            for (si.type_args, args) |*a, *o| o.* = (try resolveInput(p, idx, a)).*;
+            break :blk .{ .@"struct" = .{ .address = .{ .@"0" = defining }, .module = .{ .@"0" = si.module.@"0" }, .name = .{ .@"0" = si.name.@"0" }, .type_args = args } };
+        },
+    };
+    return out;
 }
 
 /// Which adapter call loads a type input: a Move call's type argument
@@ -383,6 +450,8 @@ pub fn fromInput(p: *Ptb, idx: usize, ti: *const types.TypeInput) Error!Ty {
 /// VMVerificationOrDeserializationError. v3 under `better_adapter_type_resolution_errors`
 /// (`resolve_datatype_names`) and the static executor report all three as TypeNotFound.
 pub fn fromInputAt(p: *Ptb, idx: usize, ti: *const types.TypeInput, site: TypeSite) Error!Ty {
+    // static executor (env.rs `load_vm_type_from_type_input`): resolve the whole input, then load
+    if (versions.executorOf(p.cfg) == .static) return loadTag(p, idx, try resolveInput(p, idx, ti));
     return switch (ti.*) {
         .bool => &Type.t_bool,
         .u8 => &Type.t_u8,
@@ -421,7 +490,10 @@ pub fn fromInputAt(p: *Ptb, idx: usize, ti: *const types.TypeInput, site: TypeSi
             const args = try p.arena.alloc(Ty, si.type_args.len);
             for (si.type_args, args) |*a, *o| o.* = try fromInputAt(p, idx, a, site);
             const dt = try datatypeByDefining(p, &defining, si.module.@"0", si.name.@"0");
-            if (dt.n_type_params != args.len) return p.diag.unsupported("type argument arity");
+            if (dt.n_type_params != args.len) return tyArgFail(p, idx, .arity);
+            for (args, handleOf(dt).type_parameters) |a, tp| {
+                if (!tp.constraints.isSubset(abilities(a))) return tyArgFail(p, idx, .constraint);
+            }
             break :blk try mk(p.arena, .{ .datatype = .{ .dt = dt, .args = args } });
         },
     };
@@ -572,7 +644,7 @@ pub fn load(p: *Ptb, srcs: []const ?ObjSource) Error!void {
                     .MaxAmountU64 => |u| u,
                 };
                 const inner_ty = switch (f.type_arg) {
-                    .Balance => |*t| try fromTag(p, t),
+                    .Balance => |*t| try loadTag(p, 0, t),
                 };
                 const bal = try frameworkOf(p, "balance", "Balance", inner_ty);
                 var owner: Id = p.sender;
@@ -695,12 +767,29 @@ pub fn load(p: *Ptb, srcs: []const ?ObjSource) Error!void {
 const mainnet_chain_id: Id = .{ 0x35, 0x83, 0x4a, 0x8a, 0xc1, 0x7c, 0xa4, 0x8f, 0xb1, 0x4a, 0xc8, 0xf9, 0x9c, 0x17, 0xc9, 0x87, 0x47, 0xe9, 0x5d, 0xd0, 0x72, 0x94, 0xae, 0x41, 0xa4, 0x6b, 0x38, 0x22, 0x46, 0xa4, 0x49, 0x9b };
 const testnet_chain_id: Id = .{ 0x4c, 0x78, 0xad, 0xac, 0xf2, 0xa2, 0xf5, 0xad, 0x80, 0xf2, 0x7e, 0xd7, 0xd5, 0x4a, 0xa6, 0x9d, 0x3a, 0x78, 0xf1, 0xca, 0x67, 0xfd, 0xef, 0x9e, 0xcf, 0x57, 0x54, 0xf5, 0xb8, 0xbb, 0x77, 0xb0 };
 
-/// `mask_or_unmask_id` with the chain identifier of `chain`.
-pub fn unmaskReservation(chain: protocol.Chain, id: *const Id) Id {
-    const mask = if (chain == .testnet) &testnet_chain_id else &mainnet_chain_id;
+/// `mask_or_unmask_id` with the chain's identifier: `chain_id` when the caller knows it (a local
+/// network's is its own genesis digest), else mainnet's or testnet's by `chain`.
+pub fn unmaskReservation(chain: protocol.Chain, chain_id: ?Id, id: *const Id) Id {
+    const mask: Id = chain_id orelse if (chain == .testnet) testnet_chain_id else mainnet_chain_id;
     var out: Id = undefined;
-    for (&out, id, mask) |*o, a, b| o.* = a ^ b;
+    for (&out, id, &mask) |*o, a, b| o.* = a ^ b;
     return out;
+}
+
+test "coin reservations unmask with the chain's own identifier" {
+    // a local network masks with its genesis digest (sui-types mask_or_unmask_id with the
+    // epoch store's chain identifier), not mainnet's: the accumulator id must come back
+    const field: Id = @splat(0x5a);
+    const local: Id = @splat(0x17);
+    var masked: Id = undefined;
+    for (&masked, &field, &local) |*o, a, b| o.* = a ^ b;
+    try std.testing.expectEqualSlices(u8, &field, &unmaskReservation(.unknown, local, &masked));
+    try std.testing.expect(!std.mem.eql(u8, &field, &unmaskReservation(.unknown, null, &masked)));
+    // without an identifier: mainnet's, testnet's on testnet
+    var on_main: Id = undefined;
+    for (&on_main, &field, &mainnet_chain_id) |*o, a, b| o.* = a ^ b;
+    try std.testing.expectEqualSlices(u8, &field, &unmaskReservation(.mainnet, null, &on_main));
+    try std.testing.expectEqualSlices(u8, &field, &unmaskReservation(.mainnet, mainnet_chain_id, &on_main));
 }
 
 /// `AccumulatorValue::get_field_id(owner, Balance<T>)` for a runtime type `T`.

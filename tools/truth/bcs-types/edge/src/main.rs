@@ -1,6 +1,8 @@
 //! Edge-case truth for the sui-types values whose Rust `Deserialize` checks more than the
 //! serde shape: `Owner::Party` (RawPartySerde + ObjectPermissions), std `Duration` (overflow
 //! check and normalization), the BN254 decimal strings of zkLogin inputs (ark-ff `from_str`),
+//! the decode-time checks of `GenericSignature::from_bytes` (zkLogin `init`, passkey `TryFrom`,
+//! legacy multisig key points),
 //! and the intent check of `SenderSignedTransaction`. Built against Mysten's sui-types 1.83.1.
 //!
 //!   source tools/env.sh
@@ -150,6 +152,10 @@ fn legacy_cases() {
 fn zk(seed: &str, a0: &str, header_json: &str, claim: &str, idx: u8) -> Vec<u8> {
     use base64::Engine;
     let u = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    zk_raw(seed, a0, &u.encode(header_json), &u.encode(claim), idx)
+}
+/// zkLogin GenericSignature wire bytes with the header and iss claim given as base64 text.
+fn zk_raw(seed: &str, a0: &str, header_b64: &str, claim_b64: &str, idx: u8) -> Vec<u8> {
     let a: Vec<String> = vec![a0.into(), "2".into(), "3".into()];
     let b: Vec<Vec<String>> = vec![vec!["4".into(), "5".into()], vec!["6".into(), "7".into()], vec!["8".into(), "9".into()]];
     let c: Vec<String> = vec!["10".into(), "11".into(), "12".into()];
@@ -157,18 +163,29 @@ fn zk(seed: &str, a0: &str, header_json: &str, claim: &str, idx: u8) -> Vec<u8> 
     v.extend(bcs::to_bytes(&a).unwrap());
     v.extend(bcs::to_bytes(&b).unwrap());
     v.extend(bcs::to_bytes(&c).unwrap());
-    v.extend(bcs::to_bytes(&u.encode(claim)).unwrap());
+    v.extend(bcs::to_bytes(&claim_b64.to_string()).unwrap());
     v.push(idx);
-    v.extend(bcs::to_bytes(&u.encode(header_json)).unwrap());
+    v.extend(bcs::to_bytes(&header_b64.to_string()).unwrap());
     v.extend(bcs::to_bytes(&seed.to_string()).unwrap());
     v.extend_from_slice(&9u64.to_le_bytes());
     let mut sig = vec![0u8]; sig.extend_from_slice(&[5u8; 64]); sig.extend_from_slice(&ed_pk(3));
     v.extend(lp(&sig));
     lp(&v)
 }
+/// The base64url slice of `payload` covering `claim`, with its index_mod_4, as a JWT carries it.
+fn claim_slice(payload: &str, claim: &str) -> (String, u8) {
+    use base64::Engine;
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+    let s = payload.find(claim).unwrap();
+    let e = s + claim.len();
+    let (a, b) = ((s * 4) / 3, (e * 4 + 2) / 3);
+    (enc[a..b].to_string(), (a % 4) as u8)
+}
 
 fn zk_cases() {
+    use base64::Engine;
     use sui_types::signature::GenericSignature as G;
+    let u = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let hdr = r#"{"alg":"RS256","typ":"JWT","kid":"abc"}"#;
     let claim = r#""iss":"https://a.bc","#;
     let fq = "21888242871839275222246405745257275088696311157297823662689037894645226208583";
@@ -177,19 +194,196 @@ fn zk_cases() {
     show::<G>("zk-fq-reduced", &zk("12345", &format!("{fq}7"), hdr, claim, 0));
     show::<G>("zk-fr-reduced", &zk(&format!("{fr}99"), "1", hdr, claim, 0));
     show::<G>("zk-both-p", &zk(fr, fq, hdr, claim, 0));
-    // semantic checks Rust performs in inputs.init(); deepwave does not yet (see CONTRACTS 2.3)
-    show::<G>("gap-zk-bad-alg", &zk("1", "1", r#"{"alg":"HS256","typ":"JWT","kid":"abc"}"#, claim, 0));
-    show::<G>("gap-zk-no-kid", &zk("1", "1", r#"{"alg":"RS256","typ":"JWT"}"#, claim, 0));
-    show::<G>("gap-zk-not-json", &zk("1", "1", "nope", claim, 0));
-    show::<G>("gap-zk-no-iss", &zk("1", "1", hdr, r#""sub":"https://a.bc","#, 0));
-    show::<G>("gap-zk-claim-no-comma", &zk("1", "1", hdr, r#""iss":"https://a.bc"x"#, 0));
-    show::<G>("gap-zk-idx3", &zk("1", "1", hdr, claim, 3));
+    // ZkLoginInputs::init: JWTHeader::new (base64url, serde JSON, alg == RS256)
+    let h = |name: &str, header: &str| show::<G>(name, &zk("1", "1", header, claim, 0));
+    h("zk-bad-alg", r#"{"alg":"HS256","typ":"JWT","kid":"abc"}"#);
+    h("zk-no-kid", r#"{"alg":"RS256","typ":"JWT"}"#);
+    h("zk-not-json", "nope");
+    h("zk-hdr-minimal", r#"{"alg":"RS256","kid":""}"#);
+    h("zk-hdr-alg-escaped", r#"{"alg":"RS256","kid":"k"}"#);
+    h("zk-hdr-key-escaped", r#"{"alg":"RS256","kid":"k"}"#);
+    h("zk-hdr-alg-lower", r#"{"alg":"rs256","kid":"k"}"#);
+    h("zk-hdr-alg-space", r#"{"alg":"RS256 ","kid":"k"}"#);
+    h("zk-hdr-kid-number", r#"{"alg":"RS256","kid":5}"#);
+    h("zk-hdr-kid-null", r#"{"alg":"RS256","kid":null}"#);
+    h("zk-hdr-alg-null", r#"{"alg":null,"kid":"k"}"#);
+    h("zk-hdr-typ-null", r#"{"alg":"RS256","kid":"k","typ":null}"#);
+    h("zk-hdr-typ-number", r#"{"alg":"RS256","kid":"k","typ":1}"#);
+    h("zk-hdr-dup-alg", r#"{"alg":"RS256","alg":"RS256","kid":"k"}"#);
+    h("zk-hdr-dup-kid", r#"{"alg":"RS256","kid":"k","kid":"k"}"#);
+    h("zk-hdr-dup-typ", r#"{"alg":"RS256","kid":"k","typ":"a","typ":"a"}"#);
+    h("zk-hdr-dup-unknown", r#"{"x":1,"alg":"RS256","x":2,"kid":"k"}"#);
+    h("zk-hdr-unknown-nested", r#"{"alg":"RS256","x":[1,{"y":null,"z":[true,false,-0.5e+3]}],"kid":"k"}"#);
+    h("zk-hdr-unknown-1e999", r#"{"alg":"RS256","x":1e999,"kid":"k"}"#);
+    h("zk-hdr-array", r#"["RS256","k",null]"#);
+    h("zk-hdr-array-2", r#"["RS256","k"]"#);
+    h("zk-hdr-array-4", r#"["RS256","k","t",1]"#);
+    h("zk-hdr-ws", " \t{ \"alg\" : \"RS256\" , \"kid\" : \"k\" }\n");
+    h("zk-hdr-trailing", r#"{"alg":"RS256","kid":"k"}x"#);
+    h("zk-hdr-trailing-comma", r#"{"alg":"RS256","kid":"k",}"#);
+    h("zk-hdr-empty-object", "{}");
+    h("zk-hdr-empty", "");
+    h("zk-hdr-unicode-kid", "{\"alg\":\"RS256\",\"kid\":\"\u{e9}\\ud83d\\ude00\"}");
+    h("zk-hdr-lone-surrogate", r#"{"alg":"RS256","kid":"\ud800"}"#);
+    h("zk-hdr-control-char", "{\"alg\":\"RS256\",\"kid\":\"a\tb\"}");
+    let deep = |n: usize| format!(r#"{{"alg":"RS256","x":{}{},"kid":"k"}}"#, "[".repeat(n), "]".repeat(n));
+    h("zk-hdr-deep-unknown-200", &deep(200));
+    // raw header bytes: invalid UTF-8 inside a skipped value (ignore_str) and inside kid
+    let raw_h = |name: &str, bytes: &[u8]| show::<G>(name, &zk_raw("1", "1", &u.encode(bytes), &u.encode(claim), 0));
+    raw_h("zk-hdr-bad-utf8-ignored", b"{\"alg\":\"RS256\",\"x\":\"\xff\",\"kid\":\"k\"}");
+    raw_h("zk-hdr-bad-utf8-kid", b"{\"alg\":\"RS256\",\"kid\":\"\xff\"}");
+    // header base64 spelling (base64ct Base64UrlUnpadded: strict)
+    let good_h = u.encode(hdr);
+    let hb = |name: &str, h64: &str| show::<G>(name, &zk_raw("1", "1", h64, &u.encode(claim), 0));
+    hb("zk-hdr-b64-padded", &format!("{}=", base64::engine::general_purpose::URL_SAFE.encode(hdr).trim_end_matches('=')));
+    hb("zk-hdr-b64-padded-full", &base64::engine::general_purpose::URL_SAFE.encode(r#"{"alg":"RS256","kid":"ab"}"#));
+    hb("zk-hdr-b64-std-alphabet", &base64::engine::general_purpose::STANDARD_NO_PAD.encode("{\"alg\":\"RS256\",\"kid\":\"\u{3fff}>>?\"}"));
+    hb("zk-hdr-b64-url-alphabet", &u.encode("{\"alg\":\"RS256\",\"kid\":\"\u{3fff}>>?\"}"));
+    let alpha = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    // a 38-byte header leaves a partial group whose spare bits must be zero
+    let h38 = r#"{"alg":"RS256","typ":"JWT","kid":"ab"}"#;
+    let mut nz38 = u.encode(h38).into_bytes();
+    let l38 = *nz38.last().unwrap();
+    let p38 = alpha.iter().position(|c| *c == l38).unwrap();
+    nz38.pop();
+    nz38.push(alpha[p38 | 1]);
+    hb("zk-hdr-b64-38", &u.encode(h38));
+    hb("zk-hdr-b64-nonzero-trailing-bits", std::str::from_utf8(&nz38).unwrap());
+    hb("zk-hdr-b64-space", &format!("{} ", good_h));
+    hb("zk-hdr-b64-len-mod-1", &format!("{}A", &good_h[..good_h.len() - 4]));
+    // iss claim: decode_base64_url + verify_extended_claim
+    let c = |name: &str, cl: &str, idx: u8| show::<G>(name, &zk("1", "1", hdr, cl, idx));
+    c("zk-no-iss", r#""sub":"https://a.bc","#, 0);
+    c("zk-claim-no-comma", r#""iss":"https://a.bc"x"#, 0);
+    c("zk-idx3", claim, 3);
+    c("zk-claim-brace", r#""iss":"https://a.bc"}"#, 0);
+    c("zk-claim-iss-number", r#""iss":1,"#, 0);
+    c("zk-claim-iss-null", r#""iss":null,"#, 0);
+    c("zk-claim-dup-last-string", r#""iss":1,"iss":"a","#, 0);
+    c("zk-claim-dup-last-number", r#""iss":"a","iss":1,"#, 0);
+    c("zk-claim-extra-member", r#""iss":"a","x":[1,2,{"y":{}}],"#, 0);
+    c("zk-claim-1e999", r#""x":1e999,"iss":"a","#, 0);
+    c("zk-claim-1e308", r#""x":1e308,"iss":"a","#, 0);
+    c("zk-claim-trailing-comma-inside", r#""iss":"a",,"#, 0);
+    c("zk-claim-iss-escaped-key", r#""iss":"a","#, 0);
+    c("zk-claim-lone-surrogate", r#""iss":"\udc00","#, 0);
+    c("zk-claim-ws", " \"iss\" : \"a\" ,", 0);
+    let nest = |n: usize| format!(r#""x":{}{},"iss":"a","#, "[".repeat(n), "]".repeat(n));
+    c("zk-claim-depth-126", &nest(126), 0);
+    c("zk-claim-depth-127", &nest(127), 0);
+    c("zk-claim-depth-128", &nest(128), 0);
+    let cr = |name: &str, c64: &str, idx: u8| show::<G>(name, &zk_raw("1", "1", &u.encode(hdr), c64, idx));
+    cr("zk-claim-1char", "I", 0);
+    cr("zk-claim-empty", "", 0);
+    cr("zk-claim-not-alphabet", &format!("{}=", u.encode(claim)), 0);
+    cr("zk-claim-plus", &u.encode(claim).replace('I', "+"), 0);
+    cr("zk-claim-bad-utf8", &u.encode(b"\"iss\":\"\xff\","), 0);
+    // slices of a real payload at each offset, and with a wrong index
+    for (pre, name) in [("{", "0"), ("{ ", "1"), ("{  ", "2")] {
+        let payload = format!(r#"{pre}"sub":"1","iss":"https://a.bc","aud":"x"}}"#);
+        let (s64, idx) = claim_slice(&payload, claim);
+        cr(&format!("zk-slice-{name}-idx{idx}"), &s64, idx);
+        cr(&format!("zk-slice-{name}-wrong-idx"), &s64, (idx + 1) % 3);
+        let (e64, eidx) = claim_slice(&payload, r#""iss":"https://a.bc","aud":"x"}"#);
+        cr(&format!("zk-slice-{name}-end-brace"), &e64, eidx);
+    }
+    // 256-char claim: (idx + len as u8 - 1) wraps in u8
+    let long = format!(r#""iss":"{}","#, "a".repeat(183));
+    c("zk-claim-long", &long, 0);
     // legacy base64 ed25519 key 0xff..ff: y = 2^255-1 is non-canonical but decompresses, so
-    // Rust accepts it (ed25519-consensus does check decompression: see gap-lg-ed-*)
+    // Rust accepts it (ed25519-consensus does check decompression: see lg-ed-y*-off-curve)
     let mut bad = vec![0u8]; bad.extend_from_slice(&[0xffu8; 32]);
     show::<G>("lg-ed-unchecked-point", &lg(1, &bm(&[0], false), &[(bad, 1)], 1));
 }
 
+/// PasskeyAuthenticator: BCS of RawPasskeyAuthenticator, then `TryFrom` (client data JSON,
+/// challenge, r1 key and signature).
+fn passkey_cases() {
+    use base64::Engine;
+    use fastcrypto::secp256r1::Secp256r1KeyPair;
+    use fastcrypto::traits::{KeyPair, ToFromBytes};
+    use rand::SeedableRng;
+    use sui_types::signature::GenericSignature as G;
+    let u = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut rng = rand::rngs::StdRng::from_seed([7u8; 32]);
+    let r1 = Secp256r1KeyPair::generate(&mut rng);
+    let pk: Vec<u8> = r1.public().as_bytes().to_vec();
+    let n = hex::decode("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551").unwrap();
+    let us = |flag: u8, r: &[u8], s: &[u8], pk: &[u8]| { let mut v = vec![flag]; v.extend_from_slice(r); v.extend_from_slice(s); v.extend_from_slice(pk); v };
+    let good_sig = us(2, &[1u8; 32], &[2u8; 32], &pk);
+    let pkw = |ad: &[u8], cdj: &[u8], sig: &[u8]| { let mut v = vec![6u8]; v.extend(lp(ad)); v.extend(lp(cdj)); v.extend(lp(sig)); lp(&v) };
+    let ch = u.encode([9u8; 32]);
+    let cd = |ty: &str, ch: &str| format!(r#"{{"type":"{ty}","challenge":"{ch}","origin":"https://x","crossOrigin":false}}"#);
+    let j = |name: &str, json: &str| show::<G>(name, &pkw(&[0x11; 37], json.as_bytes(), &good_sig));
+    j("pk-ok", &cd("webauthn.get", &ch));
+    j("pk-create", &cd("webauthn.create", &ch));
+    j("pk-payment", &cd("payment.get", &ch));
+    j("pk-type-unknown", &cd("webauthn.got", &ch));
+    j("pk-type-enum-form", &format!(r#"{{"type":{{"webauthn.get":null}},"challenge":"{ch}","origin":"o"}}"#));
+    j("pk-type-number", &format!(r#"{{"type":1,"challenge":"{ch}","origin":"o"}}"#));
+    j("pk-challenge-31", &cd("webauthn.get", &u.encode([9u8; 31])));
+    j("pk-challenge-33", &cd("webauthn.get", &u.encode([9u8; 33])));
+    j("pk-challenge-empty", &cd("webauthn.get", ""));
+    j("pk-challenge-padded", &cd("webauthn.get", &format!("{ch}=")));
+    j("pk-challenge-std", &cd("webauthn.get", &base64::engine::general_purpose::STANDARD_NO_PAD.encode([0xfbu8; 32])));
+    j("pk-challenge-url-fb", &cd("webauthn.get", &u.encode([0xfbu8; 32])));
+    let mut nz = ch.clone().into_bytes(); let l = nz.pop().unwrap(); nz.push(if l == b'Q' { b'R' } else { l + 1 });
+    j("pk-challenge-nonzero-trailing", &cd("webauthn.get", std::str::from_utf8(&nz).unwrap()));
+    j("pk-challenge-escaped", &cd("webauthn.get", &ch.replacen('J', "\\u004a", 1)));
+    j("pk-challenge-number", &format!(r#"{{"type":"webauthn.get","challenge":5,"origin":"o"}}"#));
+    j("pk-no-origin", &format!(r#"{{"type":"webauthn.get","challenge":"{ch}"}}"#));
+    j("pk-no-challenge", r#"{"type":"webauthn.get","origin":"o"}"#);
+    j("pk-no-type", &format!(r#"{{"challenge":"{ch}","origin":"o"}}"#));
+    j("pk-origin-number", &format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":1}}"#));
+    j("pk-cross-origin-null", &format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"o","crossOrigin":null}}"#));
+    j("pk-cross-origin-string", &format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"o","crossOrigin":"no"}}"#));
+    j("pk-dup-type", &format!(r#"{{"type":"webauthn.get","type":"webauthn.get","challenge":"{ch}","origin":"o"}}"#));
+    j("pk-dup-origin", &format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"o","origin":"o"}}"#));
+    j("pk-dup-unknown", &format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"o","x":1,"x":[{{}}]}}"#));
+    j("pk-extra-1e999", &format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"o","x":1e999}}"#));
+    j("pk-extra-bigint", &format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"o","x":123456789012345678901234567890}}"#));
+    j("pk-key-escaped", &format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"o"}}"#));
+    j("pk-trailing-comma", &format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"o",}}"#));
+    j("pk-trailing-ws", &format!("{} \n", cd("webauthn.get", &ch)));
+    j("pk-trailing-garbage", &format!("{}x", cd("webauthn.get", &ch)));
+    j("pk-array", &format!(r#"["webauthn.get","{ch}","o",false]"#));
+    j("pk-lone-surrogate-extra", &format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"o","x":"\ud800"}}"#));
+    let nest = |d: usize| format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"o","x":{}{}}}"#, "[".repeat(d), "]".repeat(d));
+    j("pk-depth-126", &nest(126));
+    j("pk-depth-127", &nest(127));
+    j("pk-depth-128", &nest(128));
+    // client_data_json is a Rust String: invalid UTF-8 fails BCS
+    show::<G>("pk-cdj-bad-utf8", &pkw(&[], b"{\"type\":\"webauthn.get\",\"x\":\"\xff\"}", &good_sig));
+    // user signature scheme, key and signature scalars
+    let okj = cd("webauthn.get", &ch);
+    let s = |name: &str, sig: Vec<u8>| show::<G>(name, &pkw(&[], okj.as_bytes(), &sig));
+    s("pk-sig-r1-ok-empty-ad", good_sig.clone());
+    s("pk-sig-ed25519", { let mut v = vec![0u8]; v.extend_from_slice(&[1u8; 64]); v.extend_from_slice(&ed_pk(1)); v });
+    s("pk-sig-k1", us(1, &[1u8; 32], &[2u8; 32], &pk));
+    s("pk-sig-r-zero", us(2, &[0u8; 32], &[2u8; 32], &pk));
+    s("pk-sig-s-zero", us(2, &[1u8; 32], &[0u8; 32], &pk));
+    s("pk-sig-r-n", us(2, &n, &[2u8; 32], &pk));
+    s("pk-sig-s-n", us(2, &[1u8; 32], &n, &pk));
+    let mut nm1 = n.clone(); nm1[31] -= 1;
+    s("pk-sig-s-n-minus-1", us(2, &[1u8; 32], &nm1, &pk));
+    s("pk-sig-r-ff", us(2, &[0xffu8; 32], &[2u8; 32], &pk));
+    let mut pc = pk.clone(); pc[0] = 5;
+    s("pk-pk-compact", us(2, &[1u8; 32], &[2u8; 32], &pc));
+    let mut pf = pk.clone(); pf[0] ^= 1;
+    s("pk-pk-other-parity", us(2, &[1u8; 32], &[2u8; 32], &pf));
+    let mut px = vec![2u8]; px.extend_from_slice(&[0xffu8; 32]);
+    s("pk-pk-x-over-p", us(2, &[1u8; 32], &[2u8; 32], &px));
+    let mut p0 = vec![4u8]; p0.extend_from_slice(&[0u8; 32]);
+    s("pk-pk-tag4", us(2, &[1u8; 32], &[2u8; 32], &p0));
+    // first small x that is not on P-256
+    for x in 1u8..=40 {
+        let mut b = vec![2u8; 33]; b[1..].fill(0); b[32] = x;
+        if fastcrypto::secp256r1::Secp256r1PublicKey::from_bytes(&b).is_err() {
+            s(&format!("pk-pk-x{x}-off-curve"), us(2, &[1u8; 32], &[2u8; 32], &b));
+            break;
+        }
+    }
+}
 
 /// Review round 2: legacy base64 keys go through fastcrypto `from_bytes` (secp256k1
 /// `PublicKey::from_slice`, p256 `VerifyingKey::try_from`, ed25519-consensus decompression),
@@ -227,26 +421,61 @@ fn legacy_key_cases() {
     one("lg-r1-compact-2", fk(2, &r1x2));
     one("lg-r1-identity-33", fk(2, &{ let mut z = vec![0u8; 33]; z[0] = 0; z }));
     let mut bad = vec![2u8]; bad.extend_from_slice(&[0xffu8; 32]);
-    one("gap-lg-k1-x-over-p", fk(1, &bad));
-    one("gap-lg-r1-x-over-p", fk(2, &bad));
+    one("lg-k1-x-over-p", fk(1, &bad));
+    one("lg-r1-x-over-p", fk(2, &bad));
     let mut k1bad_y = k1u.clone(); k1bad_y[64] ^= 1;
-    one("gap-lg-k1-uncompressed-off-curve", fk(1, &k1bad_y));
+    one("lg-k1-uncompressed-off-curve", fk(1, &k1bad_y));
     let mut k1p = k1c.clone(); k1p[0] = 5;
     one("lg-k1-bad-prefix", fk(1, &k1p));
     one("lg-k1-33-zero", fk(1, &[0u8; 33]));
     one("lg-k1-1byte-zero", fk(1, &[0u8]));
     one("lg-r1-1byte-zero", fk(2, &[0u8]));
-    // point validity: Rust's key parsers reject these; deepwave has no curve check yet (gap-)
+    // point validity as Rust's key parsers check it
     // ed25519: first small y that does not decompress
     for y in 2u8..=40 {
         let mut b = [0u8; 32]; b[0] = y;
         if fastcrypto::ed25519::Ed25519PublicKey::from_bytes(&b).is_err() {
-            one(&format!("gap-lg-ed-y{y}-off-curve"), fk(0, &b));
+            one(&format!("lg-ed-y{y}-off-curve"), fk(0, &b));
             break;
         }
     }
     let mut ync = [0xffu8; 32]; ync[31] = 0x7f; // y = 2^255-1 >= p, non-canonical
     one("lg-ed-y-noncanonical", fk(0, &ync));
+    // x = 0 points (y = 1 and y = p - 1) with the sign bit set: dalek negates zero, accepts
+    let mut y1 = [0u8; 32]; y1[0] = 1; y1[31] = 0x80;
+    one("lg-ed-y1-sign", fk(0, &y1));
+    let mut ym1 = [0xffu8; 32]; ym1[0] = 0xec; // p - 1 = 2^255 - 20
+    one("lg-ed-ym1", fk(0, &ym1));
+    one("lg-ed-y1", fk(0, &{ let mut b = [0u8; 32]; b[0] = 1; b }));
+    // y = p + 1 (non-canonical 1) with the sign bit
+    let mut yp1 = [0xffu8; 32]; yp1[0] = 0xee;
+    one("lg-ed-yp1-sign", fk(0, &yp1));
+    let mut r1bad = r1u.clone(); r1bad[64] ^= 1;
+    one("lg-r1-uncompressed-off-curve", fk(2, &r1bad));
+    one("lg-passkey-uncompressed-off-curve", fk(6, &r1bad));
+    let mut r1px = vec![4u8]; r1px.extend_from_slice(&[0xffu8; 64]);
+    one("lg-r1-uncompressed-over-p", fk(2, &r1px));
+    let mut cx = vec![5u8]; cx.extend_from_slice(&[0xffu8; 32]);
+    one("lg-r1-compact-x-over-p", fk(2, &cx));
+    one("lg-passkey-x-over-p", fk(6, &bad));
+    let mut k1hy_bad = k1u.clone(); k1hy_bad[64] ^= 1; k1hy_bad[0] = 6 | (k1hy_bad[64] & 1);
+    one("lg-k1-hybrid-off-curve", fk(1, &k1hy_bad));
+    for x in 1u8..=40 {
+        let mut b = vec![2u8; 33]; b[1..].fill(0); b[32] = x;
+        if fastcrypto::secp256k1::Secp256k1PublicKey::from_bytes(&b).is_err() {
+            one(&format!("lg-k1-x{x}-off-curve"), fk(1, &b));
+            break;
+        }
+    }
+    for x in 1u8..=40 {
+        let mut b = vec![3u8; 33]; b[1..].fill(0); b[32] = x;
+        if fastcrypto::secp256r1::Secp256r1PublicKey::from_bytes(&b).is_err() {
+            one(&format!("lg-r1-x{x}-off-curve"), fk(2, &b));
+            let mut c = b.clone(); c[0] = 5;
+            one(&format!("lg-r1-compact-x{x}-off-curve"), fk(2, &c));
+            break;
+        }
+    }
     // base64 spelling of the legacy key string (fastcrypto Base64 = base64ct, padded, strict)
     let raw = |name: &str, s: &str| {
         let mut v = vec![3u8];
@@ -436,6 +665,7 @@ fn main() {
         return;
     }
     zk_cases();
+    passkey_cases();
     depth_cases();
     layout_cases();
     digest_cases();

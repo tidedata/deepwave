@@ -35,6 +35,16 @@ const us = std.time.ns_per_us;
 const pmtu_step = 24;
 const pmtu_raise_ns = 600 * std.time.ns_per_s;
 const pmtu_cooldown_ns = 60 * std.time.ns_per_s;
+/// The most the congestion window may reach, whatever the controller asks for: a backstop, not
+/// a tuning knob. 64 MiB is two bandwidth-delay products of 1 Gbit/s at 250 ms (the core's port
+/// and its longest edge path), so BBR's gain of 2 still fills that path;
+/// a checkpoint feed or catch-up needs far less (34 checkpoints a second is under 10 MB/s).
+/// It stops a window that grows without a congestion signal (an application-limited sender
+/// on a clean path) from reaching gigabytes, and so bounds what the pacer derives from it.
+pub const max_cwnd: u64 = 64 << 20;
+/// The longest a backed-off probe timeout may be (`ptoDuration`): two of them still fit in the
+/// edge's 3 s "no core answered" window, and an idle timeout of 30 s ends a dead path either way.
+const pto_backoff_max_ns = 2 * std.time.ns_per_s;
 
 pub var trace: bool = false;
 fn tr(comptime fmt: []const u8, args: anytype) void {
@@ -477,6 +487,12 @@ pub const Connection = struct {
     /// that carried nothing new (the peer's spurious retransmissions).
     stream_retx: u64 = 0,
     dup_frames: u64 = 0,
+    /// ACKs that acknowledged data, and those of them that found the sender limited by its
+    /// application (RFC 9002 section 7.8: the window did not grow; BBR: an application-limited
+    /// rate sample). And ACKs after which `max_cwnd` held the window down.
+    acks: u64 = 0,
+    acks_app_limited: u64 = 0,
+    cwnd_capped: u64 = 0,
 
     peer: PeerParams = .{},
     peer_tp_checked: bool = false,
@@ -553,7 +569,8 @@ pub const Connection = struct {
     /// `Config.bbr`: the controller; it owns `cwnd` then.
     bbr: cong.Bbr = .{},
     /// The last transmit round ended because the window was full (not because the application
-    /// had nothing more): only then does CUBIC grow the window (RFC 9438 section 5.8).
+    /// had nothing more): only then does CUBIC grow the window (RFC 9438 section 5.8). Kept for
+    /// NewReno as well (`appLimited`).
     cwnd_limited: bool = false,
     /// Set by a transmit round that the pacer held back: when the next run may leave.
     pace_at: ?u64 = null,
@@ -571,7 +588,8 @@ pub const Connection = struct {
     const PeerCid = struct { seq: u64, len: u8, cid: [20]u8, token: [16]u8 };
     /// What an ACK frame told the congestion controller: its space and largest acknowledged
     /// packet number, and the round-trip sample it produced, if any.
-    const AckInfo = struct { space: Space, largest: u64, rtt: ?u64, newest_sent: u64 };
+    /// `prior_in_flight`: bytes in flight before the ACK took its packets out.
+    const AckInfo = struct { space: Space, largest: u64, rtt: ?u64, newest_sent: u64, prior_in_flight: u64 };
 
     pub fn init(gpa: Allocator, cfg: Config, now: u64) Error!*Connection {
         const c = try gpa.create(Connection);
@@ -1557,6 +1575,7 @@ pub const Connection = struct {
         var acked_bytes: u64 = 0;
         var newest_sent: u64 = 0;
         var big_acked = false;
+        const prior_in_flight = c.bytes_in_flight;
         if (c.cfg.bbr) c.bbr.ackBegin();
         // Ranges arrive in descending order; keep the first `max_ranges` (later ones are acked
         // again by the peer's next ACK) and validate them all.
@@ -1649,22 +1668,29 @@ pub const Connection = struct {
             // counts what was lost while the acknowledged packet was in flight (cc.zig)
             if (newly_acked_any) c.pto_count = 0;
             c.detectLoss(now, space);
-            if (newly_acked_any) c.bbr.onAck(.{
-                .now = now,
-                .inflight = c.bytes_in_flight,
-                .newly_acked = acked_bytes,
-                .rtt = if (newly_largest_eliciting_time != null) c.latest_rtt else null,
-                .min_rtt = c.min_rtt,
-                .srtt = if (c.rtt_initialized) c.srtt else 0,
-                .mtu = c.mtu,
-            }, &c.cwnd);
+            if (newly_acked_any) {
+                c.bbr.onAck(.{
+                    .now = now,
+                    .inflight = c.bytes_in_flight,
+                    .newly_acked = acked_bytes,
+                    .rtt = if (newly_largest_eliciting_time != null) c.latest_rtt else null,
+                    .min_rtt = c.min_rtt,
+                    .srtt = if (c.rtt_initialized) c.srtt else 0,
+                    .mtu = c.mtu,
+                }, &c.cwnd);
+                if (acked_bytes > 0) {
+                    c.acks += 1;
+                    if (c.bbr.rs.is_app_limited) c.acks_app_limited += 1;
+                }
+            }
         } else {
             if (newly_acked_any) {
                 c.pto_count = 0;
-                c.onAckedBytes(now, acked_bytes, .{ .space = space, .largest = largest, .rtt = if (newly_largest_eliciting_time != null) c.latest_rtt else null, .newest_sent = newest_sent });
+                c.onAckedBytes(now, acked_bytes, .{ .space = space, .largest = largest, .rtt = if (newly_largest_eliciting_time != null) c.latest_rtt else null, .newest_sent = newest_sent, .prior_in_flight = prior_in_flight });
             }
             c.detectLoss(now, space);
         }
+        c.capCwnd();
         if (c.cfg.pmtud and space == .app) c.blackHoleCheck(now, big_acked);
         c.updateTimer(now);
     }
@@ -1684,7 +1710,33 @@ pub const Connection = struct {
         c.srtt = (7 * c.srtt + adjusted) / 8;
     }
 
+    /// RFC 9002 section 7.8: the window was not what held the sender back. Neither was the
+    /// window full during the last transmit round (`cwnd_limited`) nor was half of it in flight
+    /// when this ACK arrived (Linux tcp_is_cwnd_limited: in slow start a flight of half the
+    /// window still doubles into it). A sender that sends a small burst now and then (a
+    /// checkpoint feed) is such a sender: its ACKs say nothing about a larger window, and
+    /// growing on them took the window to gigabytes on a clean path.
+    fn appLimited(c: *const Connection, prior_in_flight: u64) bool {
+        return !c.cwnd_limited and 2 * prior_in_flight < c.cwnd;
+    }
+
+    /// `max_cwnd`, after every change the controller makes.
+    fn capCwnd(c: *Connection) void {
+        if (c.cwnd <= max_cwnd) return;
+        c.cwnd = max_cwnd;
+        c.cwnd_capped += 1;
+    }
+
     fn onAckedBytes(c: *Connection, now: u64, bytes: u64, a: AckInfo) void {
+        if (bytes > 0) {
+            c.acks += 1;
+            if (c.appLimited(a.prior_in_flight)) {
+                c.acks_app_limited += 1;
+                // CUBIC: the next epoch starts from the window as it is then (section 5.8)
+                if (c.cfg.cubic) c.cubic.epoch = null;
+                return;
+            }
+        }
         if (c.cfg.cubic) {
             // in recovery until a packet sent after the reduction is acknowledged
             if (c.cubic.inRecovery(a.newest_sent)) return;
@@ -1871,7 +1923,12 @@ pub const Connection = struct {
     fn ptoDuration(c: *const Connection, space: Space) u64 {
         var d = c.srtt + @max(4 * c.rttvar, 1 * ms);
         if (space == .app) d += c.peer.max_ack_delay_ms * ms;
-        return d << @intCast(@min(c.pto_count, 16));
+        // RFC 9002 section 6.2.1 doubles the period per expiry and sets no ceiling. Backoff
+        // keeps an unanswered sender from flooding; past `pto_backoff_max_ns` it only makes a
+        // tail that was lost wait longer: with a smoothed round trip a queue had raised to
+        // seconds, the third expiry came 15 to 25 s after the data, and the feed stood still
+        // that long. The backoff stops there (the first period is never shortened).
+        return @max(d, @min(d << @intCast(@min(c.pto_count, 16)), pto_backoff_max_ns));
     }
 
     fn discardSpace(c: *Connection, space: Space) void {
@@ -2268,7 +2325,7 @@ pub const Connection = struct {
             }
             if (c.cfg.bbr) {
                 if (c.bytes_in_flight >= c.cwnd) c.bbr.noteCwndLimited();
-            } else if (c.cfg.cubic) {
+            } else {
                 if (c.bytes_in_flight >= c.cwnd) {
                     c.cwnd_limited = true;
                 } else if (!plan.eliciting and c.pace_at == null) c.cwnd_limited = false;
@@ -2589,7 +2646,10 @@ pub const Connection = struct {
         rec.nrec = plan.nrec;
         if (plan.nrec > 0) @memcpy(rec.recs[0..plan.nrec], plan.recs[0..plan.nrec]);
         if (plan.eliciting) {
-            if (c.cfg.bbr) rec.cc = c.bbr.onSent(now, c.bytes_in_flight, total, &c.cwnd);
+            if (c.cfg.bbr) {
+                rec.cc = c.bbr.onSent(now, c.bytes_in_flight, total, &c.cwnd);
+                c.capCwnd(); // a ProbeRTT exit here restores the saved window
+            }
             sp.sent.append(c.gpa, rec) catch c.internalError();
             sp.time_last_ack_eliciting = now;
             sp.ack_eliciting_in_flight += 1;
@@ -4388,25 +4448,26 @@ fn tuneCoreSwitches(c: *Config) void {
 test "a client that stops after one request: probe timeouts to the idle timeout, the validated size kept" {
     const gpa = std.testing.allocator;
     // 250 ms round trip (a core and a distant edge), then 102 ms (a nearer edge). The probe
-    // timeout doubles from about 3 round trips (one sample: srtt + 4 * srtt / 2) until the
-    // idle timeout cuts the series: 5 expiries on the long path, 6 on the short one.
+    // timeout doubles from about 3 round trips (one sample: srtt + 4 * srtt / 2) up to 2 s
+    // (`pto_backoff_max_ns`) and repeats that until the idle timeout cuts the series: 16
+    // expiries on the long path, 17 on the short one (5 and 6 with the backoff unbounded).
     const off = try abandonedAfterOneRequest(gpa, 250 * ms, null);
     const on = try abandonedAfterOneRequest(gpa, 250 * ms, tuneCoreSwitches);
     const near = try abandonedAfterOneRequest(gpa, 102 * ms, tuneCoreSwitches);
     // ZUI_NET_ABANDONED=1 prints each as the listener's line at the end of a connection
     if (std.c.getenv("ZUI_NET_ABANDONED") != null) for ([_]Abandoned{ off, on, near }) |r|
         std.debug.print("connection done, {d} packets sent, {d} lost, {d} PTOs, path MTU {d} (highest {d}, {d} fallbacks)\n", .{ r.pkts, r.lost, r.ptos, r.mtu, r.mtu_peak, r.black_holes });
-    try std.testing.expectEqual(@as(u64, 5), off.ptos);
+    try std.testing.expectEqual(@as(u64, 16), off.ptos);
     try std.testing.expectEqual(@as(u64, 0), off.lost);
     try std.testing.expectEqual(@as(usize, 1452), off.mtu);
-    try std.testing.expectEqual(@as(u64, 5), on.ptos);
+    try std.testing.expectEqual(@as(u64, 16), on.ptos);
     try std.testing.expectEqual(@as(u64, 0), on.lost);
     try std.testing.expectEqual(off.pkts, on.pkts);
     // the search validated the ceiling, and unanswered MAX_STREAMS and PINGs do not undo that
     try std.testing.expectEqual(@as(usize, 1472), on.mtu_peak);
     try std.testing.expectEqual(@as(usize, 1472), on.mtu);
     try std.testing.expectEqual(@as(u64, 0), on.black_holes);
-    try std.testing.expectEqual(@as(u64, 6), near.ptos);
+    try std.testing.expectEqual(@as(u64, 17), near.ptos);
     try std.testing.expectEqual(@as(usize, 1472), near.mtu);
 }
 
@@ -4695,4 +4756,407 @@ test "zui/1 requests over a lossy, reordering link with starved receivers all co
     }
     if (std.c.getenv("ZUI_NET_SIM_SEEDS") != null)
         std.debug.print("zui/1 sim: {d} seeds at {d}% drop, slowest request {d} ms, server packets lost {d}\n", .{ n, drop, worst / ms, lost });
+}
+
+// ------------------------------------------------------------------ shared-path simulation
+
+/// Senders on one bottleneck, in virtual time: each is a real `Connection` that writes to one
+/// long-lived stream on a schedule (a checkpoint feed: a burst, then nothing until the next),
+/// and a stand-in peer that acknowledges as the zui/1 client does (every second ack-eliciting
+/// packet, or 2 ms after a lone one). Both senders' datagrams wait in one FIFO queue in front
+/// of a link of `rate` bytes per second, so the queue one builds delays the other. ACKs come
+/// back after `one_way` and never queue. Pure function of its inputs: no socket, no clock.
+const PathSender = struct {
+    cc: enum { newreno, cubic, bbr } = .bbr,
+    /// `burst` bytes every `every` ns from `offset`; every 16th burst is `big` bytes (0: `burst`).
+    burst: u64,
+    big: u64 = 0,
+    every: u64 = 250 * ms,
+    offset: u64 = 0,
+    /// At `backlog_at` (ns from the start; 0: never) `backlog` bytes are written at once (a
+    /// catch-up); the bursts go on after it, or (`pause`) once it is all acknowledged (a
+    /// client that waits for the catch-up before it asks for more).
+    backlog: u64 = 0,
+    backlog_at: u64 = 0,
+    pause: bool = false,
+};
+
+const PathOpts = struct {
+    rate: u64 = 12_500_000, // 100 Mbit/s
+    one_way: u64 = 50 * ms,
+    /// Every this many datagrams one is lost (0: none).
+    drop_every: u64 = 0,
+    /// Tail drop: a datagram that finds this many bytes queued is lost (0: no limit).
+    queue_limit: u64 = 0,
+    duration: u64,
+};
+
+const PathStat = struct {
+    /// The largest window once the first minute is over and before any backlog, and the
+    /// largest burst (bytes written at once) in that time.
+    cwnd_app_max: u64 = 0,
+    burst_max_written: u64 = 0,
+    cwnd_end: u64 = 0,
+    /// The most bytes in flight, and the most window, while the backlog was being sent.
+    flight_backlog_max: u64 = 0,
+    cwnd_backlog_max: u64 = 0,
+    /// The most bytes that left in one pass (one instant), and the most by which a pass
+    /// exceeded what the pacer allowed at that moment (BBR: its bucket; 0 when within).
+    pass_max: u64 = 0,
+    pass_over_budget: u64 = 0,
+    /// Smoothed RTT: the largest after the first minute and before a backlog, and the largest
+    /// from a backlog on.
+    srtt_max: u64 = 0,
+    srtt_backlog_max: u64 = 0,
+    /// From the backlog's write to its last byte acknowledged (0: not done in the run).
+    backlog_ns: u64 = 0,
+    /// The longest the acknowledged prefix of the stream stood still while data written to it
+    /// was unacknowledged (after the first minute): the receiver saw nothing new that long.
+    stall_max: u64 = 0,
+    pkts: u64 = 0,
+    lost: u64 = 0,
+    ptos: u64 = 0,
+};
+
+const PathResult = struct {
+    s: [2]PathStat = @splat(.{}),
+    /// Time datagrams waited in the bottleneck queue: the most overall, and during a backlog.
+    queue_max: u64 = 0,
+    queue_backlog_max: u64 = 0,
+};
+
+fn simPath(gpa: Allocator, senders: []const PathSender, o: PathOpts) !PathResult {
+    std.debug.assert(senders.len >= 1 and senders.len <= 2);
+    const Flight = struct { k: u8, pn: u64, at: u64, drop: bool };
+    const AckEv = struct { at: u64, len: u16, frame: [200]u8 };
+    const Peer = struct {
+        /// Received packet numbers as ranges [lo, hi], highest first (at most 16 kept).
+        ranges: std.ArrayList([2]u64) = .empty,
+        unacked: u32 = 0,
+        ack_due: ?u64 = null,
+        their_pn: u64 = 0,
+        acks: std.ArrayList(AckEv) = .empty,
+        ack_head: usize = 0,
+
+        fn receive(p: *@This(), alloc: Allocator, pn: u64) !void {
+            var i: usize = 0;
+            while (i < p.ranges.items.len and p.ranges.items[i][0] > pn + 1) i += 1;
+            if (i < p.ranges.items.len and pn + 1 >= p.ranges.items[i][0] and pn <= p.ranges.items[i][1] + 1) {
+                const r = &p.ranges.items[i];
+                r[0] = @min(r[0], pn);
+                r[1] = @max(r[1], pn);
+                // merge with the next lower range
+                if (i + 1 < p.ranges.items.len and p.ranges.items[i + 1][1] + 1 >= r[0]) {
+                    r[0] = p.ranges.items[i + 1][0];
+                    _ = p.ranges.orderedRemove(i + 1);
+                }
+                if (i > 0 and r[1] + 1 >= p.ranges.items[i - 1][0]) {
+                    p.ranges.items[i - 1][0] = r[0];
+                    _ = p.ranges.orderedRemove(i);
+                }
+            } else try p.ranges.insert(alloc, i, .{ pn, pn });
+            if (p.ranges.items.len > 16) p.ranges.shrinkRetainingCapacity(16);
+        }
+
+        fn sendAck(p: *@This(), alloc: Allocator, at: u64) !void {
+            var ev: AckEv = .{ .at = at, .len = 0, .frame = undefined };
+            var q: usize = 0;
+            const r = p.ranges.items;
+            ev.frame[q] = 0x02;
+            q += 1;
+            putVarint(&ev.frame, &q, r[0][1]);
+            putVarint(&ev.frame, &q, 0);
+            putVarint(&ev.frame, &q, r.len - 1);
+            putVarint(&ev.frame, &q, r[0][1] - r[0][0]);
+            for (r[1..], 0..) |x, j| {
+                putVarint(&ev.frame, &q, r[j][0] - x[1] - 2);
+                putVarint(&ev.frame, &q, x[1] - x[0]);
+            }
+            ev.len = @intCast(q);
+            try p.acks.append(alloc, ev);
+            p.unacked = 0;
+            p.ack_due = null;
+        }
+    };
+
+    var conns: [2]*Connection = undefined;
+    var made: usize = 0;
+    defer for (conns[0..made]) |c| c.deinit();
+    var peers: [2]Peer = .{ .{}, .{} };
+    defer for (&peers) |*p| {
+        p.ranges.deinit(gpa);
+        p.acks.deinit(gpa);
+    };
+    var sids: [2]u64 = undefined;
+    var next_burst: [2]u64 = undefined;
+    var nburst: [2]u64 = @splat(0);
+    var backlog_written: [2]u64 = @splat(0); // when (0: not yet)
+    var backlog_end: [2]u64 = @splat(0); // stream offset the backlog ends at
+    var written: [2]u64 = @splat(0);
+    var progress: [2]u64 = @splat(0); // acknowledged prefix of the stream
+    var progress_at: [2]u64 = @splat(0); // when it last moved, or data was written onto an idle one
+    const t0: u64 = 1_000_000_000;
+    for (senders, 0..) |sd, k| {
+        const c = try testEstablished(gpa);
+        conns[k] = c;
+        made = k + 1;
+        c.cfg.keep_alive_ms = 0;
+        c.cfg.idle_timeout_ms = 0;
+        c.idle_ns = 0;
+        switch (sd.cc) {
+            .newreno => {},
+            .cubic => {
+                c.cfg.cubic = true;
+                c.cfg.hystart = true;
+            },
+            .bbr => {
+                c.cfg.bbr = true;
+                c.bbr = cong.Bbr.init(t0, c.cwnd, c.mtu, 7 + k);
+            },
+        }
+        c.peer.max_streams_bidi = 1 << 20;
+        c.peer.max_stream_data_bidi_remote = 1 << 60;
+        c.peer.max_data = 1 << 60;
+        c.send_max_data = 1 << 60;
+        sids[k] = try c.openBidi();
+        next_burst[k] = t0 + sd.offset;
+    }
+    const payload = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(payload);
+    @memset(payload, 0x5a);
+
+    var link: std.ArrayList(Flight) = .empty;
+    defer link.deinit(gpa);
+    var head: usize = 0;
+    var free_at: u64 = 0;
+    var dgrams: u64 = 0;
+    var res: PathResult = .{};
+    var out: [max_mtu]u8 = undefined;
+    var now: u64 = t0;
+    const end = t0 + o.duration;
+    const warm = t0 + 60 * std.time.ns_per_s;
+    while (now < end) {
+        // the link delivers; the peers acknowledge as they receive
+        while (head < link.items.len and link.items[head].at <= now) : (head += 1) {
+            const f = link.items[head];
+            const p = &peers[f.k];
+            if (p.ack_due) |t| if (t <= f.at) try p.sendAck(gpa, t + o.one_way);
+            if (f.drop) continue;
+            try p.receive(gpa, f.pn);
+            p.unacked += 1;
+            if (p.unacked >= 2) {
+                try p.sendAck(gpa, f.at + o.one_way);
+            } else if (p.ack_due == null) p.ack_due = f.at + 2 * ms;
+        }
+        if (head >= 4096 and head * 2 >= link.items.len) {
+            const rest = link.items.len - head;
+            std.mem.copyForwards(Flight, link.items[0..rest], link.items[head..]);
+            link.shrinkRetainingCapacity(rest);
+            head = 0;
+        }
+        for (senders, 0..) |sd, k| {
+            const c = conns[k];
+            const p = &peers[k];
+            const st = &res.s[k];
+            if (p.ack_due) |t| if (t <= now) try p.sendAck(gpa, t + o.one_way);
+            while (p.ack_head < p.acks.items.len and p.acks.items[p.ack_head].at <= now) : (p.ack_head += 1) {
+                const ev = &p.acks.items[p.ack_head];
+                sendTheirs(c, p.their_pn, ev.frame[0..ev.len], now);
+                p.their_pn += 1;
+            }
+            if (p.ack_head == p.acks.items.len) {
+                p.acks.clearRetainingCapacity();
+                p.ack_head = 0;
+            }
+            if (c.isClosed()) return error.SimClosed;
+            // the application
+            const in_backlog = backlog_written[k] != 0;
+            if (sd.backlog_at != 0 and !in_backlog and now >= t0 + sd.backlog_at) {
+                var left = sd.backlog;
+                while (left > 0) {
+                    const n = @min(left, payload.len);
+                    try c.streamWrite(sids[k], payload[0..n], false);
+                    left -= n;
+                }
+                if (written[k] == progress[k]) progress_at[k] = now;
+                written[k] += sd.backlog;
+                backlog_end[k] = written[k];
+                backlog_written[k] = now;
+            } else if (sd.pause and in_backlog and st.backlog_ns == 0) {
+                next_burst[k] = now + sd.every;
+            } else if (now >= next_burst[k]) {
+                const n = if (sd.big != 0 and nburst[k] % 16 == 15) sd.big else sd.burst;
+                try c.streamWrite(sids[k], payload[0..n], false);
+                if (written[k] == progress[k]) progress_at[k] = now;
+                written[k] += n;
+                nburst[k] += 1;
+                next_burst[k] += sd.every;
+                if (now >= warm) st.burst_max_written = @max(st.burst_max_written, n);
+            }
+            if (c.stream(sids[k])) |s| if (s.send_buf.items.len > 4 << 20) c.streamTrim(sids[k]);
+            if (c.nextTimeout()) |t| if (now >= t) c.onTimeout(now);
+            // what may leave at this instant (the pacer's bucket, read before the pass)
+            var pass: u64 = 0;
+            const pre_pacer = c.pacer;
+            const pre_rate = c.bbr.pacing_rate;
+            while (c.pollTransmit(now, &out)) |n| {
+                pass += n;
+                const wait = free_at -| now;
+                dgrams += 1;
+                if (o.queue_limit != 0 and wait * o.rate / std.time.ns_per_s + n > o.queue_limit) {
+                    // tail drop: the packet never reaches the link (the peer never sees its pn)
+                    continue;
+                }
+                const depart = @max(now, free_at) + n * std.time.ns_per_s / o.rate;
+                free_at = depart;
+                const drop = o.drop_every != 0 and dgrams % o.drop_every == 0;
+                try link.append(gpa, .{ .k = @intCast(k), .pn = c.spaces[2].next_pn - 1, .at = depart + o.one_way, .drop = drop });
+                res.queue_max = @max(res.queue_max, wait);
+                if (backlog_written[0] != 0 or backlog_written[1] != 0) res.queue_backlog_max = @max(res.queue_backlog_max, wait);
+            }
+            st.pass_max = @max(st.pass_max, pass);
+            if (c.cfg.bbr and pass > 0 and c.rtt_initialized) {
+                // A pass leaves at most what the pacer's bucket held (`Pacer.capacity`, or the
+                // credit of a late wake) and never more than one minimum round trip at the
+                // pacing rate, whatever the window: plus the datagram that overdraws the
+                // bucket and two probe datagrams.
+                const bucket = @max(pre_pacer.capacity, pre_pacer.late, c.pacer.capacity, c.pacer.late);
+                const one_rtt: u64 = @intCast(@min(@as(u128, @max(pre_rate, c.bbr.pacing_rate)) * c.bbr.min_rtt / std.time.ns_per_s, std.math.maxInt(u64)));
+                const budget = @min(bucket, one_rtt) + 3 * c.mtu;
+                if (pass > budget) st.pass_over_budget = @max(st.pass_over_budget, pass - budget);
+            }
+            if (now >= warm and backlog_written[0] == 0 and backlog_written[1] == 0) st.srtt_max = @max(st.srtt_max, c.srtt);
+            if (backlog_written[k] == 0 and now >= warm) st.cwnd_app_max = @max(st.cwnd_app_max, c.cwnd);
+            if (backlog_written[k] != 0 and st.backlog_ns == 0) {
+                st.flight_backlog_max = @max(st.flight_backlog_max, c.bytes_in_flight);
+                st.cwnd_backlog_max = @max(st.cwnd_backlog_max, c.cwnd);
+                if (c.stream(sids[k])) |s| if (s.acked.items.len > 0 and s.acked.items[0].start == 0 and s.acked.items[0].end >= backlog_end[k]) {
+                    st.backlog_ns = now - backlog_written[k];
+                };
+            }
+            if (backlog_written[0] != 0 or backlog_written[1] != 0) st.srtt_backlog_max = @max(st.srtt_backlog_max, c.srtt);
+            if (c.stream(sids[k])) |s| {
+                const pre: u64 = if (s.acked.items.len > 0 and s.acked.items[0].start == 0) s.acked.items[0].end else 0;
+                if (pre > progress[k] or written[k] == progress[k]) {
+                    progress[k] = @max(progress[k], pre);
+                    progress_at[k] = now;
+                } else if (now >= warm) st.stall_max = @max(st.stall_max, now - progress_at[k]);
+            }
+        }
+        // the next event
+        var next: u64 = end;
+        if (head < link.items.len) next = @min(next, link.items[head].at);
+        for (senders, 0..) |sd, k| {
+            const p = &peers[k];
+            if (p.ack_due) |t| next = @min(next, t);
+            if (p.ack_head < p.acks.items.len) next = @min(next, p.acks.items[p.ack_head].at);
+            if (conns[k].nextTimeout()) |t| next = @min(next, t);
+            next = @min(next, next_burst[k]);
+            if (backlog_written[k] == 0 and sd.backlog_at != 0) next = @min(next, t0 + sd.backlog_at);
+        }
+        now = if (next > now) next else now + 1000;
+    }
+    for (senders, 0..) |_, k| {
+        res.s[k].cwnd_end = conns[k].cwnd;
+        res.s[k].pkts = conns[k].pkts_sent;
+        res.s[k].lost = conns[k].pkts_lost;
+        res.s[k].ptos = conns[k].ptos;
+    }
+    return res;
+}
+
+fn envU64(name: [*:0]const u8, default: u64) u64 {
+    const v = std.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(u64, std.mem.span(v), 10) catch default;
+}
+
+test "an application-limited feed keeps its window near what it uses for hours; a catch-up after it is paced and fast" {
+    const gpa = std.testing.allocator;
+    // A checkpoint feed on a clean 100 Mbit path with a 100 ms round trip (a bandwidth-delay
+    // product of 1.25 MB): 12 KB every 250 ms, every 16th 120 KB, one datagram in 20,000 lost.
+    // Two hours of it (ZUI_NET_CWND_HOURS), then a 16 MiB catch-up written at once.
+    const hours = envU64("ZUI_NET_CWND_HOURS", 2);
+    const span = hours * 3600 * std.time.ns_per_s;
+    const bdp: u64 = 1_250_000;
+    for ([_]@FieldType(PathSender, "cc"){ .newreno, .cubic, .bbr }) |cc| {
+        const r = try simPath(gpa, &.{.{ .cc = cc, .burst = 12_000, .big = 120_000, .backlog = 16 << 20, .backlog_at = span }}, .{ .duration = span + 20 * std.time.ns_per_s, .drop_every = 20_000 });
+        const s = r.s[0];
+        if (std.c.getenv("ZUI_NET_CWND_PRINT") != null)
+            std.debug.print("\n{s}: {d} h app-limited: cwnd max {d} (largest burst {d}), srtt max {d} ms, {d} pkts {d} lost {d} ptos | catch-up 16 MiB: {d} ms, cwnd max {d}, flight max {d}, queue max {d} ms, largest pass {d} B, over budget {d} B\n", .{ @tagName(cc), hours, s.cwnd_app_max, s.burst_max_written, s.srtt_max / ms, s.pkts, s.lost, s.ptos, s.backlog_ns / ms, s.cwnd_backlog_max, s.flight_backlog_max, r.queue_backlog_max / ms, s.pass_max, s.pass_over_budget });
+        // the window stays near what the feed puts in flight: a few of its largest bursts, not
+        // what it has sent in all (the old window grew by every ACK: gigabytes in hours)
+        try std.testing.expect(s.cwnd_app_max <= 4 * s.burst_max_written);
+        try std.testing.expect(s.cwnd_app_max <= max_cwnd);
+        // the round trip stays the path's: no queue of our own
+        try std.testing.expect(s.srtt_max <= 110 * ms);
+        try std.testing.expect(s.backlog_ns != 0);
+        if (cc == .bbr) {
+            // the catch-up still runs at the path's rate (16 MiB at 12.5 MB/s is 1.34 s;
+            // main: 1.58 s). (NewReno and CUBIC regrow in congestion avoidance from the window
+            // the feed used, as RFC 9002 section 7.8 has it: 11 s here, main 8 and 11 s.)
+            try std.testing.expect(s.backlog_ns <= 2 * std.time.ns_per_s);
+            // paced: no pass leaves more than the pacer's bucket allowed at that moment, the
+            // window stays a few BDPs, and the queue it builds under two round trips
+            try std.testing.expectEqual(@as(u64, 0), s.pass_over_budget);
+            try std.testing.expect(s.cwnd_backlog_max <= 4 * bdp);
+            try std.testing.expect(r.queue_backlog_max <= 200 * ms);
+        }
+    }
+}
+
+test "a small connection sharing the path with a large feed keeps its round trip; pacing bounds each one's bursts" {
+    const gpa = std.testing.allocator;
+    // The core's two kinds of connection to one edge, BBR as the core runs: a feed (30 KB
+    // every 250 ms, every 16th 1 MB) that after 30 minutes (ZUI_NET_CWND_SHARED_MIN) catches up
+    // 32 MiB at once, and a request/response connection (2 KB every 250 ms) on the same queue.
+    const span = envU64("ZUI_NET_CWND_SHARED_MIN", 30) * 60 * std.time.ns_per_s;
+    const r = try simPath(gpa, &.{
+        .{ .burst = 30_000, .big = 1_000_000, .backlog = 32 << 20, .backlog_at = span },
+        .{ .burst = 2_000, .offset = 125 * ms },
+    }, .{ .duration = span + 20 * std.time.ns_per_s, .drop_every = 20_000 });
+    const big = r.s[0];
+    const small = r.s[1];
+    if (std.c.getenv("ZUI_NET_CWND_PRINT") != null)
+        std.debug.print("\nshared path: feed cwnd max {d} (largest burst {d}), catch-up {d} ms, cwnd max {d}, largest pass {d} B over budget {d} | small cwnd max {d}, srtt max {d} ms, during the catch-up {d} ms, largest pass {d} B over budget {d} | queue max {d} ms, during the catch-up {d} ms\n", .{ big.cwnd_app_max, big.burst_max_written, big.backlog_ns / ms, big.cwnd_backlog_max, big.pass_max, big.pass_over_budget, small.cwnd_app_max, small.srtt_max / ms, small.srtt_backlog_max / ms, small.pass_max, small.pass_over_budget, r.queue_max / ms, r.queue_backlog_max / ms });
+    try std.testing.expect(big.cwnd_app_max <= 4 * big.burst_max_written);
+    try std.testing.expect(small.cwnd_app_max <= 64 * 1200);
+    try std.testing.expectEqual(@as(u64, 0), big.pass_over_budget);
+    try std.testing.expectEqual(@as(u64, 0), small.pass_over_budget);
+    // the queue the feed builds stays under two and a half round trips (main: 1.2 s), so the
+    // small connection's smoothed round trip stays within 200 ms of the path's 100 ms
+    try std.testing.expect(r.queue_backlog_max <= 250 * ms);
+    try std.testing.expect(small.srtt_backlog_max <= 300 * ms);
+    try std.testing.expect(small.srtt_max <= 300 * ms);
+    try std.testing.expect(big.backlog_ns != 0 and big.backlog_ns <= 5 * std.time.ns_per_s);
+}
+
+test "a feed's window grown by hours of small bursts does not turn one large burst into seconds of silence" {
+    const gpa = std.testing.allocator;
+    // The stalls of 11-12 (5:47 and 6:32 AM). A feed on a 20 Mbit path with a 100 ms round
+    // trip and a queue of 1.5 s runs 20 minutes (ZUI_NET_STALL_MIN) of 12 KB every 250 ms
+    // (every 16th 120 KB), then one 8 MiB response (a catch-up) that the client waits for
+    // before it asks for more. On main the window had grown to tens of megabytes by then, so
+    // the response went into the queue whole: the round trip rose to 1.6 s, its tail
+    // overflowed the queue, nothing came after it to reveal the loss, and the tail waited
+    // for probe timeouts computed from that round trip. Now the window is what the feed
+    // used and grows from there with what the path delivers.
+    const span = envU64("ZUI_NET_STALL_MIN", 20) * 60 * std.time.ns_per_s;
+    for ([_]@FieldType(PathSender, "cc"){ .bbr, .newreno }) |cc| {
+        const r = try simPath(gpa, &.{.{ .cc = cc, .burst = 12_000, .big = 120_000, .backlog = 8 << 20, .backlog_at = span, .pause = true }}, .{ .rate = 2_500_000, .duration = span + 60 * std.time.ns_per_s, .queue_limit = 3_750_000 });
+        const s = r.s[0];
+        if (std.c.getenv("ZUI_NET_CWND_PRINT") != null)
+            std.debug.print("\nstall, {s}: cwnd before the burst {d}, longest silence {d} ms, burst done in {d} ms, srtt max {d} ms, queue max {d} ms, {d} lost {d} ptos\n", .{ @tagName(cc), s.cwnd_app_max, s.stall_max / ms, s.backlog_ns / ms, s.srtt_backlog_max / ms, r.queue_max / ms, s.lost, s.ptos });
+        // 8 MiB at 2.5 MB/s is 3.4 s
+        try std.testing.expect(s.backlog_ns != 0 and s.backlog_ns <= 8 * std.time.ns_per_s);
+        if (cc == .bbr) {
+            // BBR (the core's sender): progress at least every few round trips, and no queue
+            // of seconds
+            try std.testing.expect(s.stall_max <= 500 * ms);
+            try std.testing.expect(s.srtt_backlog_max <= 600 * ms);
+        } else {
+            // unpaced NewReno still fills a deep queue in slow start (it does on a fresh
+            // connection too), but a lost tail no longer waits seconds
+            try std.testing.expect(s.stall_max <= 1 * std.time.ns_per_s);
+        }
+    }
 }

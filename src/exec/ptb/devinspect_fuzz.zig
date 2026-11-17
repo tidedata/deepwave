@@ -581,7 +581,7 @@ pub fn runCase(f: *const Fixture, all: []const Native, n: *const Native, seed: u
         .Success => .success,
         .Failure => |x| switch (x.@"error") {
             // typing and loading: the native was not entered
-            .CommandArgumentError, .TypeArgumentError, .ArityMismatch, .NonEntryFunctionInvoked, .FunctionNotFound, .VMVerificationOrDeserializationError, .InvariantViolation, .UnusedValueWithoutDrop, .InvalidPublicFunctionReturnType, .PublishUpgradeMissingDependency => .failed_before,
+            .CommandArgumentError, .TypeArgumentError, .TypeArityMismatch, .ArityMismatch, .NonEntryFunctionInvoked, .FunctionNotFound, .VMVerificationOrDeserializationError, .InvariantViolation, .UnusedValueWithoutDrop, .InvalidPublicFunctionReturnType, .PublishUpgradeMissingDependency => .failed_before,
             else => .failed_in_execution,
         },
     };

@@ -1,7 +1,7 @@
 //! validator: the deepwave validator (docs/VALIDATOR-DESIGN.md). Composes consensus
 //! (`consensus`, `consensus_net`) with the full node (`node`) and the validator-only parts:
 //! transaction handling, checkpoint production, randomness, JWK, epochs, the Validator gRPC API,
-//! keys, and the latency work. Unaudited: everything starts behind `gate.decide`, and deepwave
+//! keys, and the latency work. Everything starts behind `gate.decide`, and deepwave
 //! never imports this module. validator-base owns this file, gate.zig, signer.zig,
 //! messages.zig, iface.zig and main.zig; lanes own their subdirectories.
 const std = @import("std");
@@ -21,6 +21,7 @@ pub const latency = @import("latency/root.zig");
 pub const conformance = @import("conformance.zig");
 pub const node = @import("node.zig");
 pub const seat = @import("seat.zig");
+pub const run = @import("run/root.zig");
 
 pub const consensus = @import("consensus");
 pub const consensus_net = @import("consensus_net");

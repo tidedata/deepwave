@@ -104,6 +104,8 @@ pub const Submit = struct {
     /// results do not change).
     preverify: preverify.Config = .{},
     preverify_stats: preverify.Stats = .{},
+    /// Latency marks (tx_received / tx_submitted).
+    tracer: iface.Tracer = .{},
 
     pub fn deinit(s: *Submit) void {
         s.inflight.deinit(s.gpa);
@@ -170,6 +172,7 @@ pub const Submit = struct {
                 const own = s.own_index orelse return fail(failure, error.InvalidRequest, "this node is not a member of the current committee");
                 if (!u.isAllowedProposer(own, p.epoch)) return fail(failure, error.InvalidRequest, try std.fmt.allocPrint(arena, "Proposer {d} is not allowed to propose this transaction", .{own}));
             }
+            s.tracer.markNow(.tx_received, &u.digest);
             const gop = try seen.getOrPut(arena, u.digest);
             if (gop.found_existing) {
                 const msg = try std.fmt.allocPrint(arena, "Repeated transaction {s}", .{checkerHex(&u.digest)});
@@ -212,7 +215,8 @@ pub const Submit = struct {
                 continue;
             };
             if (s.hooks.executed_in_last_epoch) |f| if (f(s.hooks.ctx.?, &u.digest)) {
-                results[idx] = try reject(arena, "Transaction {s} already executed", .{checkerHex(&u.digest)});
+                // UserInputError::TransactionAlreadyExecuted
+                results[idx] = try reject(arena, "Transaction {s} was already executed", .{try @import("rpc_exec").checks.b58(arena, &u.digest)});
                 continue;
             };
 
@@ -286,6 +290,7 @@ pub const Submit = struct {
                 const now = s.now_ms();
                 s.pruneInflight(now);
                 for (to_submit_idx.items, tickets, to_submit_digest.items) |i, tk, dg| {
+                    s.tracer.markNow(.tx_submitted, &dg);
                     results[i] = .{ .submitted = tk };
                     s.stats.submitted += 1;
                     s.inflight.put(s.gpa, dg, now) catch {};

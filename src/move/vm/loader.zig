@@ -323,6 +323,9 @@ pub const LoadFail = struct {
 pub const Refusal = struct {
     stage: enum { validate, jit },
     fail: LoadFail,
+    /// The status before `expect_no_verification_errors` (what a publish of the package reports:
+    /// `validate_package` passes the VM's error through); null when it is `fail`'s.
+    raw: ?ff.StatusCode = null,
 };
 
 /// What `validate_package` needs: the VM's verifier config (`verifier_config(None)`) and the
@@ -579,7 +582,7 @@ pub const Runtime = struct {
         const at_pkg: Loc = .{ .package = vid };
         const refuse = struct {
             fn f(err: ff.PartialVmError, loc: Loc) Refusal {
-                return .{ .stage = .validate, .fail = expectNoVerificationErrors(.{ .err = err, .loc = loc }) };
+                return .{ .stage = .validate, .fail = expectNoVerificationErrors(.{ .err = err, .loc = loc }), .raw = err.major };
             }
         }.f;
         for (sorted, cms, 0..) |nm, *cm, i| {

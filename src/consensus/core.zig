@@ -183,7 +183,7 @@ pub const Core = struct {
     pub fn addBlocks(self: *Core, arena: Allocator, blocks: []const types.VerifiedBlock, out: *Output) err.Error!void {
         const r = try self.block_manager.tryAcceptBlocks(arena, blocks);
         out.missing = r.missing;
-        try appendAccepted(arena, out, r.accepted);
+        try self.appendAccepted(arena, out, r.accepted);
         if (r.accepted.len > 0) {
             _ = try self.tryCommit(arena, &.{}, out);
             _ = try self.tryPropose(arena, false, out);
@@ -204,7 +204,7 @@ pub const Core = struct {
 
         const r = try self.block_manager.tryAcceptBlocks(arena, votes);
         out.missing = r.missing;
-        try appendAccepted(arena, out, r.accepted);
+        try self.appendAccepted(arena, out, r.accepted);
 
         _ = try self.tryCommit(arena, fresh.items, out);
         _ = try self.tryPropose(arena, false, out);
@@ -247,9 +247,16 @@ pub const Core = struct {
         return b.block.inner.round();
     }
 
+    /// Latency tracer mark (val-fast-finality stages; a no-op without a tracer).
+    fn mark(self: *const Core, stage: iface.Tracer.Stage, ref: types.BlockRef) void {
+        if (self.context.tracer.vtable == null) return;
+        self.context.tracer.mark(stage, ref, self.context.clock.monoNs());
+    }
+
     /// Deep copies (arena) so the driver can read accepted blocks after later flushes evict them.
-    fn appendAccepted(arena: Allocator, out: *Output, blocks: []const types.VerifiedBlock) err.Error!void {
+    fn appendAccepted(self: *const Core, arena: Allocator, out: *Output, blocks: []const types.VerifiedBlock) err.Error!void {
         for (blocks) |*b| {
+            self.mark(.block_accepted, b.reference());
             const c = try digest_mod.cloneVerified(arena, b);
             out.accepted.append(arena, c) catch return error.OutOfMemory;
         }
@@ -341,7 +348,7 @@ pub const Core = struct {
 
     fn acceptCommittedBlocks(self: *Core, arena: Allocator, blocks: []const types.VerifiedBlock, out: *Output) err.Error!void {
         const acc = try self.block_manager.tryAcceptCommittedBlocks(arena, blocks);
-        try appendAccepted(arena, out, acc);
+        try self.appendAccepted(arena, out, acc);
     }
 
     /// `CommitObserver::handle_committed_leaders`: linearize, mark local/certified, finalize
@@ -353,10 +360,20 @@ pub const Core = struct {
             // Rust try_commit: assert_eq!(certified commit_ref, sub_dag.commit_ref).
             if (expected) |e| try checkCertifiedRef(e, s.commit_ref);
             s.decided_with_local_blocks = local;
+            self.mark(.leader_committed, s.leader);
+            for (s.blocks) |*b| self.mark(.sub_dag_emitted, b.reference());
             const fin = try self.finalizer.process(arena, s);
             try appendCommitted(arena, out, fin);
         }
         for (subs) |*s| try self.dag.addScoringSubdag(s);
+        // Rust try_commit: notify_own_blocks_status(own committed refs, gc_round)
+        if (self.tx_source) |src| if (src.vtable.committed != null) if (self.context.own_index) |own| {
+            var refs: std.ArrayList(types.BlockRef) = .empty;
+            for (subs) |*s| for (s.blocks) |*b| {
+                if (b.block.inner.author() == own) refs.append(arena, b.reference()) catch return error.OutOfMemory;
+            };
+            src.committed(refs.items, self.dag.gcRound());
+        };
         return subs.len;
     }
 
@@ -400,7 +417,8 @@ pub const Core = struct {
     pub fn tryPropose(self: *Core, arena: Allocator, force: bool, out: *Output) err.Error!bool {
         const eb = (try self.tryNewBlock(arena, force)) orelse return false;
         out.proposed.append(arena, eb) catch return error.OutOfMemory;
-        try appendAccepted(arena, out, &.{eb.block});
+        self.mark(.block_proposed, eb.block.reference());
+        try self.appendAccepted(arena, out, &.{eb.block});
         _ = try self.tryCommit(arena, &.{}, out);
         return true;
     }

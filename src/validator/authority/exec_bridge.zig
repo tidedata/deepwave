@@ -52,6 +52,9 @@ pub const Runner = struct {
         /// True when every input of `item` exists at the required version.
         ready: *const fn (ctx: *anyopaque, item: *const Item) bool,
         run: *const fn (ctx: *anyopaque, arena: Allocator, item: *const Item) RunError!Outcome,
+        /// Sees every item in enqueue (consensus) order, before any of them runs: the funds
+        /// withdraw scheduler collects each commit's reservations here.
+        enqueued: ?*const fn (ctx: *anyopaque, item: *const Item) Allocator.Error!void = null,
     };
 };
 
@@ -66,10 +69,19 @@ pub const Bridge = struct {
     done: std.AutoHashMapUnmanaged(Id, Id) = .empty,
     /// Called on the executing thread after an item ran (the handler records an ack for it).
     on_done: ?struct { ctx: *anyopaque, f: *const fn (ctx: *anyopaque, key: Key) void } = null,
+    /// Latency mark tx_executed.
+    tracer: iface.Tracer = .{},
     /// Items the runner could not execute (reported; kept out of the queue).
     unsupported: u64 = 0,
     executed: u64 = 0,
     max_queue: usize = 1 << 20,
+    /// Executed user transactions read at an accumulator version whose settlement has not run
+    /// yet: their `on_done` ack waits for it, so a restart re-enqueues them with the rest of
+    /// their group. sui-core replays every commit after the last executed checkpoint and its
+    /// funds withdraw scheduler sees each group whole (`collect_withdraw_reservations` before
+    /// dedup), executed members included; their reservations decide the members still to run,
+    /// and their object withdrawals count as unsettled for them.
+    held: std.ArrayList(struct { version: u64, key: Key }) = .empty,
 
     pub fn init(gpa: Allocator, runner: Runner) Bridge {
         return .{ .gpa = gpa, .runner = runner };
@@ -82,6 +94,7 @@ pub const Bridge = struct {
         }
         b.queue.deinit(b.gpa);
         b.done.deinit(b.gpa);
+        b.held.deinit(b.gpa);
     }
 
     /// Copies `item` into the queue.
@@ -101,6 +114,7 @@ pub const Bridge = struct {
             .system = try a.dupe(versions.SystemVersion, item.system),
             .owned = try a.dupe(tx_mod.ObjRef, item.owned),
         };
+        if (b.runner.vtable.enqueued) |f| try f(b.runner.ctx, &o.item);
         try b.queue.append(b.gpa, o);
     }
 
@@ -128,8 +142,11 @@ pub const Bridge = struct {
                         continue;
                     },
                 };
-                if (o.item.digest) |d| try b.markDone(d, outcome.effects_digest);
-                if (b.on_done) |cb| cb.f(cb.ctx, o.item.key);
+                if (o.item.digest) |d| {
+                    try b.markDone(d, outcome.effects_digest);
+                    if (o.item.kind == .user) b.tracer.markNow(.tx_executed, &d);
+                }
+                try b.ack(&o.item);
                 _ = b.queue.orderedRemove(i);
                 o.arena.deinit();
                 b.gpa.destroy(o);
@@ -139,6 +156,38 @@ pub const Bridge = struct {
             }
         }
         return ran;
+    }
+
+    /// The accumulator root (0x...acc).
+    pub const acc_root_id: Id = blk: {
+        var a: Id = @splat(0);
+        a[30] = 0x0a;
+        a[31] = 0xcc;
+        break :blk a;
+    };
+
+    /// `on_done` for an executed item. A user transaction with an assigned accumulator version
+    /// is held until the settlement reading the root at that version (or later) ran.
+    fn ack(b: *Bridge, item: *const Item) Allocator.Error!void {
+        const cb = b.on_done orelse return;
+        switch (item.kind) {
+            .user => for (item.system) |s| if (std.mem.eql(u8, &s.id, &acc_root_id)) {
+                try b.held.append(b.gpa, .{ .version = s.version, .key = item.key });
+                return;
+            },
+            .accumulator_settlement => for (item.shared) |s| if (std.mem.eql(u8, &s.id, &acc_root_id)) {
+                var i: usize = 0;
+                while (i < b.held.items.len) {
+                    const h = b.held.items[i];
+                    if (h.version <= s.version) {
+                        cb.f(cb.ctx, h.key);
+                        _ = b.held.orderedRemove(i);
+                    } else i += 1;
+                }
+            },
+            else => {},
+        }
+        cb.f(cb.ctx, item.key);
     }
 
     pub fn markDone(b: *Bridge, digest: Id, effects: Id) Allocator.Error!void {
@@ -237,4 +286,37 @@ test "bridge waits for inputs and runs in dependency order" {
     try std.testing.expect(mr.ran.items[0].digest[0] == 1 and mr.ran.items[1].digest[0] == 2);
     try std.testing.expect(b.effectsDigest(&@as(Id, @splat(2))) != null);
     try std.testing.expectEqual(@as(usize, 0), b.pending());
+}
+
+test "bridge holds the ack of a user transaction until its accumulator version settled" {
+    const gpa = std.testing.allocator;
+    var mr: MemRunner = .{ .gpa = gpa };
+    defer mr.deinit();
+    var b = Bridge.init(gpa, mr.runner());
+    defer b.deinit();
+    const Acks = struct {
+        got: std.ArrayList(Key) = .empty,
+        fn f(ctx: *anyopaque, key: Key) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            s.got.append(std.testing.allocator, key) catch unreachable;
+        }
+    };
+    var acks: Acks = .{};
+    defer acks.got.deinit(gpa);
+    b.on_done = .{ .ctx = &acks, .f = Acks.f };
+    const root = Bridge.acc_root_id;
+    try mr.put(root, 7);
+    try b.enqueue(.{ .key = .{ .digest = @splat(1) }, .kind = .user, .td_bcs = "a", .digest = @splat(1), .shared = &.{}, .system = &.{.{ .id = root, .isv = 1, .version = 7 }} });
+    try b.enqueue(.{ .key = .{ .digest = @splat(2) }, .kind = .user, .td_bcs = "b", .digest = @splat(2), .shared = &.{}, .system = &.{} });
+    try std.testing.expectEqual(@as(usize, 2), try b.pump(gpa));
+    // the plain transaction is acked at once, the one read at root version 7 is held
+    try std.testing.expectEqual(@as(usize, 1), acks.got.items.len);
+    try std.testing.expectEqual(@as(u8, 2), acks.got.items[0].digest[0]);
+    const settle: Key = .{ .accumulator_settlement = .{ .epoch = 0, .height = 1 } };
+    try b.enqueue(.{ .key = settle, .kind = .accumulator_settlement, .td_bcs = null, .digest = null, .shared = &.{.{ .id = root, .isv = 1, .version = 7 }}, .system = &.{} });
+    try std.testing.expectEqual(@as(usize, 1), try b.pump(gpa));
+    try std.testing.expectEqual(@as(usize, 3), acks.got.items.len);
+    try std.testing.expectEqual(@as(u8, 1), acks.got.items[1].digest[0]);
+    try std.testing.expect(acks.got.items[2] == .accumulator_settlement);
+    try std.testing.expectEqual(@as(usize, 0), b.held.items.len);
 }

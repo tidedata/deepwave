@@ -52,8 +52,8 @@ pub const KeySpec = union(gate.KeySource) {
     /// Index of this authority in a committee generated from `seed` (tests, localnet).
     generated: struct { seed: [32]u8, index: u32 },
     /// validator.yaml key pairs (protocol, network, worker), each a file path or an in-place
-    /// base64 value as KeyPairWithPath has them. Only with an unaudited license; never used while
-    /// deepwave is unaudited. The account key is not here: sui-node never reads it on a validator.
+    /// base64 value as KeyPairWithPath has them. Only with a `network` license (`--sign-network`
+    /// naming the chain). The account key is not here: sui-node never reads it on a validator.
     file: struct { protocol: KeyText, network: KeyText, worker: KeyText },
     /// One seat of a Mysten-generated local committee (`deepwave-validator seat`), decoded by the caller.
     localnet_config: material.KeySet,
@@ -140,7 +140,10 @@ pub const Signer = struct {
         return sig.toBytes();
     }
 
-    /// BLS signature over BCS(IntentMessage(Intent::sui_app(CheckpointSummary), summary)).
+    /// BLS signature over exactly `intent_message`, which the caller builds as
+    /// `AuthoritySignInfo::new_secure` signs: BCS(IntentMessage(Intent::sui_app(CheckpointSummary),
+    /// summary)) ++ epoch (u64 LE), no extra hash (checkpoints/create.zig `signingMessage`). One
+    /// digest per (epoch, seq): a second, different digest is refused (watermark).
     pub fn signCheckpoint(self: *Signer, epoch: u64, seq: u64, summary_digest: *const [32]u8, intent_message: []const u8) Error![48]u8 {
         if (!self.license.valid()) return error.NoLicense;
         self.state.mutex.lockUncancelable(self.state.io);
@@ -172,6 +175,15 @@ pub const Signer = struct {
     /// handshakes only, nothing equivocation-relevant.
     pub fn networkSeed(self: *const Signer) [32]u8 {
         return self.state.keys.network.secret_key.seed();
+    }
+
+    /// The DKG decryption key: Rust's `RandomnessManager::try_new` uses the authority BLS private
+    /// key bytes as the ECIES private key of the randomness DKG. Nothing is signed with it here;
+    /// randomness partial signatures use the DKG share, not this key. The caller wipes the copy
+    /// once the epoch's manager holds it.
+    pub fn randomnessSecret(self: *const Signer) Error![32]u8 {
+        if (!self.license.valid()) return error.NoLicense;
+        return self.state.keys.authority.toBytes();
     }
 
     /// The authority's public BLS key (AuthorityName) and the protocol/network public keys.

@@ -143,6 +143,24 @@ pub fn gasCoin(arena: Allocator, id: Id, version: u64, owner: Id, balance: u64) 
     return buf;
 }
 
+/// A Move object (typed GasCoin; the checks here read only the owner, version and contents)
+/// with `contents` (starting with its 32-byte id) under `owner`.
+pub fn moveObject(arena: Allocator, contents: []const u8, version: u64, owner: types.Owner) ![]const u8 {
+    var w: std.Io.Writer.Allocating = .init(arena);
+    const wr = &w.writer;
+    try wr.writeAll(&.{ 0, 1, 1 });
+    try wr.writeInt(u64, version, .little);
+    var n = contents.len;
+    while (n >= 0x80) : (n >>= 7) try wr.writeByte(@as(u8, @truncate(n)) | 0x80);
+    try wr.writeByte(@intCast(n));
+    try wr.writeAll(contents);
+    try wr.writeAll(try bcs.encodeAlloc(types.Owner, arena, &owner));
+    try wr.writeByte(32);
+    try wr.writeAll(&@as([32]u8, @splat(0)));
+    try wr.writeInt(u64, 0, .little);
+    return w.written();
+}
+
 pub const TxOpts = struct {
     signer: Signer,
     /// Gas coin number (its id); each transaction should use its own.
@@ -164,6 +182,8 @@ pub const TxOpts = struct {
     extra_sig: bool = false,
     /// `TransactionExpiration::Epoch(e)` (0: expired at epoch 1, a validity failure).
     expire_epoch: ?u64 = null,
+    /// Inputs after the recipient (shared or receiving objects), unused by the command.
+    extra_inputs: []const types.CallArg = &.{},
 };
 
 pub const Made = struct {
@@ -227,8 +247,9 @@ pub const Fixture = struct {
         const version: u64 = 5;
         const coin = try gasCoin(a, id, version, sender, o.balance);
         if (o.put_coin) try f.map.put(f.gpa, id, version, coin);
-        const inputs = try a.alloc(types.CallArg, 1);
+        const inputs = try a.alloc(types.CallArg, 1 + o.extra_inputs.len);
         inputs[0] = .{ .Pure = try a.dupe(u8, &f.recipient) };
+        @memcpy(inputs[1..], o.extra_inputs);
         const objs = try a.alloc(types.Argument, 1);
         objs[0] = .GasCoin;
         const cmds = try a.alloc(types.Command, 1);

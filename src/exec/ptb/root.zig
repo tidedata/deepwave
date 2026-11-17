@@ -40,6 +40,7 @@ pub const devinspect_test = @import("devinspect_test.zig");
 pub const devinspect_fuzz = @import("devinspect_fuzz.zig");
 pub const borrow = @import("borrow.zig");
 pub const compat = @import("compat.zig");
+pub const limits = @import("limits.zig");
 const versions = @import("../versions/root.zig");
 const dynamic = @import("../versions/dynamic.zig");
 
@@ -65,6 +66,9 @@ pub const Env = struct {
     /// The transaction digest the executor is given (Rust's `execute_transaction_to_effects`
     /// takes it apart from the data); null: the digest of the transaction data.
     tx_digest: ?Id = null,
+    /// The chain's `ChainIdentifier` (genesis checkpoint digest), the coin reservation id mask
+    /// (`mask_or_unmask_id`). null: mainnet's, or testnet's on a testnet protocol config.
+    chain_id: ?Id = null,
 };
 
 pub const Ref = archive.Ref;
@@ -114,7 +118,9 @@ pub const PreState = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// The live version of a consensus (shared) object; null when the store has none.
+        /// The live version of a consensus (shared) object; null when the store has none. A
+        /// version above `SequenceNumber::MAX` is the cancellation sentinel consensus assigned
+        /// (CANCELLED_READ, CONGESTED, RANDOMNESS_UNAVAILABLE): the transaction fails early.
         shared_latest: *const fn (ctx: *const anyopaque, id: *const [32]u8) ?u64,
         /// `read_child_object`: raw BCS `Object` of the newest version of `child` at or below
         /// `upper`; null when none exists.
@@ -122,6 +128,11 @@ pub const PreState = struct {
         /// `AccountFundsRead`: the available balance of `owner` for coin type `ty`; null when
         /// the pre-state cannot answer (the transaction is then `.unsupported`).
         address_balance: *const fn (ctx: *const anyopaque, owner: *const [32]u8, ty: *const types.TypeTag) ?u128,
+        /// `ObjectConsensusStreamEnded`: the shared input `id` (start version `start`) at its
+        /// assigned `version` is no longer that consensus object; answers the digest of the
+        /// transaction that ended (or smeared) the stream there
+        /// (`get_consensus_stream_end_tx_digest`). Null: the input is the live object.
+        stream_ended: ?*const fn (ctx: *const anyopaque, id: *const [32]u8, start: u64, version: u64) ?[32]u8 = null,
     };
 };
 
@@ -225,7 +236,14 @@ const Results = struct {
 
 /// A shared input as `SharedInput`: an existing object, or one of a cancelled transaction (its
 /// version is the cancellation reason).
-const SharedRef = struct { id: Id, version: u64, digest: Id = zero32, cancelled: bool = false };
+const SharedRef = struct {
+    id: Id,
+    version: u64,
+    digest: Id = zero32,
+    cancelled: bool = false,
+    /// `SharedInput::ConsensusStreamEnded`: no object; Read/MutateConsensusStreamEnded
+    ended: enum { no, read, mutate } = .no,
+};
 
 const cancelled_read: u64 = 1 << 63;
 const congested: u64 = (1 << 63) + 1;
@@ -472,6 +490,71 @@ const Exec = struct {
             if (remaining > 0) if (try gaslessMinimum(e.arena, e.cfg, r.ty)) |min| if (min > 0 and remaining < min) return false;
         };
         return true;
+    }
+
+    /// temporary_store.rs `estimate_effects_size_upperbound` over the store as it stands.
+    fn estimateEffectsSize(e: *Exec) !u64 {
+        const r = &e.results;
+        var c: limits.Counts = .{ .writes = r.written.count(), .modifies = r.modified.count(), .inputs = e.inputs.count() };
+        const complete = e.cfg.feature_flags.complete_effects_size_estimate;
+        if (complete) {
+            // count_id_only_changes: created then deleted chained (disjoint sets)
+            for (r.created.keys()) |id| {
+                if (!r.written.contains(id) and !r.modified.contains(id)) c.id_only += 1;
+            }
+            for (r.deleted.keys()) |id| {
+                if (!r.written.contains(id) and !r.modified.contains(id)) c.id_only += 1;
+            }
+            // count_unchanged_consensus_objects_upperbound: consensus inputs not modified (a
+            // consensus-stream-ended input never gets here: unsupported at input loading), the
+            // loaded per-epoch config objects, the loaded system objects (each counted even when
+            // also an input: an upper bound)
+            for (e.inputs.keys(), e.inputs.values()) |id, *x| switch (x.owner) {
+                .Shared, .ConsensusAddressOwner => if (!r.modified.contains(id)) {
+                    c.unchanged_consensus += 1;
+                },
+                else => {},
+            };
+            if (e.per_epoch_deny_list) c.unchanged_consensus += 1;
+            if (e.clock_read != null) c.unchanged_consensus += 1;
+            if (e.root_read != null) c.unchanged_consensus += 1;
+            c.accumulator = try limits.accumulatorSize(e.arena, r.acc.items);
+        }
+        return limits.estimateV2(c, complete);
+    }
+
+    /// execution_engine.rs `check_meter_limit` (a programmable transaction is metered).
+    fn checkMeterLimit(e: *Exec) !?pkgs.Fail {
+        const max = e.cfg.getOpt("max_serialized_tx_effects_size_bytes") orelse return null;
+        const size = try e.estimateEffectsSize();
+        const hard = limits.crossed(true, size, max, e.cfg.getOpt("max_serialized_tx_effects_size_bytes_system_tx") orelse max) orelse return null;
+        return .{ .kind = .{ .EffectsTooLarge = .{ .current_size = size, .max_size = hard } } };
+    }
+
+    /// execution_engine.rs `check_written_objects_limit`: `written_objects_size`, the sum of the
+    /// written objects' `object_size_for_gas_metering`, when both limits are set.
+    fn checkWrittenObjectsLimit(e: *Exec) !?pkgs.Fail {
+        const max = e.cfg.getOpt("max_size_written_objects") orelse return null;
+        const sys = e.cfg.getOpt("max_size_written_objects_system_tx") orelse return null;
+        var size: u64 = 0;
+        for (e.results.written.values()) |*w| size += try writeSizeForGasMetering(e.arena, w);
+        const hard = limits.crossed(true, size, max, sys) orelse return null;
+        return .{ .kind = .{ .WrittenObjectsTooLarge = .{ .current_size = size, .max_size = hard } } };
+    }
+
+    /// temporary_store.rs `check_accumulator_amounts_representable`.
+    fn checkAccumulatorAmounts(e: *Exec) !?pkgs.Fail {
+        if (try limits.amountsRepresentable(e.arena, e.results.acc.items)) return null;
+        return .{ .kind = .CoinBalanceOverflow };
+    }
+
+    /// execution_engine.rs `check_effects` (bump-only path): all three computed, the first
+    /// failure in order wins.
+    fn checkEffects(e: *Exec) !?pkgs.Fail {
+        const meter = try e.checkMeterLimit();
+        const written = try e.checkWrittenObjectsLimit();
+        const representable = try e.checkAccumulatorAmounts();
+        return meter orelse written orelse representable;
     }
 
     fn handleError(e: *Exec) !void {
@@ -741,7 +824,10 @@ const SharedVersion = struct { version: u64, special: bool };
 fn sharedVersion(in: *const Inputs, id: *const Id) ?SharedVersion {
     const fx = in.effects orelse {
         const st = in.state orelse return null;
-        return .{ .version = st.vtable.shared_latest(st.ctx, id) orelse return null, .special = false };
+        const v = st.vtable.shared_latest(st.ctx, id) orelse return null;
+        // A pre-state may answer a cancellation sentinel (above SequenceNumber::MAX): a
+        // validator executing a transaction consensus cancelled (no object has such a version).
+        return .{ .version = v, .special = v >= cancelled_read };
     };
     for (fx.changed_objects) |*c| if (std.mem.eql(u8, &c[0].@"0".@"0", id)) switch (c[1].input_state) {
         .Exist => |x| return .{ .version = x[0][0].@"0", .special = false },
@@ -958,7 +1044,19 @@ const Resolve = struct {
         const field = @import("hash").blake2b256(&.{ &[_]u8{0xf0}, &root, &len_le, owner, tag });
         // load_implicitly_read_system_object(0xacc) at the version the scheduler assigned (replay:
         // the certified read-only entry's version), recorded for the effects
-        if (r.fx == null) return r.stateBalance(&root, owner, ty);
+        if (r.fx == null) {
+            const settled = try r.stateBalance(&root, owner, ty);
+            // a validator's certified execution: minus the commit's earlier object withdrawals
+            // (`UnsettledObjectFundsRead`); simulation has none (Rust's empty view)
+            if (r.unsettled == null or !(r.e.inputs.contains(owner.*) or r.e.loaded.contains(owner.*))) return settled;
+            const u = r.unsettled.?;
+            const uns = u.get(u.ctx, r.arena, &field) catch {
+                r.gap = "unsettled object withdrawals";
+                return 0;
+            };
+            // Rust: checked_sub, an invariant violation
+            return std.math.sub(u128, settled, uns) catch error.Storage;
+        }
         if (r.e.root_read == null) {
             const v = for (r.fx.?.unchanged_consensus_objects) |*u| {
                 if (std.mem.eql(u8, &u[0].@"0".@"0", &root)) switch (u[1]) {
@@ -1184,6 +1282,7 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
     var reservations: []?typing.Reservation = &.{};
     var cancel_reason: ?u64 = null;
     var any_cancelled = false;
+    var any_ended = false;
     var cancelled_ids: std.ArrayList(types.ObjectID) = .empty;
     for (pt.inputs, srcs, 0..) |*arg, *src, ri| {
         src.* = null;
@@ -1198,7 +1297,7 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
                             reservations = try arena.alloc(?typing.Reservation, pt.inputs.len);
                             @memset(reservations, null);
                         }
-                        reservations[ri] = .{ .accumulator = typing.unmaskReservation(cfg.chain, &r[0].@"0".@"0"), .amount = std.mem.readInt(u64, r[2].@"0".@"0"[0..8], .little) };
+                        reservations[ri] = .{ .accumulator = typing.unmaskReservation(cfg.chain, env.chain_id, &r[0].@"0".@"0"), .amount = std.mem.readInt(u64, r[2].@"0".@"0"[0..8], .little) };
                         continue;
                     }
                     const id = r[0].@"0".@"0";
@@ -1225,6 +1324,15 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
                         try e.shared.append(arena, .{ .id = id, .version = sv.version, .cancelled = true });
                         continue;
                     }
+                    if (in.effects == null) if (in.state) |st| if (st.vtable.stream_ended) |f| if (f(st.ctx, &id, s.initial_shared_version.@"0", sv.version)) |dep| {
+                        // `ObjectConsensusStreamEnded(version, dep)`: an input version for the
+                        // lamport timestamp and the dependency, no object; InputObjectDeleted
+                        any_ended = true;
+                        max_v = @max(max_v, sv.version);
+                        if (!cfg.feature_flags.disable_effects_tx_dependencies) try deps.append(arena, dep);
+                        try e.shared.append(arena, .{ .id = id, .version = sv.version, .ended = if (s.mutability == .Immutable) .read else .mutate });
+                        continue;
+                    };
                     const mutable = switch (s.mutability) {
                         .Mutable => true,
                         .Immutable => false,
@@ -1357,7 +1465,10 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
 
     // get_early_execution_error: a cancelled transaction fails without running
     var early: ?types.ExecutionErrorKind = null;
-    if (cancel_reason) |cr| {
+    if (any_ended) {
+        // the head of get_early_execution_error's list (after CertificateDenied)
+        early = .InputObjectDeleted;
+    } else if (cancel_reason) |cr| {
         early = if (cr == congested)
             .{ .ExecutionCancelledDueToSharedObjectCongestion = .{ .congested_objects = .{ .@"0" = cancelled_ids.items } } }
         else
@@ -1393,6 +1504,9 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
             }
         }
     }
+    // the input objects were charged (`charge_input_objects_legacy` succeeded): the legacy
+    // path's effects checks run inside that `and_then`
+    const inputs_charged = exec_err == null;
     var res: ?run.Results = null;
     var gap: ?[]const u8 = null;
     // execute_ptb ran (round_computation happens only then on the bump-only path)
@@ -1516,9 +1630,22 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
         if (exec_err == null) try record(&e, &r);
     }
 
+    // legacy::execute_transaction (execution version 4 only; the older cuts have their own
+    // checks, not modelled): check_meter_limit after the commands whatever their result (its
+    // failure replaces the execution error), check_written_objects_limit on success, then the
+    // gasless requirements, then check_accumulator_amounts_representable on success
+    const effects_checks = ev == 4;
+    if (!bump_only and effects_checks and inputs_charged) {
+        if (try e.checkMeterLimit()) |f| {
+            exec_err = f;
+            aborted = false;
+        }
+        if (exec_err == null) exec_err = try e.checkWrittenObjectsLimit();
+    }
     if (!bump_only and gasless and exec_err == null) {
         if (!try e.gaslessRequirementsMet()) exec_err = .{ .kind = .InsufficientGas };
     }
+    if (!bump_only and effects_checks and exec_err == null) exec_err = try e.checkAccumulatorAmounts();
     if (!bump_only) {
         exec_err = e.legacyChargeGas(exec_err, aborted and versions.abortAwareBucketing(cfg), protocol.gas.refreshGasPaymentLocation(gm)) catch |err| switch (err) {
             error.Unsupported => return unsupported(arena, "legacy charge path", .{}),
@@ -1532,6 +1659,8 @@ pub fn execute(arena: Allocator, env: Env, tx_data_raw: []const u8, data: *const
         if (exec_err == null) {
             if (try e.meterStorage()) |ge| exec_err = .{ .kind = gasErrKind(ge) };
         }
+        // check_effects: computed whatever the result, the execution error wins
+        if (exec_err == null and effects_checks) exec_err = try e.checkEffects();
         if (exec_err != null) e.handleError() catch return unsupported(arena, "handle_error path", .{});
     }
     var summary = e.gas.summary();
@@ -1716,7 +1845,7 @@ fn hashAll(e: *Exec) !void {
             try slots.append(e.arena, .{ .loaded = m });
         };
     }
-    for (e.shared.items) |sh| if (!sh.cancelled) if (e.inputs.getPtr(sh.id)) |in| if (in.digest == null) {
+    for (e.shared.items) |sh| if (!sh.cancelled and sh.ended == .no) if (e.inputs.getPtr(sh.id)) |in| if (in.digest == null) {
         in.digest = zero32;
         try raws.append(e.arena, in.raw);
         try slots.append(e.arena, .{ .input = in });
@@ -1842,6 +1971,17 @@ fn intoEffects(e: *Exec, summary: gas_mod.GasCostSummary, err: ?pkgs.Fail, deps:
         if (s.cancelled) {
             try unchanged.append(arena, .{ .{ .@"0" = .{ .@"0" = s.id } }, .{ .Cancelled = .{ .@"0" = s.version } } });
             continue;
+        }
+        switch (s.ended) {
+            .no => {},
+            .read => {
+                try unchanged.append(arena, .{ .{ .@"0" = .{ .@"0" = s.id } }, .{ .ReadConsensusStreamEnded = .{ .@"0" = s.version } } });
+                continue;
+            },
+            .mutate => {
+                try unchanged.append(arena, .{ .{ .@"0" = .{ .@"0" = s.id } }, .{ .MutateConsensusStreamEnded = .{ .@"0" = s.version } } });
+                continue;
+            },
         }
         var changed = false;
         for (ids.items) |id| if (std.mem.eql(u8, &id, &s.id)) {
@@ -1991,7 +2131,7 @@ fn effectsV1(e: *Exec, summary: gas_mod.GasCostSummary, err: ?pkgs.Fail, deps: [
     try modified_at.appendSlice(arena, deleted_at.items);
     var shared: std.ArrayList(ORef) = .empty;
     for (e.shared.items) |x| {
-        if (x.cancelled) return error.Unsupported;
+        if (x.cancelled or x.ended != .no) return error.Unsupported;
         try shared.append(arena, ref(x.id, x.version, e.sharedDigest(&x)));
     }
     const dep_list = try arena.alloc(types.TransactionDigest, deps.len);

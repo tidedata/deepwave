@@ -275,8 +275,13 @@ const Writer = struct {
             hdr[2] = @intCast(content_len & 0xff);
             hl = 3;
         }
-        // content currently starts at start+3; move to start+1+hl
-        std.mem.copyForwards(u8, w.buf[start + 1 + hl ..][0..content_len], w.buf[start + 3 ..][0..content_len]);
+        // content currently starts at start+3; move to start+1+hl. With the long form (hl 3) it
+        // moves one byte up, so the overlapping copy must run backwards (a forward copy smeared
+        // the first byte over the whole element: every cert of 256+ bytes, e.g. the consensus
+        // cert from "consensus_epoch_10" on, failed to parse).
+        const dst = w.buf[start + 1 + hl ..][0..content_len];
+        const src = w.buf[start + 3 ..][0..content_len];
+        if (1 + hl > 3) std.mem.copyBackwards(u8, dst, src) else std.mem.copyForwards(u8, dst, src);
         @memcpy(w.buf[start + 1 ..][0..hl], hdr[0..hl]);
         w.len = start + 1 + hl + content_len;
     }
@@ -360,6 +365,19 @@ test "generate then verify" {
     try std.testing.expectError(error.NameMismatch, verifyPeerCert(buf[0..n], "sui-other", .server, 1_800_000_000));
     buf[n - 3] ^= 1;
     try std.testing.expectError(error.BadSignature, verifyPeerCert(buf[0..n], "sui-35834a8a", .server, 1_800_000_000));
+}
+
+test "generate then verify: every name length (DER long-form lengths)" {
+    const kp = Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(9))) catch unreachable;
+    var name_buf: [99]u8 = undefined;
+    for (1..name_buf.len + 1) |len| {
+        const name = name_buf[0..len];
+        for (name, 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
+        var buf: [max_cert_len]u8 = undefined;
+        const n = generateSelfSigned(&buf, kp, @as([20]u8, @splat(0x42)), name);
+        const parsed = try verifyPeerCert(buf[0..n], name, .server, 1_800_000_000);
+        try std.testing.expectEqualSlices(u8, &kp.public_key.toBytes(), &parsed.public_key);
+    }
 }
 
 /// Test-only certificate builder: like `generateSelfSigned`, with the knobs webpki checks.

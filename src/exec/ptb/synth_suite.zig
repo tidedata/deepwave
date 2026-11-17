@@ -3,7 +3,8 @@
 //! does not reach: the coin deny list v2 (an address denied for a regulated coin through a
 //! `Coin<T>` write or a `Balance<T>` accumulator event, the global pause, epoch-gated settings),
 //! references across commands, Publish, and Upgrade of packages the tool published first (those
-//! package objects travel in `objects` and are laid over the corpus packages for that vector).
+//! package objects travel in `objects` and are laid over the corpus packages for that vector), and
+//! the `check_effects` limits (`limits/...`, from src/exec/testdata/limits.jsonl.zst).
 //!
 //! Each vector carries the transaction, its input objects, the latest objects the executor read
 //! outside the inputs, and Rust's effects, events and written objects. deepwave runs it through the
@@ -30,6 +31,15 @@ pub const path = "vectors/exec-move-synth/vectors.jsonl.zst";
 /// Vectors made by a newer release's executor (protocol 142: `clock/...`, the implicit Clock),
 /// carrying that release's system packages in their objects. Optional: older truth has none.
 pub const path_v142 = "vectors/exec-move-synth/vectors-v142.jsonl.zst";
+/// Vectors kept in the repository (`ZUI_SYNTH_ONLY=<prefixes> zui-truth-exec synth`, decompressed):
+/// `typearg/...` (type-argument constraints and arity) and `publish-fail/...` (publishes that fail
+/// deserialization, the Move verifier, linking or the Sui verifier), docs/PARITY.md G2 and G7.
+pub const repo_vectors = @embedFile("../testdata/synth_parity.jsonl");
+/// The `check_effects` limit vectors (`zui-truth-exec synth-limits`, tools/truth/exec/src/synth.rs):
+/// effects size just under and over `max_serialized_tx_effects_size_bytes` (also on the legacy gas
+/// path), written objects size one byte under and at `max_size_written_objects`, accumulator
+/// amounts at and past the representable limits. Kept in the repository (synthetic objects only).
+const limits_vectors = @embedFile("../testdata/limits.jsonl.zst");
 
 const Line = struct {
     name: []const u8,
@@ -85,14 +95,18 @@ pub fn run(ctx: *harness.Ctx) !void {
         const optional = comptime std.mem.eql(u8, file, path_v142);
         if (ctx.corpus.readFileAlloc(ctx.io, file, arena, .limited(1 << 30))) |z| {
             const text = try harness.decompressZstd(arena, z, 1 << 31);
-            try runLines(ctx, arena, text, &pkgs);
+            try runLines(ctx, arena, text, &pkgs, true);
         } else |e| {
             if (!(optional and e == error.FileNotFound)) ctx.fail("vectors", "read {s}: {s}", .{ file, @errorName(e) });
         }
     }
+    try runLines(ctx, arena, repo_vectors, &pkgs, true);
+    const limits_text = try harness.decompressZstd(arena, limits_vectors, 1 << 31);
+    // Move-call executor only: the coin executor leaves transactions this large to it
+    try runLines(ctx, arena, limits_text, &pkgs, false);
 }
 
-fn runLines(ctx: *harness.Ctx, arena: std.mem.Allocator, text: []const u8, pkgs: *const packages.Store) !void {
+fn runLines(ctx: *harness.Ctx, arena: std.mem.Allocator, text: []const u8, pkgs: *const packages.Store, coin_too: bool) !void {
     var it = harness.lines(text);
     while (it.next()) |line| {
         ctx.nextItem();
@@ -102,8 +116,11 @@ fn runLines(ctx: *harness.Ctx, arena: std.mem.Allocator, text: []const u8, pkgs:
             continue;
         };
         inline for (.{ "move", "coin" }) |path_name| {
-            const item = try std.fmt.allocPrint(a, "{s}/{s}", .{ v.name, path_name });
-            if (ctx.selected(item)) checkOne(ctx, a, arena, item, &v, pkgs, comptime std.mem.eql(u8, path_name, "coin")) catch |e| ctx.fail(item, "{s}", .{@errorName(e)});
+            const is_coin = comptime std.mem.eql(u8, path_name, "coin");
+            if (!is_coin or coin_too) {
+                const item = try std.fmt.allocPrint(a, "{s}/{s}", .{ v.name, path_name });
+                if (ctx.selected(item)) checkOne(ctx, a, arena, item, &v, pkgs, is_coin) catch |e| ctx.fail(item, "{s}", .{@errorName(e)});
+            }
         }
     }
 }

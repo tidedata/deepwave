@@ -7,6 +7,7 @@
 //! share partitioned again (skew: most locations of a restored store are in one segment). No
 //! second array: the memory is the input plus the bucket counters.
 const std = @import("std");
+const tcache = @import("core").threads;
 
 const fanout = 1024;
 /// Below this a range is sorted directly.
@@ -142,9 +143,10 @@ pub fn sortU64(gpa: std.mem.Allocator, items: []u64, threads: usize) void {
         w.busy -= 1;
     }
     w.big = items.len / (threads * 8);
-    var ts: [64]?std.Thread = @splat(null);
+    // kept threads (core/threads.zig), not a set started and ended per sort
+    var ts: [64]?tcache.Handle = @splat(null);
     const nt = @min(threads, ts.len);
-    for (ts[0 .. nt - 1]) |*t| t.* = std.Thread.spawn(.{ .stack_size = 1 << 20 }, Work.run, .{&w}) catch null;
+    for (ts[0 .. nt - 1]) |*t| t.* = tcache.spawn(Work.run, .{&w}) catch null;
     w.run();
     for (ts[0 .. nt - 1]) |t| if (t) |x| x.join();
 }

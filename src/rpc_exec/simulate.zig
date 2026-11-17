@@ -69,6 +69,9 @@ pub const Engine = struct {
     /// What a request with checks disabled gets (`--dev-inspect-disabled`, fullnode.yaml
     /// `dev-inspect-disabled`).
     dev_inspect: DevInspect = default_dev_inspect,
+    /// Executing a certified transaction (a validator's runner): `check_certificate_input`, which
+    /// skips the signing-only allowance declaration checks, instead of `check_transaction_input`.
+    certificate: bool = false,
 
     pub const DevInspect = enum {
         /// `dev-inspect-disabled: true`: sui-node's refusal (`AuthorityState::simulate_transaction`).
@@ -417,6 +420,13 @@ const Lookup = struct {
         if (l.mock) |mk| if (version == 1 and std.mem.eql(u8, id, &mock_gas_id)) return mk;
         return l.state.at(id, version);
     }
+
+    /// The store's latest object (a certified transaction's coin deny list and per-epoch config
+    /// reads, as in execution: exec.ptb then fails a denied transaction itself).
+    fn latest(ctx: *const anyopaque, id: *const Id) ?[]const u8 {
+        const l: *const Lookup = @ptrCast(@alignCast(ctx));
+        return l.state.latest(id);
+    }
 };
 
 /// exec-move's PreState over the request's `State`; address-balance reads are recorded as
@@ -510,7 +520,21 @@ fn loadedOf(arena: Allocator, kind: checks.InputKind, raw: []const u8) !Loaded {
 /// runs DevInspect<true> (see `Engine.DevInspect`).
 /// The simulation core (`transaction_simulation::simulate_transaction`): the gRPC handler above
 /// and the native engine (`src/exec/simulate`) both run transactions through it.
+/// Per-call execution options of a certified transaction.
+pub const RunOpts = struct {
+    /// The funds withdraw scheduler found the declared withdrawals above the balances
+    /// (`FundsWithdrawStatus::Insufficient`): the InsufficientFundsForWithdraw early error.
+    insufficient_funds: bool = false,
+    /// The commit's earlier successful object-funds withdrawals at this transaction's
+    /// accumulator version (`UnsettledObjectWithdrawals`); null for simulation.
+    unsettled: ?ptb.Unsettled = null,
+};
+
 pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: State, tx_raw: []const u8, td_in: types.TransactionDataV1, allow_mock: bool, dev_inspect: bool) !RunResult {
+    return runOpts(e, arena, env, state, tx_raw, td_in, allow_mock, dev_inspect, .{});
+}
+
+pub fn runOpts(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: State, tx_raw: []const u8, td_in: types.TransactionDataV1, allow_mock: bool, dev_inspect: bool, opts: RunOpts) !RunResult {
     const cfg = env.cfg;
     var td = td_in;
     // AuthorityState::simulate_transaction
@@ -525,7 +549,6 @@ pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: Stat
             return .{ .fail = try checks.unsupportedFeature(arena, "coin reservations in gas payment are not supported at this protocol version", .{}) };
         };
     }
-    if (checks.unsupportedWithdrawal(&td)) |why| return .{ .unimplemented = why };
 
     var kinds: std.ArrayList(checks.InputKind) = .empty;
     var recv: std.ArrayList(checks.Receiving) = .empty;
@@ -548,7 +571,9 @@ pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: Stat
     // pre_object_load_checks: the transaction deny config first (no signatures in simulate; the
     // input kinds are the ones computed before the mock gas coin)
     {
-        const deny_cfg = txdeny.current();
+        var deny_guard = txdeny.effective();
+        defer deny_guard.release();
+        const deny_cfg = deny_guard.config();
         if (deny_cfg.active()) {
             const deny_rules = &deny_cfg.rules;
             var pl: SimPkgs = .{ .e = e, .epoch = env.epoch, .state = state };
@@ -560,8 +585,13 @@ pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: Stat
     // gas) against the live address balances
     var withdraw_types: []types.TypeTag = &.{};
     switch (try checks.declaredWithdrawals(arena, &td, &env.chain_id, state)) {
-        .fail => |f| return .{ .fail = f },
-        .ok => |list| {
+        // a certified transaction: no signing checks (a coin reservation whose accumulator
+        // field is gone leaves its type unresolved; the scheduler decided its funds)
+        .fail => |f| if (!e.certificate) return .{ .fail = f },
+        .ok => |list| if (e.certificate) {
+            withdraw_types = try arena.alloc(types.TypeTag, list.len);
+            for (list, withdraw_types) |w, *t| t.* = w.coin;
+        } else {
             // the coin reservations' types, resolved through the accumulator field (candidates
             // for exec's reservation typing, `Inputs.reservation_types`)
             withdraw_types = try arena.alloc(types.TypeTag, list.len);
@@ -634,7 +664,7 @@ pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: Stat
         // with checks assumes them
         if (!relaxed) if (try checks.objectsInput(arena, cfg, &td, loaded, recv.items, recv_objs)) |_|
             return .{ .unimplemented = "checks disabled: inputs that fail the signing checks are not supported" };
-    } else if (try checks.transactionInput(arena, cfg, env.rgp, &td, loaded, recv.items, recv_objs)) |f| return .{ .fail = f };
+    } else if (try checks.transactionInputOpts(arena, cfg, env.rgp, &td, loaded, recv.items, recv_objs, if (e.certificate) .certificate else .signing)) |f| return .{ .fail = f };
 
     // ---- execution (`dev_inspect_transaction(.., skip_all_checks = dev_inspect)`: DevInspect<false>
     // has the effects of normal execution, DevInspect<true> its relaxed rules)
@@ -649,14 +679,17 @@ pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: Stat
         .rgp = env.rgp,
         .pkgs = e.pkgs,
         .authoritative_packages = true,
+        .chain_id = env.chain_id,
     }, sim_raw, &td, .{
-        .objs = .{ .ctx = &lookup, .get = Lookup.get },
+        .objs = .{ .ctx = &lookup, .get = Lookup.get, .latest = if (e.certificate) Lookup.latest else null },
         .effects = null,
         .unchanged_loaded = null,
         .state = .{ .ctx = &pre, .vtable = &Pre.vtable },
         .reservation_types = withdraw_types,
         .track_results = e.track_results,
         .skip_all_checks = relaxed,
+        .insufficient_funds = opts.insufficient_funds,
+        .unsettled = opts.unsettled,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .unimplemented = try std.fmt.allocPrint(arena, "execution: {s}", .{@errorName(err)}) },
@@ -694,7 +727,9 @@ pub fn run(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: Stat
         var reads: std.ArrayList(deny.Ref) = .empty;
         switch (try deny.check(arena, state, env.epoch, &pairs, &reads)) {
             .ok => {},
-            .denied => |why| return .{ .unimplemented = why },
+            // a certified transaction: exec.ptb read the deny list from the store and wrote the
+            // AddressDeniedForCoin / CoinTypeGlobalPause failure (context::finish)
+            .denied => |why| if (!e.certificate) return .{ .unimplemented = why },
         }
         for (reads.items) |r| try all_loaded.append(arena, .{ .id = r.id, .version = r.version });
     }
@@ -1815,4 +1850,45 @@ test "simulation failure message renders a Move abort like sui-node" {
     addr[31] = 0xe9;
     const f: types.ExecutionFailure = .{ .@"error" = .{ .MoveAbort = .{ .{ .module = .{ .address = .{ .@"0" = addr }, .name = .{ .@"0" = "rip_station" } }, .function = 21, .instruction = 18, .function_name = .{ .@"0" = "sell_card" } }, 6 } }, .command = 1 };
     try std.testing.expectEqualStrings("Transaction fails in simulation: Move Runtime Abort. Location: f9000000000000000000000000000000000000000000000000000000000000e9::rip_station::sell_card (function index 21) at offset 18, Abort Code: 6 in command 1", try failure.simulationFailureMessage(a.allocator(), f));
+}
+
+// Literal inputs (sui-rpc-api `simulate/resolve/literal.rs`): unresolved transactions whose
+// inputs are `google.protobuf.Value` literals, sent to a mainnet fullnode (sui-node 1.83.1, checks
+// disabled, mask `transaction.transaction.kind`) on 2026-11-13. Each case is the request and the
+// fullnode's answer: the response bytes (the resolved kind, state-independent: every input is a
+// literal or Pure) or the status code and message. Types from MoveCall parameters (0x1 and 0x2
+// functions), SplitCoins amounts, TransferObjects recipients and typed MakeMoveVector elements;
+// conflicts, invalid uses and every parse and range error.
+test "literal inputs resolve as sui-node (mainnet fullnode answers)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const dt = ptb.devinspect_test;
+    var f: dt.Fixture = undefined;
+    try f.init(arena, std.testing.io);
+    defer f.deinit();
+    const env = testEnv(&f);
+    const ms = try testState(arena, &f);
+    const engine: Engine = .{ .gpa = std.heap.page_allocator, .pkgs = &f.pkgs, .dev_inspect = .enabled };
+    const Case = struct { name: []const u8, req: []const u8, code: u8, message: []const u8, resp: []const u8 };
+    const cases = try std.json.parseFromSliceLeaky([]const Case, arena, @embedFile("testdata/literal_inputs.json"), .{});
+    try std.testing.expect(cases.len >= 90);
+    var failed: usize = 0;
+    for (cases) |k| {
+        const req = try arena.alloc(u8, k.req.len / 2);
+        _ = try std.fmt.hexToBytes(req, k.req);
+        const want = try arena.alloc(u8, k.resp.len / 2);
+        _ = try std.fmt.hexToBytes(want, k.resp);
+        switch (try engine.simulate(arena, &env, ms.state(), req)) {
+            .ok => |resp| if (k.code != 0 or !std.mem.eql(u8, resp, want)) {
+                std.debug.print("{s}: zui OK {x}; sui-node code {d} \"{s}\" {s}\n", .{ k.name, resp, k.code, k.message, k.resp });
+                failed += 1;
+            },
+            .err => |e| if (k.code != e.code or !std.mem.eql(u8, e.message, k.message)) {
+                std.debug.print("{s}: zui code {d} \"{s}\"; sui-node code {d} \"{s}\"\n", .{ k.name, e.code, e.message, k.code, k.message });
+                failed += 1;
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), failed);
 }

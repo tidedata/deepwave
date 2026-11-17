@@ -68,6 +68,11 @@ pub const AdvanceRequest = struct {
     /// The previous checkpoint's sequence number (may be below seq - 1 in Rust's wording).
     last_checkpoint_seq: u64,
     tx_digests: []const [32]u8,
+    /// Transactions of this epoch's checkpoints `max(last_checkpoint_seq - (n - 1), first of
+    /// epoch)..=last_checkpoint_seq` (locally built contents), n =
+    /// `stored_observations_num_included_checkpoints`: with `tx_digests`, the commands whose
+    /// observations the StoreExecutionTimeObservations transaction keeps.
+    window_tx_digests: []const [32]u8 = &.{},
 };
 
 pub const EpochAdvance = struct {
@@ -136,6 +141,8 @@ pub const Builder = struct {
     /// Null: build and store only (shadow, tests).
     output: ?*output_mod.Output = null,
     tracer: iface.Tracer = .{},
+    /// Why the last build returned Fatal (static text, for the operator's log).
+    fatal_reason: []const u8 = "",
     /// Accumulate the state hash after every checkpoint (needed at epoch end; the root must
     /// follow every checkpoint, so leave it on).
     accumulate: bool = true,
@@ -238,11 +245,17 @@ pub const Builder = struct {
 
     // ------------------------------------------------------------ the build
 
+    fn fatal(b: *Builder, why: []const u8) Error {
+        b.fatal_reason = why;
+        return error.Fatal;
+    }
+    const mapEnvR = mapEnvR_;
+
     /// `make_checkpoint` for one pending checkpoint.
     pub fn buildNext(b: *Builder, arena: std.mem.Allocator, pending: *const iface.PendingCheckpoint) Error!Built {
         const details = pending.details;
         const cfg = b.cfg;
-        if (!cfg.feature_flags.prepend_prologue_tx_in_consensus_commit_in_checkpoints) return error.Fatal;
+        if (!cfg.feature_flags.prepend_prologue_tx_in_consensus_commit_in_checkpoints) return b.fatal("protocol without prepend_prologue_tx_in_consensus_commit_in_checkpoints");
 
         const last = b.store.lastBuilt();
         if (last) |l| {
@@ -250,10 +263,10 @@ pub const Builder = struct {
             if (l.epoch == b.epoch) if (l.height) |h| if (details.checkpoint_height <= h) {
                 return .{ .seq = details.checkpoint_seq, .digest = l.digest, .summary_bcs = &.{}, .contents_bcs = &.{}, .num_txs = 0, .skipped = true };
             };
-            if (details.checkpoint_seq != l.seq + 1) return error.Fatal;
+            if (details.checkpoint_seq != l.seq + 1) return b.fatal("pending checkpoint does not follow the last built one");
         } else if (details.checkpoint_seq != 0) {
             // no previous checkpoint known (not even the previous epoch's): only genesis follows
-            return error.Fatal;
+            return b.fatal("no last built checkpoint and the pending one is not genesis");
         }
 
         // 1-2: resolve, wait for effects, order
@@ -263,14 +276,14 @@ pub const Builder = struct {
             for (grp.tx_roots, digs) |*k, *d| d.* = b.env.vtable.key_digest(b.env.ctx, k) orelse return error.NotReady;
             const views = try arena.alloc(ev.View, digs.len);
             for (digs, views) |*d, *v| {
-                const raw = (b.env.vtable.effects(b.env.ctx, arena, d) catch |e| return mapEnv(e)) orelse return error.NotReady;
+                const raw = (b.env.vtable.effects(b.env.ctx, arena, d) catch |e| return b.mapEnvR(e, "env.effects")) orelse return error.NotReady;
                 v.* = try ev.View.parse(arena, raw);
             }
             var ccp_first = false;
             if (digs.len > 0) {
                 const c = b.env.vtable.tx_class(b.env.ctx, &digs[0]) orelse return error.NotReady;
                 ccp_first = c == .consensus_commit_prologue;
-                if (ccp_first and !std.mem.eql(u8, &views[0].tx, &digs[0])) return error.Fatal;
+                if (ccp_first and !std.mem.eql(u8, &views[0].tx, &digs[0])) return b.fatal("prologue effects are for another transaction");
             }
             const sorted = try causal.orderForCheckpoint(arena, views, ccp_first, cfg.feature_flags.disable_effects_tx_dependencies);
             const group_start = all.items.len;
@@ -279,7 +292,7 @@ pub const Builder = struct {
                 const sd = try arena.alloc([32]u8, sorted.len);
                 for (sorted, sd) |*v, *d| d.* = v.tx;
                 const req: SettlementRequest = .{ .key = sk, .sorted_root_digests = sd, .height = grp.height, .seq = details.checkpoint_seq, .tx_index_offset = group_start };
-                const raws = (b.env.vtable.settlement_effects(b.env.ctx, arena, &req) catch |e| return mapEnv(e)) orelse return error.NotReady;
+                const raws = (b.env.vtable.settlement_effects(b.env.ctx, arena, &req) catch |e| return b.mapEnvR(e, "env.settlement_effects")) orelse return error.NotReady;
                 for (raws) |raw| try all.append(arena, try ev.View.parse(arena, raw));
             }
         }
@@ -290,11 +303,11 @@ pub const Builder = struct {
         for (all.items) |*v| {
             const class = b.env.vtable.tx_class(b.env.ctx, &v.tx) orelse return error.NotReady;
             switch (class) {
-                .forbidden => return error.Fatal,
+                .forbidden => return b.fatal("a transaction kind that may not be in a checkpoint"),
                 .randomness_state_update => |r| try rounds.append(arena, r),
                 else => {},
             }
-            try sigs.append(arena, b.env.vtable.user_signatures(b.env.ctx, arena, &v.tx) catch |e| return mapEnv(e));
+            try sigs.append(arena, b.env.vtable.user_signatures(b.env.ctx, arena, &v.tx) catch |e| return b.mapEnvR(e, "env.user_signatures"));
         }
 
         // 4: end of epoch
@@ -312,8 +325,9 @@ pub const Builder = struct {
                 .seq = details.checkpoint_seq,
                 .last_checkpoint_seq = if (last) |l| l.seq else 0,
                 .tx_digests = td,
+                .window_tx_digests = try b.observationWindow(arena, if (last) |l| l.seq else 0),
             };
-            const adv = (b.env.vtable.advance_epoch(b.env.ctx, arena, &req) catch |e| return mapEnv(e)) orelse return error.NotReady;
+            const adv = (b.env.vtable.advance_epoch(b.env.ctx, arena, &req) catch |e| return b.mapEnvR(e, "env.advance_epoch")) orelse return error.NotReady;
             try all.append(arena, try ev.View.parse(arena, adv.effects));
             try sigs.append(arena, &.{});
             const acc = try state_acc.accumulateEffects(b.gpa, cfg, all.items);
@@ -364,10 +378,10 @@ pub const Builder = struct {
         }
         const new_last = create.LastBuilt.fromSummary(&created.summary, created.summary_digest, details.checkpoint_height);
         try b.store.putBuilt(seq, details.checkpoint_height, new_last, created.summary_bcs, created.contents_bcs);
-        b.tracer.mark(.checkpoint_built, &created.summary_digest, 0);
+        b.tracer.markNow(.checkpoint_built, &created.summary_digest);
         if (b.output) |o| {
             _ = try o.checkpointCreated(&created.summary, created.summary_bcs, &created.summary_digest);
-            b.tracer.mark(.checkpoint_signed, &created.summary_digest, 0);
+            b.tracer.markNow(.checkpoint_signed, &created.summary_digest);
         }
         // only now is the checkpoint "built": a failed output above is retried by the next run
         try b.store.setLastBuilt(new_last);
@@ -380,7 +394,38 @@ pub const Builder = struct {
             .num_txs = created.num_txs,
         };
     }
+
+    /// The transactions of `AuthorityState::create_and_execute_advance_epoch_tx`'s observation
+    /// window ending at `last_seq`: this epoch's checkpoints only, never the genesis checkpoint.
+    fn observationWindow(b: *Builder, arena: std.mem.Allocator, last_seq: u64) Error![]const [32]u8 {
+        const n = switch (b.cfg.feature_flags.per_object_congestion_control_mode) {
+            .ExecutionTimeEstimate => |p| p.stored_observations_num_included_checkpoints,
+            else => return &.{},
+        };
+        var out: std.ArrayList([32]u8) = .empty;
+        var seq = last_seq;
+        var taken: u64 = 0;
+        while (seq >= 1 and taken < n) : ({
+            seq -= 1;
+            taken += 1;
+        }) {
+            const sb = (try b.store.builtSummary(arena, seq)) orelse return b.fatal("observation window: a checkpoint of the epoch was not built locally");
+            const summary = bcs.decode(types.CheckpointSummary, arena, sb) catch return b.fatal("observation window: corrupt checkpoint summary");
+            if (summary.epoch != b.epoch) break;
+            const cb = (try b.store.builtContents(arena, seq)) orelse return b.fatal("observation window: checkpoint contents missing");
+            switch (bcs.decode(types.CheckpointContents, arena, cb) catch return b.fatal("observation window: corrupt checkpoint contents")) {
+                .V1 => |c| for (c.transactions) |t| try out.append(arena, t.transaction.@"0".@"0"),
+                .V2 => |c| for (c.transactions) |t| try out.append(arena, t.digest.transaction.@"0".@"0"),
+            }
+        }
+        return out.items;
+    }
 };
+
+fn mapEnvR_(b: *Builder, e: Env.Err, what: []const u8) Error {
+    if (e == error.Fatal) b.fatal_reason = what;
+    return mapEnv(e);
+}
 
 fn mapEnv(e: Env.Err) Error {
     return switch (e) {

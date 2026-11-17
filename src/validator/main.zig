@@ -1,6 +1,6 @@
-//! deepwave-validator (unaudited). Every command runs the safety gate first (gate.zig).
+//! deepwave-validator. Every command that may sign runs the safety gate first (gate.zig).
 //!
-//!   deepwave-validator gate-check --chain-id <8 hex> --address <addr>... [--key-file] [--unaudited-validator-i-accept-the-risk]
+//!   deepwave-validator gate-check --chain-id <8 hex> --address <addr>... [--key-file] [--sign-network mainnet|testnet|CHAINID]
 //!       prints the gate's decision and exits 0 (allowed) or 1 (refused).
 //!   deepwave-validator run (--localnet DIR --index N | --config FILE --chain-id HEX8) [...]
 //!       validator mode (node.zig, val-epoch-api-keys): gate, signer, epoch lifecycle, lane hooks,
@@ -26,9 +26,15 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "budget")) return validator.latency.cli.run(init.io, init.gpa, args[2..]);
     // Signature pre-verification benchmark: synthetic local transactions, no keys, no network.
     if (std.mem.eql(u8, cmd, "preverify-bench")) return validator.authority.preverify_fixture.benchMain(init.gpa, init.io, args[2..]);
-    if (std.mem.eql(u8, cmd, "run")) return validator.node.run(init.gpa, init.io, args[2..]);
+    if (std.mem.eql(u8, cmd, "run")) {
+        // a Mysten validator.yaml: the integrated runtime; --localnet / --chain-id: the scaffold
+        if (validator.run.runtime.wants(args[2..])) return validator.run.runtime.run(init.gpa, init.io, args[2..]);
+        return validator.node.run(init.gpa, init.io, args[2..]);
+    }
     if (std.mem.eql(u8, cmd, "localnet")) return localnetCmd(init, args[2..]);
     if (std.mem.eql(u8, cmd, "seat")) return validator.seat.run(init.gpa, init.io, args[2..]);
+    if (std.mem.eql(u8, cmd, "load")) return validator.run.load.main(init.gpa, init.io, args[2..]);
+    if (std.mem.eql(u8, cmd, "signcheck")) return validator.run.signcheck.main(init.gpa, init.io, args[2..]);
     if (std.mem.eql(u8, cmd, "vectors-check") and args.len == 3) {
         const rep = validator.epoch.vectors.check(init.gpa, init.io, args[2]) catch |e| {
             std.debug.print("deepwave-validator: vectors-check: {s}\n", .{@errorName(e)});
@@ -40,7 +46,7 @@ pub fn main(init: std.process.Init) !u8 {
     var chain_id: []const u8 = "";
     var addrs: std.ArrayList([]const u8) = .empty;
     var key_source: gate.KeySource = .generated;
-    var flag = false;
+    var sign_network: ?gate.SignNetwork = null;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -52,11 +58,12 @@ pub fn main(init: std.process.Init) !u8 {
             try addrs.append(init.arena.allocator(), args[i]);
         } else if (std.mem.eql(u8, a, "--key-file")) {
             key_source = .file;
-        } else if (std.mem.eql(u8, a, gate.unaudited_runtime_flag)) {
-            flag = true;
+        } else if (std.mem.eql(u8, a, gate.sign_network_flag) and i + 1 < args.len) {
+            i += 1;
+            sign_network = gate.SignNetwork.parse(args[i]) orelse return usage();
         } else return usage();
     }
-    const decision = gate.decide(.{ .chain_id = chain_id, .addresses = addrs.items, .key_source = key_source, .unaudited_flag = flag });
+    const decision = gate.decide(.{ .chain_id = chain_id, .addresses = addrs.items, .key_source = key_source, .sign_network = sign_network });
     switch (decision) {
         .refused => |r| {
             std.debug.print("deepwave-validator: {s}\n", .{r.text()});
@@ -103,7 +110,7 @@ fn localnetCmd(init: std.process.Init, args: []const []const u8) u8 {
 }
 
 fn usage() u8 {
-    std.debug.print("usage: deepwave-validator gate-check --chain-id <8 hex> --address <addr>... [--key-file] [{s}]\n", .{gate.unaudited_runtime_flag});
+    std.debug.print("usage: deepwave-validator gate-check --chain-id <8 hex> --address <addr>... [--key-file] [{s} mainnet|testnet|CHAINID]\n", .{gate.sign_network_flag});
     std.debug.print("{s}", .{validator.node.usage});
     std.debug.print("{s}", .{validator.seat.usage});
     return 2;

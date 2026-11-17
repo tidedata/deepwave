@@ -29,6 +29,17 @@ sui-rpc = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "8c356
 prost-types = "0.14.1"
 prost = "0.14.1"
 tokio = { version = "1", features = ["full"] }
+# the funds withdraw scheduler's own sources (funds-sched)
+sui-config = { path = "../../sui/crates/sui-config" }
+mysten-common = { path = "../../sui/crates/mysten-common" }
+mysten-metrics = { path = "../../sui/crates/mysten-metrics" }
+parking_lot = "0.12.3"
+futures = "0.3.28"
+tracing = "0.1.37"
+async-trait = "0.1.61"
+nonempty = "0.9.0"
+# funds-sched: Mysten's Move package build (move/vault), as sui-core's tests build theirs
+sui-move-build = { path = "../../sui/crates/sui-move-build" }
 
 [profile.release]
 debug = 1

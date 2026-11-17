@@ -29,6 +29,8 @@ use sui_types::object::Object;
 use sui_types::storage::ObjectStore;
 use sui_types::transaction::{InputObjectKind, ObjectReadResult, ObjectReadResultKind, TransactionDataAPI, TransactionKind};
 
+mod settle;
+
 type ChildKey = (ObjectID, ObjectID, u64);
 
 fn decode(path: &Path) -> Result<CheckpointData> {
@@ -603,6 +605,8 @@ fn main() -> Result<()> {
     match args.first().map(|s| s.as_str()) {
         Some("children") => cmd_children(Path::new(&args[1]), &args[2], Path::new(&args[3])),
         Some("bench") => cmd_bench(&args[1..]),
-        _ => bail!("usage: zui-truth-exec-system children <corpus> <graphql url> <out.bin.zst> | bench system --iters N --list <file>"),
+        Some("settle-vectors") => settle::cmd_settle_vectors(Path::new(&args[1])),
+        Some("system-fail-vectors") => settle::cmd_system_fail_vectors(Path::new(&args[1])),
+        _ => bail!("usage: zui-truth-exec-system children <corpus> <graphql url> <out.bin.zst> | bench system --iters N --list <file> | settle-vectors <out.jsonl> | system-fail-vectors <out.jsonl>"),
     }
 }

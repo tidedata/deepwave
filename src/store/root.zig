@@ -85,4 +85,5 @@ test {
     _ = @import("dst.zig");
     _ = @import("clock.zig");
     _ = @import("layout.zig");
+    _ = @import("agepend.zig");
 }

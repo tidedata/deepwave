@@ -45,6 +45,22 @@ fn sleepMs(n: u64) void {
     Io.sleep(io, .fromMilliseconds(@intCast(n)), .awake) catch {};
 }
 
+// Wall-clock checks. A host that runs test binaries side by side stalls a thread now and then
+// for hundreds of ms (a test machine at load 100: over a second), so no check here rests on a ceiling
+// of a few hundred ms, and nothing that must happen during a wait rests on a sleep alone:
+// - which path a call took is read from the metrics and the answer;
+// - a helper that acts during a wait (a commit, a stop) first waits until the call under test
+//   is seen waiting (`Cue`), then for its delay, so the call's time includes that delay;
+// - a lower bound (a wait the test made) stays as it is: a stall only lengthens it;
+// - a ceiling only tells a call that did not wait, or waited once, from one that waited out a
+//   bound of seconds or hung; `slack_ms` is what a stall may add to a call.
+const slack_ms = 1500;
+/// A port no test listens on: tcpmux (1), privileged and served by nothing on a test host. Not
+/// an ephemeral port bound and let go: a test binary beside this one may get it next and answer.
+const dead_port: u16 = 1;
+/// How long a test waits for a state it is owed before it fails.
+const owed_ms = 10_000;
+
 // ---------------------------------------------------------------- the scripted core
 
 /// What the core answers, by path. Process-wide (the stream answers get no context).
@@ -357,6 +373,11 @@ const Edge = struct {
     // the guard's view of the sources
     known_tip: Atomic(u64) = .init(std.math.maxInt(u64)),
     silent_ns: Atomic(u64) = .init(0),
+    /// Threads a test runs beside its calls (readers, a later commit or stop): joined by
+    /// `joinThreads`, and in any case by `destroy` after `requestStop` released every wait, so a
+    /// test that fails while they run does not free the edge under them (it did: SIGSEGV in
+    /// raw.Pending.waitClear, a reader still waiting on the forwarder `destroy` had freed).
+    threads: std.ArrayList(std.Thread) = .empty,
 
     fn create(ep: grpc.Endpoint, cfg: forward.Config) !*Edge {
         const e = try testing.allocator.create(Edge);
@@ -376,6 +397,7 @@ const Edge = struct {
         e.next_seq = 0;
         e.known_tip = .init(std.math.maxInt(u64));
         e.silent_ns = .init(0);
+        e.threads = .empty;
         e.gt = try forward.GrpcTransport.init(sys, io, ep);
         e.gt.up.cooldown_ns = 50 * ms;
         e.f = try forward.Forwarder.create(testing.allocator, io, &e.svc, e.gt.transport(), cfg);
@@ -385,6 +407,11 @@ const Edge = struct {
     }
 
     fn destroy(e: *Edge) void {
+        if (e.threads.items.len > 0) {
+            e.f.requestStop(); // every wait ends at its next look
+            e.joinThreads();
+        }
+        e.threads.deinit(sys);
         e.f.destroy();
         // the transport's connection: closed, and its reader thread gone before the test ends
         const conn = e.gt.up.conn;
@@ -406,6 +433,40 @@ const Edge = struct {
         e.sio.deinit();
         e.tmp.cleanup();
         testing.allocator.destroy(e);
+    }
+
+    fn spawn(e: *Edge, comptime func: anytype, args: anytype) !void {
+        try e.threads.ensureUnusedCapacity(sys, 1);
+        e.threads.appendAssumeCapacity(try std.Thread.spawn(.{}, func, args));
+    }
+    fn joinThreads(e: *Edge) void {
+        for (e.threads.items) |t| t.join();
+        e.threads.clearRetainingCapacity();
+    }
+    /// Until `n` reads wait for an apply.
+    fn waitWaiters(e: *Edge, n: usize) !void {
+        const t0 = nowNs();
+        while (e.f.raw_waiters.load(.acquire) < n) {
+            if (nowNs() - t0 > owed_ms * ms) return error.ReadersNotWaiting;
+            sleepMs(1);
+        }
+    }
+    /// Starts `readers` and waits until each has taken its start time (`Reader.started`).
+    fn startReaders(e: *Edge, readers: []Reader) !void {
+        for (readers) |*r| try e.spawn(Reader.run, .{r});
+        const t0 = nowNs();
+        for (readers) |*r| while (!r.started.load(.acquire)) {
+            if (nowNs() - t0 > owed_ms * ms) return error.ReadersNotStarted;
+            sleepMs(1);
+        };
+    }
+    /// Starts `readers` (each one's read waits for an apply), waits until all of them wait,
+    /// then `hold_ms` more: each reader's time then includes at least `hold_ms` of waiting.
+    fn startWaiting(e: *Edge, readers: []Reader, hold_ms: u64) !void {
+        const before = e.f.raw_waiters.load(.acquire);
+        try e.startReaders(readers);
+        try e.waitWaiters(before + readers.len);
+        sleepMs(hold_ms);
     }
 
     fn knownTip(ctx: *anyopaque) ?u64 {
@@ -676,13 +737,17 @@ test "requests ahead of the edge wait for the follower, then go to the core" {
     core.reset();
     const up = try Server.start(core.handler, null);
     defer up.stop();
-    const e = try Edge.create(plain(up.port), .{ .ahead_wait_ms = 300 });
+    // a bound no stall reaches: a commit 80 ms into the wait always comes inside it
+    const e = try Edge.create(plain(up.port), .{ .ahead_wait_ms = 2000 });
     defer e.destroy();
     e.healthy();
     for (0..5) |_| try e.commit(null); // tip 4
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    // the way to the core open before anything is timed (the first call dials it: on a loaded
+    // host that alone took up to 2.8 s)
+    _ = try e.unary(a, p_lookup, "name");
     // GetCheckpointRequest { sequence_number = 1 }
     const at4 = try e.unary(a, p_checkpoint, "\x08\x04");
     try testing.expectEqualStrings("local:" ++ p_checkpoint, at4.message);
@@ -695,21 +760,23 @@ test "requests ahead of the edge wait for the follower, then go to the core" {
         }
     };
     var t0 = nowNs();
-    var th = try std.Thread.spawn(.{}, T.later, .{ e, 80 });
+    try e.spawn(T.later, .{ e, 80 });
     const at5 = try e.unary(a, p_checkpoint, "\x08\x05");
-    th.join();
+    e.joinThreads();
     var took = (nowNs() - t0) / ms;
+    // answered by the commit (here, not passed on at the bound)
     try testing.expectEqualStrings("local:" ++ p_checkpoint, at5.message);
-    try testing.expect(took >= 70 and took < 280);
     try testing.expectEqual(@as(u64, 0), e.forwarded(.get_checkpoint, .ahead));
+    try testing.expect(took >= 70 and took < 2000);
 
     // checkpoint 9 never arrives: the whole wait, then the core's answer
     t0 = nowNs();
     const at9 = try e.unary(a, p_checkpoint, "\x08\x09");
     took = (nowNs() - t0) / ms;
     try testing.expect(std.mem.startsWith(u8, at9.message, "core:"));
-    try testing.expect(took >= 290 and took < 1500);
     try testing.expectEqual(@as(u64, 1), e.forwarded(.get_checkpoint, .ahead));
+    // the bound, passed on once (above); past that only a hang matters (a loaded host: 4.8 s)
+    try testing.expect(took >= 1990 and took < owed_ms);
 
     // by digest: no wait at all; a local miss goes straight to the core
     e.local.code.store(5, .release);
@@ -717,8 +784,9 @@ test "requests ahead of the edge wait for the follower, then go to the core" {
     // GetCheckpointRequest { digest = 2: "d" }
     const byd = try e.unary(a, p_checkpoint, "\x12\x01d");
     try testing.expect(std.mem.startsWith(u8, byd.message, "core:"));
-    try testing.expect((nowNs() - t0) / ms < 250);
     try testing.expectEqual(@as(u64, 1), e.forwarded(.get_checkpoint, .negative));
+    try testing.expectEqual(@as(u64, 1), e.forwarded(.get_checkpoint, .ahead));
+    try testing.expect((nowNs() - t0) / ms < slack_ms);
 }
 
 test "a forwarded server stream: every message in order, then the core's status and details" {
@@ -801,17 +869,14 @@ test "deadlines: the core gets the time left, and a slow core is DEADLINE_EXCEED
     const took = (nowNs() - t0) / ms;
     try testing.expectEqual(@as(u8, 4), late.status);
     try testing.expectEqualStrings("Timeout expired", late.grpc_message);
-    try testing.expect(took >= 190 and took < 900);
+    // before the core's own answer (1500 ms): the edge's deadline answered it
+    try testing.expect(took >= 190 and took < 1500);
     try testing.expectEqual(@as(u64, 2), e.forwarded(.simulate_transaction, .policy));
 }
 
 test "a core that refuses connections: UNAVAILABLE at once, naming the upstream; local reads go on" {
     core.reset();
     // a port nobody listens on
-    var addr = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-    var l = try addr.listen(io, .{ .reuse_address = true });
-    const dead_port = l.socket.address.getPort();
-    l.deinit(io);
     const e = try Edge.create(plain(dead_port), .{});
     defer e.destroy();
     e.healthy();
@@ -921,11 +986,13 @@ test "a core that drops mid-answer: what arrived is relayed, then UNAVAILABLE; n
         defer arena.deinit();
         const t0 = nowNs();
         const rep = try loopback.call(arena.allocator(), io, front.port, p_list, &.{}, &.{"req"}, .{});
-        try testing.expect((nowNs() - t0) / ms < 3000);
+        try testing.expect((nowNs() - t0) / ms < owed_ms); // no hang
         try testing.expect(rep.ended);
         try testing.expectEqual(@as(usize, 1), rep.messages.items.len);
         try testing.expectEqualStrings("whole", rep.messages.items[0].payload);
-        try testing.expectEqualStrings("14", header(rep.trailers.items, "grpc-status").?);
+        const status = header(rep.trailers.items, "grpc-status").?;
+        if (!std.mem.eql(u8, status, "14")) std.debug.print("rst={} grpc-message: {s}\n", .{ rst, header(rep.trailers.items, "grpc-message") orelse "" });
+        try testing.expectEqualStrings("14", status);
         // (as sent: percent-encoded)
         const text = header(rep.trailers.items, "grpc-message").?;
         try testing.expect(std.mem.startsWith(u8, text, "edge:") and std.mem.indexOf(u8, text, "unavailable") != null);
@@ -1018,29 +1085,24 @@ test "read-after-write: a successful execute is held until the edge applied it, 
         const t0 = nowNs();
         const r = try e.unary(a, p_execute, req);
         try expectSameReply(want, r);
-        try testing.expect((nowNs() - t0) / ms < 400);
+        try testing.expect((nowNs() - t0) / ms < slack_ms);
         try testing.expectEqual(@as(u64, 1), hold.n.load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), e.f.metrics.execute_hold_timeouts.load(.monotonic));
         try testing.expectEqual(@as(usize, 0), e.f.pending.n.load(.acquire));
     }
-    // late: the checkpoint lands 300 ms after the execute; the answer follows it at once
+    // late: the checkpoint lands 300 ms into the hold; the answer follows it at once
     {
         const req = try executeRequest(a, "late transaction");
-        const T = struct {
-            fn later(edge: *Edge) void {
-                sleepMs(300);
-                const d = txDigest("late transaction");
-                edge.commit(&d) catch {};
-            }
-        };
         const t0 = nowNs();
-        var th = try std.Thread.spawn(.{}, T.later, .{e});
+        try e.spawn(commitLater, .{ e, Cue{ .pending = txDigest("late transaction") }, 300, txDigest("late transaction") });
         const r = try e.unary(a, p_execute, req);
         const took = (nowNs() - t0) / ms;
-        th.join();
+        e.joinThreads();
         try expectSameReply(want, r);
-        try testing.expect(took >= 290 and took < 1200);
         try testing.expectEqual(@as(u64, 2), hold.n.load(.monotonic));
+        // released by the commit, not at the 2 s bound
         try testing.expectEqual(@as(u64, 0), e.f.metrics.execute_hold_timeouts.load(.monotonic));
+        try testing.expect(took >= 290 and took < 2 * 2000);
     }
     // never: answered anyway at the 2 s bound, and the digest stays pending for the read side
     {
@@ -1049,14 +1111,14 @@ test "read-after-write: a successful execute is held until the edge applied it, 
         const r = try e.unary(a, p_execute, req);
         const took = (nowNs() - t0) / ms;
         try expectSameReply(want, r);
-        try testing.expect(took >= 1990 and took < 2900);
+        try testing.expect(took >= 1990 and took < 2 * 2000); // the bound once, not twice
         try testing.expectEqual(@as(u64, 1), e.f.metrics.execute_hold_timeouts.load(.monotonic));
         const d = txDigest("lost transaction");
         try testing.expect(e.f.pending.contains(&d));
         // ... until its checkpoint is applied after all
         try e.commit(&d);
         var waited: u32 = 0;
-        while (e.f.pending.contains(&d) and waited < 2000) : (waited += 5) sleepMs(5);
+        while (e.f.pending.contains(&d) and waited < owed_ms) : (waited += 5) sleepMs(5);
         try testing.expect(!e.f.pending.contains(&d));
     }
     // a failed execute is the core's error, at once, and nothing is pending
@@ -1069,7 +1131,7 @@ test "read-after-write: a successful execute is held until the edge applied it, 
         try testing.expectEqual(@as(u8, 3), r.status);
         try testing.expectEqualStrings("transaction rejected by the committee", r.grpc_message);
         try testing.expectEqualSlices(u8, &core.details, r.details);
-        try testing.expect((nowNs() - t0) / ms < 400);
+        try testing.expect((nowNs() - t0) / ms < slack_ms); // not held: no 2 s wait
         try testing.expectEqual(@as(usize, 0), e.f.pending.n.load(.acquire));
         try testing.expectEqual(@as(u64, 3), hold.n.load(.monotonic));
     }
@@ -1097,8 +1159,8 @@ test "read-after-write off: the execute answer is not held" {
     const t0 = nowNs();
     const r = try e.unary(a, p_execute, try executeRequest(a, "any transaction"));
     try testing.expectEqualStrings("executed: effects and all", r.message);
-    try testing.expect((nowNs() - t0) / ms < 400);
     try testing.expectEqual(@as(u64, 0), e.f.metrics.execute_hold.n.load(.monotonic));
+    try testing.expect((nowNs() - t0) / ms < slack_ms);
     try testing.expectEqual(@as(usize, 0), e.f.pending.n.load(.acquire));
 }
 
@@ -1380,7 +1442,29 @@ const p_balance = "/sui.rpc.v2.StateService/GetBalance";
 const p_balances = "/sui.rpc.v2.StateService/ListBalances";
 const p_batch = "/sui.rpc.v2.LedgerService/BatchGetObjects";
 
-fn commitLater(edge: *Edge, after_ms: u64, digest: [32]u8) void {
+/// What a helper thread waits for before its delay starts: the state the call under test is
+/// in once it waits. Gives up at the forwarder's stop (a test that failed) or after `owed_ms`.
+const Cue = union(enum) {
+    /// the execute of this digest is in the pending table (recorded, or held)
+    pending: [32]u8,
+    /// the scripted core answered this many calls (`core.calls`)
+    core_calls: u32,
+};
+
+fn waitCue(edge: *Edge, cue: Cue) void {
+    const t0 = nowNs();
+    while (!edge.f.stop_flag.load(.acquire) and nowNs() - t0 < owed_ms * ms) {
+        const seen = switch (cue) {
+            .pending => |d| edge.f.pending.contains(&d),
+            .core_calls => |n| core.calls.load(.acquire) >= n,
+        };
+        if (seen) return;
+        sleepMs(1);
+    }
+}
+
+fn commitLater(edge: *Edge, cue: Cue, after_ms: u64, digest: [32]u8) void {
+    waitCue(edge, cue);
     sleepMs(after_ms);
     edge.commit(&digest) catch {};
 }
@@ -1411,26 +1495,49 @@ test "read-after-write reads: the execute answers at once; a read of what it wro
         const data = "transaction of the " ++ @tagName(mode) ++ " run";
         const req = try executeMasked(a, data, &.{"digest"});
         const want = try loopback.unary(a, core.handler, p_execute, req);
-        // the edge applies the transaction's checkpoint (3) 300 ms after the execute starts
-        var th = try std.Thread.spawn(.{}, commitLater, .{ e, 300, txDigest(data) });
-        const exec = try timed(e, a, p_execute, req);
-        const unrelated = try timed(e, a, p_object, try idReq(a, &o_other));
-        const read = try timed(e, a, p_object, try idReq(a, &o_gas));
-        th.join();
-        std.debug.print("read-after-write {s}: execute {d} ms, unrelated read {d} ms, read of a written object {d} ms ({s})\n", .{ @tagName(mode), exec.ms, unrelated.ms, read.ms, read.reply.message });
+        const digest = txDigest(data);
+        var exec: Timed = undefined;
+        var unrelated: Timed = undefined;
+        var read_ms: u64 = 0;
+        var read_text: []const u8 = "";
+        if (mode == .hold) {
+            // the edge applies the transaction's checkpoint (3) 300 ms into the hold
+            try e.spawn(commitLater, .{ e, Cue{ .pending = digest }, 300, digest });
+            exec = try timed(e, a, p_execute, req);
+            e.joinThreads();
+            unrelated = try timed(e, a, p_object, try idReq(a, &o_other));
+            const read = try timed(e, a, p_object, try idReq(a, &o_gas));
+            read_ms = read.ms;
+            read_text = read.reply.message;
+        } else {
+            exec = try timed(e, a, p_execute, req);
+            unrelated = try timed(e, a, p_object, try idReq(a, &o_other));
+            // the read of the written object waits; checkpoint 3 comes 250 ms into its wait
+            var reader = [_]Reader{.{ .e = e, .path = p_object, .body = try idReq(a, &o_gas) }};
+            try e.startWaiting(&reader, 250);
+            try e.commit(&digest);
+            e.joinThreads();
+            read_ms = reader[0].ms;
+            read_text = try a.dupe(u8, reader[0].message());
+        }
+        std.debug.print("read-after-write {s}: execute {d} ms, unrelated read {d} ms, read of a written object {d} ms ({s})\n", .{ @tagName(mode), exec.ms, unrelated.ms, read_ms, read_text });
         // the execute answer is the core's for the client's own mask, byte for byte
         try expectSameReply(want, exec.reply);
         // whichever waited, the read of the written object is answered from the state with it
-        try testing.expectEqualStrings("local:" ++ p_object ++ "@3", read.reply.message);
-        try testing.expect(unrelated.ms < 150);
+        try testing.expectEqualStrings("local:" ++ p_object ++ "@3", read_text);
+        try testing.expect(unrelated.ms < slack_ms);
         if (mode == .hold) {
-            try testing.expect(exec.ms >= 290 and exec.ms < 1500);
-            try testing.expect(read.ms < 150);
+            // held until the commit, not the 2 s bound
+            try testing.expectEqual(@as(u64, 0), e.f.metrics.execute_hold_timeouts.load(.monotonic));
+            try testing.expect(exec.ms >= 290 and exec.ms < 2 * 2000);
+            try testing.expect(read_ms < slack_ms);
             try testing.expectEqualStrings("digest", core.seenMask()); // nothing added in hold
         } else {
-            try testing.expect(exec.ms < 150);
+            try testing.expect(exec.ms < slack_ms);
             try testing.expectEqualStrings("local:" ++ p_object ++ "@2", unrelated.reply.message);
-            try testing.expect(read.ms >= 200 and read.ms < 1500);
+            // released by the commit, not at the bound
+            try testing.expect(read_ms >= 250);
+            try testing.expectEqual(@as(u64, 0), e.f.metrics.raw_reads_late.load(.monotonic));
             // the edge asked the core for effects.bcs on its own account and took it out again
             try testing.expectEqualStrings("digest,effects.bcs", core.seenMask());
             try testing.expectEqual(@as(u64, 1), e.f.metrics.raw_recorded.load(.monotonic));
@@ -1488,10 +1595,11 @@ test "read-after-write reads: the execute answer is the core's for every client 
     const n_before = e.f.pending.n.load(.acquire);
     const failed = try timed(e, a, p_execute, try executeMasked(a, "rejected", &.{"digest"}));
     try testing.expectEqual(@as(u8, 3), failed.reply.status);
-    try testing.expect(failed.ms < 300);
+    try testing.expect(failed.ms < slack_ms); // not held: no 2 s wait
     try testing.expectEqual(n_before, e.f.pending.n.load(.acquire));
 }
 
+/// One read on its own thread (`Edge.startReaders`, `Edge.startWaiting`; joined by the edge).
 const Reader = struct {
     e: *Edge,
     path: []const u8,
@@ -1500,12 +1608,14 @@ const Reader = struct {
     text: [200]u8 = undefined,
     len: usize = 0,
     status: u8 = 255,
-    thread: std.Thread = undefined,
+    /// Set once its start time is taken.
+    started: Atomic(bool) = .init(false),
 
     fn run(r: *Reader) void {
         var arena = std.heap.ArenaAllocator.init(sys);
         defer arena.deinit();
         const t0 = nowNs();
+        r.started.store(true, .release);
         const rep = r.e.unary(arena.allocator(), r.path, r.body) catch return;
         r.ms = (nowNs() - t0) / ms;
         r.status = rep.status;
@@ -1536,12 +1646,12 @@ test "read-after-write reads: by-address reads, dynamic fields, a batch with one
     // nothing pending: nothing waits, the core is not asked
     for ([_][]const u8{ p_object, p_owned, p_balance, p_fields }) |path| {
         const r = try timed(e, a, path, try idReq(a, &o_gas));
-        try testing.expect(r.ms < 100 and std.mem.endsWith(u8, r.reply.message, "@2"));
+        try testing.expect(r.ms < slack_ms and std.mem.endsWith(u8, r.reply.message, "@2"));
     }
     // ListBalances is the core's by policy (route.balance_lists): passed on, never the edge's answer
     {
         const r = try timed(e, a, p_balances, try idReq(a, &o_gas));
-        try testing.expect(r.ms < 100 and std.mem.startsWith(u8, r.reply.message, "core:" ++ p_balances));
+        try testing.expect(r.ms < slack_ms and std.mem.startsWith(u8, r.reply.message, "core:" ++ p_balances));
         try testing.expectEqual(@as(u64, 1), e.forwarded(.list_balances, .policy));
         try testing.expectEqual(@as(u64, 0), e.servedLocal(.list_balances));
     }
@@ -1550,7 +1660,8 @@ test "read-after-write reads: by-address reads, dynamic fields, a batch with one
     const data = "the transaction everybody reads after";
     const digest = txDigest(data);
     const exec = try timed(e, a, p_execute, try executeMasked(a, data, &.{"digest"}));
-    try testing.expect(exec.ms < 150);
+    try testing.expect(exec.ms < slack_ms);
+    try testing.expectEqual(@as(u64, 0), e.f.metrics.execute_hold.n.load(.monotonic));
     // reads of what it did not write: at once, from the state the edge has
     const unrelated = [_]struct { path: []const u8, body: []const u8 }{
         .{ .path = p_object, .body = try idReq(a, &o_other) },
@@ -1564,7 +1675,7 @@ test "read-after-write reads: by-address reads, dynamic fields, a batch with one
     };
     for (unrelated) |u| {
         const r = try timed(e, a, u.path, u.body);
-        try testing.expect(r.ms < 100);
+        try testing.expect(r.ms < slack_ms);
         try testing.expect(std.mem.endsWith(u8, r.reply.message, "@2"));
     }
     try testing.expectEqual(@as(u64, 0), e.f.metrics.raw_read_wait.n.load(.monotonic));
@@ -1580,22 +1691,23 @@ test "read-after-write reads: by-address reads, dynamic fields, a batch with one
         .{ .e = e, .path = p_batch, .body = try batchReq(a, &.{ o_other, o_gas, a_other }) }, // one pending item
         .{ .e = e, .path = p_tx, .body = try txReq(a, &digest) },
     };
-    for (&readers) |*r| r.thread = try std.Thread.spawn(.{}, Reader.run, .{r});
-    sleepMs(250);
+    try e.startWaiting(&readers, 250);
     try testing.expectEqual(@as(u32, readers.len), e.f.raw_waiters.load(.acquire));
     // ListBalances of the pending owner does not wait here: it is passed to the core by policy
     // (route.balance_lists) before the pending writes are looked at, and the core has executed
     {
         const r = try timed(e, a, p_balances, try idReq(a, &a_owner));
-        try testing.expect(r.ms < 100 and std.mem.startsWith(u8, r.reply.message, "core:" ++ p_balances));
+        try testing.expect(r.ms < slack_ms and std.mem.startsWith(u8, r.reply.message, "core:" ++ p_balances));
         try testing.expectEqual(@as(u64, 2), e.forwarded(.list_balances, .policy));
         try testing.expectEqual(@as(u32, readers.len), e.f.raw_waiters.load(.acquire));
     }
     try e.commit(&digest);
-    for (&readers) |*r| r.thread.join();
+    e.joinThreads();
+    // every one released by the commit, none at the bound
+    try testing.expectEqual(@as(u64, 0), e.f.metrics.raw_reads_late.load(.monotonic));
     for (&readers) |*r| {
         std.debug.print("read-after-write reads: {s} waited {d} ms -> {s}\n", .{ r.path, r.ms, r.message() });
-        try testing.expect(r.ms >= 200 and r.ms < 1500);
+        try testing.expect(r.ms >= 250);
         try testing.expectEqual(@as(u8, 0), r.status);
         try testing.expect(std.mem.startsWith(u8, r.message(), "local:") and std.mem.endsWith(u8, r.message(), "@3"));
     }
@@ -1604,7 +1716,8 @@ test "read-after-write reads: by-address reads, dynamic fields, a batch with one
     try testing.expect(e.f.pending.idle());
     // applied: the same reads are immediate again
     const again = try timed(e, a, p_object, try idReq(a, &o_gas));
-    try testing.expect(again.ms < 100);
+    try testing.expect(again.ms < slack_ms);
+    try testing.expectEqual(@as(u64, readers.len), e.f.metrics.raw_read_wait.n.load(.monotonic));
 }
 
 test "read-after-write reads: applied early nothing waits; never applied the read is passed to the core at the bound, later reads at once, and the entry expires" {
@@ -1615,7 +1728,8 @@ test "read-after-write reads: applied early nothing waits; never applied the rea
     core.effects_bcs = try someEffects(a);
     const up = try Server.start(core.handler, null);
     defer up.stop();
-    const e = try Edge.create(plain(up.port), .{ .raw = .reads, .execute_wait_ms = 300, .raw_expiry_ms = 900 });
+    // bounds no stall between two calls reaches: the read after the execute meets its wait
+    const e = try Edge.create(plain(up.port), .{ .raw = .reads, .execute_wait_ms = 1500, .raw_expiry_ms = 3000 });
     defer e.destroy();
     e.local.st = e.st;
     e.f.source = null; // the guard is not this test's subject: it stays as `healthy` leaves it
@@ -1629,34 +1743,38 @@ test "read-after-write reads: applied early nothing waits; never applied the rea
         _ = try e.unary(a, p_execute, try executeMasked(a, data, &.{"digest"}));
         try testing.expect(e.f.pending.idle());
         const r = try timed(e, a, p_object, try idReq(a, &o_gas));
-        try testing.expect(r.ms < 100 and std.mem.endsWith(u8, r.reply.message, "@3"));
+        try testing.expect(r.ms < slack_ms and std.mem.endsWith(u8, r.reply.message, "@3"));
+        try testing.expectEqual(@as(u64, 0), e.f.metrics.raw_read_wait.n.load(.monotonic));
     }
     // never: the transaction reaches no checkpoint the edge sees
     const data = "never in a checkpoint";
     const t0 = nowNs();
     _ = try e.unary(a, p_execute, try executeMasked(a, data, &.{"digest"}));
     const first = try timed(e, a, p_object, try idReq(a, &o_gas));
-    // the wait ends 300 ms after the execute; then the core answers, not the edge's old state
-    try testing.expect(first.ms >= 200 and first.ms < 1000);
+    const first_end = (nowNs() - t0) / ms;
+    // the wait ends 1500 ms after the execute; then the core answers, not the edge's old state
+    try testing.expectEqual(@as(u64, 1), e.f.metrics.raw_read_wait.n.load(.monotonic));
+    try testing.expect(first_end >= 1490 and first_end < 2 * 1500); // the bound once, not twice
     try testing.expect(std.mem.startsWith(u8, first.reply.message, "core:"));
     // from then on reads of it go to the core at once: nobody waits twice for one transaction
     const second = try timed(e, a, p_object, try idReq(a, &o_gas));
     const owned = try timed(e, a, p_owned, try idReq(a, &a_owner));
-    try testing.expect(second.ms < 100 and std.mem.startsWith(u8, second.reply.message, "core:"));
-    try testing.expect(owned.ms < 100 and owned.reply.status == 12); // the scripted core has no StateService
+    try testing.expect(second.ms < slack_ms and std.mem.startsWith(u8, second.reply.message, "core:"));
+    try testing.expect(owned.ms < slack_ms and owned.reply.status == 12); // the scripted core has no StateService
+    try testing.expectEqual(@as(u64, 1), e.f.metrics.raw_read_wait.n.load(.monotonic));
     try testing.expectEqual(@as(u64, 3), e.f.metrics.raw_reads_late.load(.monotonic));
     try testing.expectEqual(@as(u64, 3), e.forwarded(.get_object, .ahead) + e.forwarded(.list_owned_objects, .ahead));
     // an unrelated read never noticed
     const other = try timed(e, a, p_object, try idReq(a, &o_other));
-    try testing.expect(other.ms < 100 and std.mem.startsWith(u8, other.reply.message, "local:"));
-    // the hard expiry: the entry leaves 900 ms after the execute, and reads are the edge's again
+    try testing.expect(other.ms < slack_ms and std.mem.startsWith(u8, other.reply.message, "local:"));
+    // the hard expiry: the entry leaves 3000 ms after the execute, and reads are the edge's again
     var waited: u32 = 0;
-    while (!e.f.pending.idle() and waited < 3000) : (waited += 10) sleepMs(10);
+    while (!e.f.pending.idle() and waited < owed_ms) : (waited += 10) sleepMs(10);
     const gone_after = (nowNs() - t0) / ms;
     try testing.expect(e.f.pending.idle());
-    try testing.expect(gone_after >= 890 and gone_after < 2500);
+    try testing.expect(gone_after >= 2990 and gone_after < 3000 + 1600 + slack_ms); // + the tick's sweep
     const after = try timed(e, a, p_object, try idReq(a, &o_gas));
-    try testing.expect(after.ms < 100 and std.mem.startsWith(u8, after.reply.message, "local:"));
+    try testing.expect(after.ms < slack_ms and std.mem.startsWith(u8, after.reply.message, "local:"));
     std.debug.print("read-after-write reads, never applied: first read {d} ms (core), second {d} ms (core), entry gone after {d} ms, then {d} ms (local)\n", .{ first.ms, second.ms, gone_after, after.ms });
 }
 
@@ -1668,7 +1786,8 @@ test "read-after-write reads: a full table holds the next execute instead of dro
     core.effects_bcs = try someEffects(a);
     const up = try Server.start(core.handler, null);
     defer up.stop();
-    const e = try Edge.create(plain(up.port), .{ .raw = .reads, .execute_wait_ms = 400, .raw_max_entries = 1, .raw_max_waiters = 2 });
+    // a bound the five readers below all start inside, whatever the host
+    const e = try Edge.create(plain(up.port), .{ .raw = .reads, .execute_wait_ms = 1500, .raw_max_entries = 1, .raw_max_waiters = 2 });
     defer e.destroy();
     e.local.st = e.st;
     e.f.source = null; // the guard is not this test's subject: it stays as `healthy` leaves it
@@ -1676,12 +1795,13 @@ test "read-after-write reads: a full table holds the next execute instead of dro
     try e.f.start();
     for (0..3) |_| try e.commit(null);
     const one = try timed(e, a, p_execute, try executeMasked(a, "first, recorded", &.{"digest"}));
-    try testing.expect(one.ms < 150);
+    try testing.expect(one.ms < slack_ms);
+    try testing.expectEqual(@as(u64, 0), e.f.metrics.execute_hold.n.load(.monotonic));
     // the table is full: the second execute is held as in `hold` (it never lands: the bound)
     const want = try loopback.unary(a, core.handler, p_execute, try executeMasked(a, "second, held", &.{"digest"}));
     const two = try timed(e, a, p_execute, try executeMasked(a, "second, held", &.{"digest"}));
     try expectSameReply(want, two.reply);
-    try testing.expect(two.ms >= 390 and two.ms < 1500);
+    try testing.expect(two.ms >= 1490 and two.ms < 2 * 1500); // the bound once, not twice
     try testing.expectEqual(@as(u64, 1), e.f.metrics.raw_recorded.load(.monotonic));
     try testing.expectEqual(@as(u64, 1), e.f.metrics.raw_held_instead.load(.monotonic));
     try testing.expectEqual(@as(u64, 1), e.f.metrics.execute_hold_timeouts.load(.monotonic));
@@ -1695,16 +1815,13 @@ test "read-after-write reads: a full table holds the next execute instead of dro
     _ = try e.unary(a, p_execute, try executeMasked(a, data, &.{"digest"}));
     var readers: [5]Reader = undefined;
     for (&readers) |*r| r.* = .{ .e = e, .path = p_object, .body = try idReq(a, &o_gas) };
-    for (&readers) |*r| r.thread = try std.Thread.spawn(.{}, Reader.run, .{r});
-    for (&readers) |*r| r.thread.join();
-    var waited: u32 = 0;
-    var at_once: u32 = 0;
+    try e.startReaders(&readers);
+    e.joinThreads();
     for (&readers) |*r| {
         try testing.expect(std.mem.startsWith(u8, r.message(), "core:")); // nobody got the old state
-        if (r.ms >= 200) waited += 1 else at_once += 1;
     }
-    try testing.expectEqual(@as(u32, 2), waited);
-    try testing.expectEqual(@as(u32, 3), at_once);
+    // two waited (to the bound: nothing applies it), three went to the core without a wait
+    try testing.expectEqual(@as(u64, 2), e.f.metrics.raw_read_wait.n.load(.monotonic));
     try testing.expectEqual(@as(u64, 3), e.f.metrics.raw_reads_over_limit.load(.monotonic));
 }
 
@@ -1718,7 +1835,6 @@ test "read-after-write reads: waiting reads keep serve workers; the bound keeps 
         port: u16,
         body: []const u8,
         ms: u64 = 0,
-        thread: std.Thread = undefined,
         fn run(c: *@This()) void {
             var ar = std.heap.ArenaAllocator.init(sys);
             defer ar.deinit();
@@ -1733,7 +1849,8 @@ test "read-after-write reads: waiting reads keep serve workers; the bound keeps 
         core.effects_bcs = try someEffects(a);
         const up = try Server.start(core.handler, null);
         defer up.stop();
-        const e = try Edge.create(plain(up.port), .{ .raw = .reads, .execute_wait_ms = 600, .raw_max_waiters = max_waiters });
+        // a bound the probe below would wait out without the cap: seconds, not a stall
+        const e = try Edge.create(plain(up.port), .{ .raw = .reads, .execute_wait_ms = 3000, .raw_max_waiters = max_waiters });
         defer e.destroy();
         e.f.source = null; // the guard is not this test's subject: it stays as `healthy` leaves it
         e.healthy();
@@ -1741,26 +1858,24 @@ test "read-after-write reads: waiting reads keep serve workers; the bound keeps 
         for (0..3) |_| try e.commit(null);
         const front = try Server.start(e.f.handler(), null);
         defer front.stop();
+        defer e.f.requestStop(); // a test that failed: the waits end before the server drains
         _ = try e.unary(a, p_execute, try executeMasked(a, try std.fmt.allocPrint(a, "pool round {d}", .{round}), &.{"digest"}));
         // as many clients as the pool has workers read the written object
         const clients = try a.alloc(Client, workers);
         for (clients) |*c| c.* = .{ .port = front.port, .body = try idReq(a, &o_gas) };
-        for (clients) |*c| c.thread = try std.Thread.spawn(.{}, Client.run, .{c});
-        sleepMs(150);
+        for (clients) |*c| try e.spawn(Client.run, .{c});
+        try e.waitWaiters(@min(workers, max_waiters));
         // ... and one more client reads something else
         const t0 = nowNs();
         _ = try loopback.call(a, io, front.port, p_object, &.{}, &.{try idReq(a, &o_other)}, .{});
         probe_ms[round] = (nowNs() - t0) / ms;
-        for (clients) |*c| c.thread.join();
-        var waited: u32 = 0;
-        for (clients) |*c| if (c.ms >= 300) {
-            waited += 1;
-        };
+        e.joinThreads();
+        const waited = e.f.metrics.raw_read_wait.n.load(.monotonic);
         std.debug.print("read-after-write reads, {d} serve workers, {d} clients reading a pending object, at most {d} may wait: {d} waited; an unrelated read meanwhile took {d} ms\n", .{ workers, workers, max_waiters, waited, probe_ms[round] });
         if (round == 1) try testing.expect(waited <= max_waiters);
     }
-    // with the bound the unrelated read is not behind the waiters
-    try testing.expect(probe_ms[1] < 200);
+    // with the bound the unrelated read is not behind the waiters (without it: the 3 s bound)
+    try testing.expect(probe_ms[1] < slack_ms);
 }
 
 // ---------------------------------------------------------------- the node's stop
@@ -1847,14 +1962,14 @@ test "a stopped server's forwarded streams end at once (endStreams): none holds 
     const t0 = nowNs();
     e.f.endStreams();
     try testing.expect(c.waitDone(grace_ms / 2));
-    try testing.expect((nowNs() - t0) / ms < 500);
+    try testing.expect((nowNs() - t0) / ms < slack_ms);
     // with a status, not a dropped connection (CANCELLED, as at the forwarder's own stop)
     try testing.expectEqual(@as(u8, 1), c.code.load(.acquire));
     // and the core's stream was cancelled, not left running
     waited = 0;
-    while (!core.stream_cancelled.load(.acquire) and waited < 3000) : (waited += 5) sleepMs(5);
+    while (!core.stream_cancelled.load(.acquire) and waited < owed_ms) : (waited += 5) sleepMs(5);
     try testing.expect(core.stream_cancelled.load(.acquire));
-    try testing.expect(waited < 1000);
+    try testing.expect(waited < grace_ms / 2);
 
     // the rest goes on while the server drains: a unary call is still passed to the core
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1884,19 +1999,21 @@ test "requestStop ends the tick and the floor thread without a join (the node as
     try testing.expect(core.info_calls.load(.acquire) >= 3);
 
     e.f.requestStop();
-    // what was under way ends; nothing starts after it
-    sleepMs(150);
+    // what was under way ends (given time a stalled host may take); nothing starts after it,
+    // where the tick runs every 5 ms and the floor thread every 10 ms
+    sleepMs(500);
     const ticks = stop_ticks.load(.acquire);
     const reads = core.info_calls.load(.acquire);
-    sleepMs(200);
+    sleepMs(300);
     try testing.expectEqual(ticks, stop_ticks.load(.acquire));
     try testing.expectEqual(reads, core.info_calls.load(.acquire));
     const t0 = nowNs();
     e.f.stop();
-    try testing.expect((nowNs() - t0) / ms < 50);
+    try testing.expect((nowNs() - t0) / ms < slack_ms);
 }
 
-fn stopLater(e: *Edge, after_ms: u64) void {
+fn stopLater(e: *Edge, cue: Cue, after_ms: u64) void {
+    waitCue(e, cue);
     sleepMs(after_ms);
     e.f.requestStop();
 }
@@ -1920,7 +2037,8 @@ test "requestStop releases the reads waiting for an apply: each is passed to the
     const data = "a transaction the stop finds unapplied";
     const digest = txDigest(data);
     const exec = try timed(e, a, p_execute, try executeMasked(a, data, &.{"digest"}));
-    try testing.expect(exec.ms < 150);
+    try testing.expect(exec.ms < slack_ms);
+    try testing.expectEqual(@as(u64, 0), e.f.metrics.execute_hold.n.load(.monotonic));
     var readers = [_]Reader{
         .{ .e = e, .path = p_object, .body = try idReq(a, &o_gas) },
         .{ .e = e, .path = p_object, .body = try idReq(a, &o_gas) },
@@ -1929,23 +2047,22 @@ test "requestStop releases the reads waiting for an apply: each is passed to the
         .{ .e = e, .path = p_batch, .body = try batchReq(a, &.{ o_other, o_gas, a_other }) },
         .{ .e = e, .path = p_tx, .body = try txReq(a, &digest) },
     };
-    for (&readers) |*r| r.thread = try std.Thread.spawn(.{}, Reader.run, .{r});
-    sleepMs(250);
+    try e.startWaiting(&readers, 250);
     try testing.expectEqual(@as(u32, readers.len), e.f.raw_waiters.load(.acquire));
     const local_before = e.local.calls.load(.acquire);
 
     const t0 = nowNs();
     e.f.requestStop();
-    for (&readers) |*r| r.thread.join();
+    e.joinThreads();
     const released_ms = (nowNs() - t0) / ms;
     std.debug.print("read-after-write reads, stop with {d} readers waiting (bound 5000 ms): all answered {d} ms after requestStop\n", .{ readers.len, released_ms });
     // within a slice of the stop (20 ms) and the core's answer, not 4.7 s later at the bound
-    try testing.expect(released_ms < 1000);
+    try testing.expect(released_ms < slack_ms);
     try testing.expectEqual(@as(u32, 0), e.f.raw_waiters.load(.acquire));
     // none was answered from the edge's own state: the local side was not asked again
     try testing.expectEqual(local_before, e.local.calls.load(.acquire));
     for (&readers) |*r| {
-        try testing.expect(r.ms >= 200 and r.ms < 2000);
+        try testing.expect(r.ms >= 250 and r.ms < 5000);
         try testing.expect(!std.mem.startsWith(u8, r.message(), "local:"));
         // the scripted core answers GetObject and GetTransaction; it has no StateService or batch
         const from_core = std.mem.eql(u8, r.path, p_object) or std.mem.eql(u8, r.path, p_tx);
@@ -1959,12 +2076,12 @@ test "requestStop releases the reads waiting for an apply: each is passed to the
     // written object that comes after the stop is passed on without waiting
     try testing.expect(e.f.pending.contains(&digest));
     const later = try timed(e, a, p_object, try idReq(a, &o_gas));
-    try testing.expect(later.ms < 300);
+    try testing.expect(later.ms < slack_ms);
     try testing.expect(std.mem.startsWith(u8, later.reply.message, "core:"));
     try testing.expectEqual(local_before, e.local.calls.load(.acquire));
     // a read of something no pending transaction wrote is the edge's own, as before the stop
     const other = try timed(e, a, p_object, try idReq(a, &o_other));
-    try testing.expect(other.ms < 300 and std.mem.startsWith(u8, other.reply.message, "local:"));
+    try testing.expect(other.ms < slack_ms and std.mem.startsWith(u8, other.reply.message, "local:"));
 }
 
 test "requestStop releases a held execute (hold, and a full table's wait on the store): the core's answer goes out at once" {
@@ -1984,11 +2101,12 @@ test "requestStop releases a held execute (hold, and a full table's wait on the 
         for (0..3) |_| try e.commit(null);
         const req = try executeRequest(a, try std.fmt.allocPrint(a, "held at the stop, table of {d}", .{max_entries}));
         const want = try loopback.unary(a, core.handler, p_execute, req);
-        var th = try std.Thread.spawn(.{}, stopLater, .{ e, 250 });
+        // the stop comes 250 ms after the core answered the execute (the hold starts there)
+        try e.spawn(stopLater, .{ e, Cue{ .core_calls = core.calls.load(.acquire) + 1 }, 250 });
         const exec = try timed(e, a, p_execute, req);
-        th.join();
+        e.joinThreads();
         std.debug.print("read-after-write hold, stop 250 ms into a held execute (bound 5000 ms, table of {d}): answered after {d} ms\n", .{ max_entries, exec.ms });
-        try testing.expect(exec.ms >= 200 and exec.ms < 1500);
+        try testing.expect(exec.ms >= 250 and exec.ms < 5000);
         try expectSameReply(want, exec.reply);
         try testing.expectEqual(@as(u64, 1), e.f.metrics.execute_hold_timeouts.load(.monotonic));
     }
@@ -2011,10 +2129,9 @@ fn checkpointReq(a: std.mem.Allocator, seq: u64, paths: []const []const u8) ![]u
 
 /// The edge applies its next checkpoint from its fallback: marked before the commit, as the
 /// follower's `on_batch` does (certs.zig `onApply`), with `digest` as its transaction.
-fn commitForeignLater(edge: *Edge, certs: *certs_mod.Certs, after_ms: u64, digest: [32]u8) void {
-    sleepMs(after_ms);
-    certs.onApply(edge.next_seq, false, 1) catch {};
-    edge.commit(&digest) catch {};
+fn commitForeign(edge: *Edge, certs: *certs_mod.Certs, digest: [32]u8) !void {
+    try certs.onApply(edge.next_seq, false, 1);
+    try edge.commit(&digest);
 }
 
 test "read-after-write reads beside marked certificates: a read that waited for an apply is answered once, a certificate read of that checkpoint goes to the core after one wait, and a stop releases the waiters" {
@@ -2047,21 +2164,24 @@ test "read-after-write reads beside marked certificates: a read that waited for 
     const data = "applied from the fallback";
     const digest = txDigest(data);
     const exec = try timed(e, a, p_execute, try executeMasked(a, data, &.{"digest"}));
-    try testing.expect(exec.ms < 150);
-    var th = try std.Thread.spawn(.{}, commitForeignLater, .{ e, certs, 300, digest });
+    try testing.expect(exec.ms < slack_ms);
+    try testing.expectEqual(@as(u64, 0), e.f.metrics.execute_hold.n.load(.monotonic));
     var readers = [_]Reader{
         .{ .e = e, .path = p_tx, .body = try txReq(a, &digest) }, // waits in the pending table
         .{ .e = e, .path = p_object, .body = try idReq(a, &o_gas) }, // waits in the pending table
         .{ .e = e, .path = p_checkpoint, .body = try checkpointReq(a, 3, &.{ "sequence_number", "signature" }) }, // ahead of the tip, renders the certificate
         .{ .e = e, .path = p_checkpoint, .body = try checkpointReq(a, 3, &.{ "sequence_number", "digest" }) }, // ahead of the tip, no certificate
     };
-    for (&readers) |*r| r.thread = try std.Thread.spawn(.{}, Reader.run, .{r});
-    for (&readers) |*r| r.thread.join();
-    th.join();
+    // all four under way, the two table reads seen waiting; checkpoint 3 300 ms later
+    try e.startReaders(&readers);
+    try e.waitWaiters(2);
+    sleepMs(300);
+    try commitForeign(e, certs, digest);
+    e.joinThreads();
     for (&readers) |*r| {
         std.debug.print("read-after-write reads, checkpoint 3 applied marked: {s} waited {d} ms -> {s}\n", .{ r.path, r.ms, r.message() });
-        // one wait each, for the apply at 300 ms: none waits again behind another bound
-        try testing.expect(r.ms >= 200 and r.ms < 1500);
+        // one wait each, for the apply: none waits again behind another bound (4 s each)
+        try testing.expect(r.ms >= 300 and r.ms < 4000);
         try testing.expectEqual(@as(u8, 0), r.status);
     }
     try testing.expect(certs.isMarked(3));
@@ -2086,10 +2206,11 @@ test "read-after-write reads beside marked certificates: a read that waited for 
     _ = try e.unary(a, p_execute, try executeMasked(a, data2, &.{"digest"}));
     try testing.expect(!e.f.pending.idle());
     const cert_now = try timed(e, a, p_checkpoint, try checkpointReq(a, 3, &.{"signature"}));
-    try testing.expect(cert_now.ms < 150 and std.mem.startsWith(u8, cert_now.reply.message, "core:"));
+    try testing.expect(cert_now.ms < slack_ms and std.mem.startsWith(u8, cert_now.reply.message, "core:"));
     try testing.expectEqual(@as(u64, 2), e.forwarded(.get_checkpoint, .foreign_cert));
     const plain_now = try timed(e, a, p_checkpoint, try checkpointReq(a, 3, &.{"digest"}));
-    try testing.expect(plain_now.ms < 150 and std.mem.startsWith(u8, plain_now.reply.message, "local:"));
+    try testing.expect(plain_now.ms < slack_ms and std.mem.startsWith(u8, plain_now.reply.message, "local:"));
+    try testing.expectEqual(@as(u64, 0), e.forwarded(.get_checkpoint, .ahead));
     try testing.expectEqual(@as(u64, 2), e.f.metrics.raw_read_wait.n.load(.monotonic));
 
     // The stop: the reads waiting for the second transaction are released as without marks.
@@ -2097,16 +2218,15 @@ test "read-after-write reads beside marked certificates: a read that waited for 
         .{ .e = e, .path = p_tx, .body = try txReq(a, &digest2) },
         .{ .e = e, .path = p_object, .body = try idReq(a, &o_gas) },
     };
-    for (&waiting) |*r| r.thread = try std.Thread.spawn(.{}, Reader.run, .{r});
-    sleepMs(250);
+    try e.startWaiting(&waiting, 0);
     try testing.expectEqual(@as(u32, waiting.len), e.f.raw_waiters.load(.acquire));
     const local_before = e.local.calls.load(.acquire);
     const t0 = nowNs();
     e.f.requestStop();
-    for (&waiting) |*r| r.thread.join();
+    e.joinThreads();
     const released_ms = (nowNs() - t0) / ms;
     std.debug.print("read-after-write reads beside marked certificates: stop with {d} readers waiting (bound 4000 ms): all answered {d} ms after requestStop\n", .{ waiting.len, released_ms });
-    try testing.expect(released_ms < 1000);
+    try testing.expect(released_ms < slack_ms);
     for (&waiting) |*r| {
         try testing.expectEqual(@as(u8, 0), r.status);
         try testing.expect(std.mem.startsWith(u8, r.message(), "core:"));
@@ -2114,7 +2234,7 @@ test "read-after-write reads beside marked certificates: a read that waited for 
     try testing.expectEqual(local_before, e.local.calls.load(.acquire));
     // and the certificate read still goes to the core after the stop, without a local attempt
     const cert_after = try timed(e, a, p_checkpoint, try checkpointReq(a, 3, &.{"signature"}));
-    try testing.expect(cert_after.ms < 300 and std.mem.startsWith(u8, cert_after.reply.message, "core:"));
+    try testing.expect(cert_after.ms < slack_ms and std.mem.startsWith(u8, cert_after.reply.message, "core:"));
     try testing.expectEqual(local_before, e.local.calls.load(.acquire));
     try testing.expectEqual(@as(u64, 3), e.forwarded(.get_checkpoint, .foreign_cert));
 }
@@ -2152,19 +2272,21 @@ test "read-after-write reads beside marked certificates, no core reachable: a re
     try testing.expect(!e.f.pending.idle());
     up.stop();
     up_live = false;
-    var th = try std.Thread.spawn(.{}, commitForeignLater, .{ e, certs, 300, digest });
     var readers = [_]Reader{
         .{ .e = e, .path = p_tx, .body = try txReq(a, &digest) }, // waits in the pending table
         .{ .e = e, .path = p_checkpoint, .body = try checkpointReq(a, 3, &.{ "sequence_number", "signature" }) }, // ahead of the tip, renders the certificate
     };
-    for (&readers) |*r| r.thread = try std.Thread.spawn(.{}, Reader.run, .{r});
-    for (&readers) |*r| r.thread.join();
-    th.join();
+    // both under way, the table read seen waiting; checkpoint 3 300 ms later
+    try e.startReaders(&readers);
+    try e.waitWaiters(1);
+    sleepMs(300);
+    try commitForeign(e, certs, digest);
+    e.joinThreads();
     for (&readers) |*r| {
         std.debug.print("read-after-write reads, checkpoint 3 applied marked, no core: {s} waited {d} ms -> {s}\n", .{ r.path, r.ms, r.message() });
         try testing.expectEqual(@as(u8, 0), r.status);
-        // one wait for the apply at 300 ms (and at most one refused dial), never a second bound
-        try testing.expect(r.ms >= 200 and r.ms < 3000);
+        // one wait for the apply (and at most one refused dial), never a second bound (4 s)
+        try testing.expect(r.ms >= 300 and r.ms < 4000);
     }
     // the read that waited in the table needs no core: the edge's own answer, from the state with it
     try testing.expectEqualStrings("local:" ++ p_tx ++ "@3", readers[0].message());
@@ -2180,7 +2302,7 @@ test "read-after-write reads beside marked certificates, no core reachable: a re
     try testing.expectEqual(@as(u64, 0), e.forwarded(.get_checkpoint, .ahead));
     // the next one is answered at once, without a try at the core
     const again = try timed(e, a, p_checkpoint, try checkpointReq(a, 3, &.{"signature"}));
-    try testing.expect(again.ms < 150);
+    try testing.expect(again.ms < slack_ms);
     try testing.expectEqualStrings("held:" ++ p_checkpoint ++ "@3", again.reply.message);
     try testing.expectEqual(@as(u64, 2), held.load(.monotonic));
 }
@@ -2328,14 +2450,15 @@ test "edge policy --edge-balance-lists: forward by default; local is the edge's 
     const data = "the transaction whose balances are listed after";
     const digest = txDigest(data);
     _ = try e.unary(a, p_execute, try executeMasked(a, data, &.{"digest"}));
-    var reader: Reader = .{ .e = e, .path = p_balances, .body = try idReq(a, &a_owner) };
-    reader.thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
-    sleepMs(250);
+    var reader = [_]Reader{.{ .e = e, .path = p_balances, .body = try idReq(a, &a_owner) }};
+    const late_before = e.f.metrics.raw_reads_late.load(.monotonic);
+    try e.startWaiting(&reader, 250);
     try testing.expectEqual(@as(u32, 1), e.f.raw_waiters.load(.acquire));
     try e.commit(&digest);
-    reader.thread.join();
-    try testing.expect(reader.ms >= 200 and reader.ms < 1500);
-    try testing.expectEqualStrings("local:" ++ p_balances ++ "@3", reader.message());
+    e.joinThreads();
+    try testing.expect(reader[0].ms >= 250);
+    try testing.expectEqual(late_before, e.f.metrics.raw_reads_late.load(.monotonic)); // the commit's, not the bound's
+    try testing.expectEqualStrings("local:" ++ p_balances ++ "@3", reader[0].message());
     // another address meanwhile: at once (checked after the apply here; nothing is pending)
     try testing.expect(e.f.pending.idle());
     // a local failure (the index not ready) is not the edge's to give
@@ -2445,13 +2568,13 @@ test "edge policy --edge-simulate: forward by default; local answers the simulat
     try testing.expect(!e.f.pending.idle());
     // a request that does not say who sends it: the core's, at once
     const during = try timed(e, a, p_simulate, plain_req);
-    try testing.expect(during.ms < 100);
+    try testing.expect(during.ms < slack_ms);
     try testing.expectEqualStrings("simulated", during.reply.message);
     try testing.expectEqual(@as(u64, 1), e.forwarded(.simulate_transaction, .ahead));
     // somebody else's simulation: here, at once, from the state the edge has
     for ([_][]const u8{ try simulateAs(a, .message, &a_other, null), try simulateAs(a, .bcs, &a_other, null) }) |body| {
         const other = try timed(e, a, p_simulate, body);
-        try testing.expect(other.ms < 100);
+        try testing.expect(other.ms < slack_ms);
         try testing.expectEqualStrings("local:" ++ p_simulate ++ "@2", other.reply.message);
     }
     try testing.expectEqual(@as(u64, 0), e.f.metrics.raw_read_wait.n.load(.monotonic));
@@ -2462,18 +2585,19 @@ test "edge policy --edge-simulate: forward by default; local answers the simulat
         .{ .e = e, .path = p_simulate, .body = try simulateAs(a, .message, &a_other, &a_owner) },
         .{ .e = e, .path = p_simulate, .body = try simulateAs(a, .bcs, &a_other, &a_owner) },
     };
-    for (&waiting) |*r| r.thread = try std.Thread.spawn(.{}, Reader.run, .{r});
-    sleepMs(250);
+    const late_before = e.f.metrics.raw_reads_late.load(.monotonic);
+    try e.startWaiting(&waiting, 250);
     try testing.expectEqual(@as(u32, waiting.len), e.f.raw_waiters.load(.acquire));
     try e.commit(&digest);
-    for (&waiting) |*r| r.thread.join();
+    e.joinThreads();
+    try testing.expectEqual(late_before, e.f.metrics.raw_reads_late.load(.monotonic)); // the commit's, not the bound's
     for (&waiting) |*r| {
-        try testing.expect(r.ms >= 200 and r.ms < 1500);
+        try testing.expect(r.ms >= 250);
         try testing.expectEqualStrings("local:" ++ p_simulate ++ "@3", r.message());
     }
     try testing.expectEqual(@as(u64, waiting.len), e.f.metrics.raw_read_wait.n.load(.monotonic));
     var settle: u32 = 0;
-    while (!e.f.pending.idle() and settle < 2000) : (settle += 10) sleepMs(10);
+    while (!e.f.pending.idle() and settle < owed_ms) : (settle += 10) sleepMs(10);
     try testing.expect(e.f.pending.idle());
     try testing.expectEqualStrings("local:" ++ p_simulate ++ "@3", (try e.unary(a, p_simulate, plain_req)).message);
     // the read sets stop coming: still here
@@ -2554,18 +2678,21 @@ test "edge policy --edge-simulate local-gas: gas selection is answered here too,
     const digest = txDigest(data);
     _ = try e.unary(a, p_execute, try executeMasked(a, data, &.{"digest"}));
     const other = try timed(e, a, p_simulate, gas_req);
-    try testing.expect(other.ms < 100);
+    try testing.expect(other.ms < slack_ms);
     try testing.expectEqualStrings("local:" ++ p_simulate ++ "@2", other.reply.message);
-    var mine: Reader = .{ .e = e, .path = p_simulate, .body = try std.mem.concat(a, u8, &.{ try simulateAs(a, .message, &a_owner, null), "\x20\x01" }) };
-    mine.thread = try std.Thread.spawn(.{}, Reader.run, .{&mine});
-    sleepMs(250);
+    try testing.expectEqual(@as(u64, 0), e.f.metrics.raw_read_wait.n.load(.monotonic));
+    var mine = [_]Reader{.{ .e = e, .path = p_simulate, .body = try std.mem.concat(a, u8, &.{ try simulateAs(a, .message, &a_owner, null), "\x20\x01" }) }};
+    const late_before = e.f.metrics.raw_reads_late.load(.monotonic);
+    try e.startWaiting(&mine, 250);
     try testing.expectEqual(@as(u32, 1), e.f.raw_waiters.load(.acquire));
     try e.commit(&digest);
-    mine.thread.join();
-    try testing.expect(mine.ms >= 200 and mine.ms < 1500);
-    try testing.expectEqualStrings("local:" ++ p_simulate ++ "@3", mine.message());
-    // never applied: at the bound the core answers (it has executed the transaction)
-    const e2 = try Edge.create(plain(up.port), .{ .raw = .reads, .simulate = .local_gas, .execute_wait_ms = 300 });
+    e.joinThreads();
+    try testing.expect(mine[0].ms >= 250);
+    try testing.expectEqual(late_before, e.f.metrics.raw_reads_late.load(.monotonic)); // the commit's, not the bound's
+    try testing.expectEqualStrings("local:" ++ p_simulate ++ "@3", mine[0].message());
+    // never applied: at the bound the core answers (it has executed the transaction); a bound
+    // no stall between the execute and the read reaches, so the read meets its wait
+    const e2 = try Edge.create(plain(up.port), .{ .raw = .reads, .simulate = .local_gas, .execute_wait_ms = 1500 });
     defer e2.destroy();
     e2.svc.read_sets = .{ .ctx = &rs, .has = ScriptedReadSets.has };
     e2.local.st = e2.st;
@@ -2573,9 +2700,12 @@ test "edge policy --edge-simulate local-gas: gas selection is answered here too,
     e2.healthy();
     try e2.f.start();
     for (0..3) |_| try e2.commit(null);
+    const t_exec = nowNs();
     _ = try e2.unary(a, p_execute, try executeMasked(a, "never in a checkpoint here", &.{"digest"}));
-    const late = try timed(e2, a, p_simulate, mine.body);
-    try testing.expect(late.ms >= 200 and late.ms < 1000);
+    const late = try timed(e2, a, p_simulate, mine[0].body);
+    const late_end = (nowNs() - t_exec) / ms;
+    try testing.expectEqual(@as(u64, 1), e2.f.metrics.raw_read_wait.n.load(.monotonic));
+    try testing.expect(late_end >= 1490 and late_end < 2 * 1500); // the bound once, not twice
     try testing.expectEqualStrings("simulated", late.reply.message);
     try testing.expectEqual(@as(u64, 1), e2.forwarded(.simulate_transaction, .ahead));
 }
@@ -2701,10 +2831,9 @@ test "an access gate and read-after-write: a refused read never waits; an admitt
     for (0..3) |_| try e.commit(null); // tip 2
     const data = "transaction behind the gate";
     const req = try executeMasked(a, data, &.{"digest"});
-    // the edge applies the transaction's checkpoint (3) 400 ms after the execute starts
-    var th = try std.Thread.spawn(.{}, commitLater, .{ e, 400, txDigest(data) });
     const exec = try timed(e, a, p_execute, req);
-    try testing.expect(exec.ms < 150);
+    try testing.expect(exec.ms < slack_ms);
+    try testing.expectEqual(@as(u64, 0), e.f.metrics.execute_hold.n.load(.monotonic));
     // the execute went to the core: that is what the meter says
     try testing.expectEqual(forward.Outcome.forwarded, gate.last_outcome.?);
     try testing.expectEqual(@as(u32, 1), gate.metered);
@@ -2715,7 +2844,7 @@ test "an access gate and read-after-write: a refused read never waits; an admitt
     gate.deny_code = 8;
     const refused = try timed(e, a, p_object, try idReq(a, &o_gas));
     try testing.expectEqual(@as(u8, 8), refused.reply.status);
-    try testing.expect(refused.ms < 100);
+    try testing.expect(refused.ms < slack_ms);
     try testing.expectEqual(@as(u64, 0), e.f.metrics.raw_read_wait.n.load(.monotonic));
     try testing.expectEqual(local_calls, e.local.calls.load(.acquire));
     try testing.expectEqual(core_calls, core.calls.load(.acquire));
@@ -2724,10 +2853,14 @@ test "an access gate and read-after-write: a refused read never waits; an admitt
     // edge to apply the transaction and is answered here
     gate.deny_code = 0;
     const begins = gate.begins;
-    const read = try timed(e, a, p_object, try idReq(a, &o_gas));
-    th.join();
-    try testing.expectEqualStrings("local:" ++ p_object ++ "@3", read.reply.message);
-    try testing.expect(read.ms >= 100 and read.ms < 1500);
+    // the edge applies the transaction's checkpoint (3) 250 ms into the read's wait
+    var read = [_]Reader{.{ .e = e, .path = p_object, .body = try idReq(a, &o_gas) }};
+    try e.startWaiting(&read, 250);
+    try e.commit(&txDigest(data));
+    e.joinThreads();
+    try testing.expectEqualStrings("local:" ++ p_object ++ "@3", read[0].message());
+    try testing.expect(read[0].ms >= 250);
+    try testing.expectEqual(@as(u64, 0), e.f.metrics.raw_reads_late.load(.monotonic)); // the commit's, not the bound's
     try testing.expectEqual(@as(u64, 1), e.f.metrics.raw_read_wait.n.load(.monotonic));
     try testing.expectEqual(begins + 1, gate.begins);
     try testing.expectEqual(gate.begins, gate.ends);
@@ -2739,10 +2872,6 @@ test "an access gate and read-after-write: a refused read never waits; an admitt
 test "an access gate and a held certificate: a read answered here because no core can be asked is metered as local, a call that fails on the way to the core as forwarded and failed" {
     core.reset();
     // a port nobody listens on: the core is away
-    var addr = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-    var l = try addr.listen(io, .{ .reuse_address = true });
-    const dead_port = l.socket.address.getPort();
-    l.deinit(io);
     const e = try Edge.create(plain(dead_port), .{});
     defer e.destroy();
     e.healthy();

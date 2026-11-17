@@ -29,6 +29,7 @@ pub const signatures = @import("signatures.zig");
 pub const state_update = @import("state_update.zig");
 pub const txs = @import("txs.zig");
 pub const hooks = @import("hooks.zig");
+pub const persist = @import("persist.zig");
 pub const Manager = manager.Manager;
 
 test {

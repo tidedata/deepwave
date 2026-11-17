@@ -1450,13 +1450,14 @@ test "edge pool: stop ends a connect to a core that never answers, a thread wait
     for (&calls, took) |*c, ms| {
         try std.testing.expect(!c.ok);
         try std.testing.expectEqual(@as(?Error, error.Closed), c.result);
-        try std.testing.expect(ms < 500);
+        // at the stop, not at the pool's own timeouts (4 s); room for a host that stalls threads
+        try std.testing.expect(ms < 1500);
     }
     // A call made after the stop does not touch the network.
     var late: StopCall = .{ .pool = p, .kind = .fetch };
     const t1 = nowNs(io);
     try late.start();
-    try std.testing.expect(late.join(t1) < 500);
+    try std.testing.expect(late.join(t1) < 1500);
     try std.testing.expectEqual(@as(?Error, error.Closed), late.result);
     try std.testing.expectEqual(@as(u64, 0), p.stats.requests.load(.monotonic));
 }
@@ -1484,7 +1485,7 @@ test "edge client: a connect with a stop flag ends when the flag is set" {
     t.stop.store(true, .release);
     th.join();
     try std.testing.expectEqual(@as(?Error, error.Closed), t.err);
-    try std.testing.expect((t.done_ns.load(.acquire) -| t_stop) / std.time.ns_per_ms < 500);
+    try std.testing.expect((t.done_ns.load(.acquire) -| t_stop) / std.time.ns_per_ms < 1500); // not the 4 s timeout
     // without a flag the same connect ends at its own timeout
     const t0 = nowNs(io);
     try std.testing.expectError(error.HandshakeFailed, Conn.connect(gpa, io, core.spec(), 200));

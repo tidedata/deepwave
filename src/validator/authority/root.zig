@@ -31,6 +31,8 @@ pub const preverify_fixture = @import("preverify_fixture.zig");
 pub const locks = @import("locks.zig");
 pub const sim_runner = @import("sim_runner.zig");
 pub const authority = @import("authority.zig");
+/// The transaction-deny config shared through consensus (TransactionDenyConfigManager).
+pub const deny_manager = @import("deny_manager.zig");
 
 /// Skeleton names kept for the other lanes (docs/VALIDATOR-DESIGN.md 5.3).
 /// SubmitTransaction / WaitForEffects (`authority_server.rs`).
@@ -71,8 +73,15 @@ test {
     _ = locks;
     _ = sim_runner;
     _ = authority;
+    _ = deny_manager;
+    _ = @import("commit_log.zig");
     _ = @import("handler_test.zig");
     _ = @import("tx_validator_test.zig");
     _ = @import("preverify_test.zig");
+    _ = @import("sigs_test.zig");
     _ = @import("consensus_vectors_test.zig");
+    _ = @import("deny_vectors_test.zig");
+    _ = @import("validity_vectors_test.zig");
+    _ = @import("signing_vectors_test.zig");
+    _ = @import("pkgverify_test.zig");
 }
