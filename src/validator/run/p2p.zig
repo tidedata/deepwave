@@ -276,6 +276,11 @@ const Link = struct {
     arena: std.heap.ArenaAllocator, // addr
     addr: net.peer_addr.Addr = undefined,
     mu: Io.Mutex = .init,
+    /// Requests waiting for `mu`: the pump thread leaves the connection to them (a request
+    /// services it while it waits for its answer). Without this the pump, which takes `mu` again
+    /// as soon as it lets it go, starved them: under load a call waited 30 s and more for the
+    /// lock (the randomness_net restart test's timeouts).
+    waiting: Atomic(u32) = .init(0),
     out: ?*anemo.Peer = null,
     failed_at_ms: u64 = 0,
     thread: ?std.Thread = null,
@@ -287,7 +292,9 @@ const Link = struct {
 
     fn request(l: *Link, a: Allocator, route: []const u8, headers: []const wire.Header, body: []const u8, timeout_ms: u64) ?anemo.Response {
         const n = l.owner;
+        _ = l.waiting.fetchAdd(1, .acq_rel);
         l.mu.lockUncancelable(n.io);
+        _ = l.waiting.fetchSub(1, .acq_rel);
         defer l.mu.unlock(n.io);
         if (l.out) |p| {
             if (p.request(a, route, headers, body, timeout_ms)) |r| return r else |e| {
@@ -335,7 +342,7 @@ const Link = struct {
         const n = l.owner;
         while (!n.stop_flag.load(.acquire)) {
             var pumped = false;
-            if (l.mu.tryLock()) {
+            if (l.waiting.load(.acquire) == 0 and l.mu.tryLock()) {
                 defer l.mu.unlock(n.io);
                 if (l.out) |p| {
                     p.pump(pump_ms) catch l.drop();

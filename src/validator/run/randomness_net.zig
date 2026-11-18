@@ -635,6 +635,9 @@ fn waitRounds(io: Io, sinks: []const *TestSink, first: u64, end: u64) !void {
         if (all) return;
         try Io.sleep(io, .fromMilliseconds(20), .awake);
     }
+    for (sinks, 0..) |s, i| for (first..end) |r| {
+        if (s.get(r) == null) std.debug.print("waitRounds: sink {d} has no round {d}\n", .{ i, r });
+    };
     return error.Timeout;
 }
 
