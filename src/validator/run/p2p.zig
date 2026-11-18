@@ -152,6 +152,13 @@ pub const P2p = struct {
         return self;
     }
 
+    /// Shutdown begins: every call in flight (a dial, its handshake, a request on either side's
+    /// connection) ends with Cancelled at once and new calls get null, so a thread blocked on a
+    /// dead peer does not hold up the joins before `stop`.
+    pub fn cancelCalls(self: *P2p) void {
+        self.stop_flag.store(true, .release);
+    }
+
     pub fn stop(self: *P2p) void {
         const gpa = self.gpa;
         self.stop_flag.store(true, .release);

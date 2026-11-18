@@ -1303,6 +1303,9 @@ fn runInner(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     }
     report(rt, monoMs() - t0);
     stop_flag.store(true, .release);
+    // outbound p2p calls (the certificate pull below, state sync's pushes and polls) would wait
+    // out their dial and request timeouts against peers that already stopped: end them now
+    if (rt.p2p) |p| p.cancelCalls();
     if (cu_thread) |t| t.join();
     if (sync_thread) |t| t.join();
     if (jwk_thread) |t| t.join();

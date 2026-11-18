@@ -566,11 +566,14 @@ pub fn runOpts(e: *const Engine, arena: Allocator, env: *const EpochEnv, state: 
     }
 
     const vctx: checks.ValidityCtx = .{ .cfg = cfg, .epoch = env.epoch, .chain_id = env.chain_id, .rgp = env.rgp, .committee_size = env.committee_size };
-    if (try checks.validity(arena, &vctx, &td)) |f| return .{ .fail = f };
+    // A certified transaction was judged at signing: Mysten's execution of a sequenced
+    // transaction runs neither `validity_check` nor the transaction deny config
+    // (`pre_object_load_checks`, handle_transaction only), so a certificate skips both.
+    if (!e.certificate) if (try checks.validity(arena, &vctx, &td)) |f| return .{ .fail = f };
 
     // pre_object_load_checks: the transaction deny config first (no signatures in simulate; the
     // input kinds are the ones computed before the mock gas coin)
-    {
+    if (!e.certificate) {
         var deny_guard = txdeny.effective();
         defer deny_guard.release();
         const deny_cfg = deny_guard.config();
